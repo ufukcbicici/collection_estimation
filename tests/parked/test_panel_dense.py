@@ -12,16 +12,19 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src"))
 
 from collection_estimation import config                          # noqa: E402
 from collection_estimation.ingest import read_corpus              # noqa: E402
 from collection_estimation.panel import (                         # noqa: E402
+    build_week_index,
+    to_customer_weeks,
+)
+from collection_estimation.parked.hurdle_panel import (           # noqa: E402
     HORIZONS,
     build_panel,
-    build_week_index,
     first_week,
-    to_customer_weeks,
 )
 
 

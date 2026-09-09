@@ -13,10 +13,11 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src"))
 
 from collection_estimation import config                            # noqa: E402
-from collection_estimation.cross_features import (                  # noqa: E402
+from collection_estimation.parked.cross_features import (                  # noqa: E402
     CO_WINDOW,
     MIN_LIFT,
     MIN_PAYING_WEEKS,

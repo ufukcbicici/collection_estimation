@@ -26,7 +26,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-from .panel import first_week
+from .hurdle_panel import first_week
 
 #: Partners kept per customer, at most.
 TOP_K = 5

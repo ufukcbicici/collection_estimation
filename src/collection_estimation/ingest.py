@@ -13,7 +13,9 @@ from datetime import date, datetime
 import pandas as pd
 from openpyxl import load_workbook
 
-from .config import CORPUS_DIR, ENTITY_LABEL, FIRST_DATA_ROW, HEADER_ROW
+from .config import (CORPUS_DIR, ENTITY_LABEL, FIELD_BY_HEADER,
+                     FILENAME_DATE_FORMAT, FILENAME_DATE_LENGTH, FIRST_DATA_ROW,
+                     HEADER_ROW, MARKER_TABS, OPTIONAL_FIELDS)
 
 
 class WorkbookFormatError(ValueError):
@@ -23,38 +25,16 @@ class WorkbookFormatError(ValueError):
     something is genuinely wrong, and a parser that quietly drops a file is the exact
     failure mode the corpus notes warn about — it fails silently and the loss shows up
     later as an unexplained dip in a weekly total.
+
+    On a first run against unfamiliar files this exception is the *feature*, not the
+    obstacle: it names the file, the row and the column that disagree. Run `preflight.py`
+    on one workbook to see everything that disagrees at once, rather than the first thing.
     """
 
 
-#: Tabs that are not the data sheet. Our synthetic workbooks carry a marker tab first;
-#: real EY files have a single sheet and will not match this.
-MARKER_TABS = frozenset({"_synthetic"})
-
-#: Header text -> the field name we use. Keys are normalised (see `_normalise`).
-#:
-#: Columns are bound by HEADER TEXT, never by position. This is the single most important
-#: decision in this module. The corpus spans fourteen months of a hand-touched daily
-#: extract, and a column inserted partway through would shift everything to its right by
-#: one letter. A parser using `row[7]` for the amount would then silently read the currency
-#: instead and keep running.
-FIELD_BY_HEADER = {
-    "company code": "company_code",
-    "customer": "customer",
-    "customer name": "customer_name",
-    "document date": "document_date",
-    "bank": "bank",
-    "sap document no": "sap_document_no",
-    "government inv": "government_invoice",
-    "amount in original currency": "amount_original",
-    "document currency": "document_currency",
-    "amount in local currency": "amount_local",
-    "local currency": "local_currency",
-}
-
-#: `bank` is deliberately NOT required. EY's imported schema has a bank field, but its
-#: position in the Excel layout was never observed — our generator places it in the hidden
-#: column E as an assumption. A real file may not carry it at all.
-OPTIONAL_FIELDS = frozenset({"bank"})
+#: Fields that must be present. Everything in the header map except the optional ones.
+#: The layout constants themselves live in `config.py`, which is the single place to edit
+#: when the source files change shape.
 REQUIRED_FIELDS = frozenset(FIELD_BY_HEADER.values()) - OPTIONAL_FIELDS
 
 #: Fields that must hold a number on every detail row. Zero is legitimate — EY's TR91 TRY
@@ -83,7 +63,7 @@ def _pick_data_sheet(workbook, path: str) -> str:
     """
     for name in workbook.sheetnames:
         stripped = name.strip()
-        if len(stripped) == 8 and stripped.isdigit():
+        if len(stripped) == FILENAME_DATE_LENGTH and stripped.isdigit():
             return name
     for name in workbook.sheetnames:
         if _normalise(name) not in MARKER_TABS:
@@ -254,18 +234,41 @@ def workbook_paths(directory: str = CORPUS_DIR) -> list[str]:
       `02062025` — a year out of order. The date is parsed out and sorted on.
     * Excel writes a `~$…` lock file whenever a workbook is open. It is not a valid
       archive and `load_workbook` raises a PermissionError on it.
+
+    The date format is `config.FILENAME_DATE_FORMAT`. If the real files are named some
+    other way, change it there rather than here.
     """
     dated: list[tuple[date, str]] = []
     for name in os.listdir(directory):
         if not name.upper().endswith(".XLSX") or name.startswith("~$"):
             continue
-        try:
-            when = datetime.strptime(name[:8], "%d%m%Y").date()
-        except ValueError as exc:
-            raise WorkbookFormatError(
-                f"{name}: filename does not start with a DDMMYYYY date") from exc
-        dated.append((when, os.path.join(directory, name)))
+        dated.append((_date_from_filename(name), os.path.join(directory, name)))
     return [path for _, path in sorted(dated)]
+
+
+#: strftime codes rendered the way a person writes a date pattern, so the error message
+#: below says `DDMMYYYY` rather than `%d%m%Y`. Whoever reads it is looking at filenames,
+#: not at strftime documentation.
+_READABLE = {"%d": "DD", "%m": "MM", "%Y": "YYYY", "%y": "YY", "%j": "JJJ"}
+
+
+def readable_date_format(fmt: str = FILENAME_DATE_FORMAT) -> str:
+    """`%d%m%Y` -> `DDMMYYYY`."""
+    for code, text in _READABLE.items():
+        fmt = fmt.replace(code, text)
+    return fmt
+
+
+def _date_from_filename(name: str) -> date:
+    """The date encoded in a workbook's filename."""
+    try:
+        return datetime.strptime(
+            name[:FILENAME_DATE_LENGTH], FILENAME_DATE_FORMAT).date()
+    except ValueError as exc:
+        raise WorkbookFormatError(
+            f"{name}: the first {FILENAME_DATE_LENGTH} characters are not a "
+            f"{readable_date_format()} date — set config.FILENAME_DATE_FORMAT and "
+            f"FILENAME_DATE_LENGTH to match how the real files are named") from exc
 
 
 def read_corpus(directory: str = CORPUS_DIR, *, progress: bool = False) -> pd.DataFrame:
@@ -289,7 +292,7 @@ def read_corpus(directory: str = CORPUS_DIR, *, progress: bool = False) -> pd.Da
             print(f"  ... {index}/{len(paths)} workbooks")
 
         rows = read_workbook(path)
-        expected = datetime.strptime(name[:8], "%d%m%Y").date()
+        expected = _date_from_filename(name)
         wrong = {r["document_date"] for r in rows} - {expected}
         if wrong:
             raise WorkbookFormatError(

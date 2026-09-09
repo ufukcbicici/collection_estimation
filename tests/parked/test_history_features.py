@@ -11,20 +11,21 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src"))
 
 from collection_estimation import config                            # noqa: E402
-from collection_estimation.history_features import (                # noqa: E402
+from collection_estimation.parked.history_features import (                # noqa: E402
     WINDOWS,
     attach_to_panel,
     build_history_features,
 )
 from collection_estimation.ingest import read_corpus                # noqa: E402
 from collection_estimation.panel import (                           # noqa: E402
-    build_panel,
     build_week_index,
     to_customer_weeks,
 )
+from collection_estimation.parked.hurdle_panel import build_panel   # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -128,7 +129,7 @@ def test_history_starts_at_the_customers_first_appearance():
 
 
 def test_one_row_per_customer_week(history, customer_weeks, weeks):
-    from collection_estimation.panel import first_week
+    from collection_estimation.parked.hurdle_panel import first_week
     expected = int((len(weeks) - first_week(customer_weeks)).sum())
     assert len(history) == expected
     assert not history.duplicated(["customer", "week"]).any()

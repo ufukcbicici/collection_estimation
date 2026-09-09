@@ -1,81 +1,60 @@
-"""Candidate weekly models, to be compared against the baselines.
+"""The recommended weekly model.
 
-Kept out of `baselines.py` on purpose: that module is the bar, and a candidate should not
-live in it.
+**Ridge on the calendar block + a linear trend + the recent level**, refit at every origin,
+a separate fit per horizon. Six features:
 
-**What these were built to settle, and what they actually found.**
+    level              mean of the 4 weeks ending `h` weeks before the target
+    n_business_days    0-5
+    has_month_end      the week contains the last BUSINESS day of a month
+    has_quarter_end    ... of March, June, September or December
+    n_holidays         weekday public holidays in the week
+    trend              the integer week index
 
-Every baseline under-predicts by roughly 10% of the weekly mean. The hypothesis was a
-loss/metric mismatch — squared error targets the conditional MEAN while MAPE is minimised
-nearer the MEDIAN — so two remedies were tried: fitting ``log(y)`` (targets the median) and
-a Tweedie GLM with a log link (targets the mean without a back-transform).
+Measured on the synthetic corpus at h=1: `MAPE 19.83 +/- 2.49, WAPE 19.70, bias -1.0%`.
 
-**Both failed, and the hypothesis was wrong.** Measured at h=1:
+**Chosen for the BIAS, not the accuracy.** Every candidate's MAPE sat inside one standard
+error of every other, so this was never an accuracy choice. What separates it is that it is
+the only competitive model not systematically 10-19% low, which for a cash forecast matters
+more than a point of MAPE. Beyond h=3 an 8-week moving average is just as good.
 
-    ridge            MAPE 20.04   bias  -10.9%
-    ridge_log        MAPE 20.82   bias  -12.5%     log made both worse
-    tweedie_1.3      MAPE 20.90   bias   -9.4%     barely moved the bias
-    ma8              MAPE 23.78   bias   -4.5%     the SMALLEST bias, with no calendar
-
-That last row is the tell. A moving average has no loss subtlety at all, so if it is the
-least biased the cause cannot be the loss. It is a **trend**: the weekly total grows
-**43.2%** from the first quarter of the corpus to the last, and a model fit on all history
-regresses toward the historical mean, which in a rising series sits below the present
-level. `naive` is least biased precisely because it reports the most recent value.
-
-Adding a linear time regressor removes it:
-
-    ridge+trend      MAPE 19.83   bias   -1.0%
-
-**Note what that does and does not buy.** The MAPE change (20.04 -> 19.83) is far inside
-the ~2.5 standard error, so the trend term is justified by BIAS, not accuracy. Indeed no
-model here separates from another on MAPE: the whole spread is about one point against a
-2.5 error bar. On this series the loss and the link do not matter; the trend does.
-
-**Tweedie, not Gamma, if a mean-targeting model is ever wanted.** Gamma assumes
-``Var ∝ mu^2`` — constant coefficient of variation — right for an individual payment but
-not for a weekly TOTAL, which is a sum of ~315 of them. Measured, the Tweedie power is
-**1.10** by residual regression and **1.26** by level quartile, so `p = 2` is unsupported.
-Tweedie combined with a trend over-extrapolates (bias +2.8%, MAPE 22.22), because the log
-link compounds with the linear term.
-
-The design matrix is calendar plus an optional trend, and nothing else. That is deliberate:
-it isolates the loss, the link and the trend from the effect of adding regressors.
+The variants that lost — log target, Tweedie, the derived cadence regressors — are in
+`parked/variants.py` with their numbers. `parked/variants.compare_weekly_models` re-runs
+the whole set in seconds and is worth calling once on real data.
 
 --------------------------------------------------------------------------------------
-NEGATIVE RESULT: do not model daily and sum to weekly.
+Why the trend term is here
 --------------------------------------------------------------------------------------
 
-Tried and rejected on measurement, 2026-09-09. The argument for it was that daily gives
-306 observations instead of 65, and that month-end is a DAY effect the weekly model
-averages away. Both parts fail.
+Every model under-predicted by ~10% of the weekly mean. The hypothesis was a loss/metric
+mismatch — squared error targets the conditional MEAN while MAPE is minimised nearer the
+MEDIAN. **That hypothesis was wrong.** Fitting log(y) made both MAPE and bias worse, and a
+Tweedie GLM barely moved the bias; meanwhile `ma8`, which has no loss subtlety at all, was
+the least biased model in the set. If the crudest model is the least biased, the cause is
+not the loss.
 
-    day-level calendar fit   R^2 = 0.183   (n = 306)
-    weekly calendar fit      R^2 = 0.160
-    day-level fit SUMMED to weeks: R^2 = 0.185 on weekly totals, IN-SAMPLE
+It was a **trend**. The weekly total grows across the corpus and a model fit on all history
+regresses toward a historical mean that, in a rising series, sits below the present level.
+One linear time regressor takes the bias from -10.9% to -1.0%.
 
-A ceiling of 0.185 against a current 0.160, before any out-of-sample penalty. The reason
-is in the fitted coefficients: **day-of-week dominates the day-level signal and cancels
-exactly on aggregation.** Monday runs about 37% above Friday, but every week has one of
-each, so the largest thing a daily model can see contributes nothing to a weekly total.
-What does vary week to week — month-end, month-start — is small beside it and the weekly
-model already has it.
+    ridge          MAPE 20.04   bias -10.9%
+    ridge+trend    MAPE 19.83   bias  -1.0%
 
-The sample-size argument was also overstated: daily CV / weekly CV is **1.62**, where
-independent days would give sqrt(5) = 2.24. Daily totals are correlated within a week, so
-306 observations carry well under 306 observations' worth of information.
+Note what that does and does not buy: the MAPE change is far inside the standard error, so
+the trend term is justified by BIAS, not accuracy.
 
-Wider reading: the calendar explains 16-18% of variance at either granularity, and the
-rest is heavy-tail noise from individual large payments — the largest single payment
-averages about 10% of its week. That is a property of the data, not a modelling failure.
+**On real data this is the first thing to re-examine.** The drift in the synthetic corpus is
+a generator parameter (3%/month) rather than an EY measurement. Turkish inflation makes
+nominal weekly totals non-stationary in reality too, so *some* drift handling is needed —
+but a linear trend is the crude answer. Deflating by a price index is the better one, and
+needs a series we do not have. See `weekly_design`.
 
 --------------------------------------------------------------------------------------
 NEGATIVE RESULT: the level term earns nothing, in any parameterisation.
 --------------------------------------------------------------------------------------
 
 Measured 2026-09-09. The question was whether `_rows` should pass the four recent weeks
-SEPARATELY instead of compressing them into one mean — a mean cannot weight last week
-above four weeks ago, and ridge could. It can, and it gains nothing.
+SEPARATELY instead of compressing them into one mean — a mean cannot weight last week above
+four weeks ago, and ridge could. It can, and it gains nothing.
 
 Compared PAIRED on the same (origin, horizon) pairs. That matters: the ~2.5 MAPE error bar
 is dominated by origin-to-origin variation which is COMMON to both models and cancels on
@@ -94,8 +73,8 @@ The last row is the real finding: `make_ridge(with_level=False)` scores identica
 (One cell reached significance — last-week-only at h=3, -3.25 [-6.36, -0.15]. Discount it:
 1 hit in 15 comparisons at 95% is fewer than the 0.75 expected by chance.)
 
-The cause is that the series has no persistence to exploit. Autocorrelation, n=65 so the
-se is about 0.124:
+The cause is that the series has no persistence to exploit. Autocorrelation, n=65 so the se
+is about 0.124:
 
     lag      raw     detrended
      1     +0.098    -0.144
@@ -111,24 +90,36 @@ white noise. No parameterisation of an empty feature can rescue it.
 **`with_level=True` is kept anyway, and that is a judgement, not a measurement.** A
 near-white weekly series is a property of the GENERATOR; real collections plausibly carry
 persistence (a large payer slipping a week, a backlog clearing). One parameter that costs
-measurably nothing is cheap insurance. Do not cite the level term as doing work.
+measurably nothing is cheap insurance. Do not cite the level term as doing work — and on
+real data, re-run the comparison rather than assuming the result carries over.
+
+--------------------------------------------------------------------------------------
+NEGATIVE RESULT: do not model daily and sum to weekly.
+--------------------------------------------------------------------------------------
+
+Rejected on measurement, 2026-09-09. The argument for it was that daily gives 306
+observations instead of 65, and that month-end is a DAY effect the weekly model averages
+away. Both parts fail: the day-level calendar fit summed to weeks gives R^2 = 0.185
+**in-sample** against the weekly model's 0.160, because **day-of-week dominates the
+day-level signal and cancels exactly on aggregation** (every week has one Monday and one
+Friday). The sample-size argument was overstated too — daily CV / weekly CV is 1.62 where
+independence would give 2.24. Full write-up in section 12b of the design document.
 """
 from __future__ import annotations
 
 import numpy as np
-from sklearn.linear_model import RidgeCV, TweedieRegressor
+from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 
 #: Ridge penalties searched by `RidgeCV`. Spread wide because ~50 training points against
 #: a dozen regressors can want a lot of shrinkage.
 ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0)
 
-#: L2 penalty for the Tweedie GLM. Fixed rather than searched: an inner split on ~50
-#: points is thinner than the difference it would resolve.
-TWEEDIE_ALPHA = 1e-4
-
 #: Minimum training rows before a fitted model is trusted at all.
 MIN_TRAIN = 12
+
+#: The name the recommended model is reported under.
+RECOMMENDED = "ridge+trend"
 
 
 def _rows(y: np.ndarray, design: np.ndarray, origin: int, h: int,
@@ -166,7 +157,7 @@ def _fallback(y: np.ndarray, origin: int) -> float:
 
 def make_ridge(log_target: bool = False, with_level: bool = False,
                alphas: tuple[float, ...] = ALPHAS):
-    """Ridge on the calendar block, optionally on the log of the target.
+    """Ridge on the design matrix, optionally on the log of the target.
 
     Ridge rather than OLS because ~50 training points against a dozen regressors is
     already at the edge — the same variance problem that made the *correct* horizon-aware
@@ -176,7 +167,8 @@ def make_ridge(log_target: bool = False, with_level: bool = False,
     MEDIAN, not the mean. **No smearing correction is applied, and that is deliberate.**
     Section 7.3 wants smearing because the hurdle model sums thousands of predictions and
     needs each to be a mean; here a single number is scored on relative error, which the
-    median serves better. Same transform, opposite correction.
+    median serves better. Same transform, opposite correction. (Measured, `log_target`
+    loses — it is kept only so `parked/variants.py` can reproduce that result.)
     """
     def predict(y, design, origin, target_index, h):
         X, target = _rows(y, design, origin, h, with_level)
@@ -195,82 +187,16 @@ def make_ridge(log_target: bool = False, with_level: bool = False,
     return predict
 
 
-def make_tweedie(power: float, with_level: bool = False,
-                 alpha: float = TWEEDIE_ALPHA):
-    """Tweedie GLM with a log link — targets the conditional MEAN on the natural scale.
-
-    `power` is the variance-mean exponent: 1 is Poisson-like, 2 is Gamma. Measured on this
-    series it is about 1.1 to 1.3, so values in that region are the supported ones and
-    `power=2` is offered only as a contrast.
-
-    The log link keeps predictions positive without a transform, so unlike the log-target
-    ridge there is nothing to back-transform and no median/mean confusion.
-    """
-    def predict(y, design, origin, target_index, h):
-        X, target = _rows(y, design, origin, h, with_level)
-        if len(target) < MIN_TRAIN or (target <= 0).any():
-            return _fallback(y, origin)
-        scaler = StandardScaler().fit(X)
-        try:
-            fitted = TweedieRegressor(power=power, alpha=alpha, link="log",
-                                      max_iter=2000).fit(scaler.transform(X), target)
-        except Exception:                       # noqa: BLE001 — a failed fit is not fatal
-            return _fallback(y, origin)
-        row = _predict_row(y, design, origin, target_index, with_level)
-        value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
-        return value if np.isfinite(value) and value > 0 else _fallback(y, origin)
-    return predict
-
-
-def make_ridge_with_derived(derived: dict, alphas: tuple[float, ...] = ALPHAS):
-    """Ridge on calendar + trend + the derived regressors of `derived_regressors.py`.
-
-    The derived block is indexed by ``(origin, horizon)`` rather than by week, because it
-    is computed from customer history as of the origin. So it cannot ride in the design
-    matrix the harness passes around — it is closed over here, and looked up for the
-    training rows at ``(t - h, h)`` and for the prediction at ``(origin, h)``.
-
-    That lookup is the same horizon-consistency rule as the level term: a training row
-    must carry the regressors that would have been known when forecasting its own target
-    from `h` weeks out.
-    """
-    from .derived_regressors import derived_matrix
-
-    def predict(y, design, origin, target_index, h):
-        start = h + 3
-        rows, targets = [], []
-        for t in range(start, origin + 1):
-            level = float(y[t - h - 3:t - h + 1].mean())
-            rows.append(np.concatenate(
-                ([level], design[t], derived_matrix(derived, t - h, h))))
-            targets.append(y[t])
-        if len(targets) < MIN_TRAIN:
-            return _fallback(y, origin)
-
-        X = np.asarray(rows, dtype=float)
-        target = np.asarray(targets, dtype=float)
-        scaler = StandardScaler().fit(X)
-        fitted = RidgeCV(alphas=np.asarray(alphas, dtype=float)).fit(
-            scaler.transform(X), target)
-
-        row = np.concatenate(([float(y[origin - 3:origin + 1].mean())],
-                              design[target_index],
-                              derived_matrix(derived, origin, h)))
-        value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
-        return value if np.isfinite(value) and value > 0 else _fallback(y, origin)
-    return predict
-
-
-def weekly_design(series, calendar, with_trend: bool) -> np.ndarray:
+def weekly_design(series, calendar, with_trend: bool = True) -> np.ndarray:
     """Calendar block, optionally with a linear time index appended.
 
     The trend is a *model* regressor rather than a calendar feature — it describes the
     series' drift, not the week's calendar — so it is assembled here.
 
     On real EY data the equivalent question is whether to model in nominal or real terms.
-    Turkish inflation makes nominal weekly totals non-stationary, and this corpus carries
-    a drift by construction. A trend regressor is the crude answer; deflating by a price
-    index is the better one, and needs a series we do not have.
+    Turkish inflation makes nominal weekly totals non-stationary, and the synthetic corpus
+    carries a drift by construction. A trend regressor is the crude answer; deflating by a
+    price index is the better one, and needs a series we do not have.
     """
     from .baselines import calendar_matrix
 
@@ -281,30 +207,13 @@ def weekly_design(series, calendar, with_trend: bool) -> np.ndarray:
     return np.hstack([block, trend])
 
 
-def candidate_models(with_trend: bool) -> dict:
-    """The set compared in the pipeline, suffixed so both design matrices can be merged.
+def evaluate_recommended(series, calendar):
+    """Run the recommended model over every rolling origin. One row per (horizon, origin).
 
-    Both the trend and the no-trend variants are kept, because the contrast between them
-    is the finding — the bias is a trend problem, not a loss problem, and a table showing
-    only the fixed version would hide that.
+    The single call the pipeline makes. Returns the same shape as
+    `baselines.rolling_origin_baselines`, so the two concatenate and score together.
     """
-    suffix = "+trend" if with_trend else ""
-    return {
-        f"ols_level{suffix}": make_ridge(with_level=True, alphas=(1e-8,)),
-        f"ridge{suffix}":     make_ridge(with_level=True),
-        f"ridge_log{suffix}": make_ridge(log_target=True, with_level=True),
-        f"tweedie_1.3{suffix}": make_tweedie(power=1.3, with_level=True),
-    }
-
-
-def compare_weekly_models(series, calendar) -> "object":
-    """Run every candidate, with and without the trend, on one harness."""
-    import pandas as pd
-
     from .baselines import rolling_origin
 
-    frames = []
-    for with_trend in (False, True):
-        design = weekly_design(series, calendar, with_trend)
-        frames.append(rolling_origin(series, design, candidate_models(with_trend)))
-    return pd.concat(frames, ignore_index=True)
+    design = weekly_design(series, calendar, with_trend=True)
+    return rolling_origin(series, design, {RECOMMENDED: make_ridge(with_level=True)})

@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .panel import first_week
+from .hurdle_panel import first_week
 
 #: Rolling window lengths, in weeks.
 #:
