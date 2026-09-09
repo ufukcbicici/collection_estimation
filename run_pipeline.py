@@ -5,7 +5,7 @@ at the top of the file, and every step is one call inside `main()` so you can pu
 breakpoint between any two and inspect what came out.
 
     Step 1  ingest    read the 306 daily workbooks into one table
-    Step 2  panel     Algorithm 1 of the design      (not built yet)
+    Step 2  panel     week spine + customer-week aggregation (Algorithm 1, line 1)
     Step 3  features  sections 9.1 / 9.2 / 9.3       (not built yet)
     Step 4  models    stages 1 and 2                 (not built yet)
     Step 5  evaluate  Algorithm 4, rolling origin    (not built yet)
@@ -31,6 +31,11 @@ from collection_estimation.ingest import (  # noqa: E402
     read_collections_csv,
     read_corpus,
     write_collections_csv,
+)
+from collection_estimation.panel import (  # noqa: E402
+    build_week_index,
+    to_customer_weeks,
+    weeks_without_collections,
 )
 
 # ======================================================================================
@@ -134,9 +139,31 @@ def main() -> dict:
     #         collections[collections["sap_document_no"].isna()]    # unapplied cash
 
     # ==================================================================================
-    # Step 2 — the customer-week panel        (design section 12, Algorithm 1)
+    # Step 2 — the week spine and customer-week aggregation
+    #          (design section 12, Algorithm 1, line 1)
     # ==================================================================================
-    not_built_yet("Step 2  panel", "design section 12, Algorithm 1")
+    weeks = build_week_index(collections)
+    customer_weeks = to_customer_weeks(collections, weeks)
+
+    print(f"\n--- weeks " + "-" * 63)
+    print(f"{len(weeks)} weeks, {weeks['iso_week'].iloc[0]} .. "
+          f"{weeks['iso_week'].iloc[-1]}  "
+          f"({weeks['week_start'].iloc[0]:%Y-%m-%d} .. "
+          f"{weeks['week_end'].iloc[-1]:%Y-%m-%d})")
+    empty = weeks_without_collections(customer_weeks, weeks)
+    print(f"weeks with no collections at all: {empty if empty else 'none'}")
+
+    describe(customer_weeks, "customer_weeks")
+    dense = collections["customer"].nunique() * len(weeks)
+    print(f"sparsity   : {len(customer_weeks):,} observed of {dense:,} possible "
+          f"customer-weeks ({len(customer_weeks) / dense:.2%})")
+    print(f"negative net: {int((customer_weeks['amount_net'] < 0).sum())} "
+          f"customer-weeks  (why positives and negatives are not netted)")
+
+    # >>> BREAKPOINT HERE to inspect `weeks` and `customer_weeks`. Try:
+    #         customer_weeks.groupby("week")["amount_net"].sum()      # the weekly series
+    #         customer_weeks["customer"].value_counts()               # appearance counts
+    #         customer_weeks[customer_weeks["amount_negative"] < 0]   # refunds
 
     # ==================================================================================
     # Step 3 — features                       (design sections 9.1, 9.2, 9.3)
@@ -154,12 +181,16 @@ def main() -> dict:
     not_built_yet("Step 5  evaluate", "design section 12, Algorithm 4")
 
     print("\n" + "=" * 72)
-    print("done. Next unit: the customer-week panel.")
+    print("done. Next unit: the dense panel (Algorithm 1, lines 5-11).")
     print("=" * 72)
 
     # Returned so that running this file in PyCharm's Python Console leaves every
     # intermediate bound to a name you can poke at afterwards.
-    return {"collections": collections}
+    return {
+        "collections": collections,
+        "weeks": weeks,
+        "customer_weeks": customer_weeks,
+    }
 
 
 if __name__ == "__main__":
