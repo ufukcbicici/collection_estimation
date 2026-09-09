@@ -10,9 +10,10 @@ from __future__ import annotations
 import os
 from datetime import date, datetime
 
+import pandas as pd
 from openpyxl import load_workbook
 
-from .config import ENTITY_LABEL, FIRST_DATA_ROW, HEADER_ROW
+from .config import CORPUS_DIR, ENTITY_LABEL, FIRST_DATA_ROW, HEADER_ROW
 
 
 class WorkbookFormatError(ValueError):
@@ -213,3 +214,120 @@ def read_workbook(path: str) -> list[dict]:
         return rows
     finally:
         workbook.close()
+
+
+# --------------------------------------------------------------------------------------
+# The whole corpus
+# --------------------------------------------------------------------------------------
+
+#: Column dtypes for the merged table. `customer` is the one that matters: as an inferred
+#: integer it loses any leading zero and every join against those customers then misses
+#: them, silently. See `read_collections_csv`.
+#: Second precision, pinned. A fresh read infers `datetime64[s]` from `date` objects while
+#: the CSV cache comes back as `datetime64[us]`, so without this the table's dtype depends
+#: on whether the cache was hit — and code downstream would behave differently on a first
+#: run than on every run after it. These are dates; sub-second precision means nothing.
+DATE_DTYPE = "datetime64[s]"
+
+DTYPES = {
+    "company_code": "string",
+    "customer": "string",
+    "customer_name": "string",
+    "bank": "string",
+    "sap_document_no": "string",
+    "government_invoice": "string",
+    "document_currency": "string",
+    "local_currency": "string",
+    "source_file": "string",
+    "source_row": "int64",
+    "amount_original": "float64",
+    "amount_local": "float64",
+}
+
+
+def workbook_paths(directory: str = CORPUS_DIR) -> list[str]:
+    """Every workbook in a corpus directory, in CHRONOLOGICAL order.
+
+    Two details, both of which have bitten this project already:
+
+    * The filenames are `DDMMYYYY`, so a plain lexical sort puts `01072026` before
+      `02062025` — a year out of order. The date is parsed out and sorted on.
+    * Excel writes a `~$…` lock file whenever a workbook is open. It is not a valid
+      archive and `load_workbook` raises a PermissionError on it.
+    """
+    dated: list[tuple[date, str]] = []
+    for name in os.listdir(directory):
+        if not name.upper().endswith(".XLSX") or name.startswith("~$"):
+            continue
+        try:
+            when = datetime.strptime(name[:8], "%d%m%Y").date()
+        except ValueError as exc:
+            raise WorkbookFormatError(
+                f"{name}: filename does not start with a DDMMYYYY date") from exc
+        dated.append((when, os.path.join(directory, name)))
+    return [path for _, path in sorted(dated)]
+
+
+def read_corpus(directory: str = CORPUS_DIR, *, progress: bool = False) -> pd.DataFrame:
+    """Read every workbook in a corpus directory into one table.
+
+    One row per collection, in chronological order, with `source_file` and `source_row`
+    kept so any row can be traced back to the cell it came from.
+
+    **Cross-checks the date**, which `read_workbook` deliberately does not: a file named
+    `02072026` whose rows carry a different document date is an anomaly, and consistent
+    with this module's strict stance it raises rather than being quietly accepted.
+    """
+    paths = workbook_paths(directory)
+    if not paths:
+        raise WorkbookFormatError(f"no workbooks found in {directory}")
+
+    frames: list[dict] = []
+    for index, path in enumerate(paths, start=1):
+        name = os.path.basename(path)
+        if progress and index % 50 == 0:
+            print(f"  ... {index}/{len(paths)} workbooks")
+
+        rows = read_workbook(path)
+        expected = datetime.strptime(name[:8], "%d%m%Y").date()
+        wrong = {r["document_date"] for r in rows} - {expected}
+        if wrong:
+            raise WorkbookFormatError(
+                f"{name}: filename says {expected} but rows carry "
+                f"{sorted(wrong)} in Document Date")
+        frames.extend(rows)
+
+    table = pd.DataFrame(frames)
+    table["document_date"] = pd.to_datetime(
+        table["document_date"]).astype(DATE_DTYPE)
+    for column, dtype in DTYPES.items():
+        if column in table.columns:
+            table[column] = table[column].astype(dtype)
+    return table.sort_values(["document_date", "company_code", "customer"],
+                             kind="stable").reset_index(drop=True)
+
+
+def write_collections_csv(table: pd.DataFrame, path: str) -> None:
+    """Cache the merged table."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    table.to_csv(path, index=False, encoding="utf-8")
+
+
+def read_collections_csv(path: str) -> pd.DataFrame:
+    """Load the cached table, preserving the types the CSV cannot carry itself.
+
+    **The explicit dtype is load-bearing.** `customer` holds digits, so pandas infers
+    `int64` for it by default and any leading zero is gone — after which every join
+    against those customers misses them and nothing complains. CSV has no dtype of its
+    own, so this is the only place the distinction can be restored.
+    """
+    present = pd.read_csv(path, nrows=0, encoding="utf-8").columns
+    table = pd.read_csv(
+        path,
+        dtype={col: dt for col, dt in DTYPES.items() if col in present},
+        parse_dates=["document_date"] if "document_date" in present else None,
+        encoding="utf-8",
+    )
+    if "document_date" in present:
+        table["document_date"] = table["document_date"].astype(DATE_DTYPE)
+    return table

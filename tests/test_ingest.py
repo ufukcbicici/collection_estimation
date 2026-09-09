@@ -10,7 +10,6 @@ import sys
 from datetime import date, datetime
 
 import pytest
-from openpyxl import Workbook
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -20,44 +19,7 @@ from collection_estimation.ingest import (                    # noqa: E402
     WorkbookFormatError,
     read_workbook,
 )
-
-HEADERS = ["Company Code", "Customer", "Customer Name", "Document Date", "Bank",
-           "SAP Document No", "Government Inv", "Amount in Original Currency",
-           "Document currency", "Amount in local currency", "Local Currency"]
-
-
-# ---------------------------------------------------------------- helpers
-
-def corpus_files():
-    return sorted(f for f in os.listdir(config.CORPUS_DIR)
-                  if f.upper().endswith(".XLSX") and not f.startswith("~$"))
-
-
-def build(tmp_path, headers=HEADERS, rows=(), title="MERCURY COLLECTIONS",
-          sheet="02072026", name="book.xlsx", marker_tab=True):
-    """A minimal workbook in the real layout: merged title, header on row 2, data below."""
-    wb = Workbook()
-    wb.remove(wb.active)
-    if marker_tab:
-        wb.create_sheet("_SYNTHETIC", 0).cell(row=1, column=1, value="synthetic")
-    ws = wb.create_sheet(sheet)
-    if title is not None:
-        ws.cell(row=1, column=1, value=title)
-    for i, h in enumerate(headers, start=1):
-        ws.cell(row=config.HEADER_ROW, column=i, value=h)
-    for r, values in enumerate(rows, start=config.FIRST_DATA_ROW):
-        for i, v in enumerate(values, start=1):
-            ws.cell(row=r, column=i, value=v)
-    path = os.path.join(tmp_path, name)
-    wb.save(path)
-    return path
-
-
-def detail(customer="11520039", code="TR02", amount=1000.0, cur="TRY",
-           local=None, when=datetime(2026, 7, 2), bank="hsbc",
-           sap="TR20021232", inv="GNF2026000002400"):
-    return [code, customer, "A CUSTOMER A.Ş.", when, bank, sap, inv,
-            amount, cur, amount if local is None else local, "TRY"]
+from tests.helpers import HEADERS, build, corpus_files, detail  # noqa: E402
 
 
 # ---------------------------------------------------------------- real corpus
