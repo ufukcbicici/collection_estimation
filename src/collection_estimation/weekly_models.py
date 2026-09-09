@@ -41,6 +41,33 @@ link compounds with the linear term.
 
 The design matrix is calendar plus an optional trend, and nothing else. That is deliberate:
 it isolates the loss, the link and the trend from the effect of adding regressors.
+
+--------------------------------------------------------------------------------------
+NEGATIVE RESULT: do not model daily and sum to weekly.
+--------------------------------------------------------------------------------------
+
+Tried and rejected on measurement, 2026-09-09. The argument for it was that daily gives
+306 observations instead of 65, and that month-end is a DAY effect the weekly model
+averages away. Both parts fail.
+
+    day-level calendar fit   R^2 = 0.183   (n = 306)
+    weekly calendar fit      R^2 = 0.160
+    day-level fit SUMMED to weeks: R^2 = 0.185 on weekly totals, IN-SAMPLE
+
+A ceiling of 0.185 against a current 0.160, before any out-of-sample penalty. The reason
+is in the fitted coefficients: **day-of-week dominates the day-level signal and cancels
+exactly on aggregation.** Monday runs about 37% above Friday, but every week has one of
+each, so the largest thing a daily model can see contributes nothing to a weekly total.
+What does vary week to week — month-end, month-start — is small beside it and the weekly
+model already has it.
+
+The sample-size argument was also overstated: daily CV / weekly CV is **1.62**, where
+independent days would give sqrt(5) = 2.24. Daily totals are correlated within a week, so
+306 observations carry well under 306 observations' worth of information.
+
+Wider reading: the calendar explains 16-18% of variance at either granularity, and the
+rest is heavy-tail noise from individual large payments — the largest single payment
+averages about 10% of its week. That is a property of the data, not a modelling failure.
 """
 from __future__ import annotations
 
@@ -146,6 +173,45 @@ def make_tweedie(power: float, with_level: bool = False,
         except Exception:                       # noqa: BLE001 — a failed fit is not fatal
             return _fallback(y, origin)
         row = _predict_row(y, design, origin, target_index, with_level)
+        value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
+        return value if np.isfinite(value) and value > 0 else _fallback(y, origin)
+    return predict
+
+
+def make_ridge_with_derived(derived: dict, alphas: tuple[float, ...] = ALPHAS):
+    """Ridge on calendar + trend + the derived regressors of `derived_regressors.py`.
+
+    The derived block is indexed by ``(origin, horizon)`` rather than by week, because it
+    is computed from customer history as of the origin. So it cannot ride in the design
+    matrix the harness passes around — it is closed over here, and looked up for the
+    training rows at ``(t - h, h)`` and for the prediction at ``(origin, h)``.
+
+    That lookup is the same horizon-consistency rule as the level term: a training row
+    must carry the regressors that would have been known when forecasting its own target
+    from `h` weeks out.
+    """
+    from .derived_regressors import derived_matrix
+
+    def predict(y, design, origin, target_index, h):
+        start = h + 3
+        rows, targets = [], []
+        for t in range(start, origin + 1):
+            level = float(y[t - h - 3:t - h + 1].mean())
+            rows.append(np.concatenate(
+                ([level], design[t], derived_matrix(derived, t - h, h))))
+            targets.append(y[t])
+        if len(targets) < MIN_TRAIN:
+            return _fallback(y, origin)
+
+        X = np.asarray(rows, dtype=float)
+        target = np.asarray(targets, dtype=float)
+        scaler = StandardScaler().fit(X)
+        fitted = RidgeCV(alphas=np.asarray(alphas, dtype=float)).fit(
+            scaler.transform(X), target)
+
+        row = np.concatenate(([float(y[origin - 3:origin + 1].mean())],
+                              design[target_index],
+                              derived_matrix(derived, origin, h)))
         value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
         return value if np.isfinite(value) and value > 0 else _fallback(y, origin)
     return predict
