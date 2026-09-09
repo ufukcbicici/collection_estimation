@@ -24,6 +24,7 @@ import time
 # or `src` marked as a Sources Root.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from collection_estimation import config  # noqa: E402
@@ -37,6 +38,11 @@ from collection_estimation.baselines import (  # noqa: E402
 from collection_estimation.calendar_features import (  # noqa: E402
     build_calendar_features,
     cross_check_business_days,
+)
+from collection_estimation.cross_features import (  # noqa: E402
+    TOP_K,
+    build_cross_features,
+    find_partners,
 )
 from collection_estimation.history_features import (  # noqa: E402
     attach_to_panel,
@@ -272,7 +278,32 @@ def main() -> dict:
     # ==================================================================================
     # Step 3c — cross-customer                (design section 9.3)
     # ==================================================================================
-    not_built_yet("Step 3c  cross-customer", "design section 9.3")
+    started = time.perf_counter()
+    cross = build_cross_features(customer_weeks, weeks)
+    print(f"\n--- cross-customer " + "-" * 54)
+    print(f"{len(cross):,} rows in {time.perf_counter() - started:.1f}s "
+          f"(partners rebuilt at EVERY origin — building once over all weeks would "
+          f"leak\n  future co-payments, which is the subtlest trap in section 10.2)")
+
+    partners_now = find_partners(customer_weeks, up_to_week=len(weeks) - 1)
+    sizes = [len(v) for v in partners_now.values()]
+    print(f"at the last origin: {len(partners_now):,} of "
+          f"{customer_weeks['customer'].nunique():,} customers have a partner "
+          f"({len(partners_now) / customer_weeks['customer'].nunique():.1%})")
+    if sizes:
+        at_cap = sum(1 for s in sizes if s == TOP_K)
+        print(f"  partners each: mean {np.mean(sizes):.2f}  "
+              f"{at_cap}/{len(sizes)} at the cap of {TOP_K} — the rest are limited by "
+              f"the lift floor, not by k")
+
+    by_week = cross.groupby("week", observed=True)["has_partners"].mean()
+    print(f"  share of rows with a partner: week {by_week.index[0]} "
+          f"{by_week.iloc[0]:.1%} -> week {by_week.index[-1]} {by_week.iloc[-1]:.1%}")
+    print("  empty early on by design: a lift estimate needs ten paying weeks first")
+
+    # >>> BREAKPOINT HERE to inspect `cross` and `partners_now`.
+
+    # ==================================================================================
 
     # ==================================================================================
     # Step 4a — the baselines: the bar to beat   (design section 11.2)
@@ -331,6 +362,7 @@ def main() -> dict:
         "calendar": calendar,
         "history": history,
         "features": features,
+        "cross": cross,
         "series": series,
         "evaluations": evaluations,
     }
