@@ -27,6 +27,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 import pandas as pd  # noqa: E402
 
 from collection_estimation import config  # noqa: E402
+from collection_estimation.calendar_features import (  # noqa: E402
+    build_calendar_features,
+    cross_check_business_days,
+)
 from collection_estimation.ingest import (  # noqa: E402
     read_collections_csv,
     read_corpus,
@@ -189,9 +193,35 @@ def main() -> dict:
     #         panel[panel["y_negative"] < 0]                # weeks containing a refund
 
     # ==================================================================================
-    # Step 3 — features                       (design sections 9.1, 9.2, 9.3)
+    # Step 3a — the calendar block            (design section 9.2)
     # ==================================================================================
-    not_built_yet("Step 3  features", "design sections 9.1, 9.2, 9.3")
+    calendar = build_calendar_features(weeks)
+    describe(calendar, "calendar")
+
+    print(f"month ends : {int(calendar['has_month_end'].sum())}   "
+          f"quarter ends: {int(calendar['has_quarter_end'].sum())}")
+    short = calendar[calendar["n_business_days"] < 5]
+    print(f"short weeks: {len(short)} of {len(calendar)} lose a business day to a "
+          f"public holiday")
+
+    # The hardcoded holiday table is the weak part of this block, so the disagreement
+    # against the days the corpus actually has files for is reported rather than assumed.
+    report = cross_check_business_days(weeks, collections)
+    print(f"\ncross-check against observed file dates: {len(report)} disagreement(s)")
+    if len(report):
+        with pd.option_context("display.width", 200, "display.max_colwidth", 60):
+            print(report.to_string(index=False))
+        print("  `expected_working_no_data` should be the corpus's 6 deliberately")
+        print("  missing files — those are absent observations, NOT holidays.")
+
+    # >>> BREAKPOINT HERE to inspect `calendar` and `report`. Try:
+    #         calendar[calendar["has_month_end"] == 1]
+    #         calendar[calendar["n_holidays"] > 0]
+
+    # ==================================================================================
+    # Step 3b — customer history and cross-customer   (sections 9.1, 9.3)
+    # ==================================================================================
+    not_built_yet("Step 3b  history + cross-customer", "design sections 9.1 and 9.3")
 
     # ==================================================================================
     # Step 4 — the two stages                 (design sections 6 and 7)
