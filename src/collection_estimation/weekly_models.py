@@ -68,6 +68,50 @@ independent days would give sqrt(5) = 2.24. Daily totals are correlated within a
 Wider reading: the calendar explains 16-18% of variance at either granularity, and the
 rest is heavy-tail noise from individual large payments — the largest single payment
 averages about 10% of its week. That is a property of the data, not a modelling failure.
+
+--------------------------------------------------------------------------------------
+NEGATIVE RESULT: the level term earns nothing, in any parameterisation.
+--------------------------------------------------------------------------------------
+
+Measured 2026-09-09. The question was whether `_rows` should pass the four recent weeks
+SEPARATELY instead of compressing them into one mean — a mean cannot weight last week
+above four weeks ago, and ridge could. It can, and it gains nothing.
+
+Compared PAIRED on the same (origin, horizon) pairs. That matters: the ~2.5 MAPE error bar
+is dominated by origin-to-origin variation which is COMMON to both models and cancels on
+differencing. Two independent standard errors can only say "cannot distinguish"; the paired
+CI can say "equal", which is the stronger claim actually needed here.
+
+    vs mean4                h=1     avg h=1..5    95% CI (all h)
+    four separate lags     -0.05      -0.32      [-1.49, +0.85]
+    last week only         +1.82      -0.50      [-1.79, +0.78]
+    eight lags             +1.75      +1.72         -
+    NO LEVEL AT ALL        +0.89      -0.00      [-1.37, +1.36]
+
+The last row is the real finding: `make_ridge(with_level=False)` scores identically to
+`with_level=True`. **The working model is calendar + trend.**
+
+(One cell reached significance — last-week-only at h=3, -3.25 [-6.36, -0.15]. Discount it:
+1 hit in 15 comparisons at 95% is fewer than the 0.75 expected by chance.)
+
+The cause is that the series has no persistence to exploit. Autocorrelation, n=65 so the
+se is about 0.124:
+
+    lag      raw     detrended
+     1     +0.098    -0.144
+     2     +0.207    -0.015
+     3     -0.128    -0.435
+     4     +0.427    +0.250
+     5     +0.229    +0.018
+
+Detrended, only lags 3 and 4 clear noise, and together they are a ~4-week rhythm — the
+month-end cycle, which the calendar block already holds in `has_month_end`. The rest is
+white noise. No parameterisation of an empty feature can rescue it.
+
+**`with_level=True` is kept anyway, and that is a judgement, not a measurement.** A
+near-white weekly series is a property of the GENERATOR; real collections plausibly carry
+persistence (a large payer slipping a week, a backlog clearing). One parameter that costs
+measurably nothing is cheap insurance. Do not cite the level term as doing work.
 """
 from __future__ import annotations
 
