@@ -104,13 +104,23 @@ Measured on this corpus (MAPE, by horizon in weeks):
 
 | model | h=1 | h=2 | h=3 | h=4 | h=5 |
 |---|---|---|---|---|---|
-| last week's value | 30.5 | 32.4 | 38.4 | 29.4 | 29.0 |
-| 8-week average | 24.2 | 24.1 | 23.7 | 21.8 | 22.4 |
-| **calendar-only regression** | **16.5** | **16.8** | **18.5** | **18.0** | **19.0** |
+| last week's value | 29.3 | 30.9 | 37.4 | 27.7 | 28.2 |
+| 4-week average | 25.8 | 25.0 | 23.7 | 22.9 | 23.4 |
+| 8-week average | 23.8 | 23.6 | 22.6 | 20.9 | 21.2 |
+| **calendar-only regression** | **20.7** | **20.6** | **20.8** | **20.1** | **19.2** |
+
+`run_pipeline.py` prints this on every run, so the bar stays in front of you.
 
 The calendar-only row is five parameters: recent level, business days in the target week,
 whether it contains a month end, whether it contains a quarter end, and how many weekday
 holidays fall in it.
 
-**Build that baseline first.** It sets the real bar at ~17%, not the 24% a moving average
-suggests, and anything more elaborate has to beat it.
+**The bar is ~20.7% at h=1.** Anything more elaborate has to beat it.
+
+Two things to know about these numbers:
+
+- **They belong to this corpus.** They are sensitive to where the six missing files fall —
+  one lands on 2025-09-30, the last business day of September, which is the worst possible
+  place for a calendar model. Regenerating the corpus moves them.
+- **Every model under-predicts.** The calendar model's bias at h=1 is about −12.8M TRY on
+  a 133.7M weekly mean. MAPE and WAPE hide the sign; that is why all three are reported.

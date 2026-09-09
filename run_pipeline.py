@@ -27,6 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 import pandas as pd  # noqa: E402
 
 from collection_estimation import config  # noqa: E402
+from collection_estimation.baselines import (  # noqa: E402
+    mape_table,
+    rolling_origin_baselines,
+    score,
+    weekly_totals,
+    weeks_affected_by_missing_files,
+)
 from collection_estimation.calendar_features import (  # noqa: E402
     build_calendar_features,
     cross_check_business_days,
@@ -115,6 +122,20 @@ def load_collections(force: bool = False) -> pd.DataFrame:
     write_collections_csv(table, config.COLLECTIONS)
     print(f"  cached to {config.COLLECTIONS}")
     return table
+
+
+def _oracle_missing_files() -> list[str]:
+    """Business days the corpus has no file for, as declared by the oracle.
+
+    Only available because this corpus is synthetic. On real data the equivalent comes
+    from `cross_check_business_days`, which finds the same days empirically.
+    """
+    import json
+    try:
+        with open(config.ORACLE, encoding="utf-8") as handle:
+            return json.load(handle)["ey_spec_alignment"]["missing_files"]
+    except (OSError, KeyError):
+        return []
 
 
 def not_built_yet(step: str, where: str) -> None:
@@ -206,6 +227,7 @@ def main() -> dict:
 
     # The hardcoded holiday table is the weak part of this block, so the disagreement
     # against the days the corpus actually has files for is reported rather than assumed.
+    missing_dates = _oracle_missing_files()
     report = cross_check_business_days(weeks, collections)
     print(f"\ncross-check against observed file dates: {len(report)} disagreement(s)")
     if len(report):
@@ -224,9 +246,42 @@ def main() -> dict:
     not_built_yet("Step 3b  history + cross-customer", "design sections 9.1 and 9.3")
 
     # ==================================================================================
-    # Step 4 — the two stages                 (design sections 6 and 7)
+    # Step 4a — the baselines: the bar to beat   (design section 11.2)
     # ==================================================================================
-    not_built_yet("Step 4  models", "design sections 6 and 7")
+    series = weekly_totals(customer_weeks, weeks)
+    evaluations = rolling_origin_baselines(series, calendar)
+    table = mape_table(evaluations)
+
+    print("\n=== Step 4a  baselines " + "=" * 49)
+    print(f"weekly series: mean {series.mean():,.0f} TRY   "
+          f"cv {series.std() / series.mean():.3f}   {len(series)} weeks")
+    print(f"origins      : {evaluations['origin'].nunique()}   "
+          f"evaluations {len(evaluations):,}")
+    print("\nMAPE % by horizon — lower is better:")
+    print(table.round(2).to_string())
+
+    scored = score(evaluations)
+    h1 = scored[scored["horizon"] == 1].set_index("model")
+    print("\nat h=1, all three metrics:")
+    print(h1[["mape", "wape", "bias"]].round(2).to_string())
+
+    affected = weeks_affected_by_missing_files(series, weeks, missing_dates)
+    print(f"\n{len(affected)} of {len(series)} weeks contain a day whose file is absent. "
+          "They are\nKEPT in the evaluation — dropping them would flatter every model by")
+    print("removing errors it genuinely makes.")
+
+    best = table[1].idxmin()
+    print(f"\nTHE BAR: {best} at {table.loc[best, 1]:.1f}% MAPE (h=1).")
+    print("A per-customer model that cannot beat this is not paying for its complexity.")
+
+    # >>> BREAKPOINT HERE to inspect `series`, `evaluations`, `table`. Try:
+    #         evaluations[evaluations["model"] == "calendar_aware"].nlargest(5, "actual")
+    #         series.plot()   # if you want to look at it
+
+    # ==================================================================================
+    # Step 4b — the two stages                (design sections 6 and 7)
+    # ==================================================================================
+    not_built_yet("Step 4b  models", "design sections 6 and 7")
 
     # ==================================================================================
     # Step 5 — rolling-origin evaluation      (design section 12, Algorithm 4)
