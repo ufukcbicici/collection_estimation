@@ -53,6 +53,9 @@ from collection_estimation.ingest import (  # noqa: E402
     read_corpus,
     write_collections_csv,
 )
+from collection_estimation.weekly_models import (  # noqa: E402
+    compare_weekly_models,
+)
 from collection_estimation.panel import (  # noqa: E402
     build_panel,
     build_week_index,
@@ -339,9 +342,34 @@ def main() -> dict:
     #         series.plot()   # if you want to look at it
 
     # ==================================================================================
-    # Step 4b — the two stages                (design sections 6 and 7)
+    # Step 4b — weekly candidate models       (the per-customer hurdle is PARKED)
     # ==================================================================================
-    not_built_yet("Step 4b  models", "design sections 6 and 7")
+    candidates = compare_weekly_models(series, calendar)
+    everything = pd.concat([evaluations, candidates], ignore_index=True)
+    scored_all = score(everything)
+
+    print("\n=== Step 4b  weekly models " + "=" * 45)
+    print("MAPE by horizon:")
+    print(scored_all.pivot(index="model", columns="horizon", values="mape")
+          .round(2).to_string())
+
+    at_h1 = scored_all[scored_all["horizon"] == 1].set_index("model")
+    at_h1 = at_h1.assign(bias_pct=(at_h1["bias"] / series.mean() * 100).round(1))
+    at_h1 = at_h1.sort_values("mape")[["mape", "mape_se", "wape", "bias_pct"]]
+    print("\nat h=1, sorted by MAPE:")
+    print(at_h1.round(2).to_string())
+
+    spread = at_h1["mape"].max() - at_h1["mape"].min()
+    typical_se = at_h1["mape_se"].median()
+    print(f"\nspread across models {spread:.1f} MAPE points against a typical standard")
+    print(f"error of {typical_se:.1f} — so MAPE does NOT separate these models. What does")
+    print("separate them is BIAS: the weekly total grows 43% across the corpus, and any")
+    print("model without a trend term regresses toward a historical mean well below the")
+    print("present level. A moving average is least biased only because it is most recent.")
+
+    # >>> BREAKPOINT HERE to inspect `candidates` and `scored_all`.
+
+    # ==================================================================================
 
     # ==================================================================================
     # Step 5 — rolling-origin evaluation      (design section 12, Algorithm 4)

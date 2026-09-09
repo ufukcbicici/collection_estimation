@@ -129,6 +129,44 @@ def _fit_calendar(history: np.ndarray, design: np.ndarray,
     return value if value > 0 else float(history[-4:].mean())
 
 
+def calendar_matrix(series: pd.Series, calendar: pd.DataFrame) -> np.ndarray:
+    """The calendar block as a plain array aligned to the series index."""
+    block = calendar.set_index("week").loc[series.index, list(CALENDAR_COLUMNS)]
+    return block.to_numpy(dtype=float)
+
+
+def rolling_origin(series: pd.Series, design: np.ndarray,
+                   models: dict, horizons: tuple[int, ...] = (1, 2, 3, 4, 5),
+                   warmup: int = WARMUP) -> pd.DataFrame:
+    """Algorithm 4, for any set of models: one row per (model, horizon, origin).
+
+    Each model is a callable ``fn(y, design, origin, target_index, h) -> float``. It may
+    read `y` only up to and including `origin`, and any row of `design`, because the
+    design matrix here holds calendar facts that are knowable in advance. Anything derived
+    from collections must be passed as a separate as-of-origin structure, not smuggled in
+    here — see the cross-customer block for why.
+
+    Models are refit from scratch at every origin. Affordable at this size, and it removes
+    any question of state leaking between origins.
+    """
+    y = series.to_numpy(dtype=float)
+    n = len(y)
+
+    records = []
+    for origin in range(warmup, n - 1):
+        for h in horizons:
+            target_index = origin + h
+            if target_index >= n:
+                continue
+            for name, fn in models.items():
+                records.append({
+                    "model": name, "horizon": h, "origin": origin,
+                    "target_week": target_index, "actual": y[target_index],
+                    "predicted": float(fn(y, design, origin, target_index, h)),
+                })
+    return pd.DataFrame(records)
+
+
 def rolling_origin_baselines(
         series: pd.Series,
         calendar: pd.DataFrame,
@@ -142,8 +180,7 @@ def rolling_origin_baselines(
     """
     y = series.to_numpy(dtype=float)
     n = len(y)
-    cal = calendar.set_index("week").loc[series.index, list(CALENDAR_COLUMNS)]
-    cal = cal.to_numpy(dtype=float)
+    cal = calendar_matrix(series, calendar)
 
     records = []
     for origin in range(warmup, n - 1):
@@ -208,9 +245,17 @@ def score(evaluations: pd.DataFrame) -> pd.DataFrame:
                                                        observed=True):
         actual = group["actual"].to_numpy()
         predicted = group["predicted"].to_numpy()
+        # Standard error of the MAPE across origins. With ~50 evaluation points a
+        # difference of under about 2 points is not distinguishable from noise, and a
+        # single missing file has already moved a model by 3.7. Reporting a point
+        # estimate alone is how a model gets "improved" into noise.
+        ape = np.abs((actual - predicted) / np.where(actual == 0, np.nan, actual)) * 100
+        ape = ape[np.isfinite(ape)]
         out.append({
             "model": model, "horizon": int(horizon), "n": len(group),
             "mape": round(mape(actual, predicted), 2),
+            "mape_se": round(float(ape.std(ddof=1) / np.sqrt(len(ape))), 2)
+            if len(ape) > 1 else float("nan"),
             "wape": round(wape(actual, predicted), 2),
             "bias": round(bias(actual, predicted), 0),
         })
