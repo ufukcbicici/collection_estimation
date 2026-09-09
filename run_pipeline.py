@@ -38,6 +38,10 @@ from collection_estimation.calendar_features import (  # noqa: E402
     build_calendar_features,
     cross_check_business_days,
 )
+from collection_estimation.history_features import (  # noqa: E402
+    attach_to_panel,
+    build_history_features,
+)
 from collection_estimation.ingest import (  # noqa: E402
     read_collections_csv,
     read_corpus,
@@ -241,9 +245,34 @@ def main() -> dict:
     #         calendar[calendar["n_holidays"] > 0]
 
     # ==================================================================================
-    # Step 3b — customer history and cross-customer   (sections 9.1, 9.3)
+    # Step 3b — customer history              (design section 9.1)
     # ==================================================================================
-    not_built_yet("Step 3b  history + cross-customer", "design sections 9.1 and 9.3")
+    started = time.perf_counter()
+    history = build_history_features(customer_weeks, weeks)
+    features = attach_to_panel(panel, history)
+    print(f"\n--- history " + "-" * 61)
+    print(f"{len(history):,} rows x {history.shape[1]} columns "
+          f"in {time.perf_counter() - started:.1f}s, joined onto the panel "
+          f"({len(features):,} rows)")
+
+    # NaN is deliberate here and confined to the genuinely undefined. Printing the rates
+    # keeps that visible rather than letting a surprise NaN hide among expected ones.
+    nan_rates = history.isna().mean()
+    nan_rates = nan_rates[nan_rates > 0].sort_values(ascending=False)
+    print("NaN by column (deliberate — undefined, not missing):")
+    for column, rate in nan_rates.items():
+        print(f"    {column:<12} {rate:6.1%}")
+    if nan_rates.empty:
+        print("    none")
+
+    # >>> BREAKPOINT HERE to inspect `history` and `features`. Try:
+    #         history[history["has_gap"] == 1]["gap_median"].describe()
+    #         features[["rec", "phase", "mean_4", "z"]].corr()
+
+    # ==================================================================================
+    # Step 3c — cross-customer                (design section 9.3)
+    # ==================================================================================
+    not_built_yet("Step 3c  cross-customer", "design section 9.3")
 
     # ==================================================================================
     # Step 4a — the baselines: the bar to beat   (design section 11.2)
@@ -299,6 +328,11 @@ def main() -> dict:
         "weeks": weeks,
         "customer_weeks": customer_weeks,
         "panel": panel,
+        "calendar": calendar,
+        "history": history,
+        "features": features,
+        "series": series,
+        "evaluations": evaluations,
     }
 
 
