@@ -22,3 +22,7 @@ venv/
 .idea/tasks.xml
 .idea/usage.statistics.xml
 .idea/shelf/
+
+# PyCharm remote-deployment config. Inherited from other projects and unused here; it
+# lists internal hostnames, usernames and SSH ports that have no business being pushed.
+.idea/deployment.xml
