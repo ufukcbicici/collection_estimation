@@ -16,8 +16,11 @@ sys.path.insert(0, os.path.join(
 
 from collection_estimation import config                            # noqa: E402
 from collection_estimation.calendar_features import (               # noqa: E402
+    HolidayCoverageError,
     build_calendar_features,
     business_days,
+    check_holiday_coverage,
+    covered_years,
     cross_check_business_days,
     holiday_dates,
 )
@@ -203,3 +206,47 @@ def test_cross_check_flags_a_wrong_holiday(weeks, corpus):
     report = cross_check_business_days(weeks, pd.concat([corpus, fake]))
     flagged = report[report["kind"] == "holiday_with_data"]["date"].tolist()
     assert date(2026, 4, 23) in flagged
+
+# ---------------------------------------------------------------- coverage guard
+
+def test_declared_coverage_matches_the_table():
+    assert covered_years() == {2025, 2026}
+
+
+def test_uncovered_year_raises_rather_than_silently_dropping_bayram():
+    """The whole point of the guard.
+
+    Without it, `holiday_dates` for 2027 returns no Bayram at all: a four-day religious
+    holiday is counted as five ordinary business days, every model reads a collapsed week
+    as a normal one, and nothing errors. A wrong answer that looks right is worse than a
+    refusal.
+    """
+    with pytest.raises(HolidayCoverageError, match="2027"):
+        holiday_dates(date(2027, 1, 1), date(2027, 12, 31))
+
+    with pytest.raises(HolidayCoverageError):
+        business_days(date(2026, 6, 1), date(2027, 6, 1))
+
+
+def test_the_error_says_what_to_do():
+    with pytest.raises(HolidayCoverageError) as caught:
+        holiday_dates(date(2028, 1, 1), date(2028, 2, 1))
+    message = str(caught.value)
+    assert "MOVING_HOLIDAYS" in message
+    assert "2025" in message and "2026" in message, "it must say what IS covered"
+
+
+def test_strict_false_is_an_explicit_escape_hatch():
+    """Available, but the caller has to ask for it and the counts are then wrong."""
+    got = holiday_dates(date(2027, 1, 1), date(2027, 12, 31), strict=False)
+    assert date(2027, 1, 1) in got, "fixed national holidays still resolve"
+    assert not any(name.endswith("Bayramı") for name in got.values()), (
+        "and the religious holidays are silently absent, which is the danger")
+
+
+def test_the_corpus_range_is_covered(weeks):
+    """No guard should fire on the data we actually have."""
+    first = weeks["week_start"].iloc[0].date()
+    last = weeks["week_end"].iloc[-1].date()
+    check_holiday_coverage(first, last)
+    assert build_calendar_features(weeks) is not None

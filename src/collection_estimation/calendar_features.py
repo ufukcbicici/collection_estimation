@@ -39,8 +39,45 @@ MOVING_HOLIDAYS = (
 )
 
 
-def holiday_dates(start: date, end: date) -> dict[date, str]:
-    """Every public holiday in range, mapped to its name."""
+class HolidayCoverageError(ValueError):
+    """The requested range reaches beyond the declared moving-holiday table.
+
+    Raised rather than tolerated, because the failure it prevents is silent. Without the
+    guard, `holiday_dates` for an uncovered year simply returns no Bayram: a four-day
+    religious holiday shows up as five ordinary business days, and every model reads a
+    collapsed week as a normal one. Nothing errors, nothing looks wrong, and the
+    business-day count is quietly false for two weeks a year.
+    """
+
+
+#: Years for which `MOVING_HOLIDAYS` declares the religious holidays. Derived from the
+#: table itself so the two cannot drift apart.
+def covered_years() -> set[int]:
+    return {y for first, last, _ in MOVING_HOLIDAYS
+            for y in range(first.year, last.year + 1)}
+
+
+def check_holiday_coverage(start: date, end: date) -> None:
+    """Fail loudly if any year in range has no declared religious holidays."""
+    covered = covered_years()
+    missing = sorted(set(range(start.year, end.year + 1)) - covered)
+    if missing:
+        raise HolidayCoverageError(
+            f"no Ramazan or Kurban Bayramı declared for {missing}. "
+            f"MOVING_HOLIDAYS covers {sorted(covered)}. Extend it before using data "
+            f"from {start} to {end}: without those dates a four-day Bayram week would "
+            f"be counted as five ordinary business days and nothing would complain.")
+
+
+def holiday_dates(start: date, end: date, *, strict: bool = True) -> dict[date, str]:
+    """Every public holiday in range, mapped to its name.
+
+    Raises `HolidayCoverageError` if the range covers a year the moving-holiday table does
+    not declare. Pass ``strict=False`` only when the missing dates genuinely do not matter
+    — and say so at the call site, because the resulting business-day counts are wrong.
+    """
+    if strict:
+        check_holiday_coverage(start, end)
     out: dict[date, str] = {}
     for year in range(start.year, end.year + 1):
         for month, day in FIXED_HOLIDAYS:
@@ -56,9 +93,9 @@ def holiday_dates(start: date, end: date) -> dict[date, str]:
     return out
 
 
-def business_days(start: date, end: date) -> list[date]:
+def business_days(start: date, end: date, *, strict: bool = True) -> list[date]:
     """Weekdays that are not public holidays."""
-    holidays = holiday_dates(start, end)
+    holidays = holiday_dates(start, end, strict=strict)
     out, when = [], start
     while when <= end:
         if when.weekday() < 5 and when not in holidays:
