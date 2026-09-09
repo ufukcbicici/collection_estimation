@@ -1,11 +1,27 @@
 """The weekly target series, the metrics, and the baseline models.
 
-This is the bar. Section 11.2 of the design quotes a table produced by the corpus
-generator's own benchmark; reproducing it here is a check on everything built so far —
-the corpus copy, the ingest, the week spine, the aggregation and the calendar block all
-have to line up for the numbers to match.
+This is the bar. Nothing here knows about individual customers; it exists to be beaten.
 
-Nothing in this module knows about individual customers. It exists to be beaten.
+**Two calendar models, and the difference between them is a finding.**
+
+`calendar_aware` regresses on the recent level plus the calendar. Its design matrix is
+horizon-specific: at prediction the level is the last four observed weeks, which end `h`
+weeks before the target, so each training row's level must end `h` weeks before its own
+target too. An earlier version used `y[t-4:t]` for every horizon — a one-step-ahead
+relationship applied to a level `h` weeks stale — which is correct at h=1 by coincidence
+and wrong beyond it.
+
+`calendar_only` drops the level entirely: intercept plus calendar. One parameter fewer and
+nothing that can be mis-specified.
+
+Measured, the level term earns nothing. The weekly series is barely autocorrelated —
++0.10 at lag 1, **−0.13 at lag 3**, +0.43 at lag 4 where the monthly cycle shows — so a
+horizon-specific level coefficient is estimated from ~40 noisy observations and adds
+variance rather than signal. Averaged over horizons `calendar_only` (21.0% MAPE) beats
+`calendar_aware` (21.3%).
+
+Worth knowing before building anything more elaborate: on this data the calendar carries
+the signal and the recent level does not.
 """
 from __future__ import annotations
 
@@ -133,28 +149,45 @@ def rolling_origin_baselines(
     for origin in range(warmup, n - 1):
         history = y[:origin + 1]                 # everything up to and including origin
 
-        # Design matrix for the calendar model: intercept, the level four weeks back from
-        # each row, and that row's own calendar. Built from history only.
-        rows, targets = [], []
-        for t in range(4, origin + 1):
-            rows.append(np.concatenate(([1.0, y[t - 4:t].mean()], cal[t])))
-            targets.append(y[t])
-        design = np.asarray(rows)
-        fitted = np.asarray(targets)
-
         for h in horizons:
             target_index = origin + h
             if target_index >= n:
                 continue
             actual = y[target_index]
 
+            # The design matrix is HORIZON-SPECIFIC, and this matters.
+            #
+            # At prediction time the level is the last four observed weeks, which end `h`
+            # weeks before the target. So each training row's level must also end `h`
+            # weeks before its own target — `y[t-h-3 : t-h+1]`, not `y[t-4 : t]`.
+            #
+            # Using `y[t-4 : t]` fits a one-step-ahead relationship and then applies it to
+            # a level that is `h` weeks stale. Since weekly autocorrelation decays, the
+            # coefficient comes out too large for the longer horizons and the model leans
+            # on a number it should have discounted. Correct at h=1 by coincidence, wrong
+            # at h=2 and beyond.
+            rows, targets = [], []
+            for t in range(h + 3, origin + 1):
+                level = y[t - h - 3:t - h + 1].mean()
+                rows.append(np.concatenate(([1.0, level], cal[t])))
+                targets.append(y[t])
+
+            # And the same model without the level at all: intercept plus calendar. One
+            # parameter fewer and nothing that can be mis-specified across horizons. It
+            # turns out to be as good — see the module docstring.
+            plain_rows = [np.concatenate(([1.0], cal[t]))
+                          for t in range(origin + 1)]
+
             predictions = {
                 "naive": history[-1],
                 "ma4": history[-4:].mean(),
                 "ma8": history[-8:].mean(),
                 "calendar_aware": _fit_calendar(
-                    fitted, design,
+                    np.asarray(targets), np.asarray(rows),
                     np.concatenate(([1.0, history[-4:].mean()], cal[target_index]))),
+                "calendar_only": _fit_calendar(
+                    y[:origin + 1], np.asarray(plain_rows),
+                    np.concatenate(([1.0], cal[target_index]))),
             }
             for name, predicted in predictions.items():
                 records.append({"model": name, "horizon": h, "origin": origin,
@@ -188,7 +221,7 @@ def mape_table(evaluations: pd.DataFrame) -> pd.DataFrame:
     """The section 11.2 layout: models down, horizons across, MAPE in the cells."""
     scored = score(evaluations)
     table = scored.pivot(index="model", columns="horizon", values="mape")
-    order = [m for m in ("naive", "ma4", "ma8", "calendar_aware") if m in table.index]
+    order = [m for m in ("naive", "ma4", "ma8", "calendar_aware", "calendar_only") if m in table.index]
     return table.loc[order]
 
 

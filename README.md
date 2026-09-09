@@ -106,21 +106,23 @@ Measured on this corpus (MAPE, by horizon in weeks):
 |---|---|---|---|---|---|
 | last week's value | 29.3 | 30.9 | 37.4 | 27.7 | 28.2 |
 | 4-week average | 25.8 | 25.0 | 23.7 | 22.9 | 23.4 |
-| 8-week average | 23.8 | 23.6 | 22.6 | 20.9 | 21.2 |
-| **calendar-only regression** | **20.7** | **20.6** | **20.8** | **20.1** | **19.2** |
+| 8-week average | 23.8 | 23.6 | 22.6 | **20.9** | **21.2** |
+| calendar + recent level | **20.7** | **20.5** | 22.8 | 20.5 | 22.0 |
+| calendar only | 20.9 | 20.5 | **20.8** | 21.2 | 21.6 |
 
 `run_pipeline.py` prints this on every run, so the bar stays in front of you.
 
-The calendar-only row is five parameters: recent level, business days in the target week,
-whether it contains a month end, whether it contains a quarter end, and how many weekday
-holidays fall in it.
+**The bar is ~20.7% at h=1** — but no model dominates. The calendar advantage is a
+short-horizon one: clear at h=1 and h=2, gone by h=5, where the 8-week average wins.
 
-**The bar is ~20.7% at h=1.** Anything more elaborate has to beat it.
+Three things to know:
 
-Two things to know about these numbers:
-
-- **They belong to this corpus.** They are sensitive to where the six missing files fall —
-  one lands on 2025-09-30, the last business day of September, which is the worst possible
-  place for a calendar model. Regenerating the corpus moves them.
+- **The recent-level term does not earn its place.** `calendar_only` has one parameter
+  fewer and is better averaged over horizons. The weekly series is barely autocorrelated
+  (+0.10 at lag 1, −0.13 at lag 3), so a level coefficient adds variance, not signal.
+  Do not assume a recent-level feature will help the per-customer model either.
+- **These numbers belong to this corpus.** They are sensitive to where the six missing
+  files fall — one lands on 2025-09-30, the last business day of September, the worst
+  possible place for a calendar model. Regenerating the corpus moves them.
 - **Every model under-predicts.** The calendar model's bias at h=1 is about −12.8M TRY on
   a 133.7M weekly mean. MAPE and WAPE hide the sign; that is why all three are reported.

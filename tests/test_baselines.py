@@ -151,7 +151,8 @@ def test_target_is_always_origin_plus_horizon(evaluations):
 
 
 def test_all_models_and_horizons_are_evaluated(evaluations):
-    assert set(evaluations["model"]) == {"naive", "ma4", "ma8", "calendar_aware"}
+    assert set(evaluations["model"]) == {
+        "naive", "ma4", "ma8", "calendar_aware", "calendar_only"}
     assert set(evaluations["horizon"]) == {1, 2, 3, 4, 5}
 
 
@@ -216,16 +217,48 @@ def test_a_missing_file_on_a_month_end_hurts_the_calendar_model():
     assert "2025-09-30" in missing
 
 
-def test_calendar_beats_the_moving_averages_at_every_horizon(evaluations):
-    """The finding the design leads with: the calendar carries most of the signal.
+def test_calendar_wins_clearly_at_short_horizons(evaluations):
+    """The calendar advantage is real but it is a SHORT-HORIZON advantage.
 
-    The margin is narrower than the design first reported — about 3 points at h=1 rather
-    than 8 — but the ordering is unchanged and it holds at every horizon.
+    At h=1 and h=2 both calendar models beat the 8-week average by about three points.
+    Beyond that the margin closes, and at h=5 the moving average is ahead of both.
+
+    The design originally claimed the calendar wins at every horizon. It does not — that
+    claim came from a calendar model whose level term was mis-specified for h>1 and
+    happened to score well by luck. See the module docstring in `baselines.py`.
     """
     table = mape_table(evaluations)
-    for horizon in (1, 2, 3, 4, 5):
-        assert table.loc["calendar_aware", horizon] < table.loc["ma8", horizon]
-        assert table.loc["calendar_aware", horizon] < table.loc["ma4", horizon]
+    for horizon in (1, 2):
+        for model in ("calendar_aware", "calendar_only"):
+            assert table.loc[model, horizon] < table.loc["ma8", horizon] - 2.0, (
+                f"{model} should beat ma8 clearly at h={horizon}")
+
+
+def test_no_model_dominates_at_every_horizon(evaluations):
+    """Recorded because it is easy to assume otherwise and act on it.
+
+        h=1,2  calendar models win by ~3 points
+        h=3    calendar_only wins; calendar_aware loses to ma8
+        h=4    calendar_aware wins; calendar_only loses to ma8
+        h=5    ma8 beats both
+    """
+    table = mape_table(evaluations)
+    winners = {int(h): table[h].idxmin() for h in (1, 2, 3, 4, 5)}
+    assert len(set(winners.values())) > 1, (
+        f"expected different models to win at different horizons, got {winners}")
+    assert winners[5] == "ma8", (
+        "at h=5 the 8-week average is the one to beat, not the calendar")
+
+
+def test_the_level_term_does_not_earn_its_place(evaluations):
+    """calendar_only has one parameter fewer and is better on average.
+
+    The weekly series is barely autocorrelated (+0.10 at lag 1, -0.13 at lag 3), so a
+    horizon-specific level coefficient fitted on ~40 observations adds variance rather
+    than signal.
+    """
+    table = mape_table(evaluations)
+    assert table.loc["calendar_only"].mean() < table.loc["calendar_aware"].mean()
 
 
 def test_moving_averages_beat_naive_at_horizon_one(evaluations):
