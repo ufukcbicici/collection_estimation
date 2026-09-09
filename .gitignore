@@ -1,0 +1,24 @@
+# Data. The corpus is 306 workbooks reproducible from a seed in the cockpit repo, and the
+# derived tables regenerate from it in seconds. Neither belongs in git history.
+data/raw/
+data/interim/
+data/processed/
+
+# Model artefacts and run outputs
+models/
+outputs/
+*.joblib
+*.pkl
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# PyCharm: keep the project files, drop the per-user state
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/shelf/

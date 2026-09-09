@@ -1,0 +1,30 @@
+# Weekly collections forecasting.
+#
+# The environment is CONDA-managed, so `pip freeze` does not see most of it — it reports
+# only matplotlib. The versions below were read from the interpreter itself on 2026-09-09
+# and are what the code is developed against.
+#
+# Recreate with:
+#
+#   conda create -n collection_estimation -y python=3.11 numpy pandas scikit-learn \
+#       matplotlib openpyxl pytest joblib
+#
+# There is no `python` on PATH on this machine. Invoke by full path:
+#
+#   & "C:\Users\ufuk.bicici\anaconda3\envs\collection_estimation\python.exe" <script.py>
+
+# python 3.11.16
+numpy==2.4.6
+pandas==3.0.5
+scikit-learn==1.9.0
+scipy==1.17.1
+matplotlib==3.11.0
+openpyxl==3.1.5          # reading the corpus workbooks
+joblib==1.5.3            # persisting fitted models
+pytest==9.0.3
+
+# NOT installed. Needed only to move past Random Forest to the Gamma objective in section
+# 7.4 of the design — sklearn's RandomForestRegressor offers squared_error,
+# absolute_error, friedman_mse and poisson, but not gamma.
+# lightgbm>=4.0
+# xgboost>=2.0
