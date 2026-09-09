@@ -33,7 +33,9 @@ from collection_estimation.ingest import (  # noqa: E402
     write_collections_csv,
 )
 from collection_estimation.panel import (  # noqa: E402
+    build_panel,
     build_week_index,
+    first_week,
     to_customer_weeks,
     weeks_without_collections,
 )
@@ -166,6 +168,27 @@ def main() -> dict:
     #         customer_weeks[customer_weeks["amount_negative"] < 0]   # refunds
 
     # ==================================================================================
+    # Step 2b — the dense panel               (Algorithm 1, lines 5-11)
+    # ==================================================================================
+    panel = build_panel(customer_weeks, weeks)
+    describe(panel, "panel")
+
+    cells = int((len(weeks) - first_week(customer_weeks)).sum())
+    cell_rate = len(customer_weeks[customer_weeks["amount_positive"] > 0]) / cells
+    print(f"base rate  : {panel['z'].mean():.2%} of panel rows are positive "
+          f"({cell_rate:.2%} of customer-week cells)")
+    print("             the gap is expected: a customer's FIRST appearance can never be")
+    print("             a target, and 42% of the roster appears exactly once")
+    print("rows/horizon: " + "  ".join(
+        f"h{h} {n:,}" for h, n in panel.groupby('horizon', observed=True).size().items()))
+    print(f"memory     : {panel.memory_usage(deep=True).sum() / 1e6:.0f} MB")
+
+    # >>> BREAKPOINT HERE to inspect `panel`. Try:
+    #         panel.groupby("horizon")["z"].mean()          # base rate by horizon
+    #         panel[panel["z"] == 1]["y"].describe()        # the amount target
+    #         panel[panel["y_negative"] < 0]                # weeks containing a refund
+
+    # ==================================================================================
     # Step 3 — features                       (design sections 9.1, 9.2, 9.3)
     # ==================================================================================
     not_built_yet("Step 3  features", "design sections 9.1, 9.2, 9.3")
@@ -190,6 +213,7 @@ def main() -> dict:
         "collections": collections,
         "weeks": weeks,
         "customer_weeks": customer_weeks,
+        "panel": panel,
     }
 
 
