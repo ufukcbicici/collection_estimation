@@ -33,6 +33,8 @@ import pandas as pd  # noqa: E402
 
 from collection_estimation import config  # noqa: E402
 from collection_estimation.baselines import (  # noqa: E402
+    BASELINE_MODELS,
+    paired_comparison,
     rolling_origin_baselines,
     score,
     weekly_totals,
@@ -237,7 +239,7 @@ def main() -> dict:
     # Step 4 — rolling-origin evaluation     (design section 12, Algorithm 4)
     # ==================================================================================
     baselines = rolling_origin_baselines(series, calendar)
-    recommended = evaluate_recommended(series, calendar)
+    recommended = evaluate_recommended(series, calendar, weeks)
     evaluations = pd.concat([baselines, recommended], ignore_index=True)
     scored = score(evaluations)
 
@@ -268,9 +270,26 @@ def main() -> dict:
     print(f"error of {typical_se:.1f}. Treat any difference smaller than about twice the")
     print("standard error as no difference at all.")
 
+    # Paired against the recommendation. The unpaired standard errors above cannot
+    # separate these models; differencing on shared origins removes the origin-to-origin
+    # variation that dominates them, and can therefore say "equal" rather than only
+    # "cannot distinguish".
+    paired = paired_comparison(evaluations, RECOMMENDED)
+    pooled = paired[paired["horizon"].isna()].set_index("model")
+    print(f"\npaired vs '{RECOMMENDED}', pooled over all horizons "
+          f"(negative = better):")
+    for model in pooled.index:
+        row = pooled.loc[model]
+        verdict = "distinguishable" if row["lo"] > 0 or row["hi"] < 0 else "-"
+        print(f"  {model:<22} {row['delta']:+6.2f}  "
+              f"95% CI [{row['lo']:+6.2f}, {row['hi']:+6.2f}]  {verdict}")
+
     recommended_mape = at_h1.loc[RECOMMENDED, "mape"]
     recommended_bias = at_h1.loc[RECOMMENDED, "bias_pct"]
-    best_baseline = at_h1.drop(index=RECOMMENDED)["mape"].idxmin()
+    # Only the declared baselines can be "the bar". A candidate must never be allowed to
+    # serve as its own benchmark.
+    bars = [m for m in BASELINE_MODELS if m in at_h1.index]
+    best_baseline = at_h1.loc[bars, "mape"].idxmin()
     print(f"\nRECOMMENDED MODEL '{RECOMMENDED}': {recommended_mape:.1f}% MAPE, "
           f"{recommended_bias:+.1f}% bias at h=1.")
     print(f"Best baseline is '{best_baseline}' at "

@@ -35,6 +35,11 @@ WARMUP = 12
 #: knowable in advance for any target week — that is what makes the model honest.
 CALENDAR_COLUMNS = ("n_business_days", "has_month_end", "has_quarter_end", "n_holidays")
 
+#: The models that constitute THE BAR, in reporting order. Named explicitly so that adding
+#: a candidate to the pipeline cannot accidentally promote it to "best baseline" — which
+#: would let a candidate be its own bar and quietly make every comparison meaningless.
+BASELINE_MODELS = ("naive", "ma4", "ma8", "calendar_aware", "calendar_only")
+
 
 # --------------------------------------------------------------------------------------
 # The target series
@@ -262,12 +267,60 @@ def score(evaluations: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out).sort_values(["model", "horizon"]).reset_index(drop=True)
 
 
+def paired_comparison(evaluations: pd.DataFrame, reference: str,
+                      horizons: tuple[int, ...] | None = None) -> pd.DataFrame:
+    """Every model's APE difference against `reference`, on the SAME origins.
+
+    **This is how two models should be compared here, and `score`'s standard error is
+    not.** Every model is evaluated at the same `(horizon, origin)` pairs, so the
+    origin-to-origin swings — which dominate that ±2.5 error bar — are common to both
+    models and cancel when the errors are differenced. Comparing two independent standard
+    errors throws the pairing away and is far too conservative: it can only ever conclude
+    "cannot distinguish", which is a weaker statement than "equal".
+
+    Negative `delta` means the model beats the reference. A confidence interval that spans
+    zero means the two are not distinguishable; one that does not is a real difference.
+
+    Columns: ``model``, ``horizon`` (``None`` = pooled), ``delta``, ``lo``, ``hi``, ``n``.
+    """
+    working = evaluations.copy()
+    actual = working["actual"].to_numpy(dtype=float)
+    predicted = working["predicted"].to_numpy(dtype=float)
+    working["ape"] = np.where(
+        actual == 0, np.nan, np.abs((actual - predicted) / actual) * 100)
+
+    wide = working.pivot_table(index=["horizon", "origin"], columns="model",
+                               values="ape")
+    if reference not in wide.columns:
+        raise KeyError(f"{reference!r} is not among {sorted(wide.columns)}")
+
+    def block(frame: pd.DataFrame, model: str, horizon) -> dict:
+        diff = (frame[model] - frame[reference]).dropna()
+        if len(diff) < 2:
+            return {"model": model, "horizon": horizon, "delta": float("nan"),
+                    "lo": float("nan"), "hi": float("nan"), "n": len(diff)}
+        mean = float(diff.mean())
+        se = float(diff.std(ddof=1) / np.sqrt(len(diff)))
+        return {"model": model, "horizon": horizon, "delta": round(mean, 2),
+                "lo": round(mean - 1.96 * se, 2), "hi": round(mean + 1.96 * se, 2),
+                "n": len(diff)}
+
+    rows = []
+    for model in wide.columns:
+        if model == reference:
+            continue
+        rows.append(block(wide, model, None))
+        for horizon in (horizons or sorted({h for h, _ in wide.index})):
+            if horizon in wide.index.get_level_values(0):
+                rows.append(block(wide.loc[horizon], model, int(horizon)))
+    return pd.DataFrame(rows)
+
+
 def mape_table(evaluations: pd.DataFrame) -> pd.DataFrame:
     """The section 11.2 layout: models down, horizons across, MAPE in the cells."""
     scored = score(evaluations)
     table = scored.pivot(index="model", columns="horizon", values="mape")
-    order = [m for m in ("naive", "ma4", "ma8", "calendar_aware", "calendar_only") if m in table.index]
-    return table.loc[order]
+    return table.loc[[m for m in BASELINE_MODELS if m in table.index]]
 
 
 def weeks_affected_by_missing_files(

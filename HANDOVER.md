@@ -190,6 +190,39 @@ On our synthetic corpus, at h=1: `MAPE 19.83 ± 2.49, WAPE 19.70, bias −1.0%`.
 standard error of every other. What separates this one is that it is not systematically
 10–19% low, which for a cash forecast matters more than a point of MAPE.
 
+### The four other models the pipeline runs
+
+Each changes exactly one thing about the recommendation, so the comparison is readable:
+
+| model | the question it answers |
+|---|---|
+| `ridge+trend_nolevel` | does the `level` term earn anything? |
+| `lags5+trend` | do five *individual* past weeks beat their mean? |
+| `deflated` | is dividing the drift out better than extrapolating it? |
+| `deflated_nolevel` | both of the above at once |
+
+`deflated` replaces the trend regressor with **TÜFE deflation**: divide the series by the
+Turkish consumer price index, model the stationary real series, re-inflate the prediction.
+See `inflation.py`. Its design matrix deliberately has **no trend column** — deflating has
+already removed the drift, and fitting a trend on top would model it twice.
+
+**The re-inflation is leak-free and that is load-bearing.** Converting a real forecast back
+to nominal needs the price level at the target week, which is in the future. It is projected
+from the last *published* TÜFE figure at the recently published rate — never the actual
+future index, which would hand the model perfect foresight of inflation and flatter every
+result.
+
+### ⚠ `inflation.py` will need extending
+
+`TUFE` covers **January 2025 – August 2026 only**. Outside that range the deflated models
+raise `InflationCoverageError` and are skipped; the other models still run, so you are not
+blocked. Extend the table from TÜİK when your data does.
+
+Note that TÜİK **changed the index base from 2003=100 to 2025=100 on 1 January 2026**, so no
+single published series spans this period. The table is stated on the old basis throughout
+with the newer values chained on. If you extend it, chain through the monthly *rates* rather
+than pasting published levels, or you will splice two incompatible bases together.
+
 ---
 
 ## 6. How to read the output — the one thing to get right
@@ -200,10 +233,11 @@ With ~52 rolling origins, **differences smaller than about 2 MAPE points are not
 distinguishable from noise.** During development a single missing file moved a model by 3.7
 points. Without the error bar we would have "improved" 20.89 → 19.83 and believed it.
 
-If you compare two models properly, compare them **paired** — same origins, difference of
-their errors, confidence interval on that difference. The origin-to-origin swings dominate
-the standard error and are *common to both models*, so they cancel. Two independent error
-bars can only ever say "cannot distinguish"; a paired interval can say "equal".
+The pipeline therefore also prints a **paired comparison** against the recommended model —
+same origins, difference of the two errors, confidence interval on that difference. The
+origin-to-origin swings dominate the standard error and are *common to both models*, so they
+cancel. Two independent error bars can only ever say "cannot distinguish"; a paired interval
+can say "equal", which is the claim usually needed. Read that table, not the MAPE column.
 
 Expect the real data to be **harder** than ours, not easier.
 

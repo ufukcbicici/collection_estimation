@@ -187,6 +187,86 @@ def make_ridge(log_target: bool = False, with_level: bool = False,
     return predict
 
 
+def make_lags(n_lags: int = 5, alphas: tuple[float, ...] = ALPHAS):
+    """Ridge on `n_lags` INDIVIDUAL past weeks, instead of their mean.
+
+    `make_ridge(with_level=True)` compresses the recent past into one number. A mean cannot
+    weight last week above four weeks ago; separate lags let ridge do that. This is the
+    version that asks whether the compression was throwing anything away.
+
+    Horizon-aware, like the mean: at training row `t` for horizon `h` the observable weeks
+    are `y[t-h], y[t-h-1], ...`, so the earliest usable row is `t = h + n_lags - 1`.
+
+    **Measured on the synthetic corpus, this does not help** — the paired difference against
+    the mean-of-four was -0.32 MAPE points averaged over horizons, 95% CI [-1.49, +0.85],
+    and dropping the level entirely scored the same again. It is kept in the pipeline
+    because the real EY series behaves differently from the synthetic one (its baselines are
+    far worse, meaning even less week-to-week persistence), so the question is worth asking
+    of each new data set rather than settled once. See the negative result above.
+    """
+    def predict(y, design, origin, target_index, h):
+        start = h + n_lags - 1
+        rows, targets = [], []
+        for t in range(start, origin + 1):
+            lags = [y[t - h - k] for k in range(n_lags)]
+            rows.append(np.concatenate((lags, design[t])))
+            targets.append(y[t])
+        if len(targets) < MIN_TRAIN:
+            return _fallback(y, origin)
+
+        X = np.asarray(rows, dtype=float)
+        target = np.asarray(targets, dtype=float)
+        scaler = StandardScaler().fit(X)
+        fitted = RidgeCV(alphas=np.asarray(alphas, dtype=float)).fit(
+            scaler.transform(X), target)
+
+        row = np.concatenate(([y[origin - k] for k in range(n_lags)],
+                              design[target_index]))
+        value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
+        return value if np.isfinite(value) and value > 0 else _fallback(y, origin)
+    return predict
+
+
+def make_deflated(deflator: np.ndarray, projected: np.ndarray,
+                  with_level: bool = True, alphas: tuple[float, ...] = ALPHAS):
+    """Fit in REAL terms, predict, then re-inflate the prediction to nominal.
+
+    The alternative to a trend regressor. Rather than fitting the drift and extrapolating
+    it — which works at h=1 and over-extrapolates by h=5 — the drift is divided out of the
+    target before modelling, and put back afterwards.
+
+    ``deflator``   price level per week, leak-free (`inflation.published_price_level`)
+    ``projected``  `[origin, target]` price level as projected from each origin
+                   (`inflation.projected_price_level`)
+
+    **The design matrix must NOT carry a trend.** Deflating already removes the drift;
+    fitting a trend on top would model it twice.
+
+    Two things are deliberately separated here. The model predicts a real amount, which is
+    a statement about collections. Converting that to a nominal amount is a statement about
+    inflation, and it uses only the rate published as of the origin. Mixing them — using the
+    actual future index — would let the model score well on inflation foresight it would
+    not have in production.
+    """
+    def predict(y, design, origin, target_index, h):
+        real = y / deflator
+        X, target = _rows(real, design, origin, h, with_level)
+        if len(target) < MIN_TRAIN:
+            return _fallback(y, origin)
+
+        scaler = StandardScaler().fit(X)
+        fitted = RidgeCV(alphas=np.asarray(alphas, dtype=float)).fit(
+            scaler.transform(X), target)
+        row = _predict_row(real, design, origin, target_index, with_level)
+        value = float(fitted.predict(scaler.transform(row.reshape(1, -1)))[0])
+        if not np.isfinite(value) or value <= 0:
+            return _fallback(y, origin)
+
+        # Back to nominal, at the price level projected from THIS origin.
+        return value * float(projected[origin, target_index])
+    return predict
+
+
 def weekly_design(series, calendar, with_trend: bool = True) -> np.ndarray:
     """Calendar block, optionally with a linear time index appended.
 
@@ -207,13 +287,54 @@ def weekly_design(series, calendar, with_trend: bool = True) -> np.ndarray:
     return np.hstack([block, trend])
 
 
-def evaluate_recommended(series, calendar):
-    """Run the recommended model over every rolling origin. One row per (horizon, origin).
+def evaluate_recommended(series, calendar, weeks=None):
+    """Run the recommended model and its close variants over every rolling origin.
 
     The single call the pipeline makes. Returns the same shape as
     `baselines.rolling_origin_baselines`, so the two concatenate and score together.
+
+    Four models, and each answers one question:
+
+    ``ridge+trend``       the recommendation: calendar + trend + the recent level
+    ``ridge+trend_nolevel``   does the level term earn anything? (measured: no)
+    ``lags5+trend``       do five separate lags beat their mean? (measured: no)
+    ``deflated``          does dividing the drift out beat extrapolating it?
+
+    All four sit on the same calendar block, so the comparison isolates one change each.
+    `deflated` is the exception that proves it: it uses the design matrix WITHOUT the trend
+    column, because deflating already removes the drift.
+
+    `weeks` is required for `deflated` — the deflator needs real dates. Without it the
+    other three still run, so a data set outside the TÜFE table is not blocked.
     """
     from .baselines import rolling_origin
 
     design = weekly_design(series, calendar, with_trend=True)
-    return rolling_origin(series, design, {RECOMMENDED: make_ridge(with_level=True)})
+    models = {
+        RECOMMENDED:            make_ridge(with_level=True),
+        "ridge+trend_nolevel":  make_ridge(with_level=False),
+        "lags5+trend":          make_lags(5),
+    }
+    frame = rolling_origin(series, design, models)
+
+    if weeks is None:
+        return frame
+
+    from .inflation import (InflationCoverageError, projected_price_level,
+                            published_price_level)
+    try:
+        deflator = published_price_level(weeks)
+        projected = projected_price_level(weeks)
+    except InflationCoverageError as exc:
+        print(f"\n  ! deflated model skipped: {exc}")
+        return frame
+
+    import pandas as pd
+
+    # No trend column: the deflation has already taken the drift out.
+    flat = weekly_design(series, calendar, with_trend=False)
+    deflated = rolling_origin(series, flat, {
+        "deflated":         make_deflated(deflator, projected, with_level=True),
+        "deflated_nolevel": make_deflated(deflator, projected, with_level=False),
+    })
+    return pd.concat([frame, deflated], ignore_index=True)
