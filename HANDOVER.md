@@ -3,13 +3,63 @@
 This repo forecasts EY Turkey's weekly cash collections: given collections up to week `t`,
 predict the total collected in weeks `t+1` … `t+5`.
 
-Everything in it was built and measured against a **synthetic** corpus — 306 fabricated
-daily workbooks. You have the real files. This document is how you point the pipeline at
-them.
+Everything in it was **built** against a **synthetic** corpus — 306 fabricated daily
+workbooks. This document is how you point the pipeline at the real ones.
 
 **The short version:** set one environment variable, run `preflight.py`, fix whatever it
 reports in `config.py`, run `run_pipeline.py`. If the real files have the same layout as our
 synthetic ones, no code changes at all.
+
+---
+
+## 0. It has since been run on the real files — read this before §5 and §7
+
+**A run of 2026-09-11 measured all ten models on the real EY workbooks.** Two findings that
+this document was built on did not survive it, and both are corrected in place below. If you
+are reading an older copy, these are the changes:
+
+| | this document used to say | the real files say |
+|---|---|---|
+| **the drift** | fit a linear trend; deflating is an untried idea | **deflate by TÜFE.** `deflated` 18.1% MAPE at h=1 vs `ridge+trend` 20.4%; paired **−1.36 [−2.32, −0.40]** |
+| **the `level` term** | earns nothing (−0.00 APE) | **horizon-dependent.** Helps clearly at h=1 (18.1 vs 21.5), hurts from h=3 out |
+
+The recommendation is therefore now **horizon-aware**: `deflated_nolevel` if one model must
+serve h=1…5 (flat 21.3–22.7%, +1.2% bias), `deflated` if the one-week number is what matters
+(18.1%, −0.4% bias). The full table is in [`README.md`](README.md).
+
+What that run did **not** record, and what is still worth writing down if you have it: the
+answers to §10 — entity codes, header language, whether `Customer` came through as text, and
+what the missing days mean. The modelling results came back; the ingest findings did not.
+
+Measured on the real corpus: **65 weeks, ~52 origins, standard error ≈3.0 MAPE points at
+h=1** (worse than the synthetic ≈2.5), and **16 business days with no file**.
+
+### Step 5 is new, and it is what a review asks for
+
+`reporting.py` (added 2026-09-11) produces the things an accuracy table does not:
+
+* **A per-forecast results file**, written to `data/interim/forecast_log__<corpus>.csv`.
+  One row per (model, origin, horizon) with the origin date, the **training cutoff**, the
+  target week, the actual, the prediction and the **code version** that produced it.
+  Written UTF-8-with-BOM so Excel on a Turkish machine opens it without mangling.
+* **Error in lira, not only in percent** (`mae_try`), because a percentage of a week whose
+  size varies threefold is not something anyone can plan against.
+* **Over- and under-forecasting separately.** `error = predicted − actual`, so positive is
+  an over-forecast. **These are different risks and neither is "the" risk**: an
+  over-forecast is a liquidity exposure, an under-forecast is a carrying cost.
+* **The five-week cumulative error per origin**, which is the window a rolling cash plan
+  actually covers and which **cannot be derived from the per-horizon table** — errors from
+  one origin offset or compound across the five weeks depending on the model.
+  `p95_over_try` is the liquidity number: a bad-but-not-unprecedented five-week shortfall.
+
+Two things that run showed on the synthetic corpus, worth re-checking on yours:
+
+1. **The five-week total is far more accurate than any single week** (9-20% against
+   20-40%), because the weekly errors partly cancel. Good news for the use case, and
+   invisible without this measurement.
+2. **The model with no drift correction never over-forecasts at all.** Its liquidity risk
+   is zero because it is systematically ~18% low. Reading the over-forecast rate on its
+   own would have made the worst model look the safest.
 
 ---
 
@@ -155,6 +205,7 @@ Step 1  ingest    the daily workbooks -> one table
 Step 2  weeks     week spine, customer-week aggregation, the weekly total series
 Step 3  calendar  the calendar block + a cross-check of the holiday table
 Step 4  evaluate  baselines and the recommended model, rolling origin
+Step 5  report    the per-forecast results file, error in lira, over/under, 5-week total
 ```
 
 `main()` returns every intermediate as a dict, so running it in a Python console leaves
@@ -184,22 +235,28 @@ Two details that are easy to get wrong and are already right here:
 - **Month end means the last *business* day**, not the last calendar day. A month ends on a
   weekend roughly two months in seven, before holidays are even considered.
 
-On our synthetic corpus, at h=1: `MAPE 19.83 ± 2.49, WAPE 19.70, bias −1.0%`.
+That describes the **family**. Which member to use is settled in §0: on the real files the
+`trend` column loses to TÜFE deflation, and the `level` term's value depends on the horizon.
+The figures this section used to quote — `MAPE 19.83 ± 2.49, bias −1.0%` for `ridge+trend` —
+are synthetic-corpus figures for a model the real data has since beaten.
 
-**It was chosen for the bias, not the accuracy.** Every candidate's MAPE sat inside one
-standard error of every other. What separates this one is that it is not systematically
-10–19% low, which for a cash forecast matters more than a point of MAPE.
+What has **not** changed is *why* a model gets picked. **The choice is driven by the bias,
+not the accuracy.** Candidates cluster inside a few standard errors of each other on MAPE;
+what separates them is whether they run systematically low. On the real files the two models
+with no drift correction come in ~11% under, and that is the error a cash forecast cannot
+afford.
 
 ### The four other models the pipeline runs
 
-Each changes exactly one thing about the recommendation, so the comparison is readable:
+Each changes exactly one thing about the reference model, so the comparison is readable.
+The right-hand column is what the real files answered:
 
-| model | the question it answers |
-|---|---|
-| `ridge+trend_nolevel` | does the `level` term earn anything? |
-| `lags5+trend` | do five *individual* past weeks beat their mean? |
-| `deflated` | is dividing the drift out better than extrapolating it? |
-| `deflated_nolevel` | both of the above at once |
+| model | the question it answers | on the real files |
+|---|---|---|
+| `ridge+trend_nolevel` | does the `level` term earn anything? | **at h=1 yes, from h=3 no** |
+| `lags5+trend` | do five *individual* past weeks beat their mean? | **no** — +1.33 [+0.07, +2.59], the one candidate rejected outright |
+| `deflated` | is dividing the drift out better than extrapolating it? | **yes** — −1.36 [−2.32, −0.40] |
+| `deflated_nolevel` | both of the above at once | **the flat-across-horizons choice** |
 
 `deflated` replaces the trend regressor with **TÜFE deflation**: divide the series by the
 Turkish consumer price index, model the stationary real series, re-inflate the prediction.
@@ -239,25 +296,33 @@ origin-to-origin swings dominate the standard error and are *common to both mode
 cancel. Two independent error bars can only ever say "cannot distinguish"; a paired interval
 can say "equal", which is the claim usually needed. Read that table, not the MAPE column.
 
-Expect the real data to be **harder** than ours, not easier.
+Expect the real data to be **harder** than ours, not easier. It was: the standard error came
+out ≈3.0 rather than ≈2.5, which widens the band inside which nothing is distinguishable.
+That is also why the two reversals in §0 are stated as *paired* intervals — unpaired, neither
+would have cleared.
 
 ---
 
 ## 7. What will not carry over — read before trusting any number
 
-Everything measured here comes from a corpus whose dynamics we invented. Treat these as
-hypotheses to re-test, not findings:
+Everything measured on the synthetic corpus comes from dynamics we invented. Treat those as
+hypotheses to re-test, not findings. **The first two below have since been re-tested on the
+real files and are settled; the rest are still open.**
 
-**The trend.** The synthetic weekly total drifts upward by ~3%/month because *I set that
-parameter*. It is not an EY measurement. Real Turkish nominal collections are non-stationary
-too, so some drift handling is needed — but check the actual drift, and consider deflating by
-a price index rather than fitting a straight line.
+**~~The trend.~~ SETTLED — deflate, do not extrapolate.** The synthetic weekly total drifts
+upward by ~3%/month because *I set that parameter*; it was never an EY measurement. What
+carried over was the *need* to handle nominal drift, and the real files preferred the price
+index to the straight line: `deflated` 18.1% at h=1 against `ridge+trend`'s 20.4%, paired
+−1.36 [−2.32, −0.40]. Real TÜFE rose **37.5%** across the 65 weeks, close enough to the
+fabricated 43% that the synthetic corpus could not have told these two apart.
 
-**The level term earns nothing.** Measured: dropping it entirely costs −0.00 APE points
-(95% CI [−1.37, +1.36]). The cause is that our weekly series is white noise once detrended.
-Real collections plausibly *do* persist — a large payer slipping a week, a backlog clearing.
-It is kept in the model as cheap insurance for exactly that reason. **Re-run the comparison
-on real data** rather than assuming either answer.
+**~~The level term earns nothing.~~ SETTLED — it is horizon-dependent.** The synthetic
+measurement (dropping it costs −0.00 APE, 95% CI [−1.37, +1.36]) was a property of *our
+generator*, whose weekly series is white noise once detrended. It did not survive the real
+files: the term **helps clearly at h=1** (18.1 against 21.5) and **hurts from h=3 out**.
+Every model carrying it decays with horizon; every model without it stays flat. This is
+exactly the persistence the old text guessed at — a large payer slipping a week, a backlog
+clearing — and it is why the recommendation is now horizon-aware rather than a single model.
 
 **The four negative results.** Log target, Tweedie/Gamma, daily-modelled-then-summed, and
 derived cadence regressors all lost. The code is preserved in `src/collection_estimation/

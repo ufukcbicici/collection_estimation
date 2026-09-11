@@ -29,6 +29,17 @@ import time
 # or `src` marked as a Sources Root.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
+# A Windows console defaults to a legacy code page (cp1252 here, cp857/cp1254 on a Turkish
+# machine), and printing a customer name containing "İ" then raises UnicodeEncodeError and
+# aborts the whole run. The data is Turkish, so this is not an edge case: it happened on
+# the very first preview row. Reconfigure rather than strip the characters, because the
+# names are what make the preview worth printing.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):      # not a TextIOWrapper, or already detached
+        pass
+
 import pandas as pd  # noqa: E402
 
 from collection_estimation import config  # noqa: E402
@@ -53,6 +64,14 @@ from collection_estimation.panel import (  # noqa: E402
     to_customer_weeks,
     weeks_without_collections,
 )
+from collection_estimation.reporting import (  # noqa: E402
+    cash_error,
+    code_version,
+    cumulative_by_origin,
+    cumulative_risk,
+    forecast_log,
+    write_forecast_log,
+)
 from collection_estimation.weekly_models import (  # noqa: E402
     RECOMMENDED,
     evaluate_recommended,
@@ -69,6 +88,12 @@ FORCE_REINGEST = False
 
 #: How many rows `describe()` prints.
 PREVIEW_ROWS = 8
+
+#: Where the per-forecast results file is written, relative to the data directory. One row
+#: per (model, origin, horizon) with dates, actual, prediction and the code version.
+#: Its filename carries the corpus folder name for the same reason the ingest cache does:
+#: a results file that cannot be traced to the data it came from is worse than none.
+FORECAST_LOG_NAME = "forecast_log__{corpus}.csv"
 
 
 # ======================================================================================
@@ -300,6 +325,57 @@ def main() -> dict:
     #         evaluations[evaluations["model"] == RECOMMENDED].nlargest(5, "actual")
     #         scored[scored["horizon"] == 1]
 
+    # ==================================================================================
+    # Step 5 — review reporting
+    #
+    # Everything above answers "which model is more accurate". This step answers the
+    # questions asked of a forecast before it is used: how wrong in lira, in which
+    # direction, over the window somebody actually plans against, and produced by which
+    # version of the code. See `reporting.py` for the sign convention — it is the part
+    # most easily got backwards.
+    # ==================================================================================
+    version = code_version()
+    log = forecast_log(evaluations, weeks, version=version)
+    log_path = write_forecast_log(
+        log,
+        os.path.join(config.INTERIM, FORECAST_LOG_NAME.format(
+            corpus=os.path.basename(os.path.normpath(config.CORPUS_DIR)))))
+
+    print("\n=== Step 5  review reporting " + "=" * 45)
+    print(f"code version: {version}"
+          + ("   *** uncommitted changes: treat results as provisional"
+             if version.endswith("-dirty") else ""))
+    print(f"forecast log: {log_path}")
+    print(f"              {len(log):,} rows, one per (model, origin, horizon), with "
+          f"origin\n              date, training cutoff, target week, actual and "
+          f"prediction.")
+
+    cash = cash_error(evaluations, mean_weekly=float(series.mean()))
+    cash_h1 = (cash[cash["horizon"] == 1]
+               .set_index("model")
+               .reindex(at_h1.index)          # same order as the MAPE table above
+               [["mae_try", "bias_pct", "over_rate_pct", "mean_over_try",
+                 "worst_over_try"]])
+    print("\nat h=1, error in lira and by direction "
+          "(over = expected cash that did not arrive):")
+    print(cash_h1.to_string(float_format=lambda v: f"{v:,.0f}"))
+
+    # The five-week total. The per-horizon table cannot produce this: errors from one
+    # origin offset or compound across the five weeks, and which one happens is a
+    # property of the model rather than something derivable from its h=5 number.
+    cumulative = cumulative_by_origin(evaluations)
+    risk = cumulative_risk(cumulative)
+    print("\nFIVE-WEEK CUMULATIVE per origin — the window a rolling cash plan covers:")
+    print(risk.set_index("model").to_string(
+        float_format=lambda v: f"{v:,.1f}"))
+    print("\n  mape_5w      error of the five-week TOTAL, not of week five.")
+    print("  over_rate    share of origins whose plan expected more cash than arrived.")
+    print("  p95_over     a bad-but-not-unprecedented five-week shortfall. This is the")
+    print("               number a liquidity buffer is sized against; MAPE cannot see it.")
+    print("\n  Over- and under-forecasting are DIFFERENT risks: an over-forecast is a")
+    print("  liquidity exposure, an under-forecast is a carrying cost. Neither is 'the'")
+    print("  error that matters, and both are reported for that reason.")
+
     print("\n" + "=" * 74)
     print("done.")
     print("=" * 74)
@@ -314,6 +390,10 @@ def main() -> dict:
         "calendar": calendar,
         "evaluations": evaluations,
         "scored": scored,
+        "forecast_log": log,
+        "cash_error": cash,
+        "cumulative": cumulative,
+        "cumulative_risk": risk,
     }
 
 

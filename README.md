@@ -17,7 +17,7 @@ python run_pipeline.py                            # then run
 ## The model
 
 **Ridge regression on the weekly total**, refit at every rolling origin, a separate fit per
-horizon. Six features:
+horizon, over a calendar block plus a correction for nominal drift. Six features:
 
 | feature | |
 |---|---|
@@ -26,39 +26,76 @@ horizon. Six features:
 | `has_month_end` | the week contains the last **business** day of a month |
 | `has_quarter_end` | … of March, June, September or December |
 | `n_holidays` | weekday public holidays in the week |
-| `trend` | the integer week index |
+| `trend` | the integer week index — used **only** by the models that do not deflate |
 
-On the synthetic corpus, at h=1: **MAPE 19.83 ± 2.49, WAPE 19.70, bias −1.0%.**
+**How the drift is handled is the choice that matters**, and on the real EY files dividing by
+the price index beats fitting a straight line.
 
-**Chosen for the bias, not the accuracy.** Every candidate's MAPE sits inside one standard
-error of every other, so this was never an accuracy choice — it is the only competitive model
-that is not systematically 10–19% low. Beyond h=3 an 8-week moving average is just as good.
+### The recommendation — measured on the real EY files, run of 2026-09-11
+
+| if | use | h=1 | across h=1…5 | bias |
+|---|---|---|---|---|
+| one model must serve every horizon | `deflated_nolevel` | 21.5% | flat **21.3–22.7%** | +1.2% |
+| the one-week number is what matters | `deflated` | **18.1%** | 18.1 → 24.6 | −0.4% |
+
+`deflated` divides the weekly series by Turkish TÜFE, models the stationary real series, then
+re-inflates the prediction — see [`inflation.py`](src/collection_estimation/inflation.py). Its
+design matrix carries **no `trend` column**, deliberately: deflating has already removed the
+drift, and fitting a trend on top would model it twice.
+
+Against the previous recommendation `ridge+trend` (20.4% at h=1), paired on the same origins,
+the gap is **−1.36 [−2.32, −0.40]** — outside the noise.
+
+The recommendation is horizon-dependent because the `level` term is: **every model carrying it
+decays with horizon, every model without it stays flat.**
 
 ### The bar it has to beat
 
-MAPE by horizon, measured on the synthetic corpus:
+MAPE by horizon on the real EY files, with the h=1 standard error and the signed bias. Sorted
+by h=1, which is how the pipeline prints it.
 
-| model | h=1 | h=2 | h=3 | h=4 | h=5 |
-|---|---|---|---|---|---|
-| last week's value | 29.3 | 30.9 | 37.4 | 27.7 | 28.2 |
-| 4-week average | 25.8 | 25.0 | 23.7 | 22.9 | 23.4 |
-| 8-week average | 23.8 | 23.6 | 22.6 | **20.9** | **21.2** |
-| calendar only | 20.9 | 20.5 | **20.8** | 21.2 | 21.6 |
-| calendar + recent level | 20.7 | 20.5 | 22.8 | 20.5 | 22.0 |
-| **ridge + trend** (recommended) | **19.8** | **20.1** | 22.0 | 21.6 | 21.8 |
+| model | h=1 | h=2 | h=3 | h=4 | h=5 | ±se | bias |
+|---|---|---|---|---|---|---|---|
+| **`deflated`** — recommended at h=1 | **18.1** | 20.7 | 22.0 | 24.0 | 24.6 | 2.41 | −0.4% |
+| `ridge+trend` — previous recommendation | 20.4 | 22.1 | 23.5 | 24.4 | 25.9 | 2.53 | +1.6% |
+| `calendar_only` | 21.3 | 21.3 | 21.3 | 22.1 | 22.4 | 2.37 | **−11.3%** |
+| **`deflated_nolevel`** — recommended for h=1…5 | 21.5 | 21.6 | **21.3** | **22.0** | **22.7** | 3.39 | +1.2% |
+| `lags5+trend` | 21.8 | 23.1 | 24.5 | 27.5 | 26.0 | 2.81 | −1.2% |
+| `ridge+trend_nolevel` | 21.8 | 21.4 | 21.6 | 22.2 | 22.4 | 3.20 | −4.1% |
+| `calendar_aware` | 22.2 | 22.1 | 23.2 | 23.6 | 24.3 | 2.23 | **−11.9%** |
+| `ma8` | 28.6 | 28.6 | 29.5 | 28.9 | 27.1 | 6.20 | −2.3% |
+| `ma4` | 32.0 | 30.6 | 29.7 | 29.0 | 28.2 | 7.20 | −1.3% |
+| `naive` | 39.6 | 43.8 | 39.7 | 37.8 | 34.6 | 7.36 | −0.5% |
 
-`run_pipeline.py` prints this on every run, so the bar stays in front of you.
+`run_pipeline.py` prints this on every run, so the bar stays in front of you. Read the bias
+column as carefully as the MAPE: **the two models with no drift correction run ~11% low**,
+which for a cash forecast is the error that matters and which MAPE hides entirely.
 
 ### The one thing to get right when reading these
 
 **Differences under about 2 MAPE points are not distinguishable.** With ~52 origins the
-standard error is ~2.5, and during development a single missing file moved a model by 3.7
-points. Every table the pipeline prints carries `mape_se` for this reason.
+standard error is ~3.0 on the real files (~2.5 on the synthetic corpus), and during
+development a single missing file moved a model by 3.7 points. Every table the pipeline prints
+carries `mape_se` for this reason.
 
 To compare two models properly, compare them **paired** — same origins, difference of their
 errors, confidence interval on the difference. The origin-to-origin swings that dominate the
 error bar are common to both models and cancel. Two independent error bars can only say
 "cannot distinguish"; a paired interval can say "equal".
+
+**The five horizons are not independent.** They share the origin, the training window and
+most of the same target weeks. Do not count "all five horizons agree" as five confirmations
+or derive a p-value from it — it is one consistent pattern. For the same reason the
+five-week cumulative error has to be measured directly rather than inferred from the
+per-horizon numbers; `reporting.cumulative_by_origin` does that.
+
+### Error is not only a percentage, and not only a size
+
+`reporting.py` reports error in **lira**, and splits **over-** from **under-forecasting**
+(`error = predicted − actual`, so positive is over). They are different risks: an
+over-forecast is a liquidity exposure, an under-forecast is a carrying cost. Neither is
+"the" error that matters, and reporting only one of them hides a model that looks safe
+purely by forecasting far too low.
 
 ---
 
@@ -75,6 +112,8 @@ src/collection_estimation/
     calendar_features.py      the calendar block + the Turkish holiday table
     baselines.py              metrics, rolling-origin harness, the baselines
     weekly_models.py          the recommended model
+    inflation.py              the TÜFE deflator and its leak-free re-inflation
+    reporting.py              per-forecast results file, error in lira, over/under risk
     parked/                   built and tested, NOT on the production path
 tests/                        159 tests
 data/                         gitignored — no client data ever enters git
