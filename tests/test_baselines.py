@@ -20,6 +20,7 @@ from collection_estimation.baselines import (                       # noqa: E402
     bias,
     mape,
     mape_table,
+    r2,
     rolling_origin_baselines,
     score,
     wape,
@@ -59,6 +60,25 @@ def calendar(weeks) -> pd.DataFrame:
 @pytest.fixture(scope="module")
 def evaluations(series, calendar) -> pd.DataFrame:
     return rolling_origin_baselines(series, calendar)
+
+
+#: The v1 synthetic corpus (generator seed 20260908), archived byte-identical when the
+#: installed corpus was regenerated as v2. Some findings below were measured on it and did
+#: not survive regeneration; they are pinned here so they stay reproducible as a record
+#: rather than silently re-measured on whatever corpus happens to be installed.
+V1_CORPUS_DIR = os.path.join(config.RAW, "_archive", "v1_seed20260908",
+                             "SYNTHETIC_ey_tahsilat_20250602_20260828")
+
+
+@pytest.fixture(scope="module")
+def v1_evaluations() -> pd.DataFrame:
+    """The same chain as `evaluations`, run on the archived v1 corpus."""
+    if not os.path.isdir(V1_CORPUS_DIR):
+        pytest.skip(f"v1 corpus archive not found at {V1_CORPUS_DIR}")
+    v1 = read_corpus(V1_CORPUS_DIR)
+    v1_weeks = build_week_index(v1)
+    v1_series = weekly_totals(to_customer_weeks(v1, v1_weeks), v1_weeks)
+    return rolling_origin_baselines(v1_series, build_calendar_features(v1_weeks))
 
 
 # ---------------------------------------------------------------- the target series
@@ -127,6 +147,107 @@ def test_zero_actuals_are_skipped_by_mape_not_infinite():
     assert np.isfinite(mape(actual, np.array([5.0, 110.0])))
 
 
+# ---------------------------------------------------------------- R², the fourth metric
+
+def test_r2_of_a_perfect_prediction_is_one():
+    y = np.array([100.0, 200.0, 300.0])
+    assert r2(y, y) == 1.0
+
+
+def test_r2_of_the_actuals_own_mean_is_zero():
+    """Zero means "no better than a flat line through the weeks being forecast".
+
+    That line is HINDSIGHT — its height is the mean of the very weeks being predicted,
+    which nobody could have known at the origin. So zero is the anchor the scale is read
+    against, not a bar any deployable model was asked to clear. The deployable bars are
+    the baseline models.
+    """
+    y = np.array([100.0, 200.0, 600.0])
+    flat = np.full(len(y), y.mean())
+    assert r2(y, flat) == pytest.approx(0.0)
+
+
+def test_r2_is_nan_when_the_actuals_are_constant():
+    """SST == 0, so the ratio is undefined and NaN says so.
+
+    Note that even a PERFECT prediction of a constant series comes back NaN rather than
+    1.0. Nothing was explained because there was no variance to explain — and a 1.0 here
+    would read as a flawless model down a results column.
+    """
+    flat = np.array([100.0, 100.0, 100.0])
+    assert np.isnan(r2(flat, flat))
+    assert np.isnan(r2(flat, np.array([90.0, 110.0, 100.0])))
+
+
+def test_r2_can_be_negative_and_that_is_an_ordinary_result():
+    """Negative says "worse than that flat hindsight line", not "broken".
+
+    Here the model nails four weeks out of five and misses one heavy week completely —
+    which on a series whose variance sits almost entirely in that week is enough to land
+    below zero while still scoring a perfectly respectable 16% MAPE. Anyone reading a
+    negative R² as a bug would be throwing away a usable model.
+
+        SST = 4·80² + 320² = 128_000      SSE = 400² = 160_000      1 − 1.25 = −0.25
+    """
+    actual = np.array([100.0, 100.0, 100.0, 100.0, 500.0])
+    quiet_level = np.full(5, 100.0)
+    assert r2(actual, quiet_level) == pytest.approx(-0.25)
+    assert mape(actual, quiet_level) == pytest.approx(16.0)
+
+
+def test_r2_keeps_the_zero_weeks_that_mape_drops():
+    """`mape` filters ``actual != 0``; `r2` does not, and the two answers differ.
+
+    A week with no collections has no percentage error, so MAPE is blind to whatever was
+    predicted for it. It is still part of the variance, so R² charges for it.
+
+        SST = (0−100)² + 0 + (200−100)² = 20_000       SSE = 50² = 2_500
+    """
+    actual = np.array([0.0, 100.0, 200.0])
+    exact = np.array([0.0, 100.0, 200.0])
+    wrong_on_the_zero_week = np.array([50.0, 100.0, 200.0])
+
+    assert mape(actual, exact) == mape(actual, wrong_on_the_zero_week) == 0.0
+    assert r2(actual, exact) == 1.0
+    assert r2(actual, wrong_on_the_zero_week) == pytest.approx(0.875)
+
+
+def test_mape_and_r2_can_rank_two_models_the_opposite_way():
+    """The disagreement that justifies reporting a squared-error metric at all.
+
+    Four quiet weeks of 100 and one heavy week of 500. Two models:
+
+        steady_low        10% low every week          absolute error 90 in total
+        misses_the_peak   exact on the quiet weeks,
+                          90 short on the heavy one   absolute error 90 in total
+
+    The two carry the SAME total absolute error, so WAPE cannot separate them at all —
+    which isolates the cause of the disagreement below as the squaring, not a change of
+    denominator.
+
+    MAPE prefers `misses_the_peak` (3.6% against 10%) because its single miss lands on
+    the largest denominator in the set. R² prefers `steady_low` (0.977 against 0.937)
+    because squaring makes one 90 TRY miss cost more than five small ones. The model that
+    "wins" depends entirely on which metric is quoted, and a cash plan cares about the
+    heavy week.
+
+        SST = 128_000       SSE = 2_900 (steady_low)  against  8_100 (misses_the_peak)
+    """
+    actual = np.array([100.0, 100.0, 100.0, 100.0, 500.0])
+    steady_low = np.array([90.0, 90.0, 90.0, 90.0, 450.0])
+    misses_the_peak = np.array([100.0, 100.0, 100.0, 100.0, 410.0])
+
+    assert wape(actual, steady_low) == pytest.approx(wape(actual, misses_the_peak))
+
+    assert mape(actual, steady_low) == pytest.approx(10.0)
+    assert mape(actual, misses_the_peak) == pytest.approx(3.6)
+    assert r2(actual, steady_low) == pytest.approx(0.97734375)
+    assert r2(actual, misses_the_peak) == pytest.approx(0.93671875)
+
+    assert mape(actual, misses_the_peak) < mape(actual, steady_low)
+    assert r2(actual, misses_the_peak) < r2(actual, steady_low)
+
+
 # ---------------------------------------------------------------- the harness
 
 def test_every_origin_only_uses_its_own_past(series, calendar):
@@ -172,49 +293,30 @@ def test_reproduces_the_generators_benchmark(evaluations):
     customer-week aggregation and the calendar block all have to line up with the
     generator for these to match.
 
-        generator, seed 20260908, h=1:
-        naive 28.4   ma4 25.4   ma8 23.5   calendar_aware 20.2
+    **The expected figures are read from the installed corpus's oracle**, not written
+    here. They belong to one corpus: regenerate with a different seed, or change anything
+    upstream of `missing = rng_py.sample(...)` in the generator, and they move. An earlier
+    version hardcoded the v1 corpus's table (seed 20260908: naive 28.4, ma4 25.4, ma8
+    23.5, calendar_aware 20.2) and broke on the first regeneration without anything in
+    the chain being wrong. Reading the oracle keeps the test about the CHAIN — which is
+    what it is for — and lets the corpus change underneath it.
 
-    **These figures belong to one corpus.** Regenerate with a different seed, or change
-    anything upstream of `missing = rng_py.sample(...)` in the generator, and they move —
-    see `test_a_missing_file_on_a_month_end_hurts_the_calendar_model` for why they move
-    unevenly. If this fails after a regeneration, re-read the generator's own printed
-    table before assuming the code is wrong.
+    Only h=1, and a 1.5-point tolerance: the generator computes its benchmark with its own
+    code, not this module's, so agreement to the decimal is not expected and not the
+    claim. Agreement to within a point and a half is.
     """
-    table = mape_table(evaluations)
-    generator = {"naive": 28.4, "ma4": 25.4, "ma8": 23.5, "calendar_aware": 20.2}
-    for model, expected in generator.items():
-        got = table.loc[model, 1]
-        assert abs(got - expected) < 1.5, (
-            f"{model} at h=1: got {got:.1f}, the generator printed {expected}. Either "
-            f"something in the chain from workbooks to weekly series disagrees with the "
-            f"generator, or the corpus was regenerated.")
-
-
-def test_a_missing_file_on_a_month_end_hurts_the_calendar_model():
-    """Why the baseline table is sensitive to WHERE the missing files land.
-
-    Six business days have no file. One of them — 2025-09-30 — is the last business day
-    of September, and a calendar model flags that week as a month end and predicts high.
-    The actual is missing the month's biggest day, so the model takes the full error on
-    precisely the week it is most confident about. A moving average barely notices.
-
-    This is not an artefact of synthetic data: a real extract with a day missing at month
-    end would do the same thing to a real model.
-    """
-    from datetime import date
-    from collection_estimation.calendar_features import business_days
-
-    work = business_days(date(2025, 6, 2), date(2026, 8, 30))
-    last_of_month = {}
-    for day in work:
-        last_of_month[(day.year, day.month)] = day
-    assert date(2025, 9, 30) in set(last_of_month.values())
-
     import json
     with open(config.ORACLE, encoding="utf-8") as fh:
-        missing = json.load(fh)["ey_spec_alignment"]["missing_files"]
-    assert "2025-09-30" in missing
+        benchmark = json.load(fh)["forecasting"]["benchmark"]["mape"]
+
+    table = mape_table(evaluations)
+    for model in ("naive", "ma4", "ma8", "calendar_aware"):
+        expected = benchmark[model]["1"]            # JSON keys: horizons are strings
+        got = table.loc[model, 1]
+        assert abs(got - expected) < 1.5, (
+            f"{model} at h=1: got {got:.1f}, the generator's oracle says {expected}. "
+            f"Something in the chain from workbooks to weekly series disagrees with the "
+            f"generator that wrote {config.ORACLE}.")
 
 
 def test_calendar_wins_clearly_at_short_horizons(evaluations):
@@ -234,15 +336,21 @@ def test_calendar_wins_clearly_at_short_horizons(evaluations):
                 f"{model} should beat ma8 clearly at h={horizon}")
 
 
-def test_no_model_dominates_at_every_horizon(evaluations):
+def test_no_model_dominates_at_every_horizon(v1_evaluations):
     """Recorded because it is easy to assume otherwise and act on it.
 
         h=1,2  calendar models win by ~3 points
         h=3    calendar_only wins; calendar_aware loses to ma8
         h=4    calendar_aware wins; calendar_only loses to ma8
         h=5    ma8 beats both
+
+    **A record of a finding on the v1 synthetic corpus (seed 20260908), pinned to its
+    archive.** It did not survive regeneration: on v2 (seed 58068921) `calendar_aware`
+    wins at every horizon. So it is a fact about one random draw, not about the models,
+    and is kept only as a reproducible record of what was measured. Skips if the archive
+    is absent.
     """
-    table = mape_table(evaluations)
+    table = mape_table(v1_evaluations)
     winners = {int(h): table[h].idxmin() for h in (1, 2, 3, 4, 5)}
     assert len(set(winners.values())) > 1, (
         f"expected different models to win at different horizons, got {winners}")
@@ -250,14 +358,22 @@ def test_no_model_dominates_at_every_horizon(evaluations):
         "at h=5 the 8-week average is the one to beat, not the calendar")
 
 
-def test_the_level_term_does_not_earn_its_place(evaluations):
+def test_the_level_term_does_not_earn_its_place(v1_evaluations):
     """calendar_only has one parameter fewer and is better on average.
 
     The weekly series is barely autocorrelated (+0.10 at lag 1, -0.13 at lag 3), so a
     horizon-specific level coefficient fitted on ~40 observations adds variance rather
     than signal.
+
+    **A record of a finding on the v1 synthetic corpus (seed 20260908), pinned to its
+    archive.** It did not survive regeneration — on v2 (seed 58068921) the ordering
+    reverses, `calendar_only` 22.19 against `calendar_aware` 20.85 mean MAPE — and it was
+    ALSO reversed on the real EY data, where the recent level turned out to be
+    horizon-dependent rather than worthless. Do not cite it as a property of the models.
+    Kept only as a reproducible record of what was measured on v1. Skips if the archive
+    is absent.
     """
-    table = mape_table(evaluations)
+    table = mape_table(v1_evaluations)
     assert table.loc["calendar_only"].mean() < table.loc["calendar_aware"].mean()
 
 
@@ -270,6 +386,71 @@ def test_score_reports_all_three_metrics(evaluations):
     scored = score(evaluations)
     assert {"mape", "wape", "bias"} <= set(scored.columns)
     assert (scored["n"] > 20).all(), "too few origins to trust any of these"
+
+
+def _evaluations(rows) -> pd.DataFrame:
+    """A hand-made evaluations frame from ``(model, horizon, origin, actual, predicted)``.
+
+    The corpus fixtures above are module-scoped and slow, and a metric test wants numbers
+    small enough to check by eye rather than real ones.
+    """
+    return pd.DataFrame(
+        [{"model": m, "horizon": int(h), "origin": int(o), "target_week": int(o) + int(h),
+          "actual": float(a), "predicted": float(p)} for m, h, o, a, p in rows])
+
+
+def test_score_reports_r2_beside_the_other_three(evaluations):
+    """The fourth column, added because the other three all average ABSOLUTE errors."""
+    scored = score(evaluations)
+    assert {"mape", "wape", "bias", "r2"} <= set(scored.columns)
+    assert scored["r2"].notna().all(), "no model/horizon should score an undefined R²"
+    assert (scored["r2"] < 1.0).all(), "a perfect forecast would be a leak, not a result"
+
+
+def test_r2_ranks_models_within_one_horizon_by_squared_error():
+    """Why the R² column can be read straight DOWN, which is what the pipeline claims.
+
+    Inside one horizon every model is scored on the same target weeks, so SST is shared
+    and ``1 − SSE/SST`` is a monotone transform of the sum of squared error. Ranking by
+    R² is therefore exactly ranking by SSE — no hindsight enters the COMPARISON even
+    though it sits in the number.
+    """
+    actual = [100.0, 100.0, 100.0, 100.0, 500.0]
+    predictions = {                                     # SSE, by hand:
+        "tight": [100.0, 100.0, 100.0, 100.0, 480.0],   #     20²  =    400
+        "middle": [90.0, 90.0, 90.0, 90.0, 450.0],      #  4·10² + 50²  =  2_900
+        "loose": [100.0, 100.0, 100.0, 100.0, 300.0],   #    200²  = 40_000
+    }
+    rows = [(model, 1, origin, a, p)
+            for model, predicted in predictions.items()
+            for origin, (a, p) in enumerate(zip(actual, predicted))]
+
+    scored = score(_evaluations(rows)).set_index("model")
+    sse = {model: sum((a - p) ** 2 for a, p in zip(actual, predicted))
+           for model, predicted in predictions.items()}
+
+    assert list(scored["r2"].sort_values(ascending=False).index) == sorted(sse, key=sse.get)
+
+
+def test_r2_is_not_comparable_ACROSS_horizons():
+    """Each horizon scores a different set of weeks, so each has its own denominator.
+
+    Both rows below make exactly the same errors — every prediction is 50 high — but the
+    h=2 target weeks vary less, so the same errors explain away a bigger share of a
+    smaller variance and the R² falls from 0.902 to 0.609. Reading the columns across and
+    concluding "the model degrades with horizon" would be reading the denominator.
+
+        h=1 actuals 100,100,100,100,500 → SST 128_000     SSE 5·50² = 12_500 → 0.902
+        h=2 actuals 200,200,200,200,400 → SST  32_000     SSE 5·50² = 12_500 → 0.609
+    """
+    rows = [("m", 1, origin, a, a + 50.0)
+            for origin, a in enumerate([100.0, 100.0, 100.0, 100.0, 500.0])]
+    rows += [("m", 2, origin, a, a + 50.0)
+             for origin, a in enumerate([200.0, 200.0, 200.0, 200.0, 400.0])]
+
+    scored = score(_evaluations(rows)).set_index("horizon")
+    assert scored.loc[1, "r2"] == pytest.approx(0.902)
+    assert scored.loc[2, "r2"] == pytest.approx(0.609)
 
 
 # ---------------------------------------------------------------- missing files

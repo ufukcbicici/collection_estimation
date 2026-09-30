@@ -39,7 +39,8 @@ person tries the same thing.
 ## Re-run the rejected ones on real data
 
 Every number in these docstrings was measured on a **65-week synthetic corpus whose dynamics
-we invented**. Two results depend on properties real data need not share:
+we invented** (v1, seed 20260908, archived). Two results depend on properties real data need
+not share:
 
 - the Tweedie result depends on the weekly total's variance-mean power (1.1–1.3 here, where
   Gamma assumes 2.0);

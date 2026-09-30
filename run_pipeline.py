@@ -276,11 +276,22 @@ def main() -> dict:
     print(scored.pivot(index="model", columns="horizon", values="mape")
           .round(2).to_string())
 
+    print("\nR2 by horizon - higher is better, 0 = no better than the mean")
+    print("of the weeks being forecast. Read DOWN a column: each horizon scores a")
+    print("different set of weeks, so the columns are not comparable with each other:")
+    print(scored.pivot(index="model", columns="horizon", values="r2")
+          .round(3).to_string())
+
     at_h1 = scored[scored["horizon"] == 1].set_index("model")
     at_h1 = at_h1.assign(bias_pct=(at_h1["bias"] / series.mean() * 100).round(1))
-    at_h1 = at_h1.sort_values("mape")[["mape", "mape_se", "wape", "bias_pct"]]
+    at_h1 = at_h1.sort_values("mape")[["mape", "mape_se", "wape", "bias_pct", "r2"]]
     print("\nat h=1, sorted by MAPE:")
-    print(at_h1.round(2).to_string())
+    print(at_h1.round(3).to_string())
+    print("  r2 = the share of the weekly variance the forecast tracks, measured")
+    print("  against the mean of the weeks being forecast. That mean is HINDSIGHT, so")
+    print("  this ranks the models against each other and is not a bar anyone could")
+    print("  have run; negative means worse than that flat line, which is an ordinary")
+    print("  result on a series whose variance sits in a few heavy weeks.")
 
     absent = _missing_file_dates(weeks, collections)
     if absent:

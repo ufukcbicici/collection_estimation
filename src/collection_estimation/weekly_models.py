@@ -10,7 +10,7 @@ a separate fit per horizon. Six features:
     n_holidays         weekday public holidays in the week
     trend              the integer week index
 
-Measured on the synthetic corpus at h=1: `MAPE 19.83 +/- 2.49, WAPE 19.70, bias -1.0%`.
+Measured on the v1 synthetic corpus (seed 20260908) at h=1: `MAPE 19.83 +/- 2.49, WAPE 19.70, bias -1.0%`.
 
 **Chosen for the BIAS, not the accuracy.** Every candidate's MAPE sat inside one standard
 error of every other, so this was never an accuracy choice. What separates it is that it is
@@ -197,7 +197,7 @@ def make_lags(n_lags: int = 5, alphas: tuple[float, ...] = ALPHAS):
     Horizon-aware, like the mean: at training row `t` for horizon `h` the observable weeks
     are `y[t-h], y[t-h-1], ...`, so the earliest usable row is `t = h + n_lags - 1`.
 
-    **Measured on the synthetic corpus, this does not help** — the paired difference against
+    **Measured on the v1 synthetic corpus, this does not help** — the paired difference against
     the mean-of-four was -0.32 MAPE points averaged over horizons, 95% CI [-1.49, +0.85],
     and dropping the level entirely scored the same again. It is kept in the pipeline
     because the real EY series behaves differently from the synthetic one (its baselines are

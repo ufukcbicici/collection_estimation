@@ -5,8 +5,9 @@ about why every model under-predicted, and each is a measured negative result wr
 section 12b of the design document.
 
 **Re-run these on the real EY data before trusting the conclusions.** Every number below
-was measured on a 65-week SYNTHETIC corpus whose dynamics we invented. Two of the four
-findings depend on properties of that corpus which real data need not share:
+was measured on a 65-week SYNTHETIC corpus (v1, seed 20260908, archived) whose dynamics we
+invented. Two of the four findings depend on properties of that corpus which real data need
+not share:
 
 * the Tweedie result depends on the variance-mean power of the weekly total (measured
   1.1-1.3 here, where Gamma assumes 2.0);
@@ -17,7 +18,7 @@ findings depend on properties of that corpus which real data need not share:
 the cheapest way to check whether these conclusions survive contact with real files.
 
 --------------------------------------------------------------------------------------
-What was measured, at h=1 on the synthetic corpus
+What was measured, at h=1 on the v1 synthetic corpus
 --------------------------------------------------------------------------------------
 
     ridge            MAPE 20.04   bias  -10.9%

@@ -71,10 +71,27 @@ by h=1, which is how the pipeline prints it.
 column as carefully as the MAPE: **the two models with no drift correction run ~11% low**,
 which for a cash forecast is the error that matters and which MAPE hides entirely.
 
+**R² is reported beside them from this run on.** `score` returns it per model and horizon,
+and `run_pipeline.py` prints it twice: a full model-by-horizon table and a column in the h=1
+summary. It answers a different question from the other three. MAPE and WAPE average absolute
+errors and say how wrong a typical week was; R² is squared error, so the heavy weeks dominate
+and it says whether the model followed the *shape* of the series at all. Its baseline is the
+mean of the weeks being forecast, which is hindsight, so it ranks models against each other
+and is never a bar anyone could have run — and a negative value just means worse than that
+flat line, which is ordinary on a series whose variance sits in a few weeks.
+
+**The table above carries no R² column because the real files have not been re-run since it
+was added.** On the v1 synthetic corpus it re-ranks, which is the point of having it:
+`calendar_only` scores −0.14 to −0.18 across the horizons despite a competitive MAPE,
+because it runs ~19% low there and squared error will not forgive that, while
+`deflated_nolevel` holds the best R² at h=2…5 — the same horizon-aware picture the MAPE
+table gives. Put the measured figures here after the next real run; do not carry the
+synthetic ones across.
+
 ### The one thing to get right when reading these
 
 **Differences under about 2 MAPE points are not distinguishable.** With ~52 origins the
-standard error is ~3.0 on the real files (~2.5 on the synthetic corpus), and during
+standard error is ~3.0 on the real files (~2.5 on the v1 synthetic corpus), and during
 development a single missing file moved a model by 3.7 points. Every table the pipeline prints
 carries `mape_se` for this reason.
 
@@ -115,7 +132,7 @@ src/collection_estimation/
     inflation.py              the TÜFE deflator and its leak-free re-inflation
     reporting.py              per-forecast results file, error in lira, over/under risk
     parked/                   built and tested, NOT on the production path
-tests/                        159 tests
+tests/                        218 tests
 data/                         gitignored — no client data ever enters git
 ```
 
@@ -136,8 +153,23 @@ Two different things, both kept deliberately. See [`parked/README.md`](src/colle
 ## Data
 
 `data/raw/` holds a **copy** of the synthetic corpus — 306 daily workbooks plus an oracle
-describing what was planted in them. Gitignored: it is reproducible from a seed in the
-cockpit repo.
+describing what was planted in them — and, beside the folder, a **synthetic AR ledger**
+(`SYNTHETIC_ey_ar_ledger_asof_20260828.xlsx`) generated from the same simulation, so the
+two tie to the kuruş. Its layout and rules are in the cockpit repo's
+`services/cash_core/docs/collections/ar_ledger_schema.md`. Gitignored: all of it is
+reproducible from a seed in the cockpit repo.
+
+**Two synthetic corpora exist, and the figures in this repo mostly describe the older one.**
+
+| | seed | installed | notes |
+|---|---|---|---|
+| **v1** | 20260908 | until 2026-09-30 | archived in `data/raw/_archive/v1_seed20260908/`, with its oracle and its ingest cache |
+| **v2** | 58068921 | since 2026-09-30 | adds the AR ledger, instalments, unique customer numbers; seed chosen as the most typical of ten random ones |
+
+**Every synthetic figure quoted in this repo — here, in `HANDOVER.md`, in the model
+docstrings — was measured on v1** unless it says otherwise. They are records of experiments,
+kept rather than re-measured. The real-data figures are unaffected. v1's seed was also the
+easiest of the seeds tried, so its error rates are on the flattering side.
 
 **It is synthetic.** Company names are realistic; every amount, date, document number and
 payment pattern is fabricated. Each workbook carries a `_SYNTHETIC` tab saying so. It is
@@ -148,8 +180,13 @@ estimates of error rates on EY's real files.**
 To regenerate:
 
 ```
-python services/cash_core/fixtures/generators/gen_collections_corpus.py --seed 20260908
+python services/cash_core/fixtures/generators/gen_collections_corpus.py --seed 58068921
 ```
+
+It writes the corpus folder and the ledger beside it, and overwrites the cockpit repo's
+tracked oracle. Copy all three into `data/raw/`, and **delete the matching cache in
+`data/interim/`**: the cache is named after the corpus folder, and a regenerated corpus keeps
+the same folder name, so the pipeline would otherwise keep reading the old one.
 
 **Do not use oracle fields as model features.** They exist only because the corpus is
 synthetic, and a model that uses them cannot be rebuilt on real data. Use them to diagnose

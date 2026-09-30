@@ -6,6 +6,11 @@ predict the total collected in weeks `t+1` … `t+5`.
 Everything in it was **built** against a **synthetic** corpus — 306 fabricated daily
 workbooks. This document is how you point the pipeline at the real ones.
 
+> **Which synthetic corpus.** Every synthetic figure in this document was measured on the
+> **v1** corpus (seed 20260908), archived in `data/raw/_archive/v1_seed20260908/`. Since
+> 2026-09-30 the installed corpus is **v2** (seed 58068921), which comes with a synthetic AR
+> ledger. See `README.md`, "Data". The figures are kept as records, not re-measured.
+
 **The short version:** set one environment variable, run `preflight.py`, fix whatever it
 reports in `config.py`, run `run_pipeline.py`. If the real files have the same layout as our
 synthetic ones, no code changes at all.
@@ -52,7 +57,7 @@ h=1** (worse than the synthetic ≈2.5), and **16 business days with no file**.
   one origin offset or compound across the five weeks depending on the model.
   `p95_over_try` is the liquidity number: a bad-but-not-unprecedented five-week shortfall.
 
-Two things that run showed on the synthetic corpus, worth re-checking on yours:
+Two things that run showed on the v1 synthetic corpus, worth re-checking on yours:
 
 1. **The five-week total is far more accurate than any single week** (9-20% against
    20-40%), because the weekly errors partly cancel. Good news for the use case, and
@@ -60,6 +65,72 @@ Two things that run showed on the synthetic corpus, worth re-checking on yours:
 2. **The model with no drift correction never over-forecasts at all.** Its liquidity risk
    is zero because it is systematically ~18% low. Reading the over-forecast rate on its
    own would have made the worst model look the safest.
+
+### Added 2026-09-23/24: R2, tests, and three fixes
+
+**`baselines.score` now returns a fourth metric, `r2`**, beside `mape`, `mape_se`, `wape` and
+`bias`. `run_pipeline.py` prints it twice: a model-by-horizon table and a column in the h=1
+summary. Three things about it that the docstring states and that must travel with the number:
+
+* **Its baseline is hindsight.** SST is taken around the mean of the weeks *being forecast*,
+  a line nobody could have drawn at the origin. R2 ranks models against each other; it is
+  not a deployable bar. The deployable bars stay `BASELINE_MODELS`.
+* **It is squared error, so it re-ranks.** On the v1 SYNTHETIC corpus `calendar_only` scores
+  -0.14 to -0.18 across the horizons despite a competitive MAPE, because it runs ~19% low
+  and squared error does not forgive that. `deflated_nolevel` holds the best R2 at h=2..5
+  (0.16-0.20). Best R2 anywhere is ~0.20.
+* **There is no real-file R2 yet.** The table in `README.md` deliberately has no R2 column.
+  It gets one after the next run on the EY files; the synthetic figures above must not be
+  carried across. Same rule as the deck's `SCORES`.
+
+**Tests: 159 -> 219.** `tests/test_reporting.py` is new (51 tests, the module had none) and
+`tests/test_baselines.py` gained 9 for R2. Written by the `test-writer` subagent, per the
+project rule against hand-written tests.
+
+**218 since 2026-09-30.** When the synthetic corpus was regenerated (v2), four tests broke
+because they pinned facts of v1. The benchmark test now reads its figures from the oracle; the
+two v1 findings (`ma8` wins at h=5, the level term earns nothing) now run on the archived v1
+corpus and skip without it; and the month-end test was **deleted** — measured over all 12
+month ends, the claim it encoded is false (design §11.2b).
+
+**Three fixes in `reporting.py`**, two of them found by that test pass:
+
+1. `cumulative_by_origin` checked horizon completeness with a **set** comparison, which
+   cannot see a duplicated horizon. A duplicate was summed twice into a total that still
+   looked plausible. Now checks length as well.
+2. `cumulative_risk` reports **`n_scored`** beside `n_origins`. `mape_5w` is a skipna mean,
+   so an origin whose five weeks net to zero has no percentage error and drops out of it
+   while still counting in `n_origins`. The two are equal on real data; they diverge only
+   when something is being silently dropped.
+3. Fixing (1) made an existing crash reachable: with no complete origin, `out` is empty and
+   `sort_values` raised `KeyError: 'model'`. The columns are now named explicitly, so the
+   empty case returns an empty frame of the right shape. The same pattern still exists in
+   `cash_error`, `cumulative_risk` and `baselines.score`; all are unreachable from the
+   pipeline and were left alone.
+
+**One finding reported and deliberately NOT fixed:** `forecast_log` maps a week index the
+spine does not cover to `NaT` silently, and writes a row with four empty date cells. Not
+reachable from the pipeline, which always passes the spine the evaluations were built from,
+but it is an unguarded assumption in the file whose purpose is auditability.
+
+### Measured 2026-09-23: ARIMA is not worth trying
+
+Six-line check on the weekly series, v1 synthetic corpus, 65 weeks (noise band about +-0.24):
+
+```
+nominal   lag1=+0.09 lag2=+0.18 lag3=-0.11 lag4=+0.37 lag5=+0.19
+deflated  lag1=-0.11 lag2=+0.06 lag3=-0.33 lag4=+0.22 lag5=+0.04
+diff1     lag1=-0.50 lag2=+0.22 lag3=-0.44 lag4=+0.32 lag5=-0.08
+```
+
+**Exactly one lag clears the band: lag 4**, which is the month. The calendar block already
+carries that, and more precisely: a month is 4.33 weeks, so a seasonal term at period 4
+drifts out of phase across 65 weeks while `has_month_end` marks the actual last business day.
+After TUFE deflation lag 4 falls to +0.22, inside the band. And `diff1` lag1 = **-0.50** is
+the textbook over-differencing signature, so `d=1` would manufacture structure rather than
+remove it. The AR side is already tested with more information than ARIMA would have:
+`lags5+trend` is a recorded negative result. **Re-run these three lines on the real series
+before closing the door for good** - a different ACF is the one thing that would reopen it.
 
 ---
 
@@ -74,7 +145,7 @@ conda activate collection_estimation
 Confirm the code is healthy before you introduce new data:
 
 ```powershell
-python -m pytest tests -q          # expect 159 passed
+python -m pytest tests -q          # expect 218 passed
 ```
 
 Those tests run against the synthetic corpus, which is gitignored. If it is absent, the
@@ -238,7 +309,7 @@ Two details that are easy to get wrong and are already right here:
 That describes the **family**. Which member to use is settled in §0: on the real files the
 `trend` column loses to TÜFE deflation, and the `level` term's value depends on the horizon.
 The figures this section used to quote — `MAPE 19.83 ± 2.49, bias −1.0%` for `ridge+trend` —
-are synthetic-corpus figures for a model the real data has since beaten.
+are v1 synthetic-corpus figures for a model the real data has since beaten.
 
 What has **not** changed is *why* a model gets picked. **The choice is driven by the bias,
 not the accuracy.** Candidates cluster inside a few standard errors of each other on MAPE;
@@ -305,7 +376,7 @@ would have cleared.
 
 ## 7. What will not carry over — read before trusting any number
 
-Everything measured on the synthetic corpus comes from dynamics we invented. Treat those as
+Everything measured on the (v1) synthetic corpus comes from dynamics we invented. Treat those as
 hypotheses to re-test, not findings. **The first two below have since been re-tested on the
 real files and are settled; the rest are still open.**
 
@@ -367,7 +438,7 @@ src/collection_estimation/
     baselines.py                   metrics, rolling origin, the bar to beat
     weekly_models.py               the recommended model
     parked/                        built and tested, NOT on the production path
-tests/                             159 tests
+tests/                             218 tests
 ```
 
 The full specification lives in the cockpit repo:

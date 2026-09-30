@@ -14,7 +14,9 @@ and wrong beyond it.
 `calendar_only` drops the level entirely: intercept plus calendar. One parameter fewer and
 nothing that can be mis-specified.
 
-Measured, the level term earns nothing. The weekly series is barely autocorrelated —
+Measured on the v1 synthetic corpus (seed 20260908, archived), the level term earned nothing;
+on v2 and on the real EY files it does, depending on the horizon. On v1 the weekly series was
+barely autocorrelated —
 +0.10 at lag 1, **−0.13 at lag 3**, +0.43 at lag 4 where the monthly cycle shows — so a
 horizon-specific level coefficient is estimated from ~40 noisy observations and adds
 variance rather than signal. Averaged over horizons `calendar_only` (21.0% MAPE) beats
@@ -100,13 +102,46 @@ def wape(actual: np.ndarray, predicted: np.ndarray) -> float:
 def bias(actual: np.ndarray, predicted: np.ndarray) -> float:
     """Mean signed error. Positive means over-prediction.
 
-    The only one of the three that keeps a direction. Equation (6.9) predicts a
+    The only one of the four that keeps a direction. Equation (6.9) predicts a
     systematic term here, and both MAPE and WAPE hide its sign — a model 10% high and a
     model 10% low score identically on those.
     """
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
     return float(np.mean(predicted - actual))
+
+
+def r2(actual: np.ndarray, predicted: np.ndarray) -> float:
+    """Coefficient of determination: the share of the weekly variance the forecast tracks.
+
+    ``1 - SSE/SST``, with ``SST`` measured around the mean of the actuals **in the
+    evaluation window**. Three things follow, and all three have to travel with the
+    number.
+
+    **The comparison is against hindsight.** That mean is computed from the very weeks
+    being forecast, so it is not a line anyone could have drawn at the origin. R² above
+    zero therefore means the model beat a constant chosen with knowledge of the future —
+    a harder bar than it sounds, and not a model that could be run. The deployable bars
+    are in `BASELINE_MODELS`, and R² says nothing about those.
+
+    **Negative is an ordinary result, not a broken one.** It says the forecast did worse
+    than that flat line. On a weekly total whose variance sits in a handful of heavy
+    weeks, a model that is close on average can still land below zero.
+
+    **It is a squared-error metric**, which is what it adds here. MAPE and WAPE both
+    average absolute errors, so they answer "how wrong was a typical week"; squaring makes
+    the largest misses dominate, so R² answers "did the model follow the shape of the
+    series at all". The two can disagree, and when they do the disagreement is the
+    finding: a model can win on MAPE by being reliably close in quiet weeks while missing
+    every peak. Unlike MAPE it also keeps zero weeks, which have no percentage error but
+    are part of the variance.
+    """
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    sst = float(((actual - actual.mean()) ** 2).sum())
+    if sst == 0:
+        return float("nan")
+    return 1.0 - float(((actual - predicted) ** 2).sum()) / sst
 
 
 # --------------------------------------------------------------------------------------
@@ -240,10 +275,16 @@ def rolling_origin_baselines(
 
 
 def score(evaluations: pd.DataFrame) -> pd.DataFrame:
-    """MAPE, WAPE and Bias per model and horizon.
+    """MAPE, WAPE, Bias and R² per model and horizon.
 
-    All three, always. See the docstrings above for why any one of them alone is
+    All four, always. See the docstrings above for why any one of them alone is
     misleading.
+
+    **R² is comparable across models, not across horizons.** Every horizon is scored on
+    its own set of target weeks, so each has its own variance to explain; h=5 having a
+    lower R² than h=1 is partly the horizon being harder and partly the denominator
+    changing. Within one horizon the actuals are shared, so the column is a clean ranking
+    by squared error.
     """
     out = []
     for (model, horizon), group in evaluations.groupby(["model", "horizon"],
@@ -263,6 +304,9 @@ def score(evaluations: pd.DataFrame) -> pd.DataFrame:
             if len(ape) > 1 else float("nan"),
             "wape": round(wape(actual, predicted), 2),
             "bias": round(bias(actual, predicted), 0),
+            # Squared-error, so it can disagree with the MAPE beside it. Three decimals
+            # because the differences between these models live in the second one.
+            "r2": round(r2(actual, predicted), 3),
         })
     return pd.DataFrame(out).sort_values(["model", "horizon"]).reset_index(drop=True)
 
