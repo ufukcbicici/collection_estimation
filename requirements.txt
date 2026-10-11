@@ -22,9 +22,8 @@ matplotlib==3.11.0
 openpyxl==3.1.5          # reading the corpus workbooks
 joblib==1.5.3            # persisting fitted models
 pytest==9.0.3
+lightgbm==4.7.0          # Tweedie objective for the hurdle competitor; pip-installed
+                         # 2026-10-05 (conda env, so add it with pip after the create above)
 
-# NOT installed. Needed only to move past Random Forest to the Gamma objective in section
-# 7.4 of the design — sklearn's RandomForestRegressor offers squared_error,
-# absolute_error, friedman_mse and poisson, but not gamma.
-# lightgbm>=4.0
+# NOT installed.
 # xgboost>=2.0
