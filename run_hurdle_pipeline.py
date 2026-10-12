@@ -9,7 +9,7 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     1  daily files     which days have a collections file          (U0)   <- built
     2  one day         the payment lines of one chosen file        (U0)   <- built
     3  collections     the payment lines of every file             (U0)   <- built
-    4  keys            company + customer as one key               (U1)
+    4  keys            company + customer as one key               (U1)   <- built
     5  weekly series   receipts per key and week, missing weeks    (U2)
     6  AR ledger       open invoices as known at each week         (U9a, U9b)
     7  panel           rows customer x week x horizon, with labels (U3, U4, U5)
@@ -39,12 +39,16 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     load_collections,
     read_one_file,
 )
+from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 
 # ----------------------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------------------
 SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
 CORPUS_FOLDER = Path(os.environ.get("COLLECTIONS_CORPUS_DIR", SYNTHETIC_CORPUS))
+
+# EY's company codes; a line with any other code stops the run (step 4).
+KNOWN_COMPANIES = ["TR02", "TR04", "TR05", "TR06", "TR91"]
 
 # Where step 3 caches the table of all payment lines (rebuilt when the files change).
 CACHE_FOLDER = REPO_ROOT / "data" / "interim"
@@ -71,7 +75,11 @@ def main():
     collections = load_collections(daily_files, CACHE_FOLDER)
     show_collections(collections)
 
-    # Step 4 onwards: added as each unit is built.
+    # Step 4: one key per company and customer, e.g. 'TR02-11226452'.
+    collections = add_keys(collections, KNOWN_COMPANIES)
+    show_keys(collections)
+
+    # Step 5 onwards: added as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -93,6 +101,13 @@ def show_collections(collections):
     print(f"Step 3: {len(collections):,} payment lines, "
           f"{collections['amount_try'].sum():,.2f} TRY in total, "
           f"{collections['document_date'].nunique()} days")
+
+
+def show_keys(collections):
+    """A short printout of step 4."""
+    keys_per_company = collections.groupby("company_code")["key"].nunique()
+    print(f"Step 4: {collections['key'].nunique():,} keys; per company: "
+          f"{keys_per_company.to_dict()}")
 
 
 if __name__ == "__main__":
