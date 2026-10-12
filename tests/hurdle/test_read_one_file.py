@@ -23,6 +23,7 @@ from collection_estimation.hurdle.read_collections import (
     is_nan,
     last_non_empty_row,
     list_daily_files,
+    payment_line,
     pick_data_sheet,
     read_one_file,
 )
@@ -642,6 +643,65 @@ def test_check_short_total_row_without_try_cell_skips_with_no_number_note(capsys
     rows = grand_rows((None, None, 'GRAND TOTAL'))
     check_grand_total(lines_of(10.0), rows, GRAND_COLUMNS, 'f.xlsx')
     assert 'has no number in its grand total' in capsys.readouterr().out
+
+
+# --- payment_line on hand-made rows: NaN amounts ---------------------------------------
+# openpyxl cannot write a NaN into a cell, so these call payment_line directly.
+
+LINE_FIELD_COLUMNS = find_columns(HEADER)
+
+
+def test_payment_line_nan_amount_try_raises_naming_file_row_and_field():
+    row = line(amount_try=float('nan'), amount_original=100.0)
+    with pytest.raises(ValueError, match=r'^f\.xlsx row 7: amount_try is NaN, not a number$'):
+        payment_line(row, LINE_FIELD_COLUMNS, 'f.xlsx', 7)
+
+
+def test_payment_line_nan_amount_original_raises_naming_file_row_and_field():
+    row = line(amount_try=100.0, amount_original=float('nan'))
+    with pytest.raises(ValueError,
+                       match=r'^f\.xlsx row 9: amount_original is NaN, not a number$'):
+        payment_line(row, LINE_FIELD_COLUMNS, 'f.xlsx', 9)
+
+
+def test_payment_line_nan_in_both_amounts_names_amount_original_first():
+    # The loop checks amount_original before amount_try.
+    row = line(amount_try=float('nan'), amount_original=float('nan'))
+    with pytest.raises(ValueError, match='amount_original is NaN'):
+        payment_line(row, LINE_FIELD_COLUMNS, 'f.xlsx', 3)
+
+
+def test_payment_line_float_amounts_pass_as_floats():
+    result = payment_line(line(amount_try=123.45, amount_original=10.5),
+                          LINE_FIELD_COLUMNS, 'f.xlsx', 3)
+    assert result['amount_try'] == 123.45
+    assert result['amount_original'] == 10.5
+    assert type(result['amount_try']) is float
+    assert type(result['amount_original']) is float
+
+
+def test_payment_line_int_amounts_pass_converted_to_float():
+    result = payment_line(line(amount_try=100, amount_original=7),
+                          LINE_FIELD_COLUMNS, 'f.xlsx', 3)
+    assert result['amount_try'] == 100.0 and type(result['amount_try']) is float
+    assert result['amount_original'] == 7.0 and type(result['amount_original']) is float
+
+
+def test_payment_line_carries_file_and_row_number():
+    result = payment_line(line(), LINE_FIELD_COLUMNS, 'f.xlsx', 5)
+    assert (result['source_file'], result['source_row']) == ('f.xlsx', 5)
+
+
+@pytest.mark.parametrize('field', ['amount_try', 'amount_original'])
+@pytest.mark.parametrize('value', [float('inf'), float('-inf')])
+def test_payment_line_pin_infinite_amount_is_not_rejected_by_the_nan_guard(field, value):
+    """PIN of current behaviour: the NaN guard lets +/-inf through unchanged.
+
+    If infinities should be rejected too, change this test deliberately.
+    """
+    amounts = {'amount_try': 100.0, 'amount_original': 100.0, field: value}
+    result = payment_line(line(**amounts), LINE_FIELD_COLUMNS, 'f.xlsx', 3)
+    assert result[field] == value
 
 
 # --- the synthetic corpus --------------------------------------------------------------

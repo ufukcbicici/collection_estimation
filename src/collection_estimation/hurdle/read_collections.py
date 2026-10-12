@@ -201,6 +201,9 @@ def payment_line(row: tuple, columns: dict[str, int], file_name: str, row_number
         # bool is a subclass of int in Python, so it is excluded explicitly.
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise ValueError(f"{where}: {field} is {amount!r}, not a number")
+        # NaN counts as a float in Python, but later sums would silently skip it.
+        if is_nan(amount):
+            raise ValueError(f"{where}: {field} is NaN, not a number")
         line[field] = float(amount)
 
     line["source_file"] = file_name

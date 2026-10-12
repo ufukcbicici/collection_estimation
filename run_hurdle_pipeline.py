@@ -10,7 +10,7 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     2  one day         the payment lines of one chosen file        (U0)   <- built
     3  collections     the payment lines of every file             (U0)   <- built
     4  keys            company + customer as one key               (U1)   <- built
-    5  weekly series   receipts per key and week, missing weeks    (U2)
+    5  weekly series   receipts per key and week, missing weeks    (U2)   <- built
     6  AR ledger       open invoices as known at each week         (U9a, U9b)
     7  panel           rows customer x week x horizon, with labels (U3, U4, U5)
     8  features        history, calendar, inflation, receivables   (U6-U9c)
@@ -22,7 +22,7 @@ COLLECTIONS_CORPUS_DIR to their folder; nothing in the code needs to change.
 """
 import os
 import sys
-from datetime import date  # noqa: F401  (for ONE_DAY)
+from datetime import date, timedelta  # date: for ONE_DAY
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -40,6 +40,11 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     read_one_file,
 )
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
+from collection_estimation.hurdle.series import (  # noqa: E402
+    add_week_index,
+    week_calendar,
+    weekly_amounts,
+)
 
 # ----------------------------------------------------------------------------------------
 # Settings
@@ -79,7 +84,25 @@ def main():
     collections = add_keys(collections, KNOWN_COMPANIES)
     show_keys(collections)
 
-    # Step 5 onwards: added as each unit is built.
+    # Step 5: weekly series. Weeks run Monday to Sunday; week 0 is the week of the first
+    # daily file.
+    first_day = min(daily_files)
+    week_zero = first_day - timedelta(days=first_day.weekday())
+    collections = add_week_index(collections, week_zero)
+    print(f"Step 5: week 0 starts {week_zero}; lines run from week "
+          f"{collections['week'].min()} to week {collections['week'].max()}")
+
+    # The week calendar: which weeks are complete. A week with any business day
+    # without a file is missing: its amounts are unknown, not zero.
+    weeks = week_calendar(list(daily_files), week_zero)
+    show_weeks(weeks)
+
+    # The weekly amounts per key: gross receipts (the target), refunds, unapplied lines.
+    # Checked inside: the weekly table holds every TRY and every line of step 3.
+    weekly = weekly_amounts(collections)
+    show_weekly(weekly)
+
+    # Step 6 onwards: added as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -108,6 +131,25 @@ def show_keys(collections):
     keys_per_company = collections.groupby("company_code")["key"].nunique()
     print(f"Step 4: {collections['key'].nunique():,} keys; per company: "
           f"{keys_per_company.to_dict()}")
+
+
+def show_weeks(weeks):
+    """A short printout of the week calendar."""
+    missing = weeks[weeks["is_missing"]]
+    print(f"        {len(weeks)} weeks, {len(missing)} missing:")
+    for row in missing.itertuples():
+        print(f"          week {row.week} (Monday {row.monday}): "
+              f"{row.missing_days} of {row.business_days} business days without a file")
+
+
+def show_weekly(weekly):
+    """A short printout of the weekly amounts."""
+    paid = weekly["gross_receipts"] > 0
+    print(f"        weekly amounts: {len(weekly):,} key-weeks with a line "
+          f"({paid.sum():,} with a payment); "
+          f"gross receipts {weekly['gross_receipts'].sum():,.2f} TRY, "
+          f"refunds {weekly['refunds'].sum():,.2f} TRY, "
+          f"{weekly['unapplied_lines'].sum():,} unapplied lines")
 
 
 if __name__ == "__main__":
