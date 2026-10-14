@@ -1,0 +1,16 @@
+# Settings for the hurdle model (option B) on the SYNTHETIC data: corpus v2 (seed 58068921)
+# and the synthetic AR ledger. Read by run_hurdle_pipeline.py; checked by hurdle/settings.py,
+# which rejects any missing or unknown setting. Relative paths are taken from the repo root.
+
+[data]
+corpus_folder = "data/raw/SYNTHETIC_ey_tahsilat_20250602_20260828"  # the daily files
+ledger_file   = "data/raw/SYNTHETIC_ey_ar_ledger_asof_20260828.xlsx"
+ledger_as_of  = 2026-08-28      # the date the ledger was extracted
+cache_folder  = "data/interim"  # rebuilt automatically when anything changes
+
+[companies]
+# EY's company codes; a line with any other code stops the run.
+known = ["TR02", "TR04", "TR05", "TR06", "TR91"]
+
+[debug]
+one_day = 2025-06-02            # the day whose payment lines step 2 prints

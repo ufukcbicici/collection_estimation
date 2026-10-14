@@ -3,7 +3,6 @@
 Gives the rest of the package two things: the payment lines, and the list of days that have
 a file. A day without a file is MISSING, not a day without payments.
 """
-import json
 import math
 from datetime import date, datetime
 from pathlib import Path
@@ -11,6 +10,8 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+
+from .cache import file_fingerprint, load_with_cache, source_fingerprint
 
 # "02062025 EY TAHSILAT.XLSX" is 2 June 2025. Change here if the real files are named otherwise.
 FILE_NAME_DATE_FORMAT = "%d%m%Y"
@@ -77,16 +78,23 @@ def date_from_file_name(name: str) -> date:
             f"{name}: the file name does not start with a date in the form DDMMYYYY") from None
 
 
-def find_columns(header_row: tuple) -> dict[str, int]:
+def find_columns(header_row: tuple, header_to_field: dict[str, str] | None = None,
+                 optional_fields: set[str] | None = None) -> dict[str, int]:
     """{field name: zero-based column position}, matched on the header text.
 
     Columns are found by their header text, never by their position: if a column is ever
-    inserted into the daily files, reading by position would silently shift every column
-    to its right.
+    inserted into a file, reading by position would silently shift every column to its
+    right. `header_to_field` and `optional_fields` describe the file; they default to the
+    daily collection files' HEADER_TO_FIELD and OPTIONAL_FIELDS (the AR ledger passes its own).
     """
+    if header_to_field is None:
+        header_to_field = HEADER_TO_FIELD
+    if optional_fields is None:
+        optional_fields = OPTIONAL_FIELDS
+
     # Simplify the dictionary's keys the same way as the file's headers, so a key matches
     # however it was typed (e.g. 'MÜŞTERİ' or 'müşteri').
-    field_by_header = {simplify_header(text): field for text, field in HEADER_TO_FIELD.items()}
+    field_by_header = {simplify_header(text): field for text, field in header_to_field.items()}
 
     columns = {}
     for position, header in enumerate(header_row):
@@ -98,7 +106,7 @@ def find_columns(header_row: tuple) -> dict[str, int]:
             raise ValueError(f"field '{field}' is in both column {first} and column {second}")
         columns[field] = position
 
-    required = set(HEADER_TO_FIELD.values()) - OPTIONAL_FIELDS
+    required = set(header_to_field.values()) - optional_fields
     missing = required - set(columns)
     if missing:
         raise ValueError(
@@ -285,55 +293,16 @@ def check_dates_match(lines: pd.DataFrame, file_date: date, file_name: str) -> N
 
 
 def load_collections(daily_files: dict[date, Path], cache_folder: Path) -> pd.DataFrame:
-    """The payment lines of every daily file, from the cache if the files have not changed.
+    """The payment lines of every daily file, from the cache if nothing has changed.
 
-    The cache is checked against a fingerprint of the files (full path, size, last-modified
-    time), so a regenerated, edited or different corpus is read again automatically. A
-    damaged cache is also read again rather than raising.
+    The cache is read again automatically if a file is added, removed or changed, if the
+    files are in another folder, if this module's code changes, or if the cache is damaged.
     """
-    cache_folder = Path(cache_folder)
-    cache_file = cache_folder / "hurdle_collections.pkl"
-    fingerprint_file = cache_folder / "hurdle_collections_fingerprint.json"
-    fingerprint = files_fingerprint(daily_files)
-
-    cached = read_cache(cache_file, fingerprint_file, fingerprint)
-    if cached is not None:
-        return cached
-
-    collections = read_all_files(daily_files)
-    cache_folder.mkdir(parents=True, exist_ok=True)
-    # A pickle keeps the table exactly (text IDs, None for missing text, column types).
-    # Only ever load pickles this code wrote itself.
-    collections.to_pickle(cache_file)
-    fingerprint_file.write_text(json.dumps(fingerprint, indent=1), encoding="utf-8")
-    return collections
-
-
-def read_cache(cache_file: Path, fingerprint_file: Path, fingerprint: list[list]):
-    """The cached table if both cache files exist, load, and match `fingerprint`; else None."""
-    if not (cache_file.exists() and fingerprint_file.exists()):
-        return None
-    try:
-        cached_fingerprint = json.loads(fingerprint_file.read_text(encoding="utf-8"))
-        if cached_fingerprint != fingerprint:
-            print("The daily files have changed since the cache was written; reading them again.")
-            return None
-        return pd.read_pickle(cache_file)
-    except Exception as error:
-        # A damaged cache (e.g. a run interrupted while writing it) can fail in many ways;
-        # whatever the reason, the files themselves are still there to be read again.
-        print(f"The cache could not be loaded ({error!r}); reading the files again.")
-        return None
+    fingerprint = [files_fingerprint(daily_files), source_fingerprint(Path(__file__))]
+    return load_with_cache("hurdle_collections", fingerprint,
+                           lambda: read_all_files(daily_files), cache_folder)
 
 
 def files_fingerprint(daily_files: dict[date, Path]) -> list[list]:
-    """For each file: its full path, size and last-modified time. Any change means re-read.
-
-    The full path (not just the name) makes switching to another folder with the same file
-    names, e.g. from the synthetic files to the real ones, always re-read.
-    """
-    fingerprint = []
-    for path in daily_files.values():
-        stat = path.stat()
-        fingerprint.append([str(path.resolve()), stat.st_size, stat.st_mtime])
-    return fingerprint
+    """[full path, size, last-modified time] for each daily file, in date order."""
+    return [file_fingerprint(path) for path in daily_files.values()]

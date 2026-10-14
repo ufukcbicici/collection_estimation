@@ -1,4 +1,5 @@
-"""Tests for `load_collections`, `read_cache` and `files_fingerprint` in `hurdle/read_collections.py`.
+"""Tests for `load_collections` and `files_fingerprint` in `hurdle/read_collections.py`,
+and for `read_cache` (now in `hurdle/cache.py`) as `load_collections` uses it.
 
 Each day is a small workbook built in `tmp_path` by `make_workbook` (see `workbooks.py`).
 The cache always goes to a folder under `tmp_path`, never to the repo's `data/interim/`.
@@ -14,23 +15,30 @@ import pandas as pd
 import pytest
 
 from collection_estimation.hurdle import read_collections
+from collection_estimation.hurdle.cache import read_cache, source_fingerprint
 from collection_estimation.hurdle.read_collections import (
     files_fingerprint,
     list_daily_files,
     load_collections,
     read_all_files,
-    read_cache,
 )
 from tests.hurdle.workbooks import line, make_workbook
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
+READER_SOURCE = Path(read_collections.__file__)
 
 CACHE_FILE = "hurdle_collections.pkl"
 FINGERPRINT_FILE = "hurdle_collections_fingerprint.json"
-CHANGED_NOTE = "The daily files have changed since the cache was written; reading them again."
-DAMAGED_NOTE_START = "The cache could not be loaded ("
-DAMAGED_NOTE_END = "); reading the files again."
+CHANGED_NOTE = ("hurdle_collections: the inputs have changed since the cache was written; "
+                "reading them again.")
+DAMAGED_NOTE_START = "hurdle_collections: the cache could not be loaded ("
+DAMAGED_NOTE_END = "); reading the inputs again."
+
+
+def full_fingerprint(daily_files):
+    """What `load_collections` saves: [the per-file list, [sha256 of read_collections.py]]."""
+    return [files_fingerprint(daily_files), source_fingerprint(READER_SOURCE)]
 
 
 def make_day(folder, day, *lines, **options):
@@ -120,11 +128,23 @@ def test_first_call_prints_no_change_note(days_folder, cache_folder, capsys):
     assert CHANGED_NOTE not in capsys.readouterr().out
 
 
-def test_fingerprint_file_holds_the_files_fingerprint(days_folder, cache_folder):
+def test_fingerprint_file_holds_the_files_and_source_fingerprints(days_folder, cache_folder):
     daily_files = two_days(days_folder)
     load_collections(daily_files, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert written == files_fingerprint(daily_files)
+    assert written == full_fingerprint(daily_files)
+
+
+def test_fingerprint_file_has_two_parts_files_then_source_hash(days_folder, cache_folder):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, cache_folder)
+    written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    assert len(written) == 2
+    files_part, source_part = written
+    assert files_part == files_fingerprint(daily_files)
+    assert len(source_part) == 1
+    assert len(source_part[0]) == 64
+    assert all(char in '0123456789abcdef' for char in source_part[0])
 
 
 def test_accepts_the_cache_folder_as_a_string(days_folder, cache_folder):
@@ -243,7 +263,7 @@ def test_fingerprint_file_is_updated_after_a_re_read(days_folder, cache_folder):
     daily_files = list_daily_files(days_folder)
     load_collections(daily_files, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert written == files_fingerprint(daily_files)
+    assert written == full_fingerprint(daily_files)
 
 
 def test_third_call_after_a_re_read_is_a_cache_hit(days_folder, cache_folder, monkeypatch,
@@ -401,7 +421,7 @@ def test_switching_folders_rewrites_the_fingerprint_for_the_new_folder(tmp_path,
     files_b = list_daily_files(folder_b)
     load_collections(files_b, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert written == files_fingerprint(files_b)
+    assert written == full_fingerprint(files_b)
 
 
 # --- a damaged cache: read again, never raise -------------------------------------------
@@ -428,7 +448,7 @@ def damage_then_reload(days_folder, cache_folder, damage, read_spy, capsys, monk
     assert read_spy.calls == 2
     # The cache was rewritten: the next call is a clean hit, no note, no reading.
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert written == files_fingerprint(daily_files)
+    assert written == full_fingerprint(daily_files)
     forbid_reading(monkeypatch)
     pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
     assert capsys.readouterr().out == ''
@@ -496,7 +516,7 @@ def written_cache(days_folder, cache_folder):
     daily_files = two_days(days_folder)
     table = load_collections(daily_files, cache_folder)
     return (cache_folder / CACHE_FILE, cache_folder / FINGERPRINT_FILE,
-            files_fingerprint(daily_files), table)
+            full_fingerprint(daily_files), table)
 
 
 def test_read_cache_returns_the_table_when_the_fingerprint_matches(written_cache, capsys):
@@ -510,7 +530,8 @@ def test_read_cache_returns_none_with_the_changed_note_when_the_fingerprint_diff
         written_cache, capsys):
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    different = [[entry[0], entry[1] + 1, entry[2]] for entry in fingerprint]
+    files_part, source_part = fingerprint
+    different = [[[entry[0], entry[1] + 1, entry[2]] for entry in files_part], source_part]
     assert read_cache(cache_file, fingerprint_file, different) is None
     output = capsys.readouterr().out
     assert CHANGED_NOTE in output
@@ -520,7 +541,26 @@ def test_read_cache_returns_none_with_the_changed_note_when_the_fingerprint_diff
 def test_read_cache_returns_none_when_the_fingerprint_has_one_file_less(written_cache, capsys):
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    assert read_cache(cache_file, fingerprint_file, fingerprint[:-1]) is None
+    files_part, source_part = fingerprint
+    assert read_cache(cache_file, fingerprint_file, [files_part[:-1], source_part]) is None
+    assert CHANGED_NOTE in capsys.readouterr().out
+
+
+def test_read_cache_returns_none_when_only_the_source_hash_differs(written_cache, capsys):
+    cache_file, fingerprint_file, fingerprint, _ = written_cache
+    capsys.readouterr()
+    files_part, _ = fingerprint
+    assert read_cache(cache_file, fingerprint_file, [files_part, ['0' * 64]]) is None
+    assert CHANGED_NOTE in capsys.readouterr().out
+
+
+def test_read_cache_returns_none_for_the_old_one_part_fingerprint(written_cache, capsys):
+    """A cache written before the refactor saved only the per-file list: it must re-read."""
+    cache_file, fingerprint_file, fingerprint, _ = written_cache
+    capsys.readouterr()
+    files_part, _ = fingerprint
+    fingerprint_file.write_text(json.dumps(files_part, indent=1), encoding='utf-8')
+    assert read_cache(cache_file, fingerprint_file, fingerprint) is None
     assert CHANGED_NOTE in capsys.readouterr().out
 
 
@@ -568,6 +608,81 @@ def test_read_cache_does_not_change_the_cache_files(written_cache):
     read_cache(cache_file, fingerprint_file, fingerprint)
     read_cache(cache_file, fingerprint_file, [])
     assert (cache_file.read_bytes(), fingerprint_file.read_bytes()) == before
+
+
+# --- the reader's code changed: read again ----------------------------------------------
+
+def pretend_the_code_changed(monkeypatch):
+    """From now on `read_collections.py` seems to hash to something else."""
+    monkeypatch.setattr(read_collections, 'source_fingerprint',
+                        lambda *files: ['f' * 64 for _ in files])
+
+
+def test_load_collections_hashes_its_own_source_file(monkeypatch, days_folder, cache_folder):
+    hashed = []
+
+    def spy(*files):
+        hashed.append(files)
+        return source_fingerprint(*files)
+    monkeypatch.setattr(read_collections, 'source_fingerprint', spy)
+    load_collections(two_days(days_folder), cache_folder)
+    assert len(hashed) == 1
+    assert [Path(f).resolve() for f in hashed[0]] == [READER_SOURCE.resolve()]
+
+
+def test_changed_code_reads_the_files_again_with_the_note(days_folder, cache_folder, read_spy,
+                                                          capsys, monkeypatch):
+    daily_files = two_days(days_folder)
+    first = load_collections(daily_files, cache_folder)
+    capsys.readouterr()
+    pretend_the_code_changed(monkeypatch)
+    table = load_collections(daily_files, cache_folder)
+    output = capsys.readouterr().out
+    assert CHANGED_NOTE in output
+    assert DAMAGED_NOTE_START not in output
+    assert read_spy.calls == 2
+    pd.testing.assert_frame_equal(table, first)
+
+
+def test_changed_code_rewrites_the_source_hash(days_folder, cache_folder, monkeypatch):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, cache_folder)
+    pretend_the_code_changed(monkeypatch)
+    load_collections(daily_files, cache_folder)
+    written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    assert written == [files_fingerprint(daily_files), ['f' * 64]]
+
+
+def test_after_a_code_change_the_next_call_is_a_cache_hit(days_folder, cache_folder,
+                                                          monkeypatch, capsys):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, cache_folder)
+    pretend_the_code_changed(monkeypatch)
+    second = load_collections(daily_files, cache_folder)
+    capsys.readouterr()
+    forbid_reading(monkeypatch)
+    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), second)
+    assert capsys.readouterr().out == ''
+
+
+def test_unchanged_code_is_a_cache_hit(days_folder, cache_folder, read_spy, capsys):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, cache_folder)
+    capsys.readouterr()
+    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, cache_folder)
+    assert read_spy.calls == 1
+    assert capsys.readouterr().out == ''
+
+
+def test_editing_a_copy_of_the_source_file_changes_the_hash(tmp_path):
+    """The real trigger: one edited byte in the reader's code gives another fingerprint."""
+    copy = tmp_path / 'read_collections.py'
+    copy.write_bytes(READER_SOURCE.read_bytes())
+    before = source_fingerprint(copy)
+    assert before == source_fingerprint(READER_SOURCE)
+    copy.write_bytes(READER_SOURCE.read_bytes() + b'\n# edited\n')
+    assert source_fingerprint(copy) != before
 
 
 # --- errors ----------------------------------------------------------------------------

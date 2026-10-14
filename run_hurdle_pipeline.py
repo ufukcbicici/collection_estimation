@@ -1,7 +1,7 @@
 """Run the hurdle model (option B), step by step.
 
 Open this file in PyCharm and press Run (or Debug). There are no command-line arguments:
-the settings are constants at the top, and each step is one line in `main()`, so you can
+the settings come from a TOML file (below), and each step is one line in `main()`, so you can
 put a breakpoint after any step and look at what it produced.
 
 Steps (filled in as the units are built; see option_b_implementation_plan.md):
@@ -11,18 +11,19 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     3  collections     the payment lines of every file             (U0)   <- built
     4  keys            company + customer as one key               (U1)   <- built
     5  weekly series   receipts per key and week, missing weeks    (U2)   <- built
-    6  AR ledger       open invoices as known at each week         (U9a, U9b)
+    6  AR ledger       the ledger lines (U9a); open invoices as known at each week (U9b)
     7  panel           rows customer x week x horizon, with labels (U3, U4, U5)
     8  features        history, calendar, inflation, receivables   (U6-U9c)
     9  models          stage 1, stage 2, top-ups                   (U10-U12)
    10  forecast, evaluation, calibration                           (U13-U15)
 
-To run on other files (e.g. the real EY files), set the environment variable
-COLLECTIONS_CORPUS_DIR to their folder; nothing in the code needs to change.
+The settings (data paths, company codes, ...) are in settings/synthetic.toml. To run on
+other data (e.g. the real EY files), write another settings file and point the environment
+variable HURDLE_SETTINGS to it; nothing in the code needs to change.
 """
 import os
 import sys
-from datetime import date, timedelta  # date: for ONE_DAY
+from datetime import timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -40,6 +41,11 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     read_one_file,
 )
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
+from collection_estimation.hurdle.read_ledger import (  # noqa: E402
+    check_ledger_against_collections,
+    load_ledger,
+)
+from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 from collection_estimation.hurdle.series import (  # noqa: E402
     add_week_index,
     week_calendar,
@@ -47,41 +53,37 @@ from collection_estimation.hurdle.series import (  # noqa: E402
 )
 
 # ----------------------------------------------------------------------------------------
-# Settings
+# Settings: read from a TOML file. The environment variable HURDLE_SETTINGS can point to
+# another one (e.g. settings/real.toml for the real EY files).
 # ----------------------------------------------------------------------------------------
-SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
-CORPUS_FOLDER = Path(os.environ.get("COLLECTIONS_CORPUS_DIR", SYNTHETIC_CORPUS))
-
-# EY's company codes; a line with any other code stops the run (step 4).
-KNOWN_COMPANIES = ["TR02", "TR04", "TR05", "TR06", "TR91"]
-
-# Where step 3 caches the table of all payment lines (rebuilt when the files change).
-CACHE_FOLDER = REPO_ROOT / "data" / "interim"
-
-# Step 2 reads this one day; None means the first day with a file.
-ONE_DAY = None  # e.g. date(2026, 3, 2)
+DEFAULT_SETTINGS_FILE = REPO_ROOT / "settings" / "synthetic.toml"
+SETTINGS_FILE = Path(os.environ.get("HURDLE_SETTINGS", DEFAULT_SETTINGS_FILE))
 
 
 def main():
-    print(f"Corpus folder: {CORPUS_FOLDER}")
+    settings = load_settings(SETTINGS_FILE, REPO_ROOT)
+    print(f"Settings: {settings.settings_file}")
+    print(f"Corpus folder: {settings.data.corpus_folder}")
 
     # Step 1: which days have a file. A day without a file is missing, not zero.
-    daily_files = list_daily_files(CORPUS_FOLDER)
+    daily_files = list_daily_files(settings.data.corpus_folder)
     show_daily_files(daily_files)
 
     # Step 2: the payment lines of one day, checked against the file's grand total.
-    day = ONE_DAY or min(daily_files)
+    day = settings.debug.one_day
+    if day not in daily_files:
+        raise ValueError(f"{settings.settings_file.name} [debug]: one_day {day} has no daily file")
     one_day = read_one_file(daily_files[day])
     show_one_day(day, one_day)
 
     # Step 3: the payment lines of every day, each file checked as in step 2, and every
     # line's date checked against its file's date. Read from the cache if the files have
     # not changed since the last run.
-    collections = load_collections(daily_files, CACHE_FOLDER)
+    collections = load_collections(daily_files, settings.data.cache_folder)
     show_collections(collections)
 
     # Step 4: one key per company and customer, e.g. 'TR02-11226452'.
-    collections = add_keys(collections, KNOWN_COMPANIES)
+    collections = add_keys(collections, list(settings.companies.known))
     show_keys(collections)
 
     # Step 5: weekly series. Weeks run Monday to Sunday; week 0 is the week of the first
@@ -102,7 +104,18 @@ def main():
     weekly = weekly_amounts(collections)
     show_weekly(weekly)
 
-    # Step 6 onwards: added as each unit is built.
+    # Step 6: the AR ledger lines, with the same keys as the payment lines. Read from the
+    # cache if nothing has changed since the last run.
+    ledger = load_ledger(settings.data.ledger_file, settings.data.ledger_as_of,
+                         settings.data.cache_folder)
+    ledger = add_keys(ledger, list(settings.companies.known))
+    show_ledger(ledger)
+
+    # The ledger's payments must equal the daily files' totals on every day with a file.
+    tie = check_ledger_against_collections(ledger, collections, list(daily_files))
+    show_tie(tie)
+
+    # Step 6 continues, and later steps follow, as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -150,6 +163,25 @@ def show_weekly(weekly):
           f"gross receipts {weekly['gross_receipts'].sum():,.2f} TRY, "
           f"refunds {weekly['refunds'].sum():,.2f} TRY, "
           f"{weekly['unapplied_lines'].sum():,} unapplied lines")
+
+
+def show_ledger(ledger):
+    """A short printout of the ledger."""
+    lines_per_type = ledger["document_type"].value_counts().to_dict()
+    still_open = ledger["clearing_date"].isna().sum()
+    print(f"Step 6: {len(ledger):,} ledger lines {lines_per_type}, {still_open:,} still open; "
+          f"{ledger['key'].nunique():,} keys; posted from "
+          f"{ledger['posting_date'].min():%Y-%m-%d} to {ledger['posting_date'].max():%Y-%m-%d}")
+
+
+def show_tie(tie):
+    """A short printout of the ledger-to-daily-files check."""
+    print(f"        ledger payments tie to the daily files on all {tie['days_compared']} days "
+          f"with a file; also in the ledger: {tie['days_before_first_file']} days before the "
+          f"first file ({tie['try_before_first_file']:,.2f} TRY) and "
+          f"{tie['missing_file_days_in_ledger']} missing-file days "
+          f"({tie['try_on_missing_file_days']:,.2f} TRY) and {tie['days_after_last_file']} days "
+          f"after the last file ({tie['try_after_last_file']:,.2f} TRY)")
 
 
 if __name__ == "__main__":

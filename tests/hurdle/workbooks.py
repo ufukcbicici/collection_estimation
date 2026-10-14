@@ -79,3 +79,98 @@ def make_workbook(folder, lines, grand_total=GRAND_TOTAL_DEFAULT, *, marker=True
     path = Path(folder) / f'{name} EY TAHSILAT.XLSX'
     workbook.save(path)
     return path
+
+
+# --- AR ledger (FBL5N layout) -------------------------------------------------------------
+# A ledger workbook: an optional marker sheet `_SYNTHETIC`, then a sheet 'FBL5N' with the
+# header on row 1 and one ledger line per row from row 2. Customers are fake.
+
+LEDGER_HEADER = ('Company Code', 'Customer', 'Customer Name', 'Document Number',
+                 'Document Type', 'Reference', 'Invoice Reference', 'Document Date',
+                 'Posting Date', 'Baseline Date', 'Terms of Payment', 'Net Due Date',
+                 'Amount in Doc. Curr.', 'Document Currency', 'Amount in Local Currency',
+                 'Clearing Date', 'Clearing Document')
+
+
+def ledger_row(*, company='TR02', customer='0012345', name='ACME TEST A.S.',
+               document_no='9000000001', document_type='RV', reference=None,
+               invoice_reference=None, document_date=datetime(2026, 3, 2),
+               posting_date=datetime(2026, 3, 2), baseline_date=None, terms=None,
+               net_due_date=None, amount=100.0, currency='TRY', amount_local=None,
+               clearing_date=None, clearing_document=None):
+    """One ledger line as a dict keyed by LEDGER_HEADER text (amount_local defaults to amount)."""
+    if amount_local is None:
+        amount_local = amount
+    values = (company, customer, name, document_no, document_type, reference,
+              invoice_reference, document_date, posting_date, baseline_date, terms,
+              net_due_date, amount, currency, amount_local, clearing_date, clearing_document)
+    return dict(zip(LEDGER_HEADER, values))
+
+
+def invoice(document_no='9000000001', amount=1000.0, *, e_number='GIB2026000001',
+            posted=datetime(2026, 3, 2), due=datetime(2026, 4, 1), terms='Z030', **kwargs):
+    """An invoice (RV): positive amount, a net due date and payment terms."""
+    return ledger_row(document_no=document_no, document_type='RV', reference=e_number,
+                      document_date=posted, posting_date=posted, baseline_date=posted,
+                      terms=terms, net_due_date=due, amount=amount, **kwargs)
+
+
+def payment(document_no='1400000001', amount=1000.0, *, invoice_no='9000000001',
+            posted=datetime(2026, 3, 20), **kwargs):
+    """A payment (DZ) applied to an invoice: negative amount, no due date."""
+    return ledger_row(document_no=document_no, document_type='DZ', invoice_reference=invoice_no,
+                      document_date=posted, posting_date=posted, amount=-abs(amount), **kwargs)
+
+
+def unapplied_payment(document_no='1400000002', amount=500.0, *,
+                      posted=datetime(2026, 3, 21), **kwargs):
+    """A payment (DZ) not applied to any invoice: negative amount, no invoice reference."""
+    return ledger_row(document_no=document_no, document_type='DZ', invoice_reference=None,
+                      document_date=posted, posting_date=posted, amount=-abs(amount), **kwargs)
+
+
+def credit_memo(document_no='9100000001', amount=200.0, *, e_number='GIB2026000001',
+                posted=datetime(2026, 3, 10), **kwargs):
+    """A credit memo (DG): negative amount, reference = the invoice's e-invoice number."""
+    return ledger_row(document_no=document_no, document_type='DG', reference=e_number,
+                      document_date=posted, posting_date=posted, amount=-abs(amount), **kwargs)
+
+
+def refund(document_no='1400000003', amount=200.0, *, memo_no='9100000001',
+           posted=datetime(2026, 3, 25), **kwargs):
+    """A refund paid out to the customer (DZ): positive amount, invoice reference = the memo."""
+    return ledger_row(document_no=document_no, document_type='DZ', invoice_reference=memo_no,
+                      document_date=posted, posting_date=posted, amount=abs(amount), **kwargs)
+
+
+def make_ledger_workbook(folder, lines, *, marker=True, header=LEDGER_HEADER, extra_sheets=(),
+                         name='SYNTHETIC_ledger.xlsx'):
+    """Write a ledger workbook to `folder` and return its path.
+
+    `lines` are dicts from the makers above (written in `header` order, so a shuffled or
+    shortened header moves or drops the values with it; header entries not in a dict are left
+    empty), tuples/lists written as they are, or None for an empty row.
+    """
+    workbook = Workbook()
+    first = workbook.active
+    if marker:
+        first.title = '_SYNTHETIC'
+        sheet = workbook.create_sheet('FBL5N')
+    else:
+        first.title = 'FBL5N'
+        sheet = first
+    for extra in extra_sheets:
+        workbook.create_sheet(extra)
+
+    sheet.append(list(header))
+    for row in lines:
+        if row is None:
+            sheet.append([])
+        elif isinstance(row, dict):
+            sheet.append([row.get(text) for text in header])
+        else:
+            sheet.append(list(row))
+
+    path = Path(folder) / name
+    workbook.save(path)
+    return path
