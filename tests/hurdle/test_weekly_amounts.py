@@ -18,6 +18,9 @@ from collection_estimation.hurdle.series import (
     check_weekly_totals,
     weekly_amounts,
 )
+from tests.hurdle.workbooks import SYNTHETIC_LAYOUT
+
+DATE_FORMAT = SYNTHETIC_LAYOUT.file_name_date_format  # "%d%m%Y"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
@@ -407,7 +410,7 @@ def test_check_does_not_modify_its_inputs():
 
 def corpus_lines(daily_files):
     """The payment lines of these daily files, keyed and with week numbers."""
-    table = pd.concat([read_one_file(path) for path in daily_files.values()],
+    table = pd.concat([read_one_file(path, SYNTHETIC_LAYOUT) for path in daily_files.values()],
                       ignore_index=True)
     return add_week_index(add_keys(table, COMPANIES), WEEK_ZERO)
 
@@ -416,7 +419,7 @@ def corpus_lines(daily_files):
 def first_days():
     if not SYNTHETIC_CORPUS.is_dir():
         pytest.skip("synthetic corpus not installed")
-    files = list_daily_files(SYNTHETIC_CORPUS)
+    files = list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT)
     first_three = dict(list(files.items())[:3])
     lines = corpus_lines(first_three)
     return lines, weekly_amounts(lines)
@@ -449,7 +452,7 @@ def test_synthetic_first_days_one_row_per_key_week(first_days):
 @pytest.mark.skipif(not SYNTHETIC_CORPUS.is_dir(), reason="synthetic corpus not installed")
 def test_synthetic_all_files():
     # Slow: reads all 306 daily files.
-    lines = corpus_lines(list_daily_files(SYNTHETIC_CORPUS))
+    lines = corpus_lines(list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT))
     weekly = weekly_amounts(lines)
     assert len(weekly) == 20_479
     assert (weekly["gross_receipts"] > 0).sum() == 20_365

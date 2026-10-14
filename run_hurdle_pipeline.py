@@ -40,6 +40,7 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     load_collections,
     read_one_file,
 )
+from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
@@ -66,20 +67,22 @@ def main():
     print(f"Corpus folder: {settings.data.corpus_folder}")
 
     # Step 1: which days have a file. A day without a file is missing, not zero.
-    daily_files = list_daily_files(settings.data.corpus_folder)
+    layout = settings.collections_layout
+    daily_files = list_daily_files(settings.data.corpus_folder,
+                                   layout.file_name_date_format)
     show_daily_files(daily_files)
 
     # Step 2: the payment lines of one day, checked against the file's grand total.
     day = settings.debug.one_day
     if day not in daily_files:
         raise ValueError(f"{settings.settings_file.name} [debug]: one_day {day} has no daily file")
-    one_day = read_one_file(daily_files[day])
+    one_day = read_one_file(daily_files[day], layout)
     show_one_day(day, one_day)
 
     # Step 3: the payment lines of every day, each file checked as in step 2, and every
     # line's date checked against its file's date. Read from the cache if the files have
     # not changed since the last run.
-    collections = load_collections(daily_files, settings.data.cache_folder)
+    collections = load_collections(daily_files, layout, settings.data.cache_folder)
     show_collections(collections)
 
     # Step 4: one key per company and customer, e.g. 'TR02-11226452'.
@@ -96,7 +99,8 @@ def main():
 
     # The week calendar: which weeks are complete. A week with any business day
     # without a file is missing: its amounts are unknown, not zero.
-    weeks = week_calendar(list(daily_files), week_zero)
+    holidays = load_holidays(settings.data.holidays_file)
+    weeks = week_calendar(list(daily_files), week_zero, holidays)
     show_weeks(weeks)
 
     # The weekly amounts per key: gross receipts (the target), refunds, unapplied lines.
@@ -107,7 +111,7 @@ def main():
     # Step 6: the AR ledger lines, with the same keys as the payment lines. Read from the
     # cache if nothing has changed since the last run.
     ledger = load_ledger(settings.data.ledger_file, settings.data.ledger_as_of,
-                         settings.data.cache_folder)
+                         settings.ledger_layout, settings.data.cache_folder)
     ledger = add_keys(ledger, list(settings.companies.known))
     show_ledger(ledger)
 
@@ -167,7 +171,7 @@ def show_weekly(weekly):
 
 def show_ledger(ledger):
     """A short printout of the ledger."""
-    lines_per_type = ledger["document_type"].value_counts().to_dict()
+    lines_per_type = ledger["document_role"].value_counts().to_dict()
     still_open = ledger["clearing_date"].isna().sum()
     print(f"Step 6: {len(ledger):,} ledger lines {lines_per_type}, {still_open:,} still open; "
           f"{ledger['key'].nunique():,} keys; posted from "

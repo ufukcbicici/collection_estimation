@@ -3,9 +3,11 @@
 Gives the rest of the package two things: the payment lines, and the list of days that have
 a file. A day without a file is MISSING, not a day without payments.
 """
+import dataclasses
 import math
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -13,45 +15,39 @@ from openpyxl.utils import get_column_letter
 
 from .cache import file_fingerprint, load_with_cache, source_fingerprint
 
-# "02062025 EY TAHSILAT.XLSX" is 2 June 2025. Change here if the real files are named otherwise.
-FILE_NAME_DATE_FORMAT = "%d%m%Y"
-FILE_NAME_DATE_LENGTH = 8
+if TYPE_CHECKING:
+    # Only for the type hints: settings.py imports this module, so importing it back at run
+    # time would be circular.
+    from .settings import CollectionsLayout
 
-# Header text in the workbook -> our field name. Headers are compared after folding case
-# and extra spaces (see `simplify_header`). If the real files use Turkish headers, add the
-# Turkish text as further keys pointing to the same field names.
-HEADER_TO_FIELD = {
-    "company code": "company_code",
-    "customer": "customer",
-    "customer name": "customer_name",
-    "document date": "document_date",
-    "bank": "bank",
-    "sap document no": "sap_document_no",
-    "government inv": "invoice_no",
-    "amount in original currency": "amount_original",
-    "document currency": "currency_original",
-    "amount in local currency": "amount_try",
-    "local currency": "currency_local",
-}
+# How the daily files are laid out (header texts, rows, file names) is in the settings file:
+# see [collections_layout] in settings/synthetic.toml.
+
+# Fields the reader tolerates being absent from a file.
 OPTIONAL_FIELDS = {"bank"}  # the real files may not carry a bank column
 
-# Row 1 of a daily file is a title ("MERCURY COLLECTIONS"), row 2 the header.
-HEADER_ROW = 2
-FIRST_DATA_ROW = 3
+# The fields of a payment line, in order: the code's own contract. The settings file says
+# what each one is called in the files (see hurdle/settings.py).
+COLLECTION_FIELDS = ["company_code", "customer", "customer_name", "document_date", "bank",
+                     "sap_document_no", "invoice_no", "amount_original", "currency_original",
+                     "amount_try", "currency_local"]
 
 # The payment lines' grand total must equal the file's own grand total within this (TRY).
 TIE_OUT_TOLERANCE = 0.01
 
 # The columns of the table `read_one_file` returns, in order.
-LINE_COLUMNS = list(HEADER_TO_FIELD.values()) + ["source_file", "source_row"]
+LINE_COLUMNS = COLLECTION_FIELDS + ["source_file", "source_row"]
 
 # The text columns of that table: everything except the date, the amounts and the row number.
 TEXT_COLUMNS = [column for column in LINE_COLUMNS
                 if column not in ("document_date", "amount_original", "amount_try", "source_row")]
 
 
-def list_daily_files(folder: Path) -> dict[date, Path]:
-    """Every daily workbook in `folder`, keyed by the date in its name, oldest first."""
+def list_daily_files(folder: Path, file_name_date_format: str) -> dict[date, Path]:
+    """Every daily workbook in `folder`, keyed by the date in its name, oldest first.
+
+    `file_name_date_format` says how a file name starts, e.g. "%d%m%Y" for "02062025 ...".
+    """
     files = {}
     for path in Path(folder).iterdir():
         if not path.is_file():
@@ -60,7 +56,7 @@ def list_daily_files(folder: Path) -> dict[date, Path]:
             continue
         if path.name.startswith("~$"):
             continue  # Excel's lock file for an open workbook, not a real file
-        file_date = date_from_file_name(path.name)
+        file_date = date_from_file_name(path.name, file_name_date_format)
         if file_date in files:
             raise ValueError(
                 f"two files for {file_date}: {files[file_date].name} and {path.name}")
@@ -69,29 +65,27 @@ def list_daily_files(folder: Path) -> dict[date, Path]:
     return dict(sorted(files.items()))
 
 
-def date_from_file_name(name: str) -> date:
-    """The date in the first 8 characters of a file name, e.g. '02062025' -> 2 June 2025."""
+def date_from_file_name(name: str, file_name_date_format: str) -> date:
+    """The date at the start of a file name, e.g. '02062025 ...' with "%d%m%Y" -> 2 June 2025."""
+    # How many characters the date takes, e.g. 8 for "%d%m%Y" (the settings check that the
+    # format writes and reads back a full date).
+    length = len(date(2025, 6, 2).strftime(file_name_date_format))
     try:
-        return datetime.strptime(name[:FILE_NAME_DATE_LENGTH], FILE_NAME_DATE_FORMAT).date()
+        return datetime.strptime(name[:length], file_name_date_format).date()
     except ValueError:
-        raise ValueError(
-            f"{name}: the file name does not start with a date in the form DDMMYYYY") from None
+        raise ValueError(f"{name}: the file name does not start with a date in the form "
+                         f"{file_name_date_format}") from None
 
 
-def find_columns(header_row: tuple, header_to_field: dict[str, str] | None = None,
-                 optional_fields: set[str] | None = None) -> dict[str, int]:
+def find_columns(header_row: tuple, header_to_field: dict[str, str],
+                 optional_fields: set[str]) -> dict[str, int]:
     """{field name: zero-based column position}, matched on the header text.
 
     Columns are found by their header text, never by their position: if a column is ever
     inserted into a file, reading by position would silently shift every column to its
-    right. `header_to_field` and `optional_fields` describe the file; they default to the
-    daily collection files' HEADER_TO_FIELD and OPTIONAL_FIELDS (the AR ledger passes its own).
+    right. `header_to_field` (header text -> field name) comes from the settings file;
+    `optional_fields` are the fields that may be absent.
     """
-    if header_to_field is None:
-        header_to_field = HEADER_TO_FIELD
-    if optional_fields is None:
-        optional_fields = OPTIONAL_FIELDS
-
     # Simplify the dictionary's keys the same way as the file's headers, so a key matches
     # however it was typed (e.g. 'MÜŞTERİ' or 'müşteri').
     field_by_header = {simplify_header(text): field for text, field in header_to_field.items()}
@@ -124,8 +118,10 @@ def simplify_header(text) -> str:
     return simple.replace("̇", "")
 
 
-def read_one_file(path: Path) -> pd.DataFrame:
+def read_one_file(path: Path, layout: "CollectionsLayout") -> pd.DataFrame:
     """The payment lines of one daily workbook, one row per line, in sheet order.
+
+    `layout` (from the settings file) says where the header is and what each column is called.
 
     Nothing is dropped and nothing is computed: refunds (negative amounts) and unapplied cash
     stay in. Subtotal, grand-total and blank rows are left out; they have no company code.
@@ -139,12 +135,13 @@ def read_one_file(path: Path) -> pd.DataFrame:
     finally:
         workbook.close()
 
-    if len(rows) < HEADER_ROW:
-        raise ValueError(f"{path.name}: no header row (row {HEADER_ROW})")
-    columns = find_columns(rows[HEADER_ROW - 1])
+    if len(rows) < layout.header_row:
+        raise ValueError(f"{path.name}: no header row (row {layout.header_row})")
+    columns = find_columns(rows[layout.header_row - 1], layout.headers, OPTIONAL_FIELDS)
 
     lines = []
-    for row_number, row in enumerate(rows[FIRST_DATA_ROW - 1:], start=FIRST_DATA_ROW):
+    for row_number, row in enumerate(rows[layout.first_data_row - 1:],
+                                     start=layout.first_data_row):
         if is_blank(cell(row, columns, "company_code")):
             continue  # a subtotal, the grand total, or an empty spacer row
         lines.append(payment_line(row, columns, path.name, row_number))
@@ -199,7 +196,7 @@ def payment_line(row: tuple, columns: dict[str, int], file_name: str, row_number
     if not isinstance(document_date, datetime):  # Excel dates arrive as datetime
         raise ValueError(f"{where}: document date is {document_date!r}, not a date")
 
-    line = {field: cell(row, columns, field) for field in HEADER_TO_FIELD.values()}
+    line = {field: cell(row, columns, field) for field in COLLECTION_FIELDS}
     line["company_code"] = str(line["company_code"]).strip()
     line["customer"] = customer.strip()
     line["document_date"] = document_date.date()
@@ -261,7 +258,7 @@ def is_nan(value) -> bool:
     return isinstance(value, float) and math.isnan(value)
 
 
-def read_all_files(daily_files: dict[date, Path]) -> pd.DataFrame:
+def read_all_files(daily_files: dict[date, Path], layout: "CollectionsLayout") -> pd.DataFrame:
     """The payment lines of every daily file, oldest day first, in sheet order within a day.
 
     `daily_files` is the output of `list_daily_files`; its keys are the days that have a file.
@@ -271,7 +268,7 @@ def read_all_files(daily_files: dict[date, Path]) -> pd.DataFrame:
 
     tables = []
     for count, (file_date, path) in enumerate(daily_files.items(), start=1):
-        lines = read_one_file(path)
+        lines = read_one_file(path, layout)
         check_dates_match(lines, file_date, path.name)
         tables.append(lines)
         if count % 50 == 0:
@@ -292,15 +289,21 @@ def check_dates_match(lines: pd.DataFrame, file_date: date, file_name: str) -> N
             f"{file_name}: the file name says {file_date} but lines carry {listed}")
 
 
-def load_collections(daily_files: dict[date, Path], cache_folder: Path) -> pd.DataFrame:
+def load_collections(daily_files: dict[date, Path], layout: "CollectionsLayout",
+                     cache_folder: Path) -> pd.DataFrame:
     """The payment lines of every daily file, from the cache if nothing has changed.
 
     The cache is read again automatically if a file is added, removed or changed, if the
-    files are in another folder, if this module's code changes, or if the cache is damaged.
+    files are in another folder, if the layout in the settings file changes, if this
+    module's code changes, or if the cache is damaged.
     """
-    fingerprint = [files_fingerprint(daily_files), source_fingerprint(Path(__file__))]
+    fingerprint = [
+        files_fingerprint(daily_files),
+        dataclasses.asdict(layout),  # e.g. a changed header mapping must re-read the files
+        source_fingerprint(Path(__file__)),
+    ]
     return load_with_cache("hurdle_collections", fingerprint,
-                           lambda: read_all_files(daily_files), cache_folder)
+                           lambda: read_all_files(daily_files, layout), cache_folder)
 
 
 def files_fingerprint(daily_files: dict[date, Path]) -> list[list]:

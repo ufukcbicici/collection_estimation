@@ -1,6 +1,6 @@
 """Tests for `check_ledger_against_collections` in `hurdle/read_ledger.py`.
 
-The ledger's payment lines (DZ, sign flipped) must tie, day by day, to the daily files' TRY
+The ledger's payment lines (role 'payment', e.g. DZ, sign flipped) must tie, day by day, to the daily files' TRY
 totals on every day that has a file. The inputs are small tables built by hand with
 `ledger_table` and `collections_table`. Two SLOW tests at the end use the synthetic ledger and
 corpus in `data/raw/` (each read once, ~30 s for the ledger) and are skipped when absent. The
@@ -17,6 +17,9 @@ from collection_estimation.hurdle.read_ledger import (
     check_ledger_against_collections,
     read_ledger,
 )
+from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
+
+DATE_FORMAT = SYNTHETIC_LAYOUT.file_name_date_format  # "%d%m%Y"
 
 D1, D2, D3 = date(2026, 3, 2), date(2026, 3, 3), date(2026, 3, 4)
 
@@ -25,10 +28,22 @@ RESULT_KEYS = {"days_compared", "days_before_first_file", "try_before_first_file
                "days_after_last_file", "try_after_last_file"}
 
 
-def ledger_table(lines):
-    """lines: (document_type, posting day, amount_local) triples."""
+# The role read_ledger gives each synthetic document type (see SYNTHETIC_LEDGER_LAYOUT).
+ROLE_OF_TYPE = {code: role for role, codes in SYNTHETIC_LEDGER_LAYOUT.document_types.items()
+                for code in codes}
+
+
+def ledger_table(lines, roles=None):
+    """lines: (document_type, posting day, amount_local) triples.
+
+    `roles` gives each line's document_role; by default the synthetic role of its type
+    (RV invoice, DZ payment, DG credit memo).
+    """
+    if roles is None:
+        roles = [ROLE_OF_TYPE[t] for t, _, _ in lines]
     return pd.DataFrame({
         "document_type": pd.Series([t for t, _, _ in lines], dtype=object),
+        "document_role": pd.Series(list(roles), dtype=object),
         "posting_date": pd.to_datetime(pd.Series([d for _, d, _ in lines], dtype=object)),
         "amount_local": pd.Series([a for _, _, a in lines], dtype="float64"),
     })
@@ -195,6 +210,35 @@ def test_rv_and_dg_on_days_without_a_file_are_not_counted_as_payment_days():
 def test_a_day_with_only_rv_and_dg_compares_as_zero():
     with pytest.raises(ValueError, match="ledger 0.00 TRY"):
         check([("RV", D1, 100.0), ("DG", D1, -100.0)], [(D1, 100.0)], [D1])
+
+
+# --- document roles ------------------------------------------------------------------------
+
+def test_lines_are_chosen_by_role_not_by_type_code():
+    # DA is a payment code in this ledger; a DZ marked as a credit memo is not cash.
+    ledger = ledger_table([("DA", D1, -60.0), ("DZ", D1, -40.0), ("DZ", D1, -999.0)],
+                          roles=["payment", "payment", "credit_memo"])
+    result = check_ledger_against_collections(ledger, collections_table([(D1, 100.0)]), [D1])
+    assert result["days_compared"] == 1
+
+
+def test_a_dz_line_whose_role_is_not_payment_is_ignored():
+    ledger = ledger_table([("DZ", D1, -100.0)], roles=["invoice"])
+    with pytest.raises(ValueError, match="daily files 100.00 TRY, ledger 0.00 TRY"):
+        check_ledger_against_collections(ledger, collections_table([(D1, 100.0)]), [D1])
+
+
+def test_payments_under_another_code_on_days_without_a_file_are_counted():
+    ledger = ledger_table([("ZP", D1, -7.0), ("DZ", D2, -1.0)], roles=["payment", "payment"])
+    result = check_ledger_against_collections(ledger, collections_table([(D2, 1.0)]), [D2])
+    assert result["days_before_first_file"] == 1
+    assert result["try_before_first_file"] == pytest.approx(7.0, abs=1e-9)
+
+
+def test_a_ledger_without_document_role_raises_key_error():
+    ledger = ledger_table([("DZ", D1, -1.0)]).drop(columns="document_role")
+    with pytest.raises(KeyError, match="document_role"):
+        check_ledger_against_collections(ledger, collections_table([(D1, 1.0)]), [D1])
 
 
 # --- refunds -------------------------------------------------------------------------------
@@ -493,9 +537,9 @@ EXPECTED_MISSING_FILE_DAYS = [date(2025, 9, 8), date(2025, 12, 17), date(2026, 2
 def synthetic():
     if not LEDGER_FILE.exists() or not CORPUS_FOLDER.is_dir():
         pytest.skip("the synthetic ledger or corpus is not in data/raw")
-    ledger = read_ledger(LEDGER_FILE, AS_OF)                # direct read, no cache
-    daily_files = list_daily_files(CORPUS_FOLDER)
-    collections = read_all_files(daily_files)               # direct read, no cache
+    ledger = read_ledger(LEDGER_FILE, AS_OF, SYNTHETIC_LEDGER_LAYOUT)  # direct, no cache
+    daily_files = list_daily_files(CORPUS_FOLDER, DATE_FORMAT)
+    collections = read_all_files(daily_files, SYNTHETIC_LAYOUT)  # direct read, no cache
     return ledger, collections, list(daily_files)
 
 
@@ -513,12 +557,13 @@ def test_slow_synthetic_ledger_ties_to_the_daily_files(synthetic):
 
 def test_slow_synthetic_missing_file_days_are_the_six_known_days(synthetic):
     ledger, collections, days = synthetic
-    payment_days = set(ledger.loc[ledger["document_type"] == "DZ", "posting_date"].dt.date)
+    payment_days = set(ledger.loc[ledger["document_role"] == "payment",
+                                  "posting_date"].dt.date)
     missing = sorted(day for day in payment_days - set(days) if min(days) < day < max(days))
     assert missing == EXPECTED_MISSING_FILE_DAYS
     result = check_ledger_against_collections(ledger, collections, days)
     assert result["missing_file_days_in_ledger"] == len(missing)
-    payments = ledger[ledger["document_type"] == "DZ"]
+    payments = ledger[ledger["document_role"] == "payment"]
     on_missing = -payments.loc[payments["posting_date"].dt.date.isin(missing),
                                "amount_local"].sum()
     assert result["try_on_missing_file_days"] == pytest.approx(on_missing, abs=0.01)

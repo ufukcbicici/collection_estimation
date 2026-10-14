@@ -15,7 +15,9 @@ from collection_estimation.hurdle.keys import (
     normalise_customer_id,
 )
 from collection_estimation.hurdle.read_collections import list_daily_files, read_one_file
-from tests.hurdle.workbooks import line, make_workbook
+from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, line, make_workbook
+
+DATE_FORMAT = SYNTHETIC_LAYOUT.file_name_date_format  # "%d%m%Y"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
@@ -479,7 +481,7 @@ def test_add_keys_on_a_read_workbook(tmp_path):
         line("11226452", 50.0, company="TR02"),
         line("0011226452", 25.0, company="TR04"),
     ])
-    lines = read_one_file(path)
+    lines = read_one_file(path, SYNTHETIC_LAYOUT)
     with_keys = add_keys(lines, ["TR02", "TR04", "TR05", "TR06", "TR91"])
     assert with_keys["key"].tolist() == ["TR02-11226452", "TR02-11226452", "TR04-11226452"]
     assert with_keys["customer"].tolist() == ["0011226452", "11226452", "0011226452"]
@@ -490,15 +492,15 @@ def test_add_keys_on_a_read_workbook_with_an_unknown_company(tmp_path):
     path = make_workbook(tmp_path, [line("1", 100.0, company="TR02"),
                                     line("2", 50.0, company="TR77")])
     with pytest.raises(ValueError, match="'TR77': 1"):
-        add_keys(read_one_file(path), ["TR02"])
+        add_keys(read_one_file(path, SYNTHETIC_LAYOUT), ["TR02"])
 
 
 # --- the synthetic corpus --------------------------------------------------------------
 
 @pytest.mark.skipif(not SYNTHETIC_CORPUS.is_dir(), reason="synthetic corpus not installed")
 def test_synthetic_first_file_gets_one_key_per_company_and_customer():
-    first_file = next(iter(list_daily_files(SYNTHETIC_CORPUS).values()))
-    lines = read_one_file(first_file)
+    first_file = next(iter(list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT).values()))
+    lines = read_one_file(first_file, SYNTHETIC_LAYOUT)
     with_keys = add_keys(lines, ["TR02", "TR04", "TR05", "TR06", "TR91"])
     pairs = lines[["company_code", "customer"]].drop_duplicates()
     assert len(pairs) > 0
@@ -506,8 +508,8 @@ def test_synthetic_first_file_gets_one_key_per_company_and_customer():
 
 @pytest.mark.skipif(not SYNTHETIC_CORPUS.is_dir(), reason="synthetic corpus not installed")
 def test_synthetic_customer_ids_are_already_normal():
-    first_file = next(iter(list_daily_files(SYNTHETIC_CORPUS).values()))
-    customers = read_one_file(first_file)["customer"]
+    first_file = next(iter(list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT).values()))
+    customers = read_one_file(first_file, SYNTHETIC_LAYOUT)["customer"]
     assert len(customers) > 0
     for customer in customers:
         assert normalise_customer_id(customer) == customer

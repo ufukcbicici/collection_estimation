@@ -5,6 +5,7 @@ Each day is a small workbook built in `tmp_path` by `make_workbook` (see `workbo
 The cache always goes to a folder under `tmp_path`, never to the repo's `data/interim/`.
 Customers are fake.
 """
+import dataclasses
 import json
 import os
 import shutil
@@ -22,7 +23,10 @@ from collection_estimation.hurdle.read_collections import (
     load_collections,
     read_all_files,
 )
-from tests.hurdle.workbooks import line, make_workbook
+from collection_estimation.hurdle.settings import CollectionsLayout
+from tests.hurdle.workbooks import HEADER, SYNTHETIC_LAYOUT, line, make_workbook
+
+DATE_FORMAT = SYNTHETIC_LAYOUT.file_name_date_format  # "%d%m%Y"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_CORPUS = REPO_ROOT / "data" / "raw" / "SYNTHETIC_ey_tahsilat_20250602_20260828"
@@ -36,9 +40,11 @@ DAMAGED_NOTE_START = "hurdle_collections: the cache could not be loaded ("
 DAMAGED_NOTE_END = "); reading the inputs again."
 
 
-def full_fingerprint(daily_files):
-    """What `load_collections` saves: [the per-file list, [sha256 of read_collections.py]]."""
-    return [files_fingerprint(daily_files), source_fingerprint(READER_SOURCE)]
+def full_fingerprint(daily_files, layout=SYNTHETIC_LAYOUT):
+    """What `load_collections` saves: [the per-file list, the layout as a dict,
+    [sha256 of read_collections.py]]."""
+    return [files_fingerprint(daily_files), dataclasses.asdict(layout),
+            source_fingerprint(READER_SOURCE)]
 
 
 def make_day(folder, day, *lines, **options):
@@ -55,7 +61,7 @@ def two_days(folder):
                            line('0000002', 20.0, when=june_2, sap=None, bank=None)],
                   name='02062025')
     make_day(folder, date(2025, 6, 3), ('0000003', 30.0))
-    return list_daily_files(folder)
+    return list_daily_files(folder, DATE_FORMAT)
 
 
 @pytest.fixture
@@ -76,11 +82,13 @@ class ReadSpy:
     def __init__(self):
         self.calls = 0
         self.last_files = None
+        self.last_layout = None
 
-    def __call__(self, daily_files):
+    def __call__(self, daily_files, layout):
         self.calls += 1
         self.last_files = dict(daily_files)
-        return read_all_files(daily_files)
+        self.last_layout = layout
+        return read_all_files(daily_files, layout)
 
 
 @pytest.fixture
@@ -102,53 +110,55 @@ def forbid_reading(monkeypatch):
 
 def test_first_call_returns_the_same_table_as_read_all_files(days_folder, cache_folder):
     daily_files = two_days(days_folder)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder),
-                                  read_all_files(daily_files))
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  read_all_files(daily_files, SYNTHETIC_LAYOUT))
 
 
 def test_first_call_writes_both_cache_files(days_folder, cache_folder):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     assert (cache_folder / CACHE_FILE).is_file()
     assert (cache_folder / FINGERPRINT_FILE).is_file()
 
 
 def test_first_call_creates_a_nested_cache_folder(days_folder, tmp_path):
     nested = tmp_path / 'a' / 'b' / 'c'
-    load_collections(two_days(days_folder), nested)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, nested)
     assert (nested / CACHE_FILE).is_file()
 
 
 def test_first_call_reads_the_workbooks_once(days_folder, cache_folder, read_spy):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     assert read_spy.calls == 1
 
 
 def test_first_call_prints_no_change_note(days_folder, cache_folder, capsys):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     assert CHANGED_NOTE not in capsys.readouterr().out
 
 
-def test_fingerprint_file_holds_the_files_and_source_fingerprints(days_folder, cache_folder):
+def test_fingerprint_file_holds_the_files_layout_and_source_fingerprints(days_folder, cache_folder):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
     assert written == full_fingerprint(daily_files)
 
 
-def test_fingerprint_file_has_two_parts_files_then_source_hash(days_folder, cache_folder):
+def test_fingerprint_file_has_three_parts_files_layout_then_source_hash(days_folder,
+                                                                       cache_folder):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert len(written) == 2
-    files_part, source_part = written
+    assert len(written) == 3
+    files_part, layout_part, source_part = written
     assert files_part == files_fingerprint(daily_files)
+    assert layout_part == dataclasses.asdict(SYNTHETIC_LAYOUT)
     assert len(source_part) == 1
     assert len(source_part[0]) == 64
     assert all(char in '0123456789abcdef' for char in source_part[0])
 
 
 def test_accepts_the_cache_folder_as_a_string(days_folder, cache_folder):
-    load_collections(two_days(days_folder), str(cache_folder))
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, str(cache_folder))
     assert (cache_folder / CACHE_FILE).is_file()
 
 
@@ -156,31 +166,33 @@ def test_accepts_the_cache_folder_as_a_string(days_folder, cache_folder):
 
 def test_second_call_returns_an_equal_table(days_folder, cache_folder):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
 
 
 def test_second_call_does_not_read_the_workbooks(days_folder, cache_folder, monkeypatch):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     forbid_reading(monkeypatch)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
 
 
 def test_second_call_prints_nothing(days_folder, cache_folder, capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert capsys.readouterr().out == ''
 
 
 def cached_table(days_folder, cache_folder, monkeypatch):
     """The table as it comes back from the cache (second call, reading forbidden)."""
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     forbid_reading(monkeypatch)
-    return load_collections(daily_files, cache_folder)
+    return load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
 
 
 def test_cache_keeps_the_customer_leading_zeros(days_folder, cache_folder, monkeypatch):
@@ -213,9 +225,10 @@ def test_cache_keeps_document_date_datetime64(days_folder, cache_folder, monkeyp
 # --- files changed: read again ---------------------------------------------------------
 
 def test_added_file_is_read_again_with_the_note(days_folder, cache_folder, read_spy, capsys):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     make_day(days_folder, date(2025, 6, 4), ('0000004', 40.0))
-    table = load_collections(list_daily_files(days_folder), cache_folder)
+    table = load_collections(list_daily_files(days_folder, DATE_FORMAT), SYNTHETIC_LAYOUT,
+                             cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
     assert list(table['customer']) == ['0012345', '0000002', '0000003', '0000004']
@@ -223,9 +236,9 @@ def test_added_file_is_read_again_with_the_note(days_folder, cache_folder, read_
 
 def test_removed_file_is_read_again_with_the_note(days_folder, cache_folder, read_spy, capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     del daily_files[date(2025, 6, 3)]
-    table = load_collections(daily_files, cache_folder)
+    table = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
     assert list(table['customer']) == ['0012345', '0000002']
@@ -234,11 +247,11 @@ def test_removed_file_is_read_again_with_the_note(days_folder, cache_folder, rea
 def test_rewritten_file_is_read_again_with_the_note(days_folder, cache_folder, read_spy,
                                                      capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     size_before = daily_files[date(2025, 6, 3)].stat().st_size
     make_day(days_folder, date(2025, 6, 3), ('0000003', 30.0), ('0000009', 90.0))
     assert daily_files[date(2025, 6, 3)].stat().st_size != size_before
-    table = load_collections(daily_files, cache_folder)
+    table = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
     assert list(table['customer']) == ['0012345', '0000002', '0000003', '0000009']
@@ -247,63 +260,66 @@ def test_rewritten_file_is_read_again_with_the_note(days_folder, cache_folder, r
 def test_same_size_new_mtime_is_read_again_with_the_note(days_folder, cache_folder, read_spy,
                                                           capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     path = daily_files[date(2025, 6, 3)]
     stat = path.stat()
     os.utime(path, (stat.st_atime, stat.st_mtime - 3600))
     assert path.stat().st_size == stat.st_size
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
 
 
 def test_fingerprint_file_is_updated_after_a_re_read(days_folder, cache_folder):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     make_day(days_folder, date(2025, 6, 4), ('0000004', 40.0))
-    daily_files = list_daily_files(days_folder)
-    load_collections(daily_files, cache_folder)
+    daily_files = list_daily_files(days_folder, DATE_FORMAT)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
     assert written == full_fingerprint(daily_files)
 
 
 def test_third_call_after_a_re_read_is_a_cache_hit(days_folder, cache_folder, monkeypatch,
                                                     capsys):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     make_day(days_folder, date(2025, 6, 4), ('0000004', 40.0))
-    daily_files = list_daily_files(days_folder)
-    second = load_collections(daily_files, cache_folder)
+    daily_files = list_daily_files(days_folder, DATE_FORMAT)
+    second = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     forbid_reading(monkeypatch)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), second)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  second)
     assert capsys.readouterr().out == ''
 
 
 def test_third_call_returns_the_new_table_not_the_old_one(days_folder, cache_folder,
                                                           monkeypatch):
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     make_day(days_folder, date(2025, 6, 4), ('0000004', 40.0))
-    daily_files = list_daily_files(days_folder)
-    load_collections(daily_files, cache_folder)
+    daily_files = list_daily_files(days_folder, DATE_FORMAT)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     forbid_reading(monkeypatch)
-    assert len(load_collections(daily_files, cache_folder)) == 4
+    assert len(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)) == 4
 
 
 # --- one cache file missing ------------------------------------------------------------
 
 def test_missing_fingerprint_file_reads_again(days_folder, cache_folder, read_spy):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     (cache_folder / FINGERPRINT_FILE).unlink()
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
     assert read_spy.calls == 2
     assert (cache_folder / FINGERPRINT_FILE).is_file()
 
 
 def test_missing_cache_file_reads_again(days_folder, cache_folder, read_spy):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     (cache_folder / CACHE_FILE).unlink()
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
     assert read_spy.calls == 2
     assert (cache_folder / CACHE_FILE).is_file()
 
@@ -346,7 +362,8 @@ def test_same_names_sizes_mtimes_in_two_folders_give_different_fingerprints(tmp_
     folder_a.mkdir()
     two_days(folder_a)
     copy_folder_with_same_mtimes(folder_a, folder_b)
-    files_a, files_b = list_daily_files(folder_a), list_daily_files(folder_b)
+    files_a = list_daily_files(folder_a, DATE_FORMAT)
+    files_b = list_daily_files(folder_b, DATE_FORMAT)
     fingerprint_a, fingerprint_b = files_fingerprint(files_a), files_fingerprint(files_b)
     # Only the folder differs: names, sizes and mtimes are identical.
     assert [entry[1:] for entry in fingerprint_a] == [entry[1:] for entry in fingerprint_b]
@@ -386,14 +403,14 @@ def test_switching_to_an_identical_copy_in_another_folder_reads_again(tmp_path, 
     folder_a.mkdir()
     two_days(folder_a)
     copy_folder_with_same_mtimes(folder_a, folder_b)
-    load_collections(list_daily_files(folder_a), cache_folder)
+    load_collections(list_daily_files(folder_a, DATE_FORMAT), SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
-    files_b = list_daily_files(folder_b)
-    table = load_collections(files_b, cache_folder)
+    files_b = list_daily_files(folder_b, DATE_FORMAT)
+    table = load_collections(files_b, SYNTHETIC_LAYOUT, cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
     assert read_spy.last_files == files_b
-    pd.testing.assert_frame_equal(table, read_all_files(files_b))
+    pd.testing.assert_frame_equal(table, read_all_files(files_b, SYNTHETIC_LAYOUT))
 
 
 def test_switching_folders_returns_the_new_folders_table(tmp_path, cache_folder, read_spy,
@@ -403,9 +420,10 @@ def test_switching_folders_returns_the_new_folders_table(tmp_path, cache_folder,
     folder_b.mkdir()
     make_day(folder_a, date(2025, 6, 2), ('0000001', 10.0))
     make_day(folder_b, date(2025, 6, 2), ('0000009', 90.0))
-    load_collections(list_daily_files(folder_a), cache_folder)
+    load_collections(list_daily_files(folder_a, DATE_FORMAT), SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
-    table = load_collections(list_daily_files(folder_b), cache_folder)
+    table = load_collections(list_daily_files(folder_b, DATE_FORMAT), SYNTHETIC_LAYOUT,
+                             cache_folder)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
     assert list(table['customer']) == ['0000009']
@@ -417,9 +435,9 @@ def test_switching_folders_rewrites_the_fingerprint_for_the_new_folder(tmp_path,
     folder_a.mkdir()
     two_days(folder_a)
     copy_folder_with_same_mtimes(folder_a, folder_b)
-    load_collections(list_daily_files(folder_a), cache_folder)
-    files_b = list_daily_files(folder_b)
-    load_collections(files_b, cache_folder)
+    load_collections(list_daily_files(folder_a, DATE_FORMAT), SYNTHETIC_LAYOUT, cache_folder)
+    files_b = list_daily_files(folder_b, DATE_FORMAT)
+    load_collections(files_b, SYNTHETIC_LAYOUT, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
     assert written == full_fingerprint(files_b)
 
@@ -440,17 +458,18 @@ def damage_then_reload(days_folder, cache_folder, damage, read_spy, capsys, monk
     Returns the first table and the table loaded after the damage.
     """
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     damage()
-    reloaded = load_collections(daily_files, cache_folder)
+    reloaded = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert_damaged_note(capsys.readouterr().out)
     assert read_spy.calls == 2
     # The cache was rewritten: the next call is a clean hit, no note, no reading.
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
     assert written == full_fingerprint(daily_files)
     forbid_reading(monkeypatch)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
     assert capsys.readouterr().out == ''
     return first, reloaded
 
@@ -500,10 +519,11 @@ def test_pickle_cut_in_half_reads_again_and_repairs_the_cache(
 def test_valid_json_of_the_wrong_shape_counts_as_changed(days_folder, cache_folder, read_spy,
                                                          capsys):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     (cache_folder / FINGERPRINT_FILE).write_text('{"a": 1}', encoding='utf-8')
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), first)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  first)
     assert CHANGED_NOTE in capsys.readouterr().out
     assert read_spy.calls == 2
 
@@ -514,7 +534,7 @@ def test_valid_json_of_the_wrong_shape_counts_as_changed(days_folder, cache_fold
 def written_cache(days_folder, cache_folder):
     """A cache written by `load_collections`: (cache file, fingerprint file, fingerprint, table)."""
     daily_files = two_days(days_folder)
-    table = load_collections(daily_files, cache_folder)
+    table = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     return (cache_folder / CACHE_FILE, cache_folder / FINGERPRINT_FILE,
             full_fingerprint(daily_files), table)
 
@@ -530,8 +550,9 @@ def test_read_cache_returns_none_with_the_changed_note_when_the_fingerprint_diff
         written_cache, capsys):
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    files_part, source_part = fingerprint
-    different = [[[entry[0], entry[1] + 1, entry[2]] for entry in files_part], source_part]
+    files_part, layout_part, source_part = fingerprint
+    different = [[[entry[0], entry[1] + 1, entry[2]] for entry in files_part], layout_part,
+                 source_part]
     assert read_cache(cache_file, fingerprint_file, different) is None
     output = capsys.readouterr().out
     assert CHANGED_NOTE in output
@@ -541,16 +562,18 @@ def test_read_cache_returns_none_with_the_changed_note_when_the_fingerprint_diff
 def test_read_cache_returns_none_when_the_fingerprint_has_one_file_less(written_cache, capsys):
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    files_part, source_part = fingerprint
-    assert read_cache(cache_file, fingerprint_file, [files_part[:-1], source_part]) is None
+    files_part, layout_part, source_part = fingerprint
+    assert read_cache(cache_file, fingerprint_file,
+                      [files_part[:-1], layout_part, source_part]) is None
     assert CHANGED_NOTE in capsys.readouterr().out
 
 
 def test_read_cache_returns_none_when_only_the_source_hash_differs(written_cache, capsys):
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    files_part, _ = fingerprint
-    assert read_cache(cache_file, fingerprint_file, [files_part, ['0' * 64]]) is None
+    files_part, layout_part, _ = fingerprint
+    assert read_cache(cache_file, fingerprint_file, [files_part, layout_part, ['0' * 64]]) \
+        is None
     assert CHANGED_NOTE in capsys.readouterr().out
 
 
@@ -558,7 +581,7 @@ def test_read_cache_returns_none_for_the_old_one_part_fingerprint(written_cache,
     """A cache written before the refactor saved only the per-file list: it must re-read."""
     cache_file, fingerprint_file, fingerprint, _ = written_cache
     capsys.readouterr()
-    files_part, _ = fingerprint
+    files_part, _, _ = fingerprint
     fingerprint_file.write_text(json.dumps(files_part, indent=1), encoding='utf-8')
     assert read_cache(cache_file, fingerprint_file, fingerprint) is None
     assert CHANGED_NOTE in capsys.readouterr().out
@@ -625,7 +648,7 @@ def test_load_collections_hashes_its_own_source_file(monkeypatch, days_folder, c
         hashed.append(files)
         return source_fingerprint(*files)
     monkeypatch.setattr(read_collections, 'source_fingerprint', spy)
-    load_collections(two_days(days_folder), cache_folder)
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
     assert len(hashed) == 1
     assert [Path(f).resolve() for f in hashed[0]] == [READER_SOURCE.resolve()]
 
@@ -633,10 +656,10 @@ def test_load_collections_hashes_its_own_source_file(monkeypatch, days_folder, c
 def test_changed_code_reads_the_files_again_with_the_note(days_folder, cache_folder, read_spy,
                                                           capsys, monkeypatch):
     daily_files = two_days(days_folder)
-    first = load_collections(daily_files, cache_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     pretend_the_code_changed(monkeypatch)
-    table = load_collections(daily_files, cache_folder)
+    table = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     output = capsys.readouterr().out
     assert CHANGED_NOTE in output
     assert DAMAGED_NOTE_START not in output
@@ -646,31 +669,33 @@ def test_changed_code_reads_the_files_again_with_the_note(days_folder, cache_fol
 
 def test_changed_code_rewrites_the_source_hash(days_folder, cache_folder, monkeypatch):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     pretend_the_code_changed(monkeypatch)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
-    assert written == [files_fingerprint(daily_files), ['f' * 64]]
+    assert written == [files_fingerprint(daily_files), dataclasses.asdict(SYNTHETIC_LAYOUT),
+                       ['f' * 64]]
 
 
 def test_after_a_code_change_the_next_call_is_a_cache_hit(days_folder, cache_folder,
                                                           monkeypatch, capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     pretend_the_code_changed(monkeypatch)
-    second = load_collections(daily_files, cache_folder)
+    second = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     forbid_reading(monkeypatch)
-    pd.testing.assert_frame_equal(load_collections(daily_files, cache_folder), second)
+    pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
+                                  second)
     assert capsys.readouterr().out == ''
 
 
 def test_unchanged_code_is_a_cache_hit(days_folder, cache_folder, read_spy, capsys):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
-    load_collections(daily_files, cache_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert read_spy.calls == 1
     assert capsys.readouterr().out == ''
 
@@ -685,11 +710,216 @@ def test_editing_a_copy_of_the_source_file_changes_the_hash(tmp_path):
     assert source_fingerprint(copy) != before
 
 
+# --- the layout changed: read again -----------------------------------------------------
+# The layout from the settings file is the second part of the fingerprint: a changed header
+# mapping or row must re-read the files, an equal layout must not.
+
+def layout_with(**changes):
+    """SYNTHETIC_LAYOUT with some fields replaced."""
+    return dataclasses.replace(SYNTHETIC_LAYOUT, **changes)
+
+
+def with_turkish_alias():
+    """SYNTHETIC_LAYOUT plus a second header text for `customer`."""
+    return layout_with(headers={**SYNTHETIC_LAYOUT.headers, 'MÜŞTERİ': 'customer'})
+
+
+def test_saved_fingerprint_layout_part_is_the_layout_as_a_dict(days_folder, cache_folder):
+    load_collections(two_days(days_folder), SYNTHETIC_LAYOUT, cache_folder)
+    written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    assert written[1] == {
+        'file_name_date_format': '%d%m%Y',
+        'header_row': 2,
+        'first_data_row': 3,
+        'headers': dict(SYNTHETIC_LAYOUT.headers),
+    }
+    assert list(written[1]['headers']) == list(SYNTHETIC_LAYOUT.headers)
+
+
+def test_saved_fingerprint_holds_the_layout_actually_passed(days_folder, cache_folder):
+    layout = with_turkish_alias()
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, layout, cache_folder)
+    written = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    assert written == full_fingerprint(daily_files, layout)
+    assert written[1]['headers']['MÜŞTERİ'] == 'customer'
+
+
+def test_the_layout_is_passed_on_to_read_all_files(days_folder, cache_folder, read_spy):
+    layout = with_turkish_alias()
+    load_collections(two_days(days_folder), layout, cache_folder)
+    assert read_spy.last_layout is layout
+
+
+def test_an_extra_header_alias_reads_again_with_the_note(days_folder, cache_folder, read_spy,
+                                                        capsys):
+    daily_files = two_days(days_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    table = load_collections(daily_files, with_turkish_alias(), cache_folder)
+    output = capsys.readouterr().out
+    assert CHANGED_NOTE in output
+    assert DAMAGED_NOTE_START not in output
+    assert read_spy.calls == 2
+    pd.testing.assert_frame_equal(table, first)
+
+
+def test_a_changed_header_text_reads_again_and_fails_if_it_no_longer_matches(
+        days_folder, cache_folder):
+    # The stale cache must not be served: the new mapping is applied, and it misses a column.
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    headers = dict(SYNTHETIC_LAYOUT.headers)
+    del headers['Customer']
+    headers['MÜŞTERİ'] = 'customer'
+    with pytest.raises(ValueError, match=r"missing columns \['customer'\]"):
+        load_collections(daily_files, layout_with(headers=headers), cache_folder)
+
+
+def test_a_different_header_row_reads_again_and_fails_on_the_title_row(days_folder,
+                                                                       cache_folder):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    with pytest.raises(ValueError, match='missing columns'):
+        load_collections(daily_files, layout_with(header_row=1), cache_folder)
+
+
+def header_twice_days(folder):
+    """2 and 3 June 2025, each with the header on rows 1 AND 2 and the lines from row 3, so
+    that header_row 1 and header_row 2 read the same lines."""
+    for day, customer in ((date(2025, 6, 2), '0000001'), (date(2025, 6, 3), '0000002')):
+        when = datetime(day.year, day.month, day.day)
+        make_workbook(folder, [line(customer, 10.0, when=when)],
+                      name=day.strftime('%d%m%Y'), title_rows=(HEADER,))
+    return list_daily_files(folder, DATE_FORMAT)
+
+
+def test_a_different_valid_header_row_reads_again_with_the_note(days_folder, cache_folder,
+                                                               read_spy, capsys):
+    daily_files = header_twice_days(days_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    table = load_collections(daily_files, layout_with(header_row=1), cache_folder)
+    assert CHANGED_NOTE in capsys.readouterr().out
+    assert read_spy.calls == 2
+    pd.testing.assert_frame_equal(table, first)
+
+
+def test_a_different_first_data_row_reads_again_with_the_note(days_folder, cache_folder,
+                                                             read_spy, capsys):
+    # Row 3 is blank, so first_data_row 3 and 4 read the same lines.
+    june_2 = datetime(2025, 6, 2)
+    make_workbook(days_folder, [None, line('0000001', 10.0, when=june_2)], name='02062025')
+    daily_files = list_daily_files(days_folder, DATE_FORMAT)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    table = load_collections(daily_files, layout_with(first_data_row=4), cache_folder)
+    assert CHANGED_NOTE in capsys.readouterr().out
+    assert read_spy.calls == 2
+    pd.testing.assert_frame_equal(table, first)
+
+
+def test_a_different_file_name_format_reads_again_with_the_note(days_folder, cache_folder,
+                                                               read_spy, capsys):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    load_collections(daily_files, layout_with(file_name_date_format='%Y%m%d'), cache_folder)
+    assert CHANGED_NOTE in capsys.readouterr().out
+    assert read_spy.calls == 2
+
+
+def test_an_equal_layout_built_afresh_is_a_cache_hit(days_folder, cache_folder, monkeypatch,
+                                                     capsys):
+    daily_files = two_days(days_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    forbid_reading(monkeypatch)
+    equal = CollectionsLayout(file_name_date_format='%d%m%Y', header_row=2, first_data_row=3,
+                              headers=dict(SYNTHETIC_LAYOUT.headers))
+    assert equal == SYNTHETIC_LAYOUT and equal is not SYNTHETIC_LAYOUT
+    pd.testing.assert_frame_equal(load_collections(daily_files, equal, cache_folder), first)
+    assert capsys.readouterr().out == ''
+
+
+def test_the_same_headers_in_another_order_are_a_cache_hit(days_folder, cache_folder,
+                                                           monkeypatch, capsys):
+    # Order does not change what is read; the fingerprint compares the mapping as a dict.
+    daily_files = two_days(days_folder)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    capsys.readouterr()
+    forbid_reading(monkeypatch)
+    reversed_headers = dict(reversed(list(SYNTHETIC_LAYOUT.headers.items())))
+    table = load_collections(daily_files, layout_with(headers=reversed_headers), cache_folder)
+    pd.testing.assert_frame_equal(table, first)
+    assert capsys.readouterr().out == ''
+
+
+def test_after_a_layout_change_the_next_call_with_it_is_a_cache_hit(days_folder, cache_folder,
+                                                                    monkeypatch, capsys):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    second = load_collections(daily_files, with_turkish_alias(), cache_folder)
+    capsys.readouterr()
+    forbid_reading(monkeypatch)
+    pd.testing.assert_frame_equal(load_collections(daily_files, with_turkish_alias(),
+                                                   cache_folder), second)
+    assert capsys.readouterr().out == ''
+
+
+def test_switching_back_to_the_old_layout_reads_again(days_folder, cache_folder, read_spy,
+                                                      capsys):
+    # One cache slot: the fingerprint written last is the one compared.
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    load_collections(daily_files, with_turkish_alias(), cache_folder)
+    capsys.readouterr()
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    assert CHANGED_NOTE in capsys.readouterr().out
+    assert read_spy.calls == 3
+
+
+def test_a_layout_change_rewrites_the_layout_part_only(days_folder, cache_folder):
+    daily_files = two_days(days_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
+    before = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    load_collections(daily_files, with_turkish_alias(), cache_folder)
+    after = json.loads((cache_folder / FINGERPRINT_FILE).read_text(encoding='utf-8'))
+    assert after[0] == before[0]
+    assert after[2] == before[2]
+    assert after[1] == dataclasses.asdict(with_turkish_alias()) != before[1]
+
+
+def test_read_cache_returns_none_when_only_the_layout_part_differs(written_cache, capsys):
+    cache_file, fingerprint_file, fingerprint, _ = written_cache
+    capsys.readouterr()
+    files_part, layout_part, source_part = fingerprint
+    other = {**layout_part, 'header_row': 1}
+    assert read_cache(cache_file, fingerprint_file, [files_part, other, source_part]) is None
+    assert CHANGED_NOTE in capsys.readouterr().out
+
+
+def test_read_cache_returns_none_for_the_old_two_part_fingerprint(written_cache, capsys):
+    """A cache written before L.2 saved [files, source]: it must re-read, not crash."""
+    cache_file, fingerprint_file, fingerprint, _ = written_cache
+    capsys.readouterr()
+    files_part, _, source_part = fingerprint
+    fingerprint_file.write_text(json.dumps([files_part, source_part], indent=1),
+                                encoding='utf-8')
+    assert read_cache(cache_file, fingerprint_file, fingerprint) is None
+    assert CHANGED_NOTE in capsys.readouterr().out
+
+
+def test_load_collections_requires_the_layout(days_folder, cache_folder):
+    with pytest.raises(TypeError):
+        load_collections(two_days(days_folder), cache_folder)
+
+
 # --- errors ----------------------------------------------------------------------------
 
 def test_empty_dict_raises_and_writes_no_cache(cache_folder):
     with pytest.raises(ValueError, match='no daily files'):
-        load_collections({}, cache_folder)
+        load_collections({}, SYNTHETIC_LAYOUT, cache_folder)
     assert not (cache_folder / CACHE_FILE).exists()
     assert not (cache_folder / FINGERPRINT_FILE).exists()
 
@@ -698,27 +928,29 @@ def test_read_error_propagates(days_folder, cache_folder):
     make_day(days_folder, date(2025, 6, 2), ('0000001', 10.0))
     make_day(days_folder, date(2025, 6, 3), ('0000002', 20.0), grand_total=99.0)
     with pytest.raises(ValueError, match=r'03062025 EY TAHSILAT\.XLSX.*99\.00 TRY'):
-        load_collections(list_daily_files(days_folder), cache_folder)
+        load_collections(list_daily_files(days_folder, DATE_FORMAT), SYNTHETIC_LAYOUT,
+                         cache_folder)
 
 
 def test_read_error_leaves_no_cache_files(days_folder, cache_folder):
     make_day(days_folder, date(2025, 6, 2), ('0000001', 10.0))
     make_day(days_folder, date(2025, 6, 3), ('0000002', 20.0), grand_total=99.0)
     with pytest.raises(ValueError):
-        load_collections(list_daily_files(days_folder), cache_folder)
+        load_collections(list_daily_files(days_folder, DATE_FORMAT), SYNTHETIC_LAYOUT,
+                         cache_folder)
     assert not (cache_folder / CACHE_FILE).exists()
     assert not (cache_folder / FINGERPRINT_FILE).exists()
 
 
 def test_read_error_after_a_change_does_not_serve_the_old_cache(days_folder, cache_folder):
     daily_files = two_days(days_folder)
-    load_collections(daily_files, cache_folder)
+    load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     make_day(days_folder, date(2025, 6, 3), ('0000003', 30.0), grand_total=99.0)
     with pytest.raises(ValueError, match='99.00 TRY'):
-        load_collections(daily_files, cache_folder)
+        load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     # The next call must still see the change and fail again, not return the stale table.
     with pytest.raises(ValueError, match='99.00 TRY'):
-        load_collections(daily_files, cache_folder)
+        load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
 
 
 # --- the synthetic corpus --------------------------------------------------------------
@@ -727,9 +959,9 @@ def test_read_error_after_a_change_does_not_serve_the_old_cache(days_folder, cac
 def test_synthetic_corpus_all_files_cached_and_reloaded_give_27311_lines(tmp_path,
                                                                          monkeypatch):
     """SLOW (reads all 306 workbooks once). The cache goes to tmp_path, not data/interim/."""
-    daily_files = list_daily_files(SYNTHETIC_CORPUS)
-    first = load_collections(daily_files, tmp_path / 'cache')
+    daily_files = list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT)
+    first = load_collections(daily_files, SYNTHETIC_LAYOUT, tmp_path / 'cache')
     forbid_reading(monkeypatch)
-    second = load_collections(daily_files, tmp_path / 'cache')
+    second = load_collections(daily_files, SYNTHETIC_LAYOUT, tmp_path / 'cache')
     assert len(first) == 27_311
     pd.testing.assert_frame_equal(second, first)

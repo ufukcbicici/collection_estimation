@@ -6,11 +6,63 @@
 corpus_folder = "data/raw/SYNTHETIC_ey_tahsilat_20250602_20260828"  # the daily files
 ledger_file   = "data/raw/SYNTHETIC_ey_ar_ledger_asof_20260828.xlsx"
 ledger_as_of  = 2026-08-28      # the date the ledger was extracted
+holidays_file = "settings/holidays_tr.toml"  # Turkish public holidays
 cache_folder  = "data/interim"  # rebuilt automatically when anything changes
 
 [companies]
 # EY's company codes; a line with any other code stops the run.
 known = ["TR02", "TR04", "TR05", "TR06", "TR91"]
+
+[collections_layout]
+# How the daily collection files are laid out.
+file_name_date_format = "%d%m%Y"  # "02062025 EY TAHSILAT.XLSX" is 2 June 2025
+header_row = 2                    # row 1 is a title ("MERCURY COLLECTIONS")
+first_data_row = 3
+
+[collections_layout.headers]
+# Header text in the file = our field name. Case and extra spaces do not matter. For other
+# spellings (e.g. Turkish headers), add more lines pointing to the same field names.
+"Company Code" = "company_code"
+"Customer" = "customer"
+"Customer Name" = "customer_name"
+"Document Date" = "document_date"
+"Bank" = "bank"
+"SAP Document No" = "sap_document_no"
+"Government Inv" = "invoice_no"
+"Amount in Original Currency" = "amount_original"
+"Document currency" = "currency_original"
+"Amount in local currency" = "amount_try"
+"Local Currency" = "currency_local"
+
+[ledger_layout]
+# How the AR ledger (SAP's FBL5N report) is laid out.
+header_row = 1
+first_data_row = 2
+
+[ledger_layout.headers]
+"Company Code" = "company_code"
+"Customer" = "customer"
+"Customer Name" = "customer_name"
+"Document Number" = "document_no"
+"Document Type" = "document_type"
+"Reference" = "reference"
+"Invoice Reference" = "invoice_reference"
+"Document Date" = "document_date"
+"Posting Date" = "posting_date"
+"Baseline Date" = "baseline_date"
+"Terms of Payment" = "payment_terms"
+"Net Due Date" = "net_due_date"
+"Amount in Doc. Curr." = "amount_document"
+"Document Currency" = "document_currency"
+"Amount in Local Currency" = "amount_local"
+"Clearing Date" = "clearing_date"
+"Clearing Document" = "clearing_document"
+
+[ledger_layout.document_types]
+# The SAP document-type codes this ledger uses for each role.
+invoice = ["RV"]
+payment = ["DZ"]      # payments received, and refunds paid out
+credit_memo = ["DG"]
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

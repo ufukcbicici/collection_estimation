@@ -1,8 +1,11 @@
 """Tests for `hurdle/settings.py`: `load_settings` and its helpers `check_keys`,
-`path_setting`, `date_setting` and `text_list_setting`.
+`path_setting`, `date_setting`, `text_list_setting`, `rows_setting`, `date_format_setting`,
+`headers_setting`, `document_types_setting`, `read_collections_layout` and
+`read_ledger_layout`.
 
 Every settings file is written into `tmp_path` by `write_settings`, which starts from a valid
-file and changes, removes or adds one thing.
+file and changes, removes or adds one thing. The layout sub-tables (headers, document_types)
+are written as TOML inline tables so that one change can replace a whole sub-table.
 """
 import dataclasses
 import tomllib
@@ -11,17 +14,37 @@ from pathlib import Path
 
 import pytest
 
+from collection_estimation.hurdle import read_collections
+from collection_estimation.hurdle.read_collections import (
+    COLLECTION_FIELDS,
+    OPTIONAL_FIELDS,
+)
+from collection_estimation.hurdle.read_ledger import (
+    DOCUMENT_ROLES,
+    LEDGER_FIELDS,
+    LEDGER_OPTIONAL_FIELDS,
+)
 from collection_estimation.hurdle.settings import (
+    FORMAT_SAMPLE_DATES,
+    CollectionsLayout,
     CompanySettings,
     DataSettings,
     DebugSettings,
+    LedgerLayout,
     Settings,
     check_keys,
+    date_format_setting,
     date_setting,
+    document_types_setting,
+    headers_setting,
     load_settings,
     path_setting,
+    read_collections_layout,
+    read_ledger_layout,
+    rows_setting,
     text_list_setting,
 )
+from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_SETTINGS = REPO_ROOT / "settings" / "synthetic.toml"
@@ -29,17 +52,78 @@ SYNTHETIC_SETTINGS = REPO_ROOT / "settings" / "synthetic.toml"
 FILE_NAME = "test_run.toml"
 REMOVE = object()
 
+
+def inline(mapping):
+    """A dict of TOML texts -> a TOML inline table, e.g. {"a" = "b", c = ["D"]}."""
+    return "{ " + ", ".join(f"{key} = {value}" for key, value in mapping.items()) + " }"
+
+
+def quoted(text):
+    return f'"{text}"'
+
+
+# The daily collection files' headers: every field, including the optional bank.
+COLLECTION_HEADERS = {
+    "Company Code": "company_code",
+    "Customer": "customer",
+    "Customer Name": "customer_name",
+    "Document Date": "document_date",
+    "Bank": "bank",
+    "SAP Document No": "sap_document_no",
+    "Government Inv": "invoice_no",
+    "Amount in Original Currency": "amount_original",
+    "Document currency": "currency_original",
+    "Amount in local currency": "amount_try",
+    "Local Currency": "currency_local",
+}
+# The ledger's headers: only the required fields (the optional ones are left out on purpose,
+# which also shows an optional field may be absent).
+LEDGER_HEADERS = {
+    "Company Code": "company_code",
+    "Customer": "customer",
+    "Document Number": "document_no",
+    "Document Type": "document_type",
+    "Reference": "reference",
+    "Invoice Reference": "invoice_reference",
+    "Posting Date": "posting_date",
+    "Net Due Date": "net_due_date",
+    "Amount in Doc. Curr.": "amount_document",
+    "Document Currency": "document_currency",
+    "Amount in Local Currency": "amount_local",
+    "Clearing Date": "clearing_date",
+}
+DOCUMENT_TYPES = {"invoice": '["RV"]', "payment": '["DZ"]', "credit_memo": '["DG"]'}
+
+
+def headers_toml(headers):
+    return inline({quoted(header): quoted(field) for header, field in headers.items()})
+
+
 # Each value is written as TOML text, exactly as it would appear in the file.
 VALID = {
     "data": {
         "corpus_folder": '"data/raw/corpus"',
         "ledger_file": '"data/raw/ledger.xlsx"',
         "ledger_as_of": "2026-08-28",
+        "holidays_file": '"settings/holidays.toml"',
         "cache_folder": '"data/interim"',
     },
     "companies": {"known": '["TR02", "TR04"]'},
+    "collections_layout": {
+        "file_name_date_format": '"%d%m%Y"',
+        "header_row": "2",
+        "first_data_row": "3",
+        "headers": headers_toml(COLLECTION_HEADERS),
+    },
+    "ledger_layout": {
+        "header_row": "1",
+        "first_data_row": "2",
+        "headers": headers_toml(LEDGER_HEADERS),
+        "document_types": inline(DOCUMENT_TYPES),
+    },
     "debug": {"one_day": "2025-06-02"},
 }
+ALL_SECTIONS = list(VALID)
 
 
 def write_settings(folder, changes=None, drop_section=None, top="", extra=""):
@@ -98,18 +182,21 @@ def test_returns_a_settings_object(tmp_path, repo):
     assert isinstance(settings.data, DataSettings)
     assert isinstance(settings.companies, CompanySettings)
     assert isinstance(settings.debug, DebugSettings)
+    assert isinstance(settings.collections_layout, CollectionsLayout)
+    assert isinstance(settings.ledger_layout, LedgerLayout)
 
 
 def test_paths_are_read_from_the_repo_root(tmp_path, repo):
     data = load(tmp_path, repo).data
     assert data.corpus_folder == (repo / "data" / "raw" / "corpus").resolve()
     assert data.ledger_file == (repo / "data" / "raw" / "ledger.xlsx").resolve()
+    assert data.holidays_file == (repo / "settings" / "holidays.toml").resolve()
     assert data.cache_folder == (repo / "data" / "interim").resolve()
 
 
 def test_paths_are_absolute_path_objects(tmp_path, repo):
     data = load(tmp_path, repo).data
-    for path in (data.corpus_folder, data.ledger_file, data.cache_folder):
+    for path in (data.corpus_folder, data.ledger_file, data.holidays_file, data.cache_folder):
         assert isinstance(path, Path)
         assert path.is_absolute()
 
@@ -160,7 +247,8 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
     assert load_settings(path, repo) == load_settings(path, repo)
 
 
-@pytest.mark.parametrize("attribute", ["settings_file", "data", "companies", "debug"])
+@pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
+                                       "collections_layout", "ledger_layout", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -169,7 +257,11 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
 
 @pytest.mark.parametrize("part, attribute", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
-    ("data", "cache_folder"), ("companies", "known"), ("debug", "one_day"),
+    ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
+    ("debug", "one_day"), ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
+    ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
+    ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
+    ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -205,11 +297,56 @@ def test_paths_need_not_exist(tmp_path, repo):
     data = load(tmp_path, repo).data
     assert not data.corpus_folder.exists()
     assert not data.ledger_file.exists()
+    assert not data.holidays_file.exists()
+
+
+# --- holidays_file ---------------------------------------------------------------------
+
+def test_holidays_file_is_required(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[data]", "holidays_file",
+                            changes={("data", "holidays_file"): REMOVE})
+    assert "missing" in message
+
+
+def test_holidays_file_is_resolved_from_the_repo_root(tmp_path, repo):
+    settings = load(tmp_path, repo,
+                    changes={("data", "holidays_file"): '"settings/holidays_tr.toml"'})
+    assert settings.data.holidays_file == (repo / "settings" / "holidays_tr.toml").resolve()
+
+
+def test_holidays_file_does_not_depend_on_the_working_directory(tmp_path, repo, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert load(tmp_path, repo).data.holidays_file ==         (repo / "settings" / "holidays.toml").resolve()
+
+
+def test_an_absolute_holidays_file_is_kept(tmp_path, repo):
+    absolute = (tmp_path / "elsewhere" / "holidays.toml").resolve()
+    settings = load(tmp_path, repo, changes={("data", "holidays_file"): f"'{absolute}'"})
+    assert settings.data.holidays_file == absolute
+
+
+def test_a_typo_in_holidays_file_names_both(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "'holidays_file'", "'holiday_file'",
+                            changes={("data", "holidays_file"): REMOVE,
+                                     ("data", "holiday_file"): '"settings/h.toml"'})
+    assert "missing" in message and "unknown" in message
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_holidays_file_loads_with_load_holidays():
+    from collection_estimation.hurdle.holidays import HolidayTable, load_holidays
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    table = load_holidays(settings.data.holidays_file)
+    assert isinstance(table, HolidayTable)
+    assert len(table.fixed) == 7
+    assert len(table.bayrams) == 4
 
 
 # --- strictness: sections --------------------------------------------------------------
 
-@pytest.mark.parametrize("section", ["data", "companies", "debug"])
+@pytest.mark.parametrize("section", ALL_SECTIONS)
 def test_a_missing_section_raises(tmp_path, repo, section):
     message = raises_naming(tmp_path, repo, section, drop_section=section)
     assert "missing" in message
@@ -237,7 +374,8 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
 
 @pytest.mark.parametrize("section, key", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
-    ("data", "cache_folder"), ("companies", "known"), ("debug", "one_day"),
+    ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
+    ("debug", "one_day"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -245,7 +383,7 @@ def test_a_missing_setting_raises(tmp_path, repo, section, key):
     assert "missing" in message
 
 
-@pytest.mark.parametrize("section", ["data", "companies", "debug"])
+@pytest.mark.parametrize("section", ALL_SECTIONS)
 def test_an_unknown_setting_raises(tmp_path, repo, section):
     message = raises_naming(tmp_path, repo, f"[{section}]", "surprise",
                             changes={(section, "surprise"): "1"})
@@ -267,7 +405,8 @@ def test_a_typo_message_lists_the_expected_settings(tmp_path, repo):
     message = raises_naming(
         tmp_path, repo,
         changes={("data", "ledger_as_of"): REMOVE, ("data", "ledger_as_off"): "2026-08-28"})
-    for key in ["cache_folder", "corpus_folder", "ledger_as_of", "ledger_file"]:
+    for key in ["cache_folder", "corpus_folder", "holidays_file", "ledger_as_of",
+                "ledger_file"]:
         assert key in message.split("expected")[-1]
 
 
@@ -280,7 +419,8 @@ def test_a_problem_in_a_later_section_names_that_section(tmp_path, repo):
 
 # --- types: paths ----------------------------------------------------------------------
 
-@pytest.mark.parametrize("key", ["corpus_folder", "ledger_file", "cache_folder"])
+@pytest.mark.parametrize("key", ["corpus_folder", "ledger_file", "holidays_file",
+                                 "cache_folder"])
 @pytest.mark.parametrize("bad", ["5", '""', '"   "', "true", '["data"]', "2026-08-28"],
                          ids=["number", "empty", "blank", "bool", "list", "date"])
 def test_a_path_that_is_not_text_or_is_blank_raises(tmp_path, repo, key, bad):
@@ -332,7 +472,7 @@ def test_an_empty_file_names_every_section(tmp_path, repo):
     path.write_text("", encoding="utf-8")
     with pytest.raises(ValueError) as error:
         load_settings(path, repo)
-    for section in ["data", "companies", "debug"]:
+    for section in ALL_SECTIONS:
         assert section in str(error.value)
 
 
@@ -526,6 +666,7 @@ def test_the_synthetic_settings_load_and_point_at_existing_inputs():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.data.corpus_folder.is_dir()
     assert settings.data.ledger_file.is_file()
+    assert settings.data.holidays_file.is_file()
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -536,4 +677,707 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.debug.one_day == date(2025, 6, 2)
     assert settings.data.cache_folder.parts[-2:] == ("data", "interim")
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
+    assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()
     assert settings.settings_file == SYNTHETIC_SETTINGS.resolve()
+
+
+
+# The 11 headers of the daily files, as [collections_layout.headers] in synthetic.toml gives
+# them (the module's built-in HEADER_TO_FIELD is gone since L.2: this is the reference now).
+EXPECTED_COLLECTIONS_HEADERS = {
+    "Company Code": "company_code",
+    "Customer": "customer",
+    "Customer Name": "customer_name",
+    "Document Date": "document_date",
+    "Bank": "bank",
+    "SAP Document No": "sap_document_no",
+    "Government Inv": "invoice_no",
+    "Amount in Original Currency": "amount_original",
+    "Document currency": "currency_original",
+    "Amount in local currency": "amount_try",
+    "Local Currency": "currency_local",
+}
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_collections_headers_are_the_expected_11():
+    headers = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).collections_layout.headers
+    assert headers == EXPECTED_COLLECTIONS_HEADERS
+    assert list(headers) == list(EXPECTED_COLLECTIONS_HEADERS)  # same order too
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_collections_headers_map_every_field_once_in_field_order():
+    headers = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).collections_layout.headers
+    assert list(headers.values()) == COLLECTION_FIELDS
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_collections_layout_equals_the_shared_test_layout():
+    # The tests' SYNTHETIC_LAYOUT (tests/hurdle/workbooks.py) must stay what the settings say.
+    layout = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).collections_layout
+    assert layout == SYNTHETIC_LAYOUT
+
+
+# The 17 headers of the FBL5N ledger, as [ledger_layout.headers] in synthetic.toml gives them
+# (the module's built-in LEDGER_HEADER_TO_FIELD is gone since L.3: this is the reference now).
+EXPECTED_LEDGER_HEADERS = {
+    "Company Code": "company_code",
+    "Customer": "customer",
+    "Customer Name": "customer_name",
+    "Document Number": "document_no",
+    "Document Type": "document_type",
+    "Reference": "reference",
+    "Invoice Reference": "invoice_reference",
+    "Document Date": "document_date",
+    "Posting Date": "posting_date",
+    "Baseline Date": "baseline_date",
+    "Terms of Payment": "payment_terms",
+    "Net Due Date": "net_due_date",
+    "Amount in Doc. Curr.": "amount_document",
+    "Document Currency": "document_currency",
+    "Amount in Local Currency": "amount_local",
+    "Clearing Date": "clearing_date",
+    "Clearing Document": "clearing_document",
+}
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_ledger_headers_are_the_expected_17():
+    headers = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).ledger_layout.headers
+    assert headers == EXPECTED_LEDGER_HEADERS
+    assert list(headers) == list(EXPECTED_LEDGER_HEADERS)  # same order too
+    assert list(headers.values()) == LEDGER_FIELDS
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_ledger_layout_equals_the_shared_test_layout():
+    # The tests' SYNTHETIC_LEDGER_LAYOUT (tests/hurdle/workbooks.py) must stay what the
+    # settings say.
+    layout = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).ledger_layout
+    assert layout == SYNTHETIC_LEDGER_LAYOUT
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_layouts_hold_the_expected_values():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    collections = settings.collections_layout
+    assert collections.file_name_date_format == "%d%m%Y"
+    assert (collections.header_row, collections.first_data_row) == (2, 3)
+    ledger = settings.ledger_layout
+    assert (ledger.header_row, ledger.first_data_row) == (1, 2)
+    assert ledger.document_types == {
+        "invoice": ("RV",), "payment": ("DZ",), "credit_memo": ("DG",)}
+    codes = {code for role in ledger.document_types.values() for code in role}
+    assert codes == {"RV", "DZ", "DG"}
+
+
+def test_the_field_lists_follow_the_built_in_mappings():
+    assert COLLECTION_FIELDS == list(EXPECTED_COLLECTIONS_HEADERS.values())
+    assert LEDGER_FIELDS == list(EXPECTED_LEDGER_HEADERS.values())
+
+
+def test_the_optional_fields_are_fields():
+    assert OPTIONAL_FIELDS <= set(COLLECTION_FIELDS)
+    assert LEDGER_OPTIONAL_FIELDS <= set(LEDGER_FIELDS)
+
+
+# --- layouts: happy path ---------------------------------------------------------------
+
+def test_the_collections_layout_is_read(tmp_path, repo):
+    layout = load(tmp_path, repo).collections_layout
+    assert layout == CollectionsLayout(file_name_date_format="%d%m%Y", header_row=2,
+                                       first_data_row=3, headers=COLLECTION_HEADERS)
+    assert type(layout.header_row) is int and type(layout.first_data_row) is int
+    assert type(layout.headers) is dict
+    assert list(layout.headers) == list(COLLECTION_HEADERS)  # file order
+
+
+def test_the_ledger_layout_is_read(tmp_path, repo):
+    layout = load(tmp_path, repo).ledger_layout
+    assert layout.header_row == 1 and layout.first_data_row == 2
+    assert layout.headers == LEDGER_HEADERS
+    assert list(layout.headers) == list(LEDGER_HEADERS)
+    assert layout.document_types == {
+        "invoice": ("RV",), "payment": ("DZ",), "credit_memo": ("DG",)}
+    for codes in layout.document_types.values():
+        assert type(codes) is tuple
+
+
+def test_headers_written_as_a_sub_table_section_are_read(tmp_path, repo):
+    lines = ["[collections_layout.headers]"]
+    lines += [f'"{header}" = "{field}"' for header, field in COLLECTION_HEADERS.items()]
+    settings = load(tmp_path, repo, changes={("collections_layout", "headers"): REMOVE},
+                    extra="\n".join(lines) + "\n")
+    assert settings.collections_layout.headers == COLLECTION_HEADERS
+
+
+def test_several_codes_per_role_load(tmp_path, repo):
+    types = dict(DOCUMENT_TYPES, payment='["DZ", "DA"]')
+    settings = load(tmp_path, repo,
+                    changes={("ledger_layout", "document_types"): inline(types)})
+    assert settings.ledger_layout.document_types["payment"] == ("DZ", "DA")
+
+
+def test_lower_case_codes_in_the_file_load_upper_cased(tmp_path, repo):
+    types = {"invoice": '["rv"]', "payment": '[" dz ", "Da"]', "credit_memo": '["dG"]'}
+    settings = load(tmp_path, repo,
+                    changes={("ledger_layout", "document_types"): inline(types)})
+    assert settings.ledger_layout.document_types == {
+        "invoice": ("RV",), "payment": ("DZ", "DA"), "credit_memo": ("DG",)}
+
+
+def test_case_variants_across_roles_in_the_file_raise(tmp_path, repo):
+    types = dict(DOCUMENT_TYPES, payment='["DZ", "rv"]')
+    raises_naming(tmp_path, repo, "[ledger_layout].document_types", "'RV'", "invoice",
+                  "payment", changes={("ledger_layout", "document_types"): inline(types)})
+
+
+def test_read_collections_layout_directly():
+    table = {"file_name_date_format": "%Y%m%d", "header_row": 1, "first_data_row": 5,
+             "headers": dict(COLLECTION_HEADERS)}
+    assert read_collections_layout(table, "w") == CollectionsLayout("%Y%m%d", 1, 5,
+                                                                    COLLECTION_HEADERS)
+
+
+def test_read_ledger_layout_directly():
+    table = {"header_row": 3, "first_data_row": 4, "headers": dict(LEDGER_HEADERS),
+             "document_types": {"invoice": ["RV"], "payment": ["DZ"], "credit_memo": ["DG"]}}
+    layout = read_ledger_layout(table, "w")
+    assert layout == LedgerLayout(3, 4, LEDGER_HEADERS,
+                                  {"invoice": ("RV",), "payment": ("DZ",),
+                                   "credit_memo": ("DG",)})
+
+
+def test_read_ledger_layout_checks_its_headers_against_the_ledger_fields():
+    # The collections headers are not a valid ledger mapping (e.g. 'invoice_no').
+    table = {"header_row": 1, "first_data_row": 2, "headers": dict(COLLECTION_HEADERS),
+             "document_types": {"invoice": ["RV"], "payment": ["DZ"], "credit_memo": ["DG"]}}
+    with pytest.raises(ValueError, match="w.headers"):
+        read_ledger_layout(table, "w")
+
+
+# --- layouts through load_settings: strictness ------------------------------------------
+
+@pytest.mark.parametrize("section, key", [
+    ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
+    ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
+    ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
+    ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
+])
+def test_a_missing_layout_setting_raises(tmp_path, repo, section, key):
+    message = raises_naming(tmp_path, repo, f"[{section}]", key,
+                            changes={(section, key): REMOVE})
+    assert "missing" in message
+
+
+def test_a_missing_ledger_layout_section_raises(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "ledger_layout", drop_section="ledger_layout")
+    assert "missing" in message
+
+
+def test_a_missing_headers_sub_table_raises(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[ledger_layout]", "headers",
+                            changes={("ledger_layout", "headers"): REMOVE})
+    assert "missing" in message
+
+
+def test_an_unknown_key_in_collections_layout_raises(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[collections_layout]", "sheet_name",
+                            changes={("collections_layout", "sheet_name"): '"Sheet1"'})
+    assert "unknown" in message
+
+
+def test_a_typo_in_a_layout_key_names_both(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[collections_layout]", "'header_row'", "'headr_row'",
+        changes={("collections_layout", "header_row"): REMOVE,
+                 ("collections_layout", "headr_row"): "2"})
+    assert "missing" in message and "unknown" in message
+
+
+def test_a_bad_row_in_the_file_names_file_and_section(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[ledger_layout]", "header_row",
+                  changes={("ledger_layout", "header_row"): "0"})
+
+
+def test_a_bad_date_format_in_the_file_names_file_and_section(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[collections_layout]", "file_name_date_format", "'%m%Y'",
+                  changes={("collections_layout", "file_name_date_format"): '"%m%Y"'})
+
+
+def test_a_bad_header_in_the_file_names_file_and_section(tmp_path, repo):
+    headers = dict(COLLECTION_HEADERS, Bank="bank_name")
+    raises_naming(tmp_path, repo, "[collections_layout].headers", "'Bank'", "'bank_name'",
+                  changes={("collections_layout", "headers"): headers_toml(headers)})
+
+
+def test_a_header_mapped_to_a_ledger_field_in_collections_raises(tmp_path, repo):
+    headers = dict(COLLECTION_HEADERS, Reference="reference")
+    raises_naming(tmp_path, repo, "[collections_layout].headers", "'Reference'",
+                  changes={("collections_layout", "headers"): headers_toml(headers)})
+
+
+def test_bad_document_types_in_the_file_name_file_and_section(tmp_path, repo):
+    types = dict(DOCUMENT_TYPES, credit_memo='["DZ"]')
+    raises_naming(tmp_path, repo, "[ledger_layout].document_types", "'DZ'", "payment",
+                  "credit_memo",
+                  changes={("ledger_layout", "document_types"): inline(types)})
+
+
+def test_an_unknown_role_in_the_file_names_file_and_section(tmp_path, repo):
+    types = dict(DOCUMENT_TYPES, reversal='["AB"]')
+    message = raises_naming(tmp_path, repo, "[ledger_layout].document_types", "reversal",
+                            changes={("ledger_layout", "document_types"): inline(types)})
+    assert "unknown" in message
+
+
+def test_document_types_as_a_plain_value_raises(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[ledger_layout].document_types", "not a section",
+                  changes={("ledger_layout", "document_types"): '["RV", "DZ", "DG"]'})
+
+
+def test_headers_as_a_plain_value_raises(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[collections_layout]", "headers",
+                  changes={("collections_layout", "headers"): '"Company Code"'})
+
+
+# --- rows_setting ----------------------------------------------------------------------
+
+def rows(header_row, first_data_row):
+    return {"header_row": header_row, "first_data_row": first_data_row}
+
+
+@pytest.mark.parametrize("header_row, first_data_row", [(1, 2), (2, 3), (1, 10), (5, 6)])
+def test_rows_setting_returns_the_two_rows(header_row, first_data_row):
+    assert rows_setting(rows(header_row, first_data_row), "w") == (header_row, first_data_row)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, 2.0, "2", True, False, None, [2]],
+                         ids=["zero", "negative", "fraction", "float-whole", "text", "true",
+                              "false", "none", "list"])
+def test_rows_setting_rejects_a_bad_header_row(bad):
+    with pytest.raises(ValueError) as error:
+        rows_setting(rows(bad, 10), "w")
+    message = str(error.value)
+    assert message.startswith("w: header_row is")
+    assert repr(bad) in message
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, 2.0, "2", True, None],
+                         ids=["zero", "negative", "fraction", "float-whole", "text", "true",
+                              "none"])
+def test_rows_setting_rejects_a_bad_first_data_row(bad):
+    with pytest.raises(ValueError) as error:
+        rows_setting(rows(1, bad), "w")
+    assert str(error.value).startswith("w: first_data_row is")
+
+
+def test_rows_setting_rejects_equal_rows():
+    with pytest.raises(ValueError) as error:
+        rows_setting(rows(2, 2), "w")
+    message = str(error.value)
+    assert "first_data_row 2" in message and "header_row 2" in message
+
+
+def test_rows_setting_rejects_data_before_the_header():
+    with pytest.raises(ValueError, match="must come after"):
+        rows_setting(rows(3, 2), "w")
+
+
+@pytest.mark.parametrize("section", ["collections_layout", "ledger_layout"])
+@pytest.mark.parametrize("bad", ["0", "-1", "1.5", '"2"', "true"],
+                         ids=["zero", "negative", "fraction", "text", "bool"])
+def test_a_bad_header_row_in_the_file_raises(tmp_path, repo, section, bad):
+    raises_naming(tmp_path, repo, f"[{section}]", "header_row",
+                  changes={(section, "header_row"): bad})
+
+
+@pytest.mark.parametrize("section", ["collections_layout", "ledger_layout"])
+def test_equal_rows_in_the_file_raise(tmp_path, repo, section):
+    raises_naming(tmp_path, repo, f"[{section}]", "first_data_row",
+                  changes={(section, "header_row"): "4", (section, "first_data_row"): "4"})
+
+
+# --- date_format_setting ---------------------------------------------------------------
+
+@pytest.mark.parametrize("good", ["%d%m%Y", "%Y%m%d", "%Y-%m-%d", "%d.%m.%Y"])
+def test_date_format_setting_accepts_a_full_date_format(good):
+    assert date_format_setting({"f": good}, "f", "w") == good
+
+
+@pytest.mark.parametrize("bad", ["%m%Y", "%Y", "%d%m", "%Y%m", "%d%Y", "abc"],
+                         ids=["no-day", "year-only", "no-year", "no-day-2", "no-month",
+                              "not-a-format"])
+def test_date_format_setting_rejects_a_format_that_loses_part_of_a_date(bad):
+    with pytest.raises(ValueError) as error:
+        date_format_setting({"f": bad}, "f", "w")
+    message = str(error.value)
+    assert message.startswith("w: f")
+    assert repr(bad) in message
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 5, None, ["%d%m%Y"]],
+                         ids=["empty", "blank", "number", "none", "list"])
+def test_date_format_setting_rejects_an_empty_or_non_text_value(bad):
+    with pytest.raises(ValueError, match="w: f is .*not a date format"):
+        date_format_setting({"f": bad}, "f", "w")
+
+
+def test_date_format_setting_rejects_a_dangling_percent():
+    with pytest.raises(ValueError, match="w: f"):
+        date_format_setting({"f": "%d%m%Y%"}, "f", "w")
+
+
+def test_format_sample_dates_vary_day_month_weekday_and_name_lengths():
+    assert FORMAT_SAMPLE_DATES == [date(2025, 5, 2), date(2025, 6, 2), date(2026, 9, 30),
+                                   date(2026, 12, 31)]
+    assert len({sample.weekday() for sample in FORMAT_SAMPLE_DATES}) == 4
+    assert {sample.month for sample in FORMAT_SAMPLE_DATES} >= {5, 9}  # May / September
+
+
+def written_lengths(date_format):
+    return sorted({len(sample.strftime(date_format)) for sample in FORMAT_SAMPLE_DATES})
+
+
+@pytest.mark.parametrize("bad", ["%d%B%Y", "%A%d%m%Y", "%d%m%Y%B", "%Y%m%d %A", "%B %d %Y"],
+                         ids=["month-name", "weekday-first", "month-name-last",
+                              "weekday-last", "month-name-first"])
+def test_date_format_setting_rejects_a_format_of_varying_length(bad):
+    assert len(written_lengths(bad)) > 1  # guards the sample: it must vary in length
+    with pytest.raises(ValueError) as error:
+        date_format_setting({"f": bad}, "f", "w")
+    message = str(error.value)
+    assert message == (f"w: f {bad!r} writes dates of different lengths "
+                       f"{written_lengths(bad)}; use numbers only, e.g. '%d%m%Y'")
+
+
+def test_date_format_setting_month_name_lengths_are_named():
+    # In the C / English locale: '02May2025' 9, '02June2025' 10, '31December2026' 14,
+    # '30September2026' 15.
+    if written_lengths("%d%B%Y") != [9, 10, 14, 15]:
+        pytest.skip("month names are not the English ones in this locale")
+    with pytest.raises(ValueError, match=r"different lengths \[9, 10, 14, 15\]"):
+        date_format_setting({"f": "%d%B%Y"}, "f", "w")
+
+
+def test_date_format_setting_abbreviated_month_depends_on_the_locale():
+    """'%d%b%Y' passes when every abbreviated month has the same length (e.g. 'May', 'Jun',
+    'Sep', 'Dec' in English) and raises when the locale's abbreviations differ."""
+    if len(written_lengths("%d%b%Y")) == 1:
+        assert date_format_setting({"f": "%d%b%Y"}, "f", "w") == "%d%b%Y"
+    else:
+        with pytest.raises(ValueError, match="different lengths"):
+            date_format_setting({"f": "%d%b%Y"}, "f", "w")
+
+
+@pytest.mark.parametrize("good", ["%d%m%Y", "%Y%m%d", "%d%m%y", "%y%m%d", "%Y-%m-%d",
+                                  "%d.%m.%Y", "%Y_%m_%d", "%Y%j"])
+def test_date_format_setting_accepts_numeric_formats(good):
+    assert len(written_lengths(good)) == 1
+    assert date_format_setting({"f": good}, "f", "w") == good
+
+
+def test_date_format_setting_checks_read_back_before_length():
+    # '%m%Y' loses the day: the read-back message, not the length one.
+    with pytest.raises(ValueError, match="cannot write and read back a full date"):
+        date_format_setting({"f": "%m%Y"}, "f", "w")
+
+
+def test_a_varying_length_date_format_in_the_file_names_file_and_section(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[collections_layout]", "file_name_date_format",
+                  "'%d%B%Y'", "different lengths",
+                  changes={("collections_layout", "file_name_date_format"): '"%d%B%Y"'})
+
+
+# --- headers_setting -------------------------------------------------------------------
+
+FIELDS = ["company_code", "customer", "bank"]
+OPTIONAL = {"bank"}
+
+
+def headers(value):
+    return headers_setting({"h": value}, "h", FIELDS, OPTIONAL, "w")
+
+
+def test_headers_setting_returns_the_mapping_in_file_order():
+    value = {"Customer": "customer", "Company Code": "company_code", "Bank": "bank"}
+    result = headers(value)
+    assert result == value
+    assert list(result) == ["Customer", "Company Code", "Bank"]
+
+
+def test_headers_setting_returns_a_copy():
+    value = {"Company Code": "company_code", "Customer": "customer"}
+    result = headers(value)
+    assert result is not value
+    result["Extra"] = "bank"
+    assert value == {"Company Code": "company_code", "Customer": "customer"}
+
+
+def test_headers_setting_result_does_not_follow_later_changes_to_the_input():
+    value = {"Company Code": "company_code", "Customer": "customer"}
+    result = headers(value)
+    value["Bank"] = "bank"
+    assert "Bank" not in result
+
+
+def test_headers_setting_allows_an_optional_field_to_be_absent():
+    assert headers({"Company Code": "company_code", "Customer": "customer"}) == {
+        "Company Code": "company_code", "Customer": "customer"}
+
+
+def test_headers_setting_allows_two_headers_for_one_field():
+    value = {"Company Code": "company_code", "Customer": "customer",
+             "MÜŞTERİ": "customer"}
+    assert headers(value) == value
+
+
+def test_headers_setting_rejects_an_unknown_field_naming_header_and_value():
+    with pytest.raises(ValueError) as error:
+        headers({"Company Code": "company_code", "Customer": "client"})
+    message = str(error.value)
+    assert message.startswith("w.h:")
+    assert "'Customer'" in message and "'client'" in message
+
+
+@pytest.mark.parametrize("bad", [5, None, ["customer"], {"a": "b"}, True],
+                         ids=["number", "none", "list", "table", "bool"])
+def test_headers_setting_rejects_a_non_text_field(bad):
+    with pytest.raises(ValueError, match="'Customer' maps to"):
+        headers({"Company Code": "company_code", "Customer": bad})
+
+
+def test_headers_setting_field_names_are_compared_exactly():
+    with pytest.raises(ValueError, match="'Customer'"):
+        headers({"Company Code": "company_code", "Customer": "Customer"})
+
+
+def test_headers_setting_names_a_missing_required_field_as_a_list():
+    with pytest.raises(ValueError) as error:
+        headers({"Company Code": "company_code", "Bank": "bank"})
+    assert str(error.value) == "w.h: no header for the required fields ['customer']"
+
+
+def test_headers_setting_names_every_missing_required_field_in_field_order():
+    with pytest.raises(ValueError) as error:
+        headers({"Bank": "bank"})
+    assert "['company_code', 'customer']" in str(error.value)
+
+
+@pytest.mark.parametrize("first, second", [
+    ("Customer", " customer "), ("Customer", "CUSTOMER"), ("Customer", "Customer\t"),
+    ("MÜŞTERİ", "müşteri"),
+], ids=["spaces-and-case", "upper", "tab", "turkish-dotted-i"])
+def test_headers_setting_rejects_two_headers_equal_after_simplifying(first, second):
+    value = {"Company Code": "company_code", first: "customer", second: "customer"}
+    with pytest.raises(ValueError) as error:
+        headers(value)
+    message = str(error.value)
+    assert f"'{first}'" in message and f"'{second}'" in message
+    assert "same header" in message
+
+
+def test_headers_setting_rejects_inner_space_variants():
+    with pytest.raises(ValueError, match="'Company Code' and 'company  code'"):
+        headers({"Company Code": "company_code", "company  code": "company_code",
+                 "Customer": "customer"})
+
+
+def test_headers_setting_rejects_simplified_duplicates_even_for_different_fields():
+    with pytest.raises(ValueError, match="same header"):
+        headers({"Company Code": "company_code", "Customer": "customer", "CUSTOMER": "bank"})
+
+
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "blank"])
+def test_headers_setting_rejects_an_empty_header_text(blank):
+    with pytest.raises(ValueError, match="empty"):
+        headers({"Company Code": "company_code", "Customer": "customer", blank: "bank"})
+
+
+@pytest.mark.parametrize("bad", [{}, "Customer", ["Customer"], None, 5],
+                         ids=["empty-table", "text", "list", "none", "number"])
+def test_headers_setting_rejects_an_empty_or_non_table_value(bad):
+    with pytest.raises(ValueError, match="w: h is .*not a table"):
+        headers(bad)
+
+
+def test_headers_setting_does_not_modify_the_input_when_it_raises():
+    value = {"Customer": "customer"}
+    with pytest.raises(ValueError):
+        headers(value)
+    assert value == {"Customer": "customer"}
+
+
+def test_headers_with_turkish_and_english_spellings_load(tmp_path, repo):
+    with_turkish = dict(COLLECTION_HEADERS)
+    with_turkish["MÜŞTERİ"] = "customer"
+    with_turkish["ŞİRKET KODU"] = "company_code"
+    settings = load(tmp_path, repo,
+                    changes={("collections_layout", "headers"): headers_toml(with_turkish)})
+    assert settings.collections_layout.headers == with_turkish
+
+
+def test_turkish_case_variants_in_the_file_raise(tmp_path, repo):
+    with_turkish = dict(COLLECTION_HEADERS)
+    with_turkish["MÜŞTERİ"] = "customer"
+    with_turkish["müşteri"] = "customer"
+    raises_naming(tmp_path, repo, "[collections_layout].headers", "same header",
+                  changes={("collections_layout", "headers"): headers_toml(with_turkish)})
+
+
+def test_collections_headers_without_the_optional_bank_load(tmp_path, repo):
+    without_bank = {h: f for h, f in COLLECTION_HEADERS.items() if f != "bank"}
+    settings = load(tmp_path, repo,
+                    changes={("collections_layout", "headers"): headers_toml(without_bank)})
+    assert "bank" not in settings.collections_layout.headers.values()
+
+
+@pytest.mark.parametrize("field", sorted(set(COLLECTION_FIELDS) - OPTIONAL_FIELDS))
+def test_every_required_collection_field_must_have_a_header(tmp_path, repo, field):
+    without = {h: f for h, f in COLLECTION_HEADERS.items() if f != field}
+    raises_naming(tmp_path, repo, "[collections_layout].headers", f"'{field}'",
+                  changes={("collections_layout", "headers"): headers_toml(without)})
+
+
+@pytest.mark.parametrize("field", sorted(set(LEDGER_FIELDS) - LEDGER_OPTIONAL_FIELDS))
+def test_every_required_ledger_field_must_have_a_header(tmp_path, repo, field):
+    without = {h: f for h, f in LEDGER_HEADERS.items() if f != field}
+    raises_naming(tmp_path, repo, "[ledger_layout].headers", f"'{field}'",
+                  changes={("ledger_layout", "headers"): headers_toml(without)})
+
+
+def test_the_ledger_headers_in_the_test_file_cover_exactly_the_required_fields():
+    # Guards this file's own sample: LEDGER_HEADERS is meant to be the minimal valid mapping.
+    assert set(LEDGER_HEADERS.values()) == set(LEDGER_FIELDS) - LEDGER_OPTIONAL_FIELDS
+
+
+# --- document_types_setting ------------------------------------------------------------
+
+def document_types(value):
+    return document_types_setting({"d": value}, "d", "w")
+
+
+GOOD_TYPES = {"invoice": ["RV"], "payment": ["DZ"], "credit_memo": ["DG"]}
+
+
+def test_document_types_setting_returns_tuples_per_role():
+    result = document_types(GOOD_TYPES)
+    assert result == {"invoice": ("RV",), "payment": ("DZ",), "credit_memo": ("DG",)}
+    assert set(result) == set(DOCUMENT_ROLES)
+
+
+def test_document_types_setting_allows_several_codes_per_role():
+    result = document_types(dict(GOOD_TYPES, payment=["DZ", "DA"]))
+    assert result["payment"] == ("DZ", "DA")
+
+
+def test_document_types_setting_does_not_modify_the_input():
+    value = {role: list(codes) for role, codes in GOOD_TYPES.items()}
+    document_types(value)
+    assert value == GOOD_TYPES
+
+
+@pytest.mark.parametrize("role", DOCUMENT_ROLES)
+def test_document_types_setting_rejects_a_missing_role(role):
+    value = {r: c for r, c in GOOD_TYPES.items() if r != role}
+    with pytest.raises(ValueError) as error:
+        document_types(value)
+    message = str(error.value)
+    assert message.startswith("w.d")
+    assert "missing" in message and role in message
+
+
+def test_document_types_setting_rejects_an_unknown_role():
+    with pytest.raises(ValueError) as error:
+        document_types(dict(GOOD_TYPES, reversal=["AB"]))
+    assert "unknown ['reversal']" in str(error.value)
+
+
+def test_document_types_setting_names_both_sides_of_a_typo():
+    value = {"invoice": ["RV"], "payment": ["DZ"], "credit_memos": ["DG"]}
+    with pytest.raises(ValueError) as error:
+        document_types(value)
+    message = str(error.value)
+    assert "missing ['credit_memo']" in message and "unknown ['credit_memos']" in message
+
+
+@pytest.mark.parametrize("bad", [["RV", "DZ", "DG"], "RV", None, 5],
+                         ids=["list", "text", "none", "number"])
+def test_document_types_setting_rejects_a_non_table(bad):
+    with pytest.raises(ValueError, match="not a section"):
+        document_types(bad)
+
+
+@pytest.mark.parametrize("bad", ["RV", [], ["RV", ""], ["RV", "  "], ["RV", 1], [["RV"]]],
+                         ids=["text", "empty-list", "empty-code", "blank-code", "number",
+                              "nested"])
+def test_document_types_setting_rejects_a_bad_code_list(bad):
+    with pytest.raises(ValueError) as error:
+        document_types(dict(GOOD_TYPES, invoice=bad))
+    assert "invoice" in str(error.value)
+
+
+def test_document_types_setting_rejects_a_duplicate_within_a_role():
+    with pytest.raises(ValueError) as error:
+        document_types(dict(GOOD_TYPES, payment=["DZ", "DA", "DZ"]))
+    assert str(error.value) == "w.d: payment lists ['DZ'] more than once"
+
+
+def test_document_types_setting_rejects_a_code_in_two_roles():
+    with pytest.raises(ValueError) as error:
+        document_types(dict(GOOD_TYPES, credit_memo=["DG", "RV"]))
+    message = str(error.value)
+    assert "'RV'" in message and "invoice" in message and "credit_memo" in message
+
+
+def test_document_types_setting_strips_and_upper_cases_codes():
+    result = document_types({"invoice": [" rv "], "payment": ["dz", "Da "],
+                             "credit_memo": ["DG"]})
+    assert result == {"invoice": ("RV",), "payment": ("DZ", "DA"), "credit_memo": ("DG",)}
+    for codes in result.values():
+        assert type(codes) is tuple
+
+
+def test_document_types_setting_keeps_the_order_of_codes_in_a_role():
+    result = document_types(dict(GOOD_TYPES, payment=["zz", "DZ", "aa"]))
+    assert result["payment"] == ("ZZ", "DZ", "AA")
+
+
+def test_document_types_setting_does_not_modify_lower_case_input():
+    value = {"invoice": [" rv "], "payment": ["dz"], "credit_memo": ["dg"]}
+    document_types(value)
+    assert value == {"invoice": [" rv "], "payment": ["dz"], "credit_memo": ["dg"]}
+
+
+@pytest.mark.parametrize("written", [["DZ", "dz"], ["DZ", " DZ "], ["dz", "Dz"], ["DA", "dz", "DZ"]],
+                         ids=["case", "spaces", "two-cases", "among-others"])
+def test_document_types_setting_rejects_a_code_twice_after_normalising(written):
+    with pytest.raises(ValueError) as error:
+        document_types(dict(GOOD_TYPES, payment=written))
+    assert str(error.value) == (f"w.d: payment lists the same code twice when case and "
+                                f"spaces are ignored: {written}")
+
+
+def test_document_types_setting_exact_duplicate_uses_the_plain_message():
+    # An exact duplicate is caught first, by text_list_setting.
+    with pytest.raises(ValueError, match=r"payment lists \['DZ'\] more than once"):
+        document_types(dict(GOOD_TYPES, payment=["DZ", "DZ"]))
+
+
+@pytest.mark.parametrize("invoice_codes, payment_codes", [
+    (["RV"], ["rv"]), (["rv"], ["RV"]), ([" rv"], ["Rv "]), (["RV", "AB"], ["DZ", "rv"]),
+], ids=["upper-lower", "lower-upper", "spaces", "among-others"])
+def test_document_types_setting_rejects_a_code_in_two_roles_after_upper_casing(invoice_codes,
+                                                                             payment_codes):
+    with pytest.raises(ValueError) as error:
+        document_types({"invoice": invoice_codes, "payment": payment_codes,
+                        "credit_memo": ["DG"]})
+    assert str(error.value) == "w.d: code 'RV' is listed for both invoice and payment"
+
+
+def test_document_types_setting_names_the_roles_in_role_order():
+    # The first role (in DOCUMENT_ROLES order) holding the code is named first.
+    with pytest.raises(ValueError) as error:
+        document_types({"invoice": ["RV"], "payment": ["DZ"], "credit_memo": ["DZ"]})
+    assert str(error.value) == "w.d: code 'DZ' is listed for both payment and credit_memo"

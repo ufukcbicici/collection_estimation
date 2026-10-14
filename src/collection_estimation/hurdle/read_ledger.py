@@ -7,8 +7,10 @@ at each past week is a later step; this module only reads and checks.
 Sign convention (SAP's): what the customer owes is positive. An invoice is +, a payment -,
 a credit memo -, and a refund paid out to the customer +.
 """
+import dataclasses
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -17,41 +19,33 @@ from . import read_collections
 from .cache import file_fingerprint, load_with_cache, source_fingerprint
 from .read_collections import cell, find_columns, is_blank, is_nan, pick_data_sheet
 
-# FBL5N header text -> our field name. Compared after folding case and spaces. When the real
-# ledger arrives, add its labels as further keys pointing to the same field names.
-LEDGER_HEADER_TO_FIELD = {
-    "company code": "company_code",
-    "customer": "customer",
-    "customer name": "customer_name",
-    "document number": "document_no",
-    "document type": "document_type",
-    "reference": "reference",
-    "invoice reference": "invoice_reference",
-    "document date": "document_date",
-    "posting date": "posting_date",
-    "baseline date": "baseline_date",
-    "terms of payment": "payment_terms",
-    "net due date": "net_due_date",
-    "amount in doc. curr.": "amount_document",
-    "document currency": "document_currency",
-    "amount in local currency": "amount_local",
-    "clearing date": "clearing_date",
-    "clearing document": "clearing_document",
-}
+if TYPE_CHECKING:
+    # Only for the type hints: settings.py imports this module, so importing it back at run
+    # time would be circular.
+    from .settings import LedgerLayout
+
+# How the ledger is laid out (header texts, rows, document-type codes) is in the settings file:
+# see [ledger_layout] in settings/synthetic.toml.
+
 # Kept when present, for reconciliation; the model does not need them.
 LEDGER_OPTIONAL_FIELDS = {
     "customer_name", "document_date", "baseline_date", "payment_terms", "clearing_document",
 }
 
-# The FBL5N sheet has its header on row 1.
-LEDGER_HEADER_ROW = 1
-LEDGER_FIRST_DATA_ROW = 2
+# The fields of a ledger line, in order: the code's own contract. The settings file says
+# what each one is called in the ledger (see hurdle/settings.py).
+LEDGER_FIELDS = ["company_code", "customer", "customer_name", "document_no", "document_type",
+                 "reference", "invoice_reference", "document_date", "posting_date",
+                 "baseline_date", "payment_terms", "net_due_date", "amount_document",
+                 "document_currency", "amount_local", "clearing_date", "clearing_document"]
 
-# RV = invoice, DZ = payment (or a refund paid out), DG = credit memo.
-DOCUMENT_TYPES = {"RV", "DZ", "DG"}
+# What a ledger line can be. The settings file says which SAP document-type codes this
+# ledger uses for each role (SAP codes are configured per company, e.g. RV or DR).
+DOCUMENT_ROLES = ["invoice", "payment", "credit_memo"]
 
 # The columns of the table `read_ledger` returns, in order, and which of them hold what.
-LEDGER_COLUMNS = list(LEDGER_HEADER_TO_FIELD.values()) + ["source_row"]
+# `document_role` is the role of the line's document type (see DOCUMENT_ROLES).
+LEDGER_COLUMNS = LEDGER_FIELDS + ["document_role", "source_row"]
 LEDGER_DATE_COLUMNS = ["document_date", "posting_date", "baseline_date", "net_due_date",
                        "clearing_date"]
 LEDGER_AMOUNT_COLUMNS = ["amount_document", "amount_local"]
@@ -63,26 +57,31 @@ REQUIRED_TEXT = ["company_code", "customer", "document_no", "document_type",
                  "document_currency"]
 
 
-def load_ledger(path: Path, as_of: date, cache_folder: Path) -> pd.DataFrame:
+def load_ledger(path: Path, as_of: date, layout: "LedgerLayout",
+                cache_folder: Path) -> pd.DataFrame:
     """The ledger lines (see `read_ledger`), from the cache if nothing has changed.
 
     The cache is read again automatically if the ledger file changes, `as_of` changes, the
-    code of this module or of read_collections (whose helpers it uses) changes, or the cache
-    is damaged.
+    layout in the settings file changes, the code of this module or of read_collections
+    (whose helpers it uses) changes, or the cache is damaged.
     """
     fingerprint = [
         file_fingerprint(path),
         pd.Timestamp(as_of).date().isoformat(),  # '2026-08-28', whether a date or datetime
+        dataclasses.asdict(layout),  # e.g. a changed header or document-type code
         source_fingerprint(Path(__file__), Path(read_collections.__file__)),
     ]
     return load_with_cache("hurdle_ledger", fingerprint,
-                           lambda: read_ledger(path, as_of), cache_folder)
+                           lambda: read_ledger(path, as_of, layout), cache_folder)
 
 
-def read_ledger(path: Path, as_of: date) -> pd.DataFrame:
+def read_ledger(path: Path, as_of: date, layout: "LedgerLayout") -> pd.DataFrame:
     """The ledger lines, one row per line, in sheet order, with our field names.
 
     `as_of` is the date the ledger was extracted; nothing in it may be dated later.
+    `layout` (from the settings file) says where the header is, what each column is called,
+    and which document-type codes are invoices, payments and credit memos; the role of each
+    line is added as `document_role`.
     Raises ValueError if the file is malformed, a line has a wrong type, a document type is
     unknown, an invoice has no due date, or a date is after `as_of`.
     """
@@ -94,14 +93,13 @@ def read_ledger(path: Path, as_of: date) -> pd.DataFrame:
     finally:
         workbook.close()
 
-    if len(rows) < LEDGER_HEADER_ROW:
-        raise ValueError(f"{path.name}: no header row (row {LEDGER_HEADER_ROW})")
-    columns = find_columns(rows[LEDGER_HEADER_ROW - 1], LEDGER_HEADER_TO_FIELD,
-                           LEDGER_OPTIONAL_FIELDS)
+    if len(rows) < layout.header_row:
+        raise ValueError(f"{path.name}: no header row (row {layout.header_row})")
+    columns = find_columns(rows[layout.header_row - 1], layout.headers, LEDGER_OPTIONAL_FIELDS)
 
     lines = []
-    for row_number, row in enumerate(rows[LEDGER_FIRST_DATA_ROW - 1:],
-                                     start=LEDGER_FIRST_DATA_ROW):
+    for row_number, row in enumerate(rows[layout.first_data_row - 1:],
+                                     start=layout.first_data_row):
         if all(is_blank(value) for value in row):
             continue  # an empty row, e.g. at the end of the sheet
         lines.append(ledger_line(row, columns, f"{path.name} row {row_number}", row_number))
@@ -117,7 +115,8 @@ def read_ledger(path: Path, as_of: date) -> pd.DataFrame:
     for column in LEDGER_TEXT_COLUMNS:
         ledger[column] = ledger[column].astype(object).where(ledger[column].notna(), None)
 
-    check_document_types(ledger, path.name)
+    ledger["document_role"] = document_roles(ledger["document_type"], layout.document_types,
+                                             path.name)
     check_invoices_have_due_dates(ledger, path.name)
     check_nothing_after(ledger, as_of, path.name)
     return ledger
@@ -130,7 +129,7 @@ def ledger_line(row: tuple, columns: dict[str, int], where: str, row_number: int
     date is required. Amounts: a number, never NaN.
     """
     line = {}
-    for field in LEDGER_HEADER_TO_FIELD.values():
+    for field in LEDGER_FIELDS:
         value = cell(row, columns, field)
         if field in LEDGER_DATE_COLUMNS:
             line[field] = date_or_none(value, where, field)
@@ -145,6 +144,7 @@ def ledger_line(row: tuple, columns: dict[str, int], where: str, row_number: int
     if line["posting_date"] is None:
         raise ValueError(f"{where}: posting_date is empty")
     line["document_type"] = line["document_type"].upper()
+    line["document_role"] = None  # set for the whole table in `read_ledger`
     line["source_row"] = row_number
     return line
 
@@ -181,22 +181,32 @@ def number(value, where: str, field: str) -> float:
     return float(value)
 
 
-def check_document_types(ledger: pd.DataFrame, file_name: str) -> None:
-    """Raise ValueError naming every document type other than RV, DZ and DG, with its count.
+def document_roles(document_types: pd.Series, codes_per_role: dict[str, tuple[str, ...]],
+                   file_name: str) -> pd.Series:
+    """The role of each line ('invoice', 'payment' or 'credit_memo'), from its document type.
 
-    A real export may hold other types (e.g. opening balances, reversals); each one needs a
-    decision before it is used, rather than being handled wrongly without notice.
+    `codes_per_role` comes from the settings file, e.g. {'invoice': ('RV',), ...}. A type not
+    listed there raises ValueError naming each with its count: a real export may hold other
+    types (e.g. opening balances, reversals), and each needs a decision before it is used,
+    rather than being handled wrongly without notice.
     """
-    is_unknown = ~ledger["document_type"].isin(DOCUMENT_TYPES)
+    # Codes are compared stripped and upper-cased, as the lines' document types are, however
+    # the layout was made (the settings file already upper-cases them).
+    role_of_code = {code.strip().upper(): role
+                    for role, codes in codes_per_role.items() for code in codes}
+    roles = document_types.map(role_of_code)
+    is_unknown = roles.isna()
     if is_unknown.any():
-        lines_per_type = ledger.loc[is_unknown, "document_type"].value_counts().to_dict()
+        # dropna=False, so a missing document type is named in the message too.
+        lines_per_type = document_types[is_unknown].value_counts(dropna=False).to_dict()
         raise ValueError(f"{file_name}: unknown document types (type: number of lines): "
-                         f"{lines_per_type}; known types are {sorted(DOCUMENT_TYPES)}")
+                         f"{lines_per_type}; the settings list {sorted(role_of_code)}")
+    return roles.astype(object)
 
 
 def check_invoices_have_due_dates(ledger: pd.DataFrame, file_name: str) -> None:
-    """Raise ValueError if an invoice (RV) has no net due date."""
-    no_due_date = (ledger["document_type"] == "RV") & ledger["net_due_date"].isna()
+    """Raise ValueError if an invoice has no net due date."""
+    no_due_date = (ledger["document_role"] == "invoice") & ledger["net_due_date"].isna()
     if no_due_date.any():
         first_rows = ledger.loc[no_due_date, "source_row"].head(5).tolist()
         raise ValueError(f"{file_name}: {no_due_date.sum()} invoices have no net due date "
@@ -218,8 +228,8 @@ def check_ledger_against_collections(ledger: pd.DataFrame, collections: pd.DataF
                                      days_with_file: list[date]) -> dict:
     """Check that the ledger's payments and the daily files describe the same money.
 
-    For every day that has a daily file, the ledger's payment lines (DZ, sign flipped so
-    money received is positive) posted that day must add up to the daily file's TRY total,
+    For every day that has a daily file, the ledger's payment lines (role 'payment', sign
+    flipped so money received is positive) posted that day must add up to the daily file's TRY total,
     within 0.01 TRY. Raises ValueError listing the first days that differ.
 
     Ledger payments on days without a file are expected and are not compared. They are
@@ -227,7 +237,7 @@ def check_ledger_against_collections(ledger: pd.DataFrame, collections: pd.DataF
     (outside what the daily files cover, e.g. a ledger extracted later), and days in between
     (a missing file: cash the daily files lost). Returns those counts and the TRY they hold.
     """
-    payments = ledger[ledger["document_type"] == "DZ"]
+    payments = ledger[ledger["document_role"] == "payment"]
     received = -payments["amount_local"]  # the ledger records a payment received as negative
     ledger_per_day = received.groupby(payments["posting_date"].dt.date).sum()
     files_per_day = collections.groupby(collections["document_date"].dt.date)["amount_try"].sum()

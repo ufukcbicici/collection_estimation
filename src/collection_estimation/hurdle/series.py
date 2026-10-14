@@ -7,7 +7,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from .holidays import public_holidays
+from .holidays import HolidayTable, public_holidays
 
 
 def week_numbers(dates: pd.Series, week_zero: date) -> pd.Series:
@@ -31,7 +31,8 @@ def add_week_index(collections: pd.DataFrame, week_zero: date) -> pd.DataFrame:
     return with_weeks
 
 
-def week_calendar(days_with_file: list[date], week_zero: date) -> pd.DataFrame:
+def week_calendar(days_with_file: list[date], week_zero: date,
+                  holidays: HolidayTable) -> pd.DataFrame:
     """One row per week, from week zero to the week of the last file.
 
     Columns: week, monday, business_days (weekdays that are not public holidays),
@@ -53,14 +54,14 @@ def week_calendar(days_with_file: list[date], week_zero: date) -> pd.DataFrame:
 
     last_day = max(days_with_file)
     last_sunday = last_day + timedelta(days=6 - last_day.weekday())
-    holidays = public_holidays(week_zero, last_sunday)
+    holiday_days = public_holidays(week_zero, last_sunday, holidays)
     has_file = set(days_with_file)
 
     # One row per calendar day; a few hundred days, so a plain loop is clear and fast enough.
     rows = []
     day = week_zero
     while day <= last_sunday:
-        is_business_day = day.weekday() < 5 and day not in holidays
+        is_business_day = day.weekday() < 5 and day not in holiday_days
         rows.append({
             "day": day,
             "is_business_day": is_business_day,

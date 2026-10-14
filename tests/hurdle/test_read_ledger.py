@@ -4,6 +4,7 @@ Every workbook is built in `tmp_path` by `make_ledger_workbook` (see `workbooks.
 Customers are fake. The integration tests at the end read the synthetic ledger in
 `data/raw/` once per session (~30 s) and are skipped when it is absent.
 """
+import dataclasses
 from datetime import date, datetime
 from pathlib import Path
 
@@ -11,27 +12,28 @@ import pandas as pd
 import pytest
 
 from collection_estimation.hurdle.read_ledger import (
-    DOCUMENT_TYPES,
+    DOCUMENT_ROLES,
     LEDGER_AMOUNT_COLUMNS,
     LEDGER_COLUMNS,
     LEDGER_DATE_COLUMNS,
-    LEDGER_FIRST_DATA_ROW,
-    LEDGER_HEADER_ROW,
-    LEDGER_HEADER_TO_FIELD,
+    LEDGER_FIELDS,
     LEDGER_OPTIONAL_FIELDS,
     LEDGER_TEXT_COLUMNS,
     REQUIRED_TEXT,
-    check_document_types,
     check_invoices_have_due_dates,
     check_nothing_after,
     date_or_none,
+    document_roles,
     ledger_line,
     number,
     read_ledger,
     text_or_none,
 )
+from collection_estimation.hurdle.settings import LedgerLayout, document_types_setting
 from tests.hurdle.workbooks import (
     LEDGER_HEADER,
+    SYNTHETIC_LEDGER_HEADERS,
+    SYNTHETIC_LEDGER_LAYOUT,
     credit_memo,
     invoice,
     ledger_row,
@@ -50,8 +52,17 @@ def five_lines():
     return [invoice(), payment(), unapplied_payment(), credit_memo(), refund()]
 
 
-def read(tmp_path, lines, **kwargs):
-    return read_ledger(make_ledger_workbook(tmp_path, lines, **kwargs), AS_OF)
+LAYOUT = SYNTHETIC_LEDGER_LAYOUT  # header on row 1, lines from row 2, RV / DZ / DG
+
+
+def read(tmp_path, lines, layout=LAYOUT, **kwargs):
+    return read_ledger(make_ledger_workbook(tmp_path, lines, **kwargs), AS_OF, layout)
+
+
+def with_types(**codes_per_role):
+    """The synthetic layout with other document-type codes for some roles."""
+    return dataclasses.replace(LAYOUT, document_types=dict(LAYOUT.document_types,
+                                                           **codes_per_role))
 
 
 def without(header, *removed):
@@ -61,22 +72,26 @@ def without(header, *removed):
 # --- constants -----------------------------------------------------------------------------
 
 def test_constants_are_consistent():
-    assert LEDGER_HEADER_ROW == 1
-    assert LEDGER_FIRST_DATA_ROW == 2
-    assert DOCUMENT_TYPES == {'RV', 'DZ', 'DG'}
-    assert LEDGER_COLUMNS == list(LEDGER_HEADER_TO_FIELD.values()) + ['source_row']
-    assert len(LEDGER_HEADER_TO_FIELD) == 17
-    assert LEDGER_OPTIONAL_FIELDS <= set(LEDGER_HEADER_TO_FIELD.values())
+    assert DOCUMENT_ROLES == ['invoice', 'payment', 'credit_memo']
+    assert LEDGER_COLUMNS == LEDGER_FIELDS + ['document_role', 'source_row']
+    assert len(LEDGER_FIELDS) == 17
+    assert len(set(LEDGER_FIELDS)) == 17
+    assert LEDGER_OPTIONAL_FIELDS <= set(LEDGER_FIELDS)
     assert set(REQUIRED_TEXT) <= set(LEDGER_TEXT_COLUMNS)
+    assert 'document_role' in LEDGER_TEXT_COLUMNS
     # Every column is exactly one of date / amount / text / source_row.
     groups = LEDGER_DATE_COLUMNS + LEDGER_AMOUNT_COLUMNS + LEDGER_TEXT_COLUMNS + ['source_row']
     assert sorted(groups) == sorted(LEDGER_COLUMNS)
     assert len(groups) == len(set(groups))
 
 
-def test_builder_header_matches_the_module_dictionary():
-    simplified = [' '.join(text.split()).casefold() for text in LEDGER_HEADER]
-    assert simplified == list(LEDGER_HEADER_TO_FIELD)
+def test_builder_header_matches_the_shared_layout():
+    assert LEDGER_HEADER == tuple(SYNTHETIC_LEDGER_HEADERS)
+    assert list(SYNTHETIC_LEDGER_HEADERS.values()) == LEDGER_FIELDS
+    assert LAYOUT == LedgerLayout(header_row=1, first_data_row=2,
+                                  headers=SYNTHETIC_LEDGER_HEADERS,
+                                  document_types={'invoice': ('RV',), 'payment': ('DZ',),
+                                                  'credit_memo': ('DG',)})
 
 
 # --- happy path ----------------------------------------------------------------------------
@@ -207,7 +222,7 @@ def test_cleared_line_keeps_clearing_date_and_document(tmp_path):
 
 def test_read_ledger_accepts_a_string_path(tmp_path):
     path = make_ledger_workbook(tmp_path, [invoice()])
-    assert len(read_ledger(str(path), AS_OF)) == 1
+    assert len(read_ledger(str(path), AS_OF, LAYOUT)) == 1
 
 
 # --- empty rows ----------------------------------------------------------------------------
@@ -248,8 +263,8 @@ def test_completely_empty_sheet_raises_no_header_row(tmp_path):
     workbook.create_sheet('FBL5N')
     path = tmp_path / 'empty.xlsx'
     workbook.save(path)
-    with pytest.raises(ValueError, match='no header row'):
-        read_ledger(path, AS_OF)
+    with pytest.raises(ValueError, match=r'empty\.xlsx: no header row \(row 1\)'):
+        read_ledger(path, AS_OF, LAYOUT)
 
 
 # --- columns found by header text ----------------------------------------------------------
@@ -411,10 +426,11 @@ def test_empty_optional_and_unrequired_fields_are_fine(tmp_path):
 # --- ledger_line directly ------------------------------------------------------------------
 
 def test_ledger_line_builds_the_dict():
-    columns = {field: position for position, field in enumerate(LEDGER_HEADER_TO_FIELD.values())}
+    columns = {field: position for position, field in enumerate(LEDGER_FIELDS)}
     row = tuple(invoice().values())
     line = ledger_line(row, columns, WHERE, 7)
     assert list(line) == LEDGER_COLUMNS
+    assert line['document_role'] is None  # set for the whole table by read_ledger
     assert line['source_row'] == 7
     assert line['posting_date'] == date(2026, 3, 2)
     assert type(line['posting_date']) is date
@@ -422,7 +438,7 @@ def test_ledger_line_builds_the_dict():
 
 
 def test_ledger_line_short_row_gives_none_for_missing_cells():
-    columns = {field: position for position, field in enumerate(LEDGER_HEADER_TO_FIELD.values())}
+    columns = {field: position for position, field in enumerate(LEDGER_FIELDS)}
     # A row cut short after the local amount: clearing date and document missing.
     row = tuple(invoice().values())[:15]
     line = ledger_line(row, columns, WHERE, 2)
@@ -430,7 +446,7 @@ def test_ledger_line_short_row_gives_none_for_missing_cells():
     assert line['clearing_document'] is None
 
 
-# --- check_document_types ------------------------------------------------------------------
+# --- document_roles ------------------------------------------------------------------
 
 def frame(**columns):
     """A small ledger-like table for the checks."""
@@ -440,54 +456,392 @@ def frame(**columns):
     return table
 
 
-def test_known_document_types_pass():
-    check_document_types(frame(document_type=['RV', 'DZ', 'DG', 'RV']), 'x.xlsx')
+ROLE_OF_TYPE = {'RV': 'invoice', 'DZ': 'payment', 'DG': 'credit_memo'}
 
 
-def test_empty_table_passes_document_type_check():
-    check_document_types(frame(document_type=pd.Series([], dtype=object)), 'x.xlsx')
+def with_roles(**columns):
+    """`frame`, plus the document_role of each document_type (RV / DZ / DG)."""
+    table = frame(**columns)
+    table['document_role'] = table['document_type'].map(ROLE_OF_TYPE).astype(object)
+    return table
+
+
+TYPES = {'invoice': ('RV',), 'payment': ('DZ',), 'credit_memo': ('DG',)}
+
+
+def test_document_roles_gives_the_role_of_each_line():
+    roles = document_roles(pd.Series(['RV', 'DZ', 'DG', 'RV', 'DZ']), TYPES, 'x.xlsx')
+    assert roles.tolist() == ['invoice', 'payment', 'credit_memo', 'invoice', 'payment']
+
+
+def test_document_roles_is_object_dtype():
+    roles = document_roles(pd.Series(['RV', 'DZ', 'DG']), TYPES, 'x.xlsx')
+    assert roles.dtype == object
+    assert all(type(role) is str for role in roles)
+
+
+def test_document_roles_keeps_the_index():
+    types = pd.Series(['DG', 'RV'], index=[10, 3])
+    roles = document_roles(types, TYPES, 'x.xlsx')
+    assert roles.index.tolist() == [10, 3]
+    assert roles.to_dict() == {10: 'credit_memo', 3: 'invoice'}
+
+
+def test_document_roles_several_codes_for_one_role():
+    types = dict(TYPES, payment=('DZ', 'DA'))
+    roles = document_roles(pd.Series(['DA', 'DZ', 'RV']), types, 'x.xlsx')
+    assert roles.tolist() == ['payment', 'payment', 'invoice']
+
+
+def test_document_roles_of_an_empty_series_is_empty_and_object():
+    roles = document_roles(pd.Series([], dtype=object), TYPES, 'x.xlsx')
+    assert len(roles) == 0
+    assert roles.dtype == object
+
+
+def test_document_roles_does_not_modify_its_inputs():
+    types = pd.Series(['RV', 'DZ'])
+    codes = {'invoice': ('RV',), 'payment': ('DZ',), 'credit_memo': ('DG',)}
+    document_roles(types, codes, 'x.xlsx')
+    assert types.tolist() == ['RV', 'DZ']
+    assert codes == TYPES
 
 
 def test_unknown_document_types_raise_with_counts_and_known_list():
-    table = frame(document_type=['RV', 'AB', 'DZ', 'AB', 'DA'])
+    types = pd.Series(['RV', 'AB', 'DZ', 'AB', 'DA'])
     with pytest.raises(ValueError) as error:
-        check_document_types(table, 'x.xlsx')
+        document_roles(types, TYPES, 'x.xlsx')
     message = str(error.value)
     assert message.startswith('x.xlsx: unknown document types')
     assert "'AB': 2" in message
     assert "'DA': 1" in message
-    assert "'RV'" not in message.split('known types')[0]
-    assert "known types are ['DG', 'DZ', 'RV']" in message
+    unknown_part = message.split('the settings list')[0]
+    assert "'RV'" not in unknown_part and "'DZ'" not in unknown_part
+    assert message.endswith("the settings list ['DG', 'DZ', 'RV']")
+
+
+def test_unknown_document_types_list_the_known_codes_sorted_across_roles():
+    types = {'invoice': ('ZZ', 'RV'), 'payment': ('DZ', 'AA'), 'credit_memo': ('DG',)}
+    with pytest.raises(ValueError, match=r"the settings list \['AA', 'DG', 'DZ', 'RV', 'ZZ'\]$"):
+        document_roles(pd.Series(['XX']), types, 'x.xlsx')
+
+
+def test_a_code_dropped_from_the_settings_becomes_unknown():
+    types = dict(TYPES, credit_memo=('DX',))
+    with pytest.raises(ValueError, match=r"unknown document types .*\{'DG': 1\}"):
+        document_roles(pd.Series(['RV', 'DG']), types, 'x.xlsx')
 
 
 def test_unknown_document_type_in_a_workbook_raises(tmp_path):
     lines = [invoice(), ledger_row(document_type='ab', document_no='1'),
              ledger_row(document_type='AB', document_no='2'),
              ledger_row(document_type='DA', document_no='3')]
-    with pytest.raises(ValueError, match=r"unknown document types.*'AB': 2.*'DA': 1"):
+    with pytest.raises(ValueError,
+                       match=r"SYNTHETIC_ledger\.xlsx: unknown document types .*'AB': 2.*'DA': 1"
+                             r".*the settings list \['DG', 'DZ', 'RV'\]"):
         read(tmp_path, lines)
+
+
+def test_a_type_not_in_the_layout_raises_from_read_ledger_with_counts(tmp_path):
+    # DA is a real SAP code, but this layout does not list it.
+    lines = [invoice(), payment(), payment(document_no='2'), credit_memo()]
+    for row in lines[1:3]:
+        row['Document Type'] = 'DA'
+    with pytest.raises(ValueError, match=r"unknown document types .*\{'DA': 2\}"):
+        read(tmp_path, lines)
+
+
+# --- document_roles: codes in a hand-built layout are normalised --------------------
+
+def test_document_roles_matches_lower_case_and_padded_layout_codes():
+    # A layout built by hand (not through the settings file) with ('rv',) and (' Dz ',).
+    types = {'invoice': ('rv',), 'payment': (' Dz ',), 'credit_memo': ('DG',)}
+    roles = document_roles(pd.Series(['RV', 'DZ', 'DG']), types, 'x.xlsx')
+    assert roles.tolist() == ['invoice', 'payment', 'credit_memo']
+
+
+def test_document_roles_message_lists_the_layout_codes_normalised():
+    types = {'invoice': ('rv',), 'payment': (' Dz ',), 'credit_memo': ('dg',)}
+    with pytest.raises(ValueError, match=r"the settings list \['DG', 'DZ', 'RV'\]$"):
+        document_roles(pd.Series(['XX']), types, 'x.xlsx')
+
+
+def test_document_roles_does_not_modify_a_hand_built_layout():
+    types = {'invoice': ('rv',), 'payment': (' Dz ',), 'credit_memo': ('DG',)}
+    document_roles(pd.Series(['RV', 'DZ']), types, 'x.xlsx')
+    assert types == {'invoice': ('rv',), 'payment': (' Dz ',), 'credit_memo': ('DG',)}
+
+
+def test_a_hand_built_layout_with_lower_case_codes_reads_a_workbook(tmp_path):
+    layout = with_types(invoice=('rv',), payment=(' Dz ',))
+    ledger = read(tmp_path, [invoice(), payment(), credit_memo()], layout)
+    assert ledger['document_role'].tolist() == ['invoice', 'payment', 'credit_memo']
+
+
+def test_a_hand_built_layout_with_lower_case_codes_reads_like_the_upper_case_one(tmp_path):
+    lines = [invoice(), payment(), credit_memo()]
+    lower = read(tmp_path, lines, with_types(invoice=('rv',), payment=(' Dz ',),
+                                             credit_memo=('dg',)))
+    upper = read(tmp_path, lines)
+    pd.testing.assert_frame_equal(lower, upper)
+
+
+# --- document_roles: a missing type is named ----------------------------------------
+
+def test_a_missing_document_type_is_named_in_the_unknown_types_message():
+    with pytest.raises(ValueError) as error:
+        document_roles(pd.Series(['RV', None, 'DZ'], dtype=object), TYPES, 'x.xlsx')
+    message = str(error.value)
+    assert message.startswith('x.xlsx: unknown document types')
+    assert 'None: 1' in message
+
+
+def test_missing_document_types_are_counted_together():
+    with pytest.raises(ValueError, match=r"\{None: 2\}"):
+        document_roles(pd.Series([None, 'RV', None], dtype=object), TYPES, 'x.xlsx')
+
+
+def test_a_missing_type_is_named_beside_an_unknown_code():
+    with pytest.raises(ValueError) as error:
+        document_roles(pd.Series(['AB', None, 'AB'], dtype=object), TYPES, 'x.xlsx')
+    message = str(error.value)
+    assert "'AB': 2" in message
+    assert 'None: 1' in message
+
+
+def test_a_message_with_only_a_missing_type_does_not_show_empty_counts():
+    # With value_counts() (dropna=True) the missing type was dropped and the counts read {}.
+    with pytest.raises(ValueError) as error:
+        document_roles(pd.Series([None], dtype=object), TYPES, 'x.xlsx')
+    assert '{}' not in str(error.value)
+
+
+# --- the document_role column --------------------------------------------------------
+
+def test_document_role_column_is_present_in_ledger_columns_order(tmp_path):
+    ledger = read(tmp_path, five_lines())
+    assert 'document_role' in ledger.columns
+    assert list(ledger.columns) == LEDGER_COLUMNS
+    assert list(ledger.columns).index('document_role') == len(LEDGER_FIELDS)
+    assert ledger.columns[-1] == 'source_row'
+
+
+def test_document_role_is_right_per_line(tmp_path):
+    ledger = read(tmp_path, five_lines())
+    # invoice, payment, unapplied payment, credit memo, refund (a DZ: a payment)
+    assert ledger['document_role'].tolist() == [
+        'invoice', 'payment', 'payment', 'credit_memo', 'payment']
+
+
+def test_document_role_is_object_dtype(tmp_path):
+    ledger = read(tmp_path, five_lines())
+    assert ledger['document_role'].dtype == object
+    assert all(type(role) is str for role in ledger['document_role'])
+
+
+def test_document_role_of_an_empty_ledger_is_an_empty_object_column(tmp_path):
+    ledger = read(tmp_path, [])
+    assert ledger['document_role'].dtype == object
+    assert len(ledger['document_role']) == 0
+
+
+def test_document_role_follows_lower_case_types_in_the_ledger(tmp_path):
+    lines = [invoice(), payment(), credit_memo()]
+    for row, text in zip(lines, ['rv', ' dz ', 'Dg']):
+        row['Document Type'] = text
+    ledger = read(tmp_path, lines)
+    assert ledger['document_type'].tolist() == ['RV', 'DZ', 'DG']
+    assert ledger['document_role'].tolist() == ['invoice', 'payment', 'credit_memo']
+
+
+def test_several_codes_for_one_role_both_map_to_payment(tmp_path):
+    second = payment(document_no='1400000009')
+    second['Document Type'] = 'DA'
+    ledger = read(tmp_path, [invoice(), payment(), second],
+                  layout=with_types(payment=('DZ', 'DA')))
+    assert ledger['document_type'].tolist() == ['RV', 'DZ', 'DA']
+    assert ledger['document_role'].tolist() == ['invoice', 'payment', 'payment']
+
+
+def test_other_codes_in_the_layout_give_the_roles(tmp_path):
+    # SAP codes are configured per company: e.g. DR for invoices.
+    lines = [invoice(), payment(), credit_memo()]
+    lines[0]['Document Type'] = 'DR'
+    ledger = read(tmp_path, lines, layout=with_types(invoice=('DR',)))
+    assert ledger['document_role'].tolist() == ['invoice', 'payment', 'credit_memo']
+
+
+def test_rv_is_unknown_when_the_layout_lists_another_invoice_code(tmp_path):
+    with pytest.raises(ValueError, match=r"unknown document types .*\{'RV': 1\}"):
+        read(tmp_path, [invoice(), payment()], layout=with_types(invoice=('DR',)))
+
+
+def test_lower_case_codes_in_the_settings_match_upper_case_ledger_types(tmp_path):
+    codes = document_types_setting(
+        {'d': {'invoice': ['rv'], 'payment': [' dz ', 'Da'], 'credit_memo': ['dg']}}, 'd', 'w')
+    assert codes == {'invoice': ('RV',), 'payment': ('DZ', 'DA'), 'credit_memo': ('DG',)}
+    second = payment(document_no='1400000009')
+    second['Document Type'] = 'DA'
+    ledger = read(tmp_path, [invoice(), payment(), second, credit_memo()],
+                  layout=dataclasses.replace(LAYOUT, document_types=codes))
+    assert ledger['document_role'].tolist() == ['invoice', 'payment', 'payment', 'credit_memo']
+
+
+def test_the_due_date_check_follows_the_role_not_the_code(tmp_path):
+    # With DR as the invoice code, a DR without a due date is caught ...
+    line = invoice()
+    line['Document Type'] = 'DR'
+    line['Net Due Date'] = None
+    with pytest.raises(ValueError, match=r'1 invoices have no net due date \(first rows: \[2\]\)'):
+        read(tmp_path, [line], layout=with_types(invoice=('DR',), credit_memo=('DG', 'RV')))
+
+
+def test_an_rv_that_the_layout_calls_a_credit_memo_needs_no_due_date(tmp_path):
+    # ... and an RV the layout calls a credit memo is not an invoice, so it needs none.
+    line = invoice()
+    line['Net Due Date'] = None
+    ledger = read(tmp_path, [line], layout=with_types(invoice=('DR',), credit_memo=('DG', 'RV')))
+    assert ledger['document_role'].tolist() == ['credit_memo']
+
+
+# --- layouts other than the synthetic one --------------------------------------------
+
+TURKISH_HEADERS = {
+    'Şirket Kodu': 'company_code',
+    'Müşteri': 'customer',
+    'Müşteri Adı': 'customer_name',
+    'Belge Numarası': 'document_no',
+    'Belge Türü': 'document_type',
+    'Referans': 'reference',
+    'Fatura Referansı': 'invoice_reference',
+    'Belge Tarihi': 'document_date',
+    'Kayıt Tarihi': 'posting_date',
+    'Temel Tarih': 'baseline_date',
+    'Ödeme Koşulu': 'payment_terms',
+    'Net Vade Tarihi': 'net_due_date',
+    'Belge Para Birimi Tutarı': 'amount_document',
+    'Belge Para Birimi': 'document_currency',
+    'Yerel Para Birimi Tutarı': 'amount_local',
+    'Denkleştirme Tarihi': 'clearing_date',
+    'Denkleştirme Belgesi': 'clearing_document',
+}
+
+
+def as_turkish(row):
+    """A line dict keyed by LEDGER_HEADER -> the same values keyed by TURKISH_HEADERS."""
+    english_to_turkish = dict(zip(LEDGER_HEADER, TURKISH_HEADERS))
+    return {english_to_turkish[text]: value for text, value in row.items()}
+
+
+def only_type_in_turkish(text):
+    return 'Belge Türü' if text == 'Document Type' else text
+
+
+def test_turkish_header_texts_read_a_workbook_built_that_way(tmp_path):
+    layout = dataclasses.replace(LAYOUT, headers=TURKISH_HEADERS)
+    lines = [as_turkish(row) for row in five_lines()]
+    ledger = read(tmp_path, lines, layout=layout, header=tuple(TURKISH_HEADERS))
+    other = tmp_path / 'english'
+    other.mkdir()
+    pd.testing.assert_frame_equal(ledger, read(other, five_lines()))
+    assert ledger['document_type'].tolist() == ['RV', 'DZ', 'DZ', 'DG', 'DZ']
+
+
+def test_belge_turu_alone_renamed_maps_to_document_type(tmp_path):
+    headers = {only_type_in_turkish(text): field
+               for text, field in SYNTHETIC_LEDGER_HEADERS.items()}
+    header = tuple(only_type_in_turkish(text) for text in LEDGER_HEADER)
+    lines = [{only_type_in_turkish(text): value for text, value in row.items()}
+             for row in five_lines()]
+    ledger = read(tmp_path, lines, layout=dataclasses.replace(LAYOUT, headers=headers),
+                  header=header)
+    assert ledger['document_type'].tolist() == ['RV', 'DZ', 'DZ', 'DG', 'DZ']
+    assert ledger['document_role'].tolist() == [
+        'invoice', 'payment', 'payment', 'credit_memo', 'payment']
+
+
+def test_english_headers_against_a_turkish_layout_raise_missing_columns(tmp_path):
+    layout = dataclasses.replace(LAYOUT, headers=TURKISH_HEADERS)
+    with pytest.raises(ValueError, match='missing columns'):
+        read(tmp_path, five_lines(), layout=layout)
+
+
+def test_a_layout_with_the_header_on_row_3_reads_lines_from_row_4(tmp_path):
+    layout = dataclasses.replace(LAYOUT, header_row=3, first_data_row=4)
+    title_rows = (('CUSTOMER LINE ITEMS',), ('Extracted 28.08.2026',))
+    ledger = read(tmp_path, five_lines(), layout=layout, title_rows=title_rows)
+    assert ledger['source_row'].tolist() == [4, 5, 6, 7, 8]
+    other = tmp_path / 'plain'
+    other.mkdir()
+    plain = read(other, five_lines())
+    pd.testing.assert_frame_equal(ledger.drop(columns='source_row'),
+                                  plain.drop(columns='source_row'))
+
+
+def test_a_gap_between_header_and_first_data_row_skips_the_rows_between(tmp_path):
+    # Header on row 1, data from row 3: the row in between (e.g. a sub-header) is not read.
+    layout = dataclasses.replace(LAYOUT, header_row=1, first_data_row=3)
+    sub_header = ['(text)'] * len(LEDGER_HEADER)
+    ledger = read(tmp_path, [sub_header, invoice(), payment()], layout=layout)
+    assert ledger['source_row'].tolist() == [3, 4]
+    assert ledger['document_role'].tolist() == ['invoice', 'payment']
+
+
+def test_the_synthetic_rows_against_a_title_row_workbook_raise(tmp_path):
+    # The header is on row 2 but the layout says row 1: the title is taken as the header.
+    with pytest.raises(ValueError, match='missing columns'):
+        read(tmp_path, five_lines(), title_rows=(('CUSTOMER LINE ITEMS',),))
+
+
+def test_a_header_row_past_the_end_of_the_sheet_raises(tmp_path):
+    layout = dataclasses.replace(LAYOUT, header_row=50, first_data_row=51)
+    with pytest.raises(ValueError, match=r'no header row \(row 50\)'):
+        read(tmp_path, five_lines(), layout=layout)
+
+
+def test_read_ledger_does_not_modify_the_layout(tmp_path):
+    layout = LedgerLayout(header_row=1, first_data_row=2, headers=dict(SYNTHETIC_LEDGER_HEADERS),
+                          document_types={'invoice': ('RV',), 'payment': ('DZ',),
+                                          'credit_memo': ('DG',)})
+    read(tmp_path, five_lines(), layout=layout)
+    assert layout == LAYOUT
 
 
 # --- check_invoices_have_due_dates ---------------------------------------------------------
 
 def test_invoice_without_due_date_raises_with_count_and_rows():
-    table = frame(document_type=['RV', 'RV', 'DZ', 'RV'],
-                  net_due_date=pd.to_datetime([None, '2026-04-01', None, None]))
+    table = with_roles(document_type=['RV', 'RV', 'DZ', 'RV'],
+                       net_due_date=pd.to_datetime([None, '2026-04-01', None, None]))
     with pytest.raises(ValueError,
                        match=r'x\.xlsx: 2 invoices have no net due date \(first rows: \[2, 5\]\)'):
         check_invoices_have_due_dates(table, 'x.xlsx')
 
 
 def test_invoice_without_due_date_lists_at_most_five_rows():
-    table = frame(document_type=['RV'] * 7, net_due_date=pd.to_datetime([None] * 7))
+    table = with_roles(document_type=['RV'] * 7, net_due_date=pd.to_datetime([None] * 7))
     with pytest.raises(ValueError, match=r'7 invoices .*\[2, 3, 4, 5, 6\]\)'):
         check_invoices_have_due_dates(table, 'x.xlsx')
 
 
 def test_payment_and_credit_memo_without_due_date_are_fine():
-    table = frame(document_type=['RV', 'DZ', 'DG'],
-                  net_due_date=pd.to_datetime(['2026-04-01', None, None]))
+    table = with_roles(document_type=['RV', 'DZ', 'DG'],
+                       net_due_date=pd.to_datetime(['2026-04-01', None, None]))
     check_invoices_have_due_dates(table, 'x.xlsx')
+
+
+def test_the_due_date_check_reads_the_role_column_not_the_type():
+    # A line whose role is 'invoice' is checked whatever its code; an RV whose role is not
+    # 'invoice' is not.
+    table = frame(document_type=['DR', 'RV'], document_role=['invoice', 'credit_memo'],
+                  net_due_date=pd.to_datetime([None, None]))
+    with pytest.raises(ValueError, match=r'1 invoices have no net due date \(first rows: \[2\]\)'):
+        check_invoices_have_due_dates(table, 'x.xlsx')
+
+
+def test_the_due_date_check_needs_the_role_column():
+    table = frame(document_type=['RV'], net_due_date=pd.to_datetime([None]))
+    with pytest.raises(KeyError, match='document_role'):
+        check_invoices_have_due_dates(table, 'x.xlsx')
 
 
 def test_invoice_without_due_date_in_a_workbook_raises(tmp_path):
@@ -666,13 +1020,22 @@ LEDGER_FILE = (Path(__file__).resolve().parents[2] / 'data' / 'raw'
 def synthetic_ledger():
     if not LEDGER_FILE.exists():
         pytest.skip(f'{LEDGER_FILE.name} is not in data/raw')
-    return read_ledger(LEDGER_FILE, date(2026, 8, 28))
+    return read_ledger(LEDGER_FILE, date(2026, 8, 28), LAYOUT)
 
 
 def test_slow_synthetic_ledger_line_counts(synthetic_ledger):
     assert len(synthetic_ledger) == 75_100
     assert synthetic_ledger['document_type'].value_counts().to_dict() == {
         'RV': 37_808, 'DZ': 37_164, 'DG': 128}
+
+
+def test_slow_synthetic_ledger_document_role_counts(synthetic_ledger):
+    assert synthetic_ledger['document_role'].value_counts().to_dict() == {
+        'invoice': 37_808, 'payment': 37_164, 'credit_memo': 128}
+    assert synthetic_ledger['document_role'].dtype == object
+    pairs = synthetic_ledger.groupby(['document_type', 'document_role']).size().to_dict()
+    assert pairs == {('RV', 'invoice'): 37_808, ('DZ', 'payment'): 37_164,
+                     ('DG', 'credit_memo'): 128}
 
 
 def test_slow_synthetic_ledger_open_lines(synthetic_ledger):
@@ -685,14 +1048,14 @@ def test_slow_synthetic_ledger_posting_date_range(synthetic_ledger):
 
 
 def test_slow_synthetic_ledger_every_invoice_has_a_due_date(synthetic_ledger):
-    invoices = synthetic_ledger[synthetic_ledger['document_type'] == 'RV']
+    invoices = synthetic_ledger[synthetic_ledger['document_role'] == 'invoice']
     assert invoices['net_due_date'].notna().all()
 
 
 def test_slow_synthetic_ledger_shape_and_types(synthetic_ledger):
     assert list(synthetic_ledger.columns) == LEDGER_COLUMNS
     assert synthetic_ledger['source_row'].is_monotonic_increasing
-    assert synthetic_ledger['source_row'].iloc[0] == LEDGER_FIRST_DATA_ROW
+    assert synthetic_ledger['source_row'].iloc[0] == LAYOUT.first_data_row == 2
     for column in LEDGER_DATE_COLUMNS:
         assert pd.api.types.is_datetime64_any_dtype(synthetic_ledger[column]), column
 
