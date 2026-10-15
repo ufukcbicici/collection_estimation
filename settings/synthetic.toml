@@ -66,3 +66,4 @@ credit_memo = ["DG"]
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
+sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)

@@ -43,6 +43,7 @@ from collection_estimation.hurdle.settings import (
     read_ledger_layout,
     rows_setting,
     text_list_setting,
+    week_setting,
 )
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
@@ -121,7 +122,7 @@ VALID = {
         "headers": headers_toml(LEDGER_HEADERS),
         "document_types": inline(DOCUMENT_TYPES),
     },
-    "debug": {"one_day": "2025-06-02"},
+    "debug": {"one_day": "2025-06-02", "sample_week": "30"},
 }
 ALL_SECTIONS = list(VALID)
 
@@ -258,7 +259,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
 @pytest.mark.parametrize("part, attribute", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
-    ("debug", "one_day"), ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
+    ("debug", "one_day"), ("debug", "sample_week"), ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
     ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
     ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
@@ -375,7 +376,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
 @pytest.mark.parametrize("section, key", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
-    ("debug", "one_day"),
+    ("debug", "one_day"), ("debug", "sample_week"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -436,6 +437,49 @@ def test_a_path_that_is_not_text_or_is_blank_raises(tmp_path, repo, key, bad):
 ], ids=["string", "datetime", "midnight-datetime", "datetime-with-zone", "number", "time"])
 def test_a_date_that_is_not_a_toml_date_raises(tmp_path, repo, section, key, bad):
     raises_naming(tmp_path, repo, f"[{section}]", key, changes={(section, key): bad})
+
+
+# --- types: sample_week ----------------------------------------------------------------
+
+def test_sample_week_is_an_int(tmp_path, repo):
+    value = load(tmp_path, repo).debug.sample_week
+    assert type(value) is int
+    assert value == 30
+
+
+@pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("63", 63), ("1_000", 1000)])
+def test_sample_week_accepts_a_whole_number_of_0_or_more(tmp_path, repo, good, expected):
+    settings = load(tmp_path, repo, changes={("debug", "sample_week"): good})
+    assert settings.debug.sample_week == expected
+    assert type(settings.debug.sample_week) is int
+
+
+@pytest.mark.parametrize("bad", [
+    "-1", "-30", "1.5", "30.0", '"30"', "true", "false", "[30]", "2025-06-02", "{ week = 30 }",
+], ids=["minus-one", "negative", "fraction", "whole-float", "string", "true", "false", "list",
+        "date", "table"])
+def test_sample_week_that_is_not_a_week_number_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[debug]", "sample_week",
+                            changes={("debug", "sample_week"): bad})
+    assert "week number" in message
+
+
+def test_a_sample_week_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[debug]", "'sample_week'", "'sample_weak'",
+        changes={("debug", "sample_week"): REMOVE, ("debug", "sample_weak"): "30"})
+    assert "missing" in message and "unknown" in message
+
+
+def test_week_setting_accepts_zero_and_positive_ints():
+    assert week_setting({"w": 0}, "w", "here") == 0
+    assert week_setting({"w": 7}, "w", "here") == 7
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, 30.0, "30", True, False, None])
+def test_week_setting_rejects_non_week_values_naming_where_and_key(bad):
+    with pytest.raises(ValueError, match="here: w is"):
+        week_setting({"w": bad}, "w", "here")
 
 
 # --- types: known ----------------------------------------------------------------------
@@ -675,6 +719,8 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.data.ledger_as_of == date(2026, 8, 28)
     assert settings.companies.known == ("TR02", "TR04", "TR05", "TR06", "TR91")
     assert settings.debug.one_day == date(2025, 6, 2)
+    assert settings.debug.sample_week == 30
+    assert type(settings.debug.sample_week) is int
     assert settings.data.cache_folder.parts[-2:] == ("data", "interim")
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()

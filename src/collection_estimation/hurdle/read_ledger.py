@@ -118,6 +118,7 @@ def read_ledger(path: Path, as_of: date, layout: "LedgerLayout") -> pd.DataFrame
     ledger["document_role"] = document_roles(ledger["document_type"], layout.document_types,
                                              path.name)
     check_invoices_have_due_dates(ledger, path.name)
+    check_document_numbers_unique(ledger, path.name)
     check_nothing_after(ledger, as_of, path.name)
     return ledger
 
@@ -211,6 +212,30 @@ def check_invoices_have_due_dates(ledger: pd.DataFrame, file_name: str) -> None:
         first_rows = ledger.loc[no_due_date, "source_row"].head(5).tolist()
         raise ValueError(f"{file_name}: {no_due_date.sum()} invoices have no net due date "
                          f"(first rows: {first_rows})")
+
+
+def check_document_numbers_unique(ledger: pd.DataFrame, file_name: str) -> None:
+    """Raise ValueError if two invoices or credit memos of one company share a document number.
+
+    A payment names the document it pays by company and number, so that pair must point to
+    one document. It may not: SAP numbers documents per company AND fiscal year (a number can
+    come back in a later year), and one document can have several line items. The ledger as
+    read has neither the fiscal year nor the line item, so the code cannot tell these cases
+    apart; it stops and lists the lines, so that a person can decide (e.g. add the fiscal
+    year and line item to the ledger layout).
+    """
+    can_be_paid = ledger[ledger["document_role"].isin(["invoice", "credit_memo"])]
+    shared = can_be_paid[can_be_paid.duplicated(["company_code", "document_no"], keep=False)]
+    if not shared.empty:
+        groups = shared.groupby(["company_code", "document_no"]).ngroups
+        columns = ["company_code", "document_no", "document_role", "posting_date",
+                   "net_due_date", "amount_document", "source_row"]
+        first_lines = shared.sort_values(["company_code", "document_no", "source_row"])
+        raise ValueError(
+            f"{file_name}: {groups} document numbers are used by more than one invoice or "
+            f"credit memo of the same company, so payments cannot be matched to one document; "
+            f"the fiscal year and line item would tell them apart. First lines:\n"
+            f"{first_lines[columns].head(10).to_string(index=False)}")
 
 
 def check_nothing_after(ledger: pd.DataFrame, as_of: date, file_name: str) -> None:

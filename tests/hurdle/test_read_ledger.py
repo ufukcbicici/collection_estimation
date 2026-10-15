@@ -20,6 +20,7 @@ from collection_estimation.hurdle.read_ledger import (
     LEDGER_OPTIONAL_FIELDS,
     LEDGER_TEXT_COLUMNS,
     REQUIRED_TEXT,
+    check_document_numbers_unique,
     check_invoices_have_due_dates,
     check_nothing_after,
     date_or_none,
@@ -859,6 +860,257 @@ def test_lower_case_rv_without_due_date_is_still_caught(tmp_path):
         read(tmp_path, [line])
 
 
+# --- check_document_numbers_unique ---------------------------------------------------------
+
+SHARED_COLUMNS = ['company_code', 'document_no', 'document_role', 'posting_date',
+                  'net_due_date', 'amount_document', 'source_row']
+SHARED_INTRO = (' document numbers are used by more than one invoice or credit memo of the '
+                'same company, so payments cannot be matched to one document; the fiscal year '
+                'and line item would tell them apart. First lines:\n')
+
+
+def numbered(*lines):
+    """A ledger-like table from (company, number, role) triples; source rows from 2.
+
+    Each line gets its own posting date, due date and amount so the listed table shows which
+    line is which.
+    """
+    count = len(lines)
+    return pd.DataFrame({
+        'company_code': [company for company, _, _ in lines],
+        'document_no': [number for _, number, _ in lines],
+        'document_role': pd.Series([role for _, _, role in lines], dtype=object),
+        'posting_date': pd.to_datetime([f'2025-03-{day:02d}' for day in range(1, count + 1)]),
+        'net_due_date': pd.to_datetime([f'2025-04-{day:02d}' for day in range(1, count + 1)]),
+        'amount_document': [100.0 * (position + 1) for position in range(count)],
+        'source_row': list(range(2, 2 + count)),
+    })
+
+
+def expected_message(file_name, groups, table, rows):
+    """The message the check should give, listing `rows` (source rows, in listed order)."""
+    listed = table.set_index('source_row', drop=False).loc[rows, SHARED_COLUMNS]
+    return f'{file_name}: {groups}{SHARED_INTRO}{listed.to_string(index=False)}'
+
+
+def message_of(table, file_name='x.xlsx'):
+    with pytest.raises(ValueError) as error:
+        check_document_numbers_unique(table, file_name)
+    return str(error.value)
+
+
+def listed_rows(message):
+    """The source rows in the table of the message (its last column), in listed order."""
+    table_lines = message.split('First lines:\n', 1)[1].splitlines()
+    return [int(text.split()[-1]) for text in table_lines[1:]]
+
+
+def test_two_invoices_of_one_company_with_one_number_raise():
+    table = numbered(('TR02', '9000000001', 'invoice'), ('TR02', '9000000001', 'invoice'))
+    assert message_of(table) == expected_message('x.xlsx', 1, table, [2, 3])
+
+
+def test_an_invoice_and_a_credit_memo_with_one_number_raise():
+    table = numbered(('TR02', '9000000001', 'invoice'), ('TR02', '9000000001', 'credit_memo'))
+    message = message_of(table)
+    assert message == expected_message('x.xlsx', 1, table, [2, 3])
+    assert 'credit_memo' in message
+
+
+def test_two_credit_memos_with_one_number_raise():
+    table = numbered(('TR02', '9100000001', 'credit_memo'), ('TR02', '9100000001', 'credit_memo'))
+    assert message_of(table).startswith('x.xlsx: 1 document numbers')
+
+
+def test_the_same_number_in_two_companies_is_fine():
+    table = numbered(('TR01', '9000000001', 'invoice'), ('TR02', '9000000001', 'invoice'),
+                     ('TR03', '9000000001', 'credit_memo'))
+    check_document_numbers_unique(table, 'x.xlsx')
+
+
+def test_payments_sharing_a_number_with_each_other_are_fine():
+    table = numbered(('TR02', '1400000001', 'payment'), ('TR02', '1400000001', 'payment'),
+                     ('TR02', '1400000001', 'payment'))
+    check_document_numbers_unique(table, 'x.xlsx')
+
+
+def test_a_payment_sharing_a_number_with_an_invoice_is_fine():
+    table = numbered(('TR02', '9000000001', 'invoice'), ('TR02', '9000000001', 'payment'),
+                     ('TR02', '9100000001', 'credit_memo'), ('TR02', '9100000001', 'payment'))
+    check_document_numbers_unique(table, 'x.xlsx')
+
+
+def test_a_payment_with_the_shared_number_is_not_listed():
+    table = numbered(('TR02', '9000000001', 'invoice'), ('TR02', '9000000001', 'payment'),
+                     ('TR02', '9000000001', 'invoice'))
+    message = message_of(table)
+    assert message == expected_message('x.xlsx', 1, table, [2, 4])
+    assert 'payment' not in message.split('First lines:\n', 1)[1]
+
+
+def test_n_counts_the_shared_pairs():
+    table = numbered(('TR02', '1', 'invoice'), ('TR02', '2', 'invoice'),
+                     ('TR02', '1', 'invoice'), ('TR02', '2', 'credit_memo'),
+                     ('TR02', '3', 'invoice'))
+    message = message_of(table)
+    assert message.startswith('x.xlsx: 2 document numbers')
+    assert message == expected_message('x.xlsx', 2, table, [2, 4, 3, 5])
+
+
+def test_one_number_shared_in_two_companies_counts_twice():
+    # (TR01, 1) and (TR02, 1) are two pairs, even though the number is the same.
+    table = numbered(('TR01', '1', 'invoice'), ('TR02', '1', 'invoice'),
+                     ('TR01', '1', 'invoice'), ('TR02', '1', 'invoice'))
+    assert message_of(table) == expected_message('x.xlsx', 2, table, [2, 4, 3, 5])
+
+
+def test_a_triple_counts_as_one_pair_and_lists_all_three_lines():
+    table = numbered(('TR02', '7', 'invoice'), ('TR02', '7', 'credit_memo'),
+                     ('TR02', '7', 'invoice'))
+    message = message_of(table)
+    assert message.startswith('x.xlsx: 1 document numbers')
+    assert listed_rows(message) == [2, 3, 4]
+    assert message == expected_message('x.xlsx', 1, table, [2, 3, 4])
+
+
+def test_more_than_ten_shared_lines_lists_only_ten():
+    lines = [('TR02', str(number), 'invoice') for number in range(1, 7) for _ in range(2)]
+    table = numbered(*lines)  # 6 pairs, 12 lines
+    message = message_of(table)
+    assert message.startswith('x.xlsx: 6 document numbers')
+    rows = listed_rows(message)
+    assert rows == list(range(2, 12))
+    assert len(message.split('First lines:\n', 1)[1].splitlines()) == 1 + 10  # header + 10
+    assert message == expected_message('x.xlsx', 6, table, rows)
+
+
+def test_exactly_ten_shared_lines_lists_all_ten():
+    lines = [('TR02', str(number), 'invoice') for number in range(1, 6) for _ in range(2)]
+    assert listed_rows(message_of(numbered(*lines))) == list(range(2, 12))
+
+
+def test_only_the_shared_lines_are_listed():
+    table = numbered(('TR02', '1', 'invoice'), ('TR02', '2', 'invoice'),
+                     ('TR01', '1', 'invoice'), ('TR02', '1', 'credit_memo'),
+                     ('TR02', '3', 'credit_memo'), ('TR02', '2', 'payment'))
+    message = message_of(table)
+    assert listed_rows(message) == [2, 5]
+    assert message == expected_message('x.xlsx', 1, table, [2, 5])
+
+
+def test_listed_lines_are_sorted_by_company_number_and_source_row():
+    # Sheet order is scrambled; the list is company, then number, then source row.
+    table = numbered(('TR02', 'B', 'invoice'), ('TR01', 'Z', 'invoice'),
+                     ('TR02', 'A', 'invoice'), ('TR02', 'B', 'credit_memo'),
+                     ('TR01', 'Z', 'invoice'), ('TR02', 'A', 'invoice'))
+    message = message_of(table)
+    # TR01 Z (rows 3, 6), TR02 A (rows 4, 7), TR02 B (rows 2, 5)
+    assert listed_rows(message) == [3, 6, 4, 7, 2, 5]
+    assert message == expected_message('x.xlsx', 3, table, [3, 6, 4, 7, 2, 5])
+
+
+def test_sorting_follows_source_row_not_the_table_order():
+    table = numbered(('TR02', '1', 'invoice'), ('TR02', '1', 'invoice'))
+    reversed_table = table.iloc[::-1]
+    assert listed_rows(message_of(reversed_table)) == [2, 3]
+
+
+def test_no_error_when_all_numbers_are_distinct():
+    table = numbered(('TR02', '1', 'invoice'), ('TR02', '2', 'invoice'),
+                     ('TR02', '3', 'credit_memo'), ('TR01', '4', 'invoice'))
+    check_document_numbers_unique(table, 'x.xlsx')
+
+
+def test_an_empty_ledger_passes():
+    check_document_numbers_unique(numbered(), 'x.xlsx')
+
+
+def test_the_check_does_not_modify_its_input():
+    table = numbered(('TR02', 'B', 'invoice'), ('TR02', 'A', 'payment'),
+                     ('TR02', 'B', 'credit_memo'))
+    before = table.copy(deep=True)
+    message_of(table)
+    pd.testing.assert_frame_equal(table, before)
+    passing = numbered(('TR02', 'B', 'invoice'), ('TR02', 'A', 'payment'))
+    before = passing.copy(deep=True)
+    check_document_numbers_unique(passing, 'x.xlsx')
+    pd.testing.assert_frame_equal(passing, before)
+
+
+def test_the_file_name_starts_the_message():
+    table = numbered(('TR02', '1', 'invoice'), ('TR02', '1', 'invoice'))
+    assert message_of(table, 'ledger 2026.xlsx').startswith('ledger 2026.xlsx: 1 document numbers')
+
+
+# --- check_document_numbers_unique through read_ledger -------------------------------------
+
+def test_a_number_reused_a_year_later_in_a_workbook_raises(tmp_path):
+    lines = [invoice('9000000001', posted=datetime(2025, 3, 2), due=datetime(2025, 4, 1)),
+             payment(posted=datetime(2025, 3, 20)),
+             invoice('9000000001', amount=750.0, posted=datetime(2026, 3, 2),
+                     due=datetime(2026, 4, 1))]
+    with pytest.raises(ValueError) as error:
+        read(tmp_path, lines)
+    message = str(error.value)
+    expected = pd.DataFrame({
+        'company_code': ['TR02', 'TR02'],
+        'document_no': ['9000000001', '9000000001'],
+        'document_role': ['invoice', 'invoice'],
+        'posting_date': pd.to_datetime(['2025-03-02', '2026-03-02']),
+        'net_due_date': pd.to_datetime(['2025-04-01', '2026-04-01']),
+        'amount_document': [1000.0, 750.0],
+        'source_row': [2, 4],
+    })
+    assert message == (f'SYNTHETIC_ledger.xlsx: 1{SHARED_INTRO}'
+                       f'{expected.to_string(index=False)}')
+
+
+def test_an_invoice_and_a_credit_memo_with_one_number_in_a_workbook_raise(tmp_path):
+    lines = [invoice('9000000001'), credit_memo('9000000001')]
+    with pytest.raises(ValueError, match=r'SYNTHETIC_ledger\.xlsx: 1 document numbers are used'):
+        read(tmp_path, lines)
+
+
+def test_the_same_number_in_two_companies_in_a_workbook_is_fine(tmp_path):
+    lines = [invoice('9000000001', company='TR01'), invoice('9000000001', company='TR02')]
+    assert len(read(tmp_path, lines)) == 2
+
+
+def test_payments_sharing_numbers_in_a_workbook_are_fine(tmp_path):
+    lines = [invoice('9000000001'), payment('9000000001'), payment('1400000001'),
+             payment('1400000001'), unapplied_payment('1400000001')]
+    assert read(tmp_path, lines)['document_role'].tolist() == [
+        'invoice', 'payment', 'payment', 'payment', 'payment']
+
+
+def test_the_check_follows_the_role_in_a_workbook(tmp_path):
+    # Two DR lines with one number: DR is an invoice code in this layout, so they are caught.
+    lines = [invoice('9000000001'), invoice('9000000001')]
+    for row in lines:
+        row['Document Type'] = 'DR'
+    with pytest.raises(ValueError, match='1 document numbers'):
+        read(tmp_path, lines, layout=with_types(invoice=('DR',)))
+
+
+def test_the_five_lines_pass_the_check(tmp_path):
+    assert len(read(tmp_path, five_lines())) == 5
+
+
+def test_the_due_date_check_runs_before_the_number_check(tmp_path):
+    first = invoice('9000000001')
+    first['Net Due Date'] = None
+    lines = [first, invoice('9000000001')]
+    with pytest.raises(ValueError, match='invoices have no net due date'):
+        read(tmp_path, lines)
+
+
+def test_the_number_check_runs_before_the_extract_date_check(tmp_path):
+    lines = [invoice('9000000001'), invoice('9000000001', posted=datetime(2026, 9, 1),
+                                            due=datetime(2026, 10, 1))]
+    with pytest.raises(ValueError, match='1 document numbers'):
+        read(tmp_path, lines)
+
+
 # --- check_nothing_after -------------------------------------------------------------------
 
 def dated(posting, clearing):
@@ -1058,6 +1310,14 @@ def test_slow_synthetic_ledger_shape_and_types(synthetic_ledger):
     assert synthetic_ledger['source_row'].iloc[0] == LAYOUT.first_data_row == 2
     for column in LEDGER_DATE_COLUMNS:
         assert pd.api.types.is_datetime64_any_dtype(synthetic_ledger[column]), column
+
+
+def test_slow_synthetic_ledger_has_no_shared_document_numbers(synthetic_ledger):
+    # read_ledger already ran the check; run it again on the table and confirm directly.
+    check_document_numbers_unique(synthetic_ledger, LEDGER_FILE.name)
+    can_be_paid = synthetic_ledger[
+        synthetic_ledger['document_role'].isin(['invoice', 'credit_memo'])]
+    assert not can_be_paid.duplicated(['company_code', 'document_no']).any()
 
 
 def test_slow_synthetic_ledger_earlier_as_of_raises(synthetic_ledger):

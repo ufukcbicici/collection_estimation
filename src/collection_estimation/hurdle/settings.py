@@ -32,6 +32,7 @@ class CompanySettings:
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
+    sample_week: int      # the week step 7 shows in detail (0 = the week of the first file)
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     companies = raw["companies"]
     check_keys(companies, {"known"}, f"{name} [companies]")
     debug = raw["debug"]
-    check_keys(debug, {"one_day"}, f"{name} [debug]")
+    check_keys(debug, {"one_day", "sample_week"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
     check_keys(collections_layout,
                {"file_name_date_format", "header_row", "first_data_row", "headers"},
@@ -110,6 +111,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         ledger_layout=read_ledger_layout(ledger_layout, f"{name} [ledger_layout]"),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
+            sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
         ),
     )
 
@@ -290,3 +292,12 @@ def document_types_setting(table: dict, key: str, where: str) -> dict[str, tuple
             role_of_code[code] = role
         roles[role] = codes
     return roles
+
+
+def week_setting(table: dict, key: str, where: str) -> int:
+    """A week number: a whole number, 0 or more (0 is the week of the first daily file)."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{where}: {key} is {value!r}, not a week number (0 or more)")
+    return value

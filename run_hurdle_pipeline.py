@@ -11,11 +11,12 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     3  collections     the payment lines of every file             (U0)   <- built
     4  keys            company + customer as one key               (U1)   <- built
     5  weekly series   receipts per key and week, missing weeks    (U2)   <- built
-    6  AR ledger       the ledger lines (U9a); open invoices as known at each week (U9b)
-    7  panel           rows customer x week x horizon, with labels (U3, U4, U5)
-    8  features        history, calendar, inflation, receivables   (U6-U9c)
-    9  models          stage 1, stage 2, top-ups                   (U10-U12)
-   10  forecast, evaluation, calibration                           (U13-U15)
+    6  AR ledger       the ledger lines and their tie to the daily files (U9a)   <- built
+    7  receivables     each key's receivables as known at each week (U9b)    <- in progress
+    8  panel           rows customer x week x horizon, with labels (U3, U4, U5)
+    9  features        history, calendar, inflation, receivables   (U6-U9c)
+   10  models          stage 1, stage 2, top-ups                   (U10-U12)
+   11  forecast, evaluation, calibration                           (U13-U15)
 
 The settings (data paths, company codes, ...) are in settings/synthetic.toml. To run on
 other data (e.g. the real EY files), write another settings file and point the environment
@@ -35,6 +36,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 # Customer names are Turkish; a Windows console would otherwise crash printing "İ".
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import pandas as pd  # noqa: E402
+
 from collection_estimation.hurdle.read_collections import (  # noqa: E402
     list_daily_files,
     load_collections,
@@ -42,6 +45,11 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
 )
 from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
+from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
+    exchange_rates,
+    open_invoices_at,
+    rates_known_at,
+)
 from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
     load_ledger,
@@ -119,7 +127,23 @@ def main():
     tie = check_ledger_against_collections(ledger, collections, list(daily_files))
     show_tie(tie)
 
-    # Step 6 continues, and later steps follow, as each unit is built.
+    # Step 7: receivables as known at each week. Built unit by unit; for now, the exchange
+    # rates (TRY per unit of each foreign currency, per day) from the daily files and ledger.
+    rates = exchange_rates(collections, ledger)
+    show_rates(rates)
+    # The rates known at the end of week 0 (its Sunday): the last rate on or before that day.
+    end_of_week_0 = week_zero + timedelta(days=6)
+    print(f"        rates known at the end of week 0 ({end_of_week_0}): "
+          f"{ {currency: round(rate, 2) for currency, rate in rates_known_at(rates, end_of_week_0).items()} }")
+
+    # The invoices open at the end of the sample week (settings: [debug] sample_week), as
+    # the ledger showed them then.
+    sample_week = settings.debug.sample_week
+    end_of_sample_week = week_zero + timedelta(days=7 * sample_week + 6)
+    open_invoices = open_invoices_at(ledger, end_of_sample_week)
+    show_open_invoices(open_invoices, sample_week, end_of_sample_week)
+
+    # Step 7 continues, and later steps follow, as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -186,6 +210,27 @@ def show_tie(tie):
           f"{tie['missing_file_days_in_ledger']} missing-file days "
           f"({tie['try_on_missing_file_days']:,.2f} TRY) and {tie['days_after_last_file']} days "
           f"after the last file ({tie['try_after_last_file']:,.2f} TRY)")
+
+
+def show_rates(rates):
+    """A short printout of the exchange rates."""
+    print(f"Step 7: exchange rates for {rates['currency'].nunique()} currencies:")
+    for currency, rows in rates.groupby("currency"):
+        print(f"          {currency}: {len(rows)} days from {rows['day'].min()} to "
+              f"{rows['day'].max()}, {rows['rate'].min():.2f} to {rows['rate'].max():.2f} TRY")
+
+
+def show_open_invoices(open_invoices, week, cutoff):
+    """A short printout of the invoices open at one week."""
+    partly_paid = (open_invoices["paid"] > 0).sum()
+    overdue = (open_invoices["net_due_date"] < pd.Timestamp(cutoff)).sum()
+    print(f"        open invoices at the end of week {week} ({cutoff}): {len(open_invoices):,} "
+          f"({partly_paid:,} partly paid, {overdue:,} overdue), for "
+          f"{open_invoices['key'].nunique():,} keys")
+    per_currency = open_invoices.groupby("currency")["outstanding"].sum()
+    print(f"        outstanding per currency: "
+          f"{ {currency: round(amount) for currency, amount in per_currency.items()} }")
+    print(open_invoices.drop(columns=["key", "customer_id"]).head(3).to_string())
 
 
 if __name__ == "__main__":
