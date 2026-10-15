@@ -67,6 +67,9 @@ credit_memo = ["DG"]
 [receivables]
 # How each customer's receivables are summarised from the AR ledger.
 min_cleared_for_delay = 3       # fewer cleared invoices: the usual delay is unknown (NaN)
+horizons = 5                    # the "due in week t+1 ... t+5" columns
+leak_check_weeks = [0, 16, 32, 48]  # rebuilt from a ledger cut off at the week and compared;
+                                    # spread over the history (the last week proves little)
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

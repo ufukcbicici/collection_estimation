@@ -45,6 +45,7 @@ from collection_estimation.hurdle.settings import (
     read_ledger_layout,
     rows_setting,
     text_list_setting,
+    week_list_setting,
     week_setting,
 )
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
@@ -124,7 +125,8 @@ VALID = {
         "headers": headers_toml(LEDGER_HEADERS),
         "document_types": inline(DOCUMENT_TYPES),
     },
-    "receivables": {"min_cleared_for_delay": "3"},
+    "receivables": {"min_cleared_for_delay": "3", "horizons": "5",
+                    "leak_check_weeks": "[0, 30]"},
     "debug": {"one_day": "2025-06-02", "sample_week": "30"},
 }
 ALL_SECTIONS = list(VALID)
@@ -268,7 +270,8 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
     ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
-    ("receivables", "min_cleared_for_delay"),
+    ("receivables", "min_cleared_for_delay"), ("receivables", "horizons"),
+    ("receivables", "leak_check_weeks"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -383,6 +386,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
     ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
+    ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -531,6 +535,108 @@ def test_a_min_cleared_for_delay_typo_names_the_missing_and_the_unknown_setting(
         changes={("receivables", "min_cleared_for_delay"): REMOVE,
                  ("receivables", "min_clear_for_delay"): "3"})
     assert "missing" in message and "unknown" in message
+
+
+# --- types: horizons (count_setting) ------------------------------------------------------
+
+def test_horizons_is_read_as_an_int(tmp_path, repo):
+    value = load(tmp_path, repo).receivables.horizons
+    assert value == 5
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("good, expected", [("1", 1), ("3", 3), ("13", 13)])
+def test_horizons_accepts_a_whole_number_of_1_or_more(tmp_path, repo, good, expected):
+    settings = load(tmp_path, repo, changes={("receivables", "horizons"): good})
+    assert settings.receivables.horizons == expected
+    assert type(settings.receivables.horizons) is int
+
+
+@pytest.mark.parametrize("bad", [
+    "0", "-1", "1.5", "5.0", '"5"', "true", "false", "[5]",
+], ids=["zero", "minus-one", "fraction", "whole-float", "string", "true", "false", "list"])
+def test_horizons_that_is_not_a_count_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[receivables]", "horizons",
+                            changes={("receivables", "horizons"): bad})
+    assert "1 or more" in message
+
+
+def test_horizons_does_not_borrow_min_cleared_for_delay(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("receivables", "horizons"): "2",
+                                             ("receivables", "min_cleared_for_delay"): "7"})
+    assert settings.receivables.horizons == 2
+    assert settings.receivables.min_cleared_for_delay == 7
+
+
+def test_a_missing_horizons_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[receivables]", "horizons",
+                            changes={("receivables", "horizons"): REMOVE})
+    assert "missing" in message
+
+
+def test_a_horizons_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[receivables]", "'horizons'", "'horizon'",
+        changes={("receivables", "horizons"): REMOVE, ("receivables", "horizon"): "5"})
+    assert "missing" in message and "unknown" in message
+
+
+# --- types: leak_check_weeks (week_list_setting) ------------------------------------------
+
+def test_leak_check_weeks_is_read_as_a_tuple_of_ints_in_file_order(tmp_path, repo):
+    value = load(tmp_path, repo).receivables.leak_check_weeks
+    assert value == (0, 30)
+    assert type(value) is tuple
+    assert all(type(week) is int for week in value)
+
+
+@pytest.mark.parametrize("good, expected", [
+    ("[]", ()), ("[0]", (0,)), ("[0, 30]", (0, 30)), ("[64, 0, 30]", (64, 0, 30)),
+], ids=["empty", "zero", "two", "unsorted-kept-in-order"])
+def test_leak_check_weeks_accepts_distinct_week_numbers(tmp_path, repo, good, expected):
+    settings = load(tmp_path, repo, changes={("receivables", "leak_check_weeks"): good})
+    assert settings.receivables.leak_check_weeks == expected
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("[-1]", "-1"), ("[0, 1.5]", "1.5"), ('["3"]', "'3'"), ("[true]", "True"),
+    ("[0, false]", "False"), ("[[3]]", "[3]"),
+], ids=["minus-one", "fraction", "string", "true", "false", "nested-list"])
+def test_leak_check_weeks_with_a_non_week_item_raises_naming_it(tmp_path, repo, bad, shown):
+    message = raises_naming(tmp_path, repo, "[receivables]", "leak_check_weeks", shown,
+                            changes={("receivables", "leak_check_weeks"): bad})
+    assert "0 or more" in message
+
+
+@pytest.mark.parametrize("bad", ["3", '"0, 30"', "true", "{ a = 1 }"],
+                         ids=["int", "string", "bool", "table"])
+def test_leak_check_weeks_that_is_not_a_list_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[receivables]", "leak_check_weeks",
+                            changes={("receivables", "leak_check_weeks"): bad})
+    assert "not a list" in message
+
+
+def test_leak_check_weeks_with_duplicates_raises_naming_them(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[receivables]", "leak_check_weeks", "[0, 30]",
+                            changes={("receivables", "leak_check_weeks"): "[30, 0, 30, 5, 0]"})
+    assert "more than once" in message
+
+
+def test_a_missing_leak_check_weeks_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[receivables]", "leak_check_weeks",
+                            changes={("receivables", "leak_check_weeks"): REMOVE})
+    assert "missing" in message
+
+
+def test_week_list_setting_direct_calls():
+    assert week_list_setting({"w": []}, "w", "here") == ()
+    assert week_list_setting({"w": [3, 0]}, "w", "here") == (3, 0)
+    with pytest.raises(ValueError, match="here: w holds True"):
+        week_list_setting({"w": [True]}, "w", "here")
+    with pytest.raises(ValueError, match="here: w is"):
+        week_list_setting({"w": (0, 1)}, "w", "here")
+    with pytest.raises(ValueError, match=r"here: w lists \[2\] more than once"):
+        week_list_setting({"w": [2, 2]}, "w", "here")
 
 
 def test_count_setting_accepts_one_and_more():
@@ -792,6 +898,10 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert type(settings.debug.sample_week) is int
     assert settings.receivables.min_cleared_for_delay == 3
     assert type(settings.receivables.min_cleared_for_delay) is int
+    assert settings.receivables.horizons == 5
+    assert type(settings.receivables.horizons) is int
+    assert settings.receivables.leak_check_weeks == (0, 16, 32, 48)
+    assert type(settings.receivables.leak_check_weeks) is tuple
     assert settings.data.cache_folder.parts[-2:] == ("data", "interim")
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()

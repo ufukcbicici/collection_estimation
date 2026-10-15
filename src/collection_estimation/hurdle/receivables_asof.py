@@ -4,9 +4,11 @@ Only ledger lines posted by the end of week t are used for week t, so every numb
 that was known at the time. Amounts owed in a foreign currency are worked out in that
 currency and converted to TRY at the last exchange rate known at t.
 """
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
+
+from .series import week_numbers
 
 # The local currency: amounts in it need no conversion.
 LOCAL_CURRENCY = "TRY"
@@ -20,6 +22,9 @@ NOTHING_LEFT = 0.005
 
 # The columns of the table `payment_delays_at` returns, in order.
 DELAY_COLUMNS = ["key", "usual_delay_days", "cleared_invoices"]
+
+# Per-key totals must add up to the open invoices' total within this (TRY).
+TIE_OUT_TOLERANCE = 0.01
 
 
 def exchange_rates(collections: pd.DataFrame, ledger: pd.DataFrame) -> pd.DataFrame:
@@ -192,3 +197,212 @@ def payment_delays_at(ledger: pd.DataFrame, cutoff: date, min_cleared: int) -> p
     too_few = per_key["cleared_invoices"] < min_cleared
     per_key.loc[too_few, "usual_delay_days"] = float("nan")
     return per_key[DELAY_COLUMNS]
+
+
+def due_in_week_columns(horizons: int) -> list[str]:
+    """['due_in_week_1', ..., 'due_in_week_<horizons>']."""
+    return [f"due_in_week_{h}" for h in range(1, horizons + 1)]
+
+
+def receivables_columns(horizons: int) -> list[str]:
+    """The columns of the table `receivables_at` returns, in order."""
+    return (["key", "week"] + due_in_week_columns(horizons)
+            + ["due_later", "overdue", "overdue_days", "open_invoices", "unapplied_cash",
+               "open_balance", "usual_delay_days", "cleared_invoices"])
+
+
+def receivables_at(ledger: pd.DataFrame, week: int, week_zero: date, rates: pd.DataFrame,
+                   horizons: int, min_cleared: int) -> pd.DataFrame:
+    """Each customer's receivables at the end of `week` (its Sunday), as the ledger showed them.
+
+    One row per key with at least one ledger line posted by then. Amounts are in TRY at the
+    rates known at the end of the week. Columns (see `receivables_columns`):
+    - due_in_week_1 ... due_in_week_<horizons>: outstanding on open invoices due in that week
+      ahead; due_later: due after the last of them; overdue: due on or before the end of
+      `week`; overdue_days: the amount-weighted average days past due (0 if none);
+      open_invoices: how many are open. These add up to the open invoices' outstanding total.
+    - unapplied_cash: open payments not yet matched to an invoice (a positive amount);
+      open_balance: the sum of all the customer's open lines (what it really owes).
+    - usual_delay_days, cleared_invoices: from `payment_delays_at`.
+    """
+    cutoff = end_of_week(week_zero, week)
+    rates_at_cutoff = rates_known_at(rates, cutoff)
+
+    invoices = open_invoices_at(ledger, cutoff)
+    invoices["outstanding_try"] = to_try(invoices["outstanding"], invoices["currency"],
+                                         rates_at_cutoff, cutoff)
+    buckets = due_buckets(invoices, week, week_zero, cutoff, horizons)
+    balances = open_lines_at(ledger, cutoff, rates_at_cutoff)
+    delays = payment_delays_at(ledger, cutoff, min_cleared)
+
+    posted_by_cutoff = ledger[ledger["posting_date"] <= pd.Timestamp(cutoff)]
+    # dtype=object keeps the column as text even when no key is known yet (an empty list
+    # would otherwise become a column of numbers, which cannot be merged with text keys).
+    keys = pd.Series(sorted(posted_by_cutoff["key"].unique()), dtype=object)
+    table = pd.DataFrame({"key": keys})
+    table["week"] = week
+    for part in (buckets, balances, delays):
+        table = table.merge(part, on="key", how="left")
+
+    # A key with nothing open, or no cleared invoice yet, gets zeros; its usual delay stays NaN.
+    amounts = due_in_week_columns(horizons) + ["due_later", "overdue", "overdue_days",
+                                               "unapplied_cash", "open_balance"]
+    table[amounts] = table[amounts].fillna(0.0)
+    for count in ("open_invoices", "cleared_invoices"):
+        table[count] = table[count].fillna(0).astype("int64")
+    table["week"] = table["week"].astype("int64")
+    return table[receivables_columns(horizons)]
+
+
+def to_try(amounts: pd.Series, currencies: pd.Series, rates_at_cutoff: dict[str, float],
+           cutoff: date) -> pd.Series:
+    """`amounts` converted to TRY at `rates_at_cutoff` (from `rates_known_at`).
+
+    Raises ValueError naming any currency that has no rate known at `cutoff`, rather than
+    guessing one.
+    """
+    codes = currencies.map(normalise_currency)
+    if codes.isna().any():
+        raise ValueError(f"{codes.isna().sum()} amounts to convert at {cutoff} have no currency")
+    no_rate = sorted(set(codes) - set(rates_at_cutoff))
+    if no_rate:
+        raise ValueError(f"no exchange rate known on or before {cutoff} for {no_rate}")
+    return amounts * codes.map(rates_at_cutoff)
+
+
+def due_buckets(invoices: pd.DataFrame, week: int, week_zero: date, cutoff: date,
+                horizons: int) -> pd.DataFrame:
+    """Per key, the open invoices' outstanding TRY split by when it is due.
+
+    `invoices` is `open_invoices_at` with an `outstanding_try` column. An invoice due in week
+    t+h (h = 1 ... horizons) goes to due_in_week_<h>; due later, to due_later; due on or
+    before the end of week t, to overdue. Raises ValueError if the parts of a key do not add
+    up to its total (no invoice may be lost or counted twice).
+    """
+    no_due_date = invoices["net_due_date"].isna()
+    if no_due_date.any():
+        raise ValueError(f"at {cutoff}, {no_due_date.sum()} open invoices have no net due date "
+                         f"(first: {invoices.loc[no_due_date, 'document_no'].head(5).tolist()})")
+    weeks_ahead = week_numbers(invoices["net_due_date"], week_zero) - week
+    amount = invoices["outstanding_try"]
+    is_overdue = weeks_ahead <= 0
+    days_past_due = (pd.Timestamp(cutoff) - invoices["net_due_date"]).dt.days
+
+    parts = pd.DataFrame({"key": invoices["key"], "total": amount})
+    for h, column in enumerate(due_in_week_columns(horizons), start=1):
+        parts[column] = amount.where(weeks_ahead == h, 0.0)
+    parts["due_later"] = amount.where(weeks_ahead > horizons, 0.0)
+    parts["overdue"] = amount.where(is_overdue, 0.0)
+    parts["overdue_amount_x_days"] = (amount * days_past_due).where(is_overdue, 0.0)
+    parts["open_invoices"] = 1
+
+    per_key = parts.groupby("key", as_index=False).sum()
+    # The amount-weighted average days past due; 0 for a key with nothing overdue.
+    has_overdue = per_key["overdue"] > 0
+    per_key["overdue_days"] = 0.0
+    per_key.loc[has_overdue, "overdue_days"] = (per_key.loc[has_overdue, "overdue_amount_x_days"]
+                                                / per_key.loc[has_overdue, "overdue"])
+
+    columns = due_in_week_columns(horizons) + ["due_later", "overdue"]
+    differs = (per_key[columns].sum(axis=1) - per_key["total"]).abs() > TIE_OUT_TOLERANCE
+    if differs.any():
+        raise ValueError(f"at {cutoff}, the due-date split does not add up to the open "
+                         f"invoices' total for {differs.sum()} keys "
+                         f"(first: {per_key.loc[differs, 'key'].head(5).tolist()})")
+    return per_key[["key"] + columns + ["overdue_days", "open_invoices"]]
+
+
+def open_lines_at(ledger: pd.DataFrame, cutoff: date,
+                  rates_at_cutoff: dict[str, float]) -> pd.DataFrame:
+    """Per key, in TRY at `rates_at_cutoff`: open_balance (the sum of every line open at the
+    end of `cutoff`: invoices, their partial payments, unapplied cash, credit memos, refunds)
+    and unapplied_cash (open payments with no invoice reference, as a positive amount).
+
+    A line is open at `cutoff` if it was posted by then and not cleared by then.
+    """
+    cutoff_day = pd.Timestamp(cutoff)
+    known = ledger[ledger["posting_date"] <= cutoff_day]
+    is_open = known["clearing_date"].isna() | (known["clearing_date"] > cutoff_day)
+    open_lines = known[is_open]
+
+    amount_try = to_try(open_lines["amount_document"], open_lines["document_currency"],
+                        rates_at_cutoff, cutoff)
+    is_unapplied = ((open_lines["document_role"] == "payment")
+                    & open_lines["invoice_reference"].isna())
+    parts = pd.DataFrame({
+        "key": open_lines["key"],
+        "open_balance": amount_try,
+        # A payment is negative in the ledger; unapplied cash is kept as a positive amount.
+        "unapplied_cash": (-amount_try).where(is_unapplied, 0.0),
+    })
+    return parts.groupby("key", as_index=False).sum()[["key", "unapplied_cash", "open_balance"]]
+
+
+def end_of_week(week_zero: date, week: int) -> date:
+    """The Sunday that ends `week` (weeks run Monday to Sunday from the Monday `week_zero`)."""
+    return week_zero + timedelta(days=7 * week + 6)
+
+
+def receivables_by_week(ledger: pd.DataFrame, rates: pd.DataFrame, week_zero: date,
+                        last_week: int, as_of: date, horizons: int, min_cleared: int,
+                        leak_check_weeks: tuple[int, ...]) -> pd.DataFrame:
+    """`receivables_at` for every week from 0 to `last_week`, in one table (key x week).
+
+    `as_of` is the date the ledger was extracted. The last week may end a few days after it
+    (e.g. on the weekend), but must start on or before it: otherwise the ledger is older
+    than the weeks asked for, and their receivables would be incomplete, so this raises.
+    Each week in `leak_check_weeks` is then rebuilt from a ledger cut off at that week (see
+    `check_no_leak`); a difference raises.
+    """
+    last_monday = week_zero + timedelta(days=7 * last_week)
+    if last_monday > as_of:
+        raise ValueError(f"week {last_week} starts on {last_monday}, after the ledger's "
+                         f"extract date {as_of}: the ledger is too old for it")
+    if end_of_week(week_zero, last_week) > as_of:
+        print(f"Note: week {last_week} ends on {end_of_week(week_zero, last_week)}, after the "
+              f"ledger's extract date {as_of}; its receivables are as of {as_of}")
+
+    tables = []
+    for week in range(last_week + 1):
+        tables.append(receivables_at(ledger, week, week_zero, rates, horizons, min_cleared))
+        if (week + 1) % 10 == 0:
+            print(f"  ... receivables for {week + 1} of {last_week + 1} weeks")
+    by_week = pd.concat(tables, ignore_index=True)
+
+    check_no_leak(by_week, ledger, rates, leak_check_weeks, last_week, week_zero, horizons,
+                  min_cleared)
+    return by_week
+
+
+def check_no_leak(by_week: pd.DataFrame, ledger: pd.DataFrame, rates: pd.DataFrame,
+                  weeks: tuple[int, ...], last_week: int, week_zero: date, horizons: int,
+                  min_cleared: int) -> None:
+    """Rebuild each of `weeks` from data cut off at that week, and compare with `by_week`.
+
+    The ledger is cut with `ledger_as_known_at`, and the rates to days on or before the
+    week's Sunday. If a week's rows differ, something from after the week was used: raises
+    ValueError. A week with no rows (before any ledger line) compares as an empty table.
+    Checking the last week proves little: nothing in the ledger comes after it.
+    """
+    for week in weeks:
+        if not 0 <= week <= last_week:
+            raise ValueError(f"leak check: week {week} is outside the weeks built "
+                             f"(0 to {last_week})")
+        cutoff = end_of_week(week_zero, week)
+        rebuilt = receivables_at(ledger_as_known_at(ledger, cutoff), week, week_zero,
+                                 rates[rates["day"] <= cutoff], horizons, min_cleared)
+        stored = by_week[by_week["week"] == week].reset_index(drop=True)
+        if not rebuilt.equals(stored):
+            raise ValueError(f"leak check: week {week} differs when rebuilt from data cut off "
+                             f"at {cutoff}, so something from after the week was used")
+
+
+def ledger_as_known_at(ledger: pd.DataFrame, cutoff: date) -> pd.DataFrame:
+    """The ledger as it looked at the end of `cutoff`: lines posted later removed, and
+    clearings made later undone (clearing date and clearing document emptied)."""
+    cutoff_day = pd.Timestamp(cutoff)
+    known = ledger[ledger["posting_date"] <= cutoff_day].copy()
+    cleared_later = known["clearing_date"] > cutoff_day
+    known.loc[cleared_later, "clearing_date"] = pd.NaT
+    known.loc[cleared_later, "clearing_document"] = None
+    return known

@@ -12,7 +12,7 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     4  keys            company + customer as one key               (U1)   <- built
     5  weekly series   receipts per key and week, missing weeks    (U2)   <- built
     6  AR ledger       the ledger lines and their tie to the daily files (U9a)   <- built
-    7  receivables     each key's receivables as known at each week (U9b)    <- in progress
+    7  receivables     each key's receivables as known at each week (U9b)    <- built
     8  panel           rows customer x week x horizon, with labels (U3, U4, U5)
     9  features        history, calendar, inflation, receivables   (U6-U9c)
    10  models          stage 1, stage 2, top-ups                   (U10-U12)
@@ -47,9 +47,7 @@ from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
     exchange_rates,
-    open_invoices_at,
-    payment_delays_at,
-    rates_known_at,
+    receivables_by_week,
 )
 from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
@@ -128,28 +126,20 @@ def main():
     tie = check_ledger_against_collections(ledger, collections, list(daily_files))
     show_tie(tie)
 
-    # Step 7: receivables as known at each week. Built unit by unit; for now, the exchange
-    # rates (TRY per unit of each foreign currency, per day) from the daily files and ledger.
+    # Step 7: each key's receivables as known at the end of every week, in TRY at the rates
+    # known then (one row per key and week). Weeks named in [receivables] leak_check_weeks
+    # are rebuilt from a ledger cut off at that week and compared.
     rates = exchange_rates(collections, ledger)
     show_rates(rates)
-    # The rates known at the end of week 0 (its Sunday): the last rate on or before that day.
-    end_of_week_0 = week_zero + timedelta(days=6)
-    print(f"        rates known at the end of week 0 ({end_of_week_0}): "
-          f"{ {currency: round(rate, 2) for currency, rate in rates_known_at(rates, end_of_week_0).items()} }")
+    receivables = receivables_by_week(
+        ledger, rates, week_zero, last_week=int(weeks["week"].max()),
+        as_of=settings.data.ledger_as_of, horizons=settings.receivables.horizons,
+        min_cleared=settings.receivables.min_cleared_for_delay,
+        leak_check_weeks=settings.receivables.leak_check_weeks)
+    show_receivables_by_week(receivables, settings.receivables.leak_check_weeks,
+                             settings.debug.sample_week)
 
-    # The invoices open at the end of the sample week (settings: [debug] sample_week), as
-    # the ledger showed them then.
-    sample_week = settings.debug.sample_week
-    end_of_sample_week = week_zero + timedelta(days=7 * sample_week + 6)
-    open_invoices = open_invoices_at(ledger, end_of_sample_week)
-    show_open_invoices(open_invoices, sample_week, end_of_sample_week)
-
-    # How late each customer usually paid, judged from invoices cleared by the sample week.
-    delays = payment_delays_at(ledger, end_of_sample_week,
-                               settings.receivables.min_cleared_for_delay)
-    show_delays(delays, sample_week, settings.receivables.min_cleared_for_delay)
-
-    # Step 7 continues, and later steps follow, as each unit is built.
+    # Step 8 onwards: added as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -226,27 +216,20 @@ def show_rates(rates):
               f"{rows['day'].max()}, {rows['rate'].min():.2f} to {rows['rate'].max():.2f} TRY")
 
 
-def show_open_invoices(open_invoices, week, cutoff):
-    """A short printout of the invoices open at one week."""
-    partly_paid = (open_invoices["paid"] > 0).sum()
-    overdue = (open_invoices["net_due_date"] < pd.Timestamp(cutoff)).sum()
-    print(f"        open invoices at the end of week {week} ({cutoff}): {len(open_invoices):,} "
-          f"({partly_paid:,} partly paid, {overdue:,} overdue), for "
-          f"{open_invoices['key'].nunique():,} keys")
-    per_currency = open_invoices.groupby("currency")["outstanding"].sum()
-    print(f"        outstanding per currency: "
-          f"{ {currency: round(amount) for currency, amount in per_currency.items()} }")
-    print(open_invoices.drop(columns=["key", "customer_id"]).head(3).to_string())
-
-
-def show_delays(delays, week, min_cleared):
-    """A short printout of the payment delays at one week."""
-    known = delays["usual_delay_days"].dropna()
-    print(f"        payment delays at the end of week {week}: {len(delays):,} keys with a cleared "
-          f"invoice; {len(known):,} with a usual delay (at least {min_cleared} cleared), "
-          f"{len(delays) - len(known):,} unknown")
-    print(f"        usual delay in days: median {known.median():.1f}, "
-          f"10% at or below {known.quantile(0.1):.1f}, 90% at or below {known.quantile(0.9):.1f}")
+def show_receivables_by_week(receivables, leak_check_weeks, sample_week):
+    """A short printout of the receivables of every week."""
+    print(f"        receivables: {len(receivables):,} rows, {receivables['key'].nunique():,} "
+          f"keys, weeks {receivables['week'].min()} to {receivables['week'].max()}; "
+          f"leak check passed for weeks {list(leak_check_weeks)}")
+    columns = ["open_balance", "overdue", "due_in_week_1", "unapplied_cash"]
+    totals = receivables.groupby("week")[columns].sum() / 1e6
+    every_eighth_week = totals.loc[totals.index % 8 == 0]
+    print("        totals per week, million TRY (every 8th week):")
+    print(every_eighth_week.round(1).to_string())
+    one_week = receivables[receivables["week"] == sample_week]
+    print(f"        week {sample_week}: {len(one_week):,} keys, "
+          f"{(one_week['open_invoices'] > 0).sum():,} with an open invoice, "
+          f"{one_week['usual_delay_days'].notna().sum():,} with a usual delay")
 
 
 if __name__ == "__main__":

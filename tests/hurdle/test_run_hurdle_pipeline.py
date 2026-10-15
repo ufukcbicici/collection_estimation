@@ -38,6 +38,11 @@ except TypeError:
     pass
 else:
     raise AssertionError("week_calendar still accepts the old two-argument call")
+# After U9b.5: step 7 builds every week's receivables in one call.
+inspect.signature(script.exchange_rates).bind("collections", "ledger")
+inspect.signature(script.receivables_by_week).bind(
+    "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5, min_cleared=3,
+    leak_check_weeks=(0, 30, 64))
 print("ok")
 """
 

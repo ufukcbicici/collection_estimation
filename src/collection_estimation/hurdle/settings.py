@@ -32,6 +32,8 @@ class CompanySettings:
 class ReceivablesSettings:
     """How the receivables features are built from the AR ledger."""
     min_cleared_for_delay: int   # fewer cleared invoices than this: usual delay unknown (NaN)
+    horizons: int                # how many weeks ahead the "due in week t+h" columns cover
+    leak_check_weeks: tuple[int, ...]   # weeks rebuilt from a cut-off ledger and compared
 
 
 @dataclass(frozen=True)
@@ -92,7 +94,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     companies = raw["companies"]
     check_keys(companies, {"known"}, f"{name} [companies]")
     receivables = raw["receivables"]
-    check_keys(receivables, {"min_cleared_for_delay"}, f"{name} [receivables]")
+    check_keys(receivables, {"min_cleared_for_delay", "horizons", "leak_check_weeks"},
+               f"{name} [receivables]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -121,6 +124,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         receivables=ReceivablesSettings(
             min_cleared_for_delay=count_setting(receivables, "min_cleared_for_delay",
                                                 f"{name} [receivables]"),
+            horizons=count_setting(receivables, "horizons", f"{name} [receivables]"),
+            leak_check_weeks=week_list_setting(receivables, "leak_check_weeks",
+                                               f"{name} [receivables]"),
         ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
@@ -323,3 +329,18 @@ def count_setting(table: dict, key: str, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{where}: {key} is {value!r}, not a whole number of 1 or more")
     return value
+
+
+def week_list_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
+    """A list of different week numbers (each a whole number, 0 or more); may be empty."""
+    value = table[key]
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} is {value!r}, not a list of week numbers")
+    for item in value:
+        # bool is a subclass of int in Python, so it is excluded explicitly.
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError(f"{where}: {key} holds {item!r}, not a week number (0 or more)")
+    duplicates = sorted({item for item in value if value.count(item) > 1})
+    if duplicates:
+        raise ValueError(f"{where}: {key} lists {duplicates} more than once")
+    return tuple(value)
