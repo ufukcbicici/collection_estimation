@@ -31,8 +31,10 @@ from collection_estimation.hurdle.settings import (
     DataSettings,
     DebugSettings,
     LedgerLayout,
+    ReceivablesSettings,
     Settings,
     check_keys,
+    count_setting,
     date_format_setting,
     date_setting,
     document_types_setting,
@@ -122,6 +124,7 @@ VALID = {
         "headers": headers_toml(LEDGER_HEADERS),
         "document_types": inline(DOCUMENT_TYPES),
     },
+    "receivables": {"min_cleared_for_delay": "3"},
     "debug": {"one_day": "2025-06-02", "sample_week": "30"},
 }
 ALL_SECTIONS = list(VALID)
@@ -185,6 +188,7 @@ def test_returns_a_settings_object(tmp_path, repo):
     assert isinstance(settings.debug, DebugSettings)
     assert isinstance(settings.collections_layout, CollectionsLayout)
     assert isinstance(settings.ledger_layout, LedgerLayout)
+    assert isinstance(settings.receivables, ReceivablesSettings)
 
 
 def test_paths_are_read_from_the_repo_root(tmp_path, repo):
@@ -249,7 +253,8 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
-                                       "collections_layout", "ledger_layout", "debug"])
+                                       "collections_layout", "ledger_layout", "receivables",
+                                       "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -263,6 +268,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
     ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
+    ("receivables", "min_cleared_for_delay"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -376,7 +382,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
 @pytest.mark.parametrize("section, key", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
-    ("debug", "one_day"), ("debug", "sample_week"),
+    ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -480,6 +486,69 @@ def test_week_setting_accepts_zero_and_positive_ints():
 def test_week_setting_rejects_non_week_values_naming_where_and_key(bad):
     with pytest.raises(ValueError, match="here: w is"):
         week_setting({"w": bad}, "w", "here")
+
+
+# --- types: min_cleared_for_delay (count_setting) -----------------------------------------
+
+def test_min_cleared_for_delay_is_read_as_an_int(tmp_path, repo):
+    value = load(tmp_path, repo).receivables.min_cleared_for_delay
+    assert value == 3
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("good, expected", [("1", 1), ("2", 2), ("10", 10), ("1_000", 1000)])
+def test_min_cleared_for_delay_accepts_a_whole_number_of_1_or_more(tmp_path, repo, good,
+                                                                  expected):
+    settings = load(tmp_path, repo, changes={("receivables", "min_cleared_for_delay"): good})
+    assert settings.receivables.min_cleared_for_delay == expected
+    assert type(settings.receivables.min_cleared_for_delay) is int
+
+
+@pytest.mark.parametrize("bad", [
+    "0", "-1", "1.5", "3.0", '"3"', "true", "false", "[3]", "2025-06-02", "{ n = 3 }",
+], ids=["zero", "minus-one", "fraction", "whole-float", "string", "true", "false", "list",
+        "date", "table"])
+def test_min_cleared_for_delay_that_is_not_a_count_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[receivables]", "min_cleared_for_delay",
+                            changes={("receivables", "min_cleared_for_delay"): bad})
+    assert "1 or more" in message
+
+
+def test_a_missing_receivables_section_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "receivables", drop_section="receivables")
+    assert "missing" in message
+
+
+def test_an_empty_receivables_section_names_the_missing_setting(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[receivables]", "min_cleared_for_delay",
+                            changes={("receivables", "min_cleared_for_delay"): REMOVE})
+    assert "missing" in message
+
+
+def test_a_min_cleared_for_delay_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[receivables]", "'min_cleared_for_delay'", "'min_clear_for_delay'",
+        changes={("receivables", "min_cleared_for_delay"): REMOVE,
+                 ("receivables", "min_clear_for_delay"): "3"})
+    assert "missing" in message and "unknown" in message
+
+
+def test_count_setting_accepts_one_and_more():
+    assert count_setting({"n": 1}, "n", "here") == 1
+    assert count_setting({"n": 3}, "n", "here") == 3
+    assert type(count_setting({"n": 3}, "n", "here")) is int
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, 3.0, "3", True, False, None, [3]])
+def test_count_setting_rejects_non_counts_naming_where_and_key(bad):
+    with pytest.raises(ValueError, match="here: n is"):
+        count_setting({"n": bad}, "n", "here")
+
+
+def test_count_setting_message_shows_the_value():
+    with pytest.raises(ValueError) as error:
+        count_setting({"n": 0}, "n", "here")
+    assert str(error.value) == "here: n is 0, not a whole number of 1 or more"
 
 
 # --- types: known ----------------------------------------------------------------------
@@ -721,6 +790,8 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.debug.one_day == date(2025, 6, 2)
     assert settings.debug.sample_week == 30
     assert type(settings.debug.sample_week) is int
+    assert settings.receivables.min_cleared_for_delay == 3
+    assert type(settings.receivables.min_cleared_for_delay) is int
     assert settings.data.cache_folder.parts[-2:] == ("data", "interim")
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()

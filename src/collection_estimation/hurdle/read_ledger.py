@@ -119,6 +119,7 @@ def read_ledger(path: Path, as_of: date, layout: "LedgerLayout") -> pd.DataFrame
                                              path.name)
     check_invoices_have_due_dates(ledger, path.name)
     check_document_numbers_unique(ledger, path.name)
+    check_cleared_after_posting(ledger, path.name)
     check_nothing_after(ledger, as_of, path.name)
     return ledger
 
@@ -236,6 +237,20 @@ def check_document_numbers_unique(ledger: pd.DataFrame, file_name: str) -> None:
             f"credit memo of the same company, so payments cannot be matched to one document; "
             f"the fiscal year and line item would tell them apart. First lines:\n"
             f"{first_lines[columns].head(10).to_string(index=False)}")
+
+
+def check_cleared_after_posting(ledger: pd.DataFrame, file_name: str) -> None:
+    """Raise ValueError if a line is cleared before it was posted.
+
+    A document cannot be settled before it exists, so such a line is inconsistent data.
+    Left in, it would be dropped without notice by the steps that look at what was posted
+    by a given week.
+    """
+    cleared_before_posted = ledger["clearing_date"] < ledger["posting_date"]
+    if cleared_before_posted.any():
+        first_rows = ledger.loc[cleared_before_posted, "source_row"].head(5).tolist()
+        raise ValueError(f"{file_name}: {cleared_before_posted.sum()} lines have a clearing "
+                         f"date before their posting date (first rows: {first_rows})")
 
 
 def check_nothing_after(ledger: pd.DataFrame, as_of: date, file_name: str) -> None:

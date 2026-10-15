@@ -20,6 +20,7 @@ from collection_estimation.hurdle.read_ledger import (
     LEDGER_OPTIONAL_FIELDS,
     LEDGER_TEXT_COLUMNS,
     REQUIRED_TEXT,
+    check_cleared_after_posting,
     check_document_numbers_unique,
     check_invoices_have_due_dates,
     check_nothing_after,
@@ -1111,6 +1112,200 @@ def test_the_number_check_runs_before_the_extract_date_check(tmp_path):
         read(tmp_path, lines)
 
 
+# --- check_cleared_after_posting -----------------------------------------------------------
+
+def posted_and_cleared(posting, clearing, roles=None):
+    """A ledger-like table of posting and clearing dates (and roles); source rows from 2."""
+    table = frame(posting_date=pd.to_datetime(posting), clearing_date=pd.to_datetime(clearing))
+    if roles is not None:
+        table['document_role'] = pd.Series(roles, dtype=object)
+    return table
+
+
+def test_one_line_cleared_before_posting_raises():
+    table = posted_and_cleared(['2026-03-02', '2026-03-10', '2026-03-20'],
+                               ['2026-03-20', '2026-03-09', None])
+    with pytest.raises(ValueError,
+                       match=r'^x\.xlsx: 1 lines have a clearing date before their posting date '
+                             r'\(first rows: \[3\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_several_lines_cleared_before_posting_give_the_count_and_rows():
+    table = posted_and_cleared(['2026-03-10', '2026-03-02', '2026-03-10', '2026-03-10'],
+                               ['2026-03-01', '2026-03-05', '2026-03-09', '2026-02-28'])
+    with pytest.raises(ValueError,
+                       match=r'^x\.xlsx: 3 lines have a clearing date before their posting date '
+                             r'\(first rows: \[2, 4, 5\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_cleared_before_posting_lists_at_most_five_rows():
+    table = posted_and_cleared(['2026-03-10'] * 8, ['2026-03-01'] * 8)
+    with pytest.raises(ValueError, match=r': 8 lines .*\(first rows: \[2, 3, 4, 5, 6\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_exactly_five_bad_lines_lists_all_five():
+    table = posted_and_cleared(['2026-03-10'] * 6, ['2026-03-01'] * 5 + ['2026-03-10'])
+    with pytest.raises(ValueError, match=r': 5 lines .*\(first rows: \[2, 3, 4, 5, 6\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_cleared_before_posting_rows_are_in_table_order():
+    # The first rows are taken in table order, not sorted by source row.
+    table = posted_and_cleared(['2026-03-10'] * 3, ['2026-03-01'] * 3)
+    table['source_row'] = [9, 4, 7]
+    with pytest.raises(ValueError, match=r'\(first rows: \[9, 4, 7\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_cleared_one_day_before_posting_raises():
+    table = posted_and_cleared(['2026-03-10'], ['2026-03-09'])
+    with pytest.raises(ValueError, match='1 lines have a clearing date before'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_cleared_on_the_posting_date_passes():
+    table = posted_and_cleared(['2026-03-10', '2026-03-02'], ['2026-03-10', '2026-03-02'])
+    check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_cleared_after_posting_passes():
+    table = posted_and_cleared(['2026-03-02', '2026-03-02'], ['2026-03-03', '2027-01-01'])
+    check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_open_lines_pass_the_clearing_check():
+    table = posted_and_cleared(['2026-03-02', '2026-08-28'], [None, None])
+    check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_open_lines_are_not_counted_beside_a_bad_line():
+    table = posted_and_cleared(['2026-03-02', '2026-03-10', '2026-03-02'],
+                               [None, '2026-03-01', None])
+    with pytest.raises(ValueError, match=r': 1 lines .*\(first rows: \[3\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+@pytest.mark.parametrize('role', DOCUMENT_ROLES)
+def test_every_role_is_checked_for_clearing_before_posting(role):
+    others = [other for other in DOCUMENT_ROLES if other != role]
+    table = posted_and_cleared(['2026-03-02', '2026-03-10', '2026-03-02'],
+                               ['2026-03-05', '2026-03-01', '2026-03-05'],
+                               roles=[others[0], role, others[1]])
+    with pytest.raises(ValueError, match=r': 1 lines .*\(first rows: \[3\]\)$'):
+        check_cleared_after_posting(table, 'x.xlsx')
+
+
+def test_an_empty_ledger_passes_the_clearing_check():
+    check_cleared_after_posting(posted_and_cleared([], []), 'x.xlsx')
+
+
+def test_the_clearing_check_does_not_modify_its_input():
+    failing = posted_and_cleared(['2026-03-10', '2026-03-02'], ['2026-03-01', None],
+                                 roles=['invoice', 'payment'])
+    before = failing.copy(deep=True)
+    with pytest.raises(ValueError):
+        check_cleared_after_posting(failing, 'x.xlsx')
+    pd.testing.assert_frame_equal(failing, before)
+    passing = posted_and_cleared(['2026-03-02', '2026-03-02'], ['2026-03-02', None],
+                                 roles=['invoice', 'payment'])
+    before = passing.copy(deep=True)
+    check_cleared_after_posting(passing, 'x.xlsx')
+    pd.testing.assert_frame_equal(passing, before)
+
+
+def test_the_file_name_starts_the_clearing_message():
+    table = posted_and_cleared(['2026-03-10'], ['2026-03-01'])
+    with pytest.raises(ValueError, match=r'^ledger 2026\.xlsx: 1 lines have a clearing date'):
+        check_cleared_after_posting(table, 'ledger 2026.xlsx')
+
+
+# --- check_cleared_after_posting through read_ledger ---------------------------------------
+
+def test_an_invoice_cleared_before_posting_in_a_workbook_raises(tmp_path):
+    lines = [invoice(clearing_date=datetime(2026, 3, 1)), payment()]
+    with pytest.raises(ValueError,
+                       match=r'^SYNTHETIC_ledger\.xlsx: 1 lines have a clearing date before their '
+                             r'posting date \(first rows: \[2\]\)$'):
+        read(tmp_path, lines)
+
+
+def test_several_lines_cleared_before_posting_in_a_workbook_raise(tmp_path):
+    bad = [invoice(str(9000000001 + position), clearing_date=datetime(2026, 3, 1))
+           for position in range(7)]
+    # Row 2 blank (skipped); rows 3, 4 bad; row 5 a payment cleared after posting; 6..10 bad.
+    lines = [None, bad[0], bad[1], payment(clearing_date=datetime(2026, 3, 20))] + bad[2:]
+    with pytest.raises(ValueError,
+                       match=r': 7 lines have a clearing date before their posting date '
+                             r'\(first rows: \[3, 4, 6, 7, 8\]\)$'):
+        read(tmp_path, lines)
+
+
+def test_lines_cleared_on_their_posting_date_in_a_workbook_pass(tmp_path):
+    day = datetime(2026, 3, 2)
+    lines = [invoice(clearing_date=day), payment(posted=day, clearing_date=day),
+             credit_memo(posted=day, clearing_date=day)]
+    ledger = read(tmp_path, lines)
+    assert len(ledger) == 3
+    assert (ledger['clearing_date'] == ledger['posting_date']).all()
+
+
+def test_open_lines_in_a_workbook_pass_the_clearing_check(tmp_path):
+    ledger = read(tmp_path, five_lines())
+    assert ledger['clearing_date'].isna().all()
+
+
+@pytest.mark.parametrize('maker, role', [(invoice, 'invoice'), (payment, 'payment'),
+                                         (unapplied_payment, 'payment'),
+                                         (credit_memo, 'credit_memo'), (refund, 'payment')])
+def test_every_role_cleared_before_posting_in_a_workbook_raises(tmp_path, maker, role):
+    # Every maker posts in March 2026; the bad line goes last (row 6).
+    bad = maker(clearing_date=datetime(2026, 2, 1))
+    others = [line for line in five_lines() if line['Document Number'] != bad['Document Number']]
+    with pytest.raises(ValueError, match=r': 1 lines .*\(first rows: \[6\]\)$'):
+        read(tmp_path, others + [bad])
+    # The same line cleared after posting reads, with the role named.
+    good = maker(clearing_date=datetime(2026, 4, 30))
+    other = tmp_path / 'good'
+    other.mkdir()
+    ledger = read(other, others + [good])
+    assert ledger['document_role'].iloc[-1] == role
+
+
+def test_an_empty_ledger_workbook_passes_the_clearing_check(tmp_path):
+    assert len(read(tmp_path, [])) == 0
+
+
+def test_the_number_check_runs_before_the_clearing_check(tmp_path):
+    lines = [invoice('9000000001'), invoice('9000000001', clearing_date=datetime(2026, 3, 1))]
+    with pytest.raises(ValueError, match='1 document numbers are used'):
+        read(tmp_path, lines)
+
+
+def test_the_due_date_check_runs_before_the_clearing_check(tmp_path):
+    line = invoice(clearing_date=datetime(2026, 3, 1))
+    line['Net Due Date'] = None
+    with pytest.raises(ValueError, match='invoices have no net due date'):
+        read(tmp_path, [line])
+
+
+def test_the_clearing_check_runs_before_the_extract_date_check(tmp_path):
+    lines = [invoice(clearing_date=datetime(2026, 3, 1)),
+             payment(posted=datetime(2026, 9, 1))]  # posted after AS_OF
+    with pytest.raises(ValueError, match='clearing date before their posting date'):
+        read(tmp_path, lines)
+
+
+def test_one_line_failing_both_date_checks_reports_the_clearing_check(tmp_path):
+    # Posted and cleared after AS_OF, and cleared before it was posted.
+    lines = [invoice(posted=datetime(2026, 9, 10), due=datetime(2026, 10, 10),
+                     clearing_date=datetime(2026, 9, 5))]
+    with pytest.raises(ValueError, match=r'1 lines have a clearing date before .*\[2\]'):
+        read(tmp_path, lines)
+
+
 # --- check_nothing_after -------------------------------------------------------------------
 
 def dated(posting, clearing):
@@ -1325,3 +1520,10 @@ def test_slow_synthetic_ledger_earlier_as_of_raises(synthetic_ledger):
     check_nothing_after(synthetic_ledger, date(2026, 8, 28), LEDGER_FILE.name)
     with pytest.raises(ValueError, match='after the extract date 2026-08-01'):
         check_nothing_after(synthetic_ledger, date(2026, 8, 1), LEDGER_FILE.name)
+
+
+def test_slow_synthetic_ledger_has_no_line_cleared_before_posting(synthetic_ledger):
+    # read_ledger already ran the check; run it again on the table and confirm directly.
+    check_cleared_after_posting(synthetic_ledger, LEDGER_FILE.name)
+    assert synthetic_ledger['clearing_date'].notna().sum() > 0
+    assert not (synthetic_ledger['clearing_date'] < synthetic_ledger['posting_date']).any()

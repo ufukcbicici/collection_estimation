@@ -48,6 +48,7 @@ from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
     exchange_rates,
     open_invoices_at,
+    payment_delays_at,
     rates_known_at,
 )
 from collection_estimation.hurdle.read_ledger import (  # noqa: E402
@@ -143,6 +144,11 @@ def main():
     open_invoices = open_invoices_at(ledger, end_of_sample_week)
     show_open_invoices(open_invoices, sample_week, end_of_sample_week)
 
+    # How late each customer usually paid, judged from invoices cleared by the sample week.
+    delays = payment_delays_at(ledger, end_of_sample_week,
+                               settings.receivables.min_cleared_for_delay)
+    show_delays(delays, sample_week, settings.receivables.min_cleared_for_delay)
+
     # Step 7 continues, and later steps follow, as each unit is built.
 
 
@@ -231,6 +237,16 @@ def show_open_invoices(open_invoices, week, cutoff):
     print(f"        outstanding per currency: "
           f"{ {currency: round(amount) for currency, amount in per_currency.items()} }")
     print(open_invoices.drop(columns=["key", "customer_id"]).head(3).to_string())
+
+
+def show_delays(delays, week, min_cleared):
+    """A short printout of the payment delays at one week."""
+    known = delays["usual_delay_days"].dropna()
+    print(f"        payment delays at the end of week {week}: {len(delays):,} keys with a cleared "
+          f"invoice; {len(known):,} with a usual delay (at least {min_cleared} cleared), "
+          f"{len(delays) - len(known):,} unknown")
+    print(f"        usual delay in days: median {known.median():.1f}, "
+          f"10% at or below {known.quantile(0.1):.1f}, 90% at or below {known.quantile(0.9):.1f}")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,10 @@ invoice = ["RV"]
 payment = ["DZ"]      # payments received, and refunds paid out
 credit_memo = ["DG"]
 
+[receivables]
+# How each customer's receivables are summarised from the AR ledger.
+min_cleared_for_delay = 3       # fewer cleared invoices: the usual delay is unknown (NaN)
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)

@@ -18,6 +18,9 @@ OPEN_INVOICE_COLUMNS = ["key", "company_code", "customer_id", "document_no", "cu
 # An open invoice with no more than this left to pay (in its own currency) is left out.
 NOTHING_LEFT = 0.005
 
+# The columns of the table `payment_delays_at` returns, in order.
+DELAY_COLUMNS = ["key", "usual_delay_days", "cleared_invoices"]
+
 
 def exchange_rates(collections: pd.DataFrame, ledger: pd.DataFrame) -> pd.DataFrame:
     """TRY per unit of each foreign currency, for every day that has a line in it.
@@ -118,7 +121,7 @@ def open_invoices_at(ledger: pd.DataFrame, cutoff: date) -> pd.DataFrame:
     invoices = known[known["document_role"] == "invoice"]
     is_open = invoices["clearing_date"].isna() | (invoices["clearing_date"] > cutoff_day)
     invoices = invoices[is_open]
-    max_invoice_count = invoices.groupby(["company_code", "document_no"]).size().max()
+    max_invoice_count = invoices.groupby(["key", "document_no"]).size().max()
     if max_invoice_count > 1:
         raise ValueError("Duplicate entries in the invoices table!")
 
@@ -141,3 +144,51 @@ def open_invoices_at(ledger: pd.DataFrame, cutoff: date) -> pd.DataFrame:
               f"left to pay "
               f"and are left out")
     return table.loc[~nothing_left, OPEN_INVOICE_COLUMNS].reset_index(drop=True)
+
+
+def payment_delays_at(ledger: pd.DataFrame, cutoff: date, min_cleared: int) -> pd.DataFrame:
+    """How late each customer usually pays, judged from invoices cleared by `cutoff`.
+
+    For every invoice posted and cleared on or before `cutoff`, the money arrived on the
+    latest posting date of the payments in its clearing group (the lines sharing its
+    company and `clearing_document`, which also finds unapplied cash matched later). Days
+    late = that date - the net due date; negative means paid early. The clearing date itself
+    is not used: matching can lag the payment by weeks.
+
+    One row per key with at least one such invoice: `usual_delay_days` is the median days
+    late, or NaN if the key has fewer than `min_cleared` cleared invoices; `cleared_invoices`
+    is how many. An invoice cleared without any payment (e.g. by a credit memo) does not
+    count. Raises ValueError if a cleared invoice has no clearing document.
+    """
+    cutoff_day = pd.Timestamp(cutoff)
+    known = ledger[ledger["posting_date"] <= cutoff_day]
+
+    invoices = known[known["document_role"] == "invoice"]
+    max_invoice_count = invoices.groupby(["key", "document_no"]).size().max()
+    if max_invoice_count > 1:
+        raise ValueError("Duplicate entries in the invoices table!")
+
+    cleared = invoices[invoices["clearing_date"] <= cutoff_day]
+    no_clearing_document = cleared["clearing_document"].isna()
+
+    if no_clearing_document.any():
+        raise ValueError(f"{no_clearing_document.sum()} invoices cleared by {cutoff_day.date()} "
+                         f"have no clearing document, so their payments cannot be found "
+                         f"(first rows: {first_rows(cleared, no_clearing_document)})")
+
+    payments = known[(known["document_role"] == "payment") & known["clearing_document"].notna()]
+    money_arrived = payments.groupby(["company_code", "clearing_document"])["posting_date"].max()
+
+    # An inner merge: invoices cleared without any payment have no arrival date and drop out.
+    table = cleared.merge(money_arrived.rename("money_arrived").reset_index(),
+                          on=["company_code", "clearing_document"], how="inner")
+    table["days_late"] = (table["money_arrived"] - table["net_due_date"]).dt.days
+
+    per_key = table.groupby("key").agg(
+        usual_delay_days=("days_late", "median"),
+        cleared_invoices=("days_late", "size"),
+    ).reset_index()
+    per_key["usual_delay_days"] = per_key["usual_delay_days"].astype("float64")
+    too_few = per_key["cleared_invoices"] < min_cleared
+    per_key.loc[too_few, "usual_delay_days"] = float("nan")
+    return per_key[DELAY_COLUMNS]

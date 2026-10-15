@@ -29,6 +29,12 @@ class CompanySettings:
 
 
 @dataclass(frozen=True)
+class ReceivablesSettings:
+    """How the receivables features are built from the AR ledger."""
+    min_cleared_for_delay: int   # fewer cleared invoices than this: usual delay unknown (NaN)
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -61,6 +67,7 @@ class Settings:
     companies: CompanySettings
     collections_layout: CollectionsLayout
     ledger_layout: LedgerLayout
+    receivables: ReceivablesSettings
     debug: DebugSettings
 
 
@@ -75,8 +82,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         raw = tomllib.load(file)
     name = settings_file.name
 
-    check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "debug"},
-               name)
+    check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
+                     "debug"}, name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -84,6 +91,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                f"{name} [data]")
     companies = raw["companies"]
     check_keys(companies, {"known"}, f"{name} [companies]")
+    receivables = raw["receivables"]
+    check_keys(receivables, {"min_cleared_for_delay"}, f"{name} [receivables]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -109,6 +118,10 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         collections_layout=read_collections_layout(collections_layout,
                                                    f"{name} [collections_layout]"),
         ledger_layout=read_ledger_layout(ledger_layout, f"{name} [ledger_layout]"),
+        receivables=ReceivablesSettings(
+            min_cleared_for_delay=count_setting(receivables, "min_cleared_for_delay",
+                                                f"{name} [receivables]"),
+        ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
@@ -300,4 +313,13 @@ def week_setting(table: dict, key: str, where: str) -> int:
     # bool is a subclass of int in Python, so it is excluded explicitly.
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{where}: {key} is {value!r}, not a week number (0 or more)")
+    return value
+
+
+def count_setting(table: dict, key: str, where: str) -> int:
+    """A count: a whole number, 1 or more."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where}: {key} is {value!r}, not a whole number of 1 or more")
     return value
