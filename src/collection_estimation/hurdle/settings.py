@@ -19,6 +19,7 @@ class DataSettings:
     ledger_file: Path     # the AR ledger
     ledger_as_of: date    # the date the ledger was extracted
     holidays_file: Path   # the public holidays (e.g. settings/holidays_tr.toml)
+    fill_missing_days_from_ledger: bool   # fill days without a daily file from the ledger
     cache_folder: Path
 
 
@@ -89,7 +90,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
-                      "cache_folder"},
+                      "fill_missing_days_from_ledger", "cache_folder"},
                f"{name} [data]")
     companies = raw["companies"]
     check_keys(companies, {"known"}, f"{name} [companies]")
@@ -113,6 +114,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             ledger_file=path_setting(data, "ledger_file", repo_root, f"{name} [data]"),
             ledger_as_of=date_setting(data, "ledger_as_of", f"{name} [data]"),
             holidays_file=path_setting(data, "holidays_file", repo_root, f"{name} [data]"),
+            fill_missing_days_from_ledger=bool_setting(data, "fill_missing_days_from_ledger",
+                                                       f"{name} [data]"),
             cache_folder=path_setting(data, "cache_folder", repo_root, f"{name} [data]"),
         ),
         companies=CompanySettings(
@@ -344,3 +347,11 @@ def week_list_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
     if duplicates:
         raise ValueError(f"{where}: {key} lists {duplicates} more than once")
     return tuple(value)
+
+
+def bool_setting(table: dict, key: str, where: str) -> bool:
+    """A yes/no setting written as true or false (no quotes)."""
+    value = table[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: {key} is {value!r}, not true or false")
+    return value

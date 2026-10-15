@@ -7,6 +7,8 @@ corpus_folder = "data/raw/SYNTHETIC_ey_tahsilat_20250602_20260828"  # the daily 
 ledger_file   = "data/raw/SYNTHETIC_ey_ar_ledger_asof_20260828.xlsx"
 ledger_as_of  = 2026-08-28      # the date the ledger was extracted
 holidays_file = "settings/holidays_tr.toml"  # Turkish public holidays
+fill_missing_days_from_ledger = true   # days without a daily file: take their payments
+                                       # from the ledger (false: the weeks stay missing)
 cache_folder  = "data/interim"  # rebuilt automatically when anything changes
 
 [companies]

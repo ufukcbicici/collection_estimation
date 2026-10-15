@@ -233,8 +233,8 @@ def test_last_synthetic_file_is_week_64():
 # A holiday-free stretch: Monday 2026-02-02 to Sunday 2026-03-15 has no public holiday.
 
 CALENDAR_ZERO = date(2026, 2, 2)  # a Monday
-CALENDAR_COLUMNS = ["week", "monday", "business_days", "days_with_file", "missing_days",
-                    "is_missing"]
+CALENDAR_COLUMNS = ["week", "monday", "business_days", "days_with_file", "filled_days",
+                    "missing_days", "is_missing"]
 
 
 def weekdays(monday):
@@ -263,7 +263,8 @@ def test_calendar_full_week_is_complete():
     calendar = week_calendar(weekdays(CALENDAR_ZERO), CALENDAR_ZERO, HOLIDAYS)
     assert len(calendar) == 1
     assert row(calendar, 0) == {"week": 0, "monday": CALENDAR_ZERO, "business_days": 5,
-                                "days_with_file": 5, "missing_days": 0, "is_missing": False}
+                                "days_with_file": 5, "filled_days": 0, "missing_days": 0,
+                                "is_missing": False}
 
 
 def test_calendar_monday_is_a_date_object():
@@ -482,7 +483,8 @@ def test_calendar_single_day_gives_one_row():
     calendar = week_calendar([CALENDAR_ZERO], CALENDAR_ZERO, HOLIDAYS)
     assert len(calendar) == 1
     assert row(calendar, 0) == {"week": 0, "monday": CALENDAR_ZERO, "business_days": 5,
-                                "days_with_file": 1, "missing_days": 4, "is_missing": True}
+                                "days_with_file": 1, "filled_days": 0, "missing_days": 4,
+                                "is_missing": True}
 
 
 def test_calendar_single_late_day_still_starts_at_week_zero():
@@ -542,7 +544,8 @@ def test_calendar_does_not_modify_the_input_list():
 
 # --- week_calendar: dtypes -------------------------------------------------------------
 
-@pytest.mark.parametrize("column", ["week", "business_days", "days_with_file", "missing_days"])
+@pytest.mark.parametrize("column", ["week", "business_days", "days_with_file", "filled_days",
+                                    "missing_days"])
 def test_calendar_count_columns_are_int64(column):
     calendar = week_calendar(three_weeks_with_a_gap(), CALENDAR_ZERO, HOLIDAYS)
     assert calendar[column].dtype == "int64"
@@ -703,3 +706,183 @@ def test_calendar_does_not_modify_an_input_list_of_datetimes():
     assert days == before
     assert [type(d) for d in days] == [datetime, pd.Timestamp, date]
     assert days[0].hour == 14 and days[1].hour == 9
+
+
+# --- week_calendar: filled_days (days without a file filled from the ledger) -----------
+# Week 0 below is Monday 2026-02-02 to Sunday 2026-02-08 (no holiday); Wednesday 2026-02-04
+# has no file. A file on the next Monday keeps week 0 from being the last week.
+
+WEDNESDAY = date(2026, 2, 4)
+SATURDAY = date(2026, 2, 7)
+
+
+def files_without_wednesday():
+    days = [d for d in weekdays(CALENDAR_ZERO) if d != WEDNESDAY]
+    return days + [date(2026, 2, 9)]
+
+
+def test_calendar_a_filled_missing_day_makes_the_week_complete():
+    week = row(week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS,
+                             [WEDNESDAY]), 0)
+    assert week["days_with_file"] == 4
+    assert week["filled_days"] == 1
+    assert week["missing_days"] == 0
+    assert not week["is_missing"]
+
+
+def test_calendar_filled_days_sit_between_days_with_file_and_missing_days():
+    calendar = week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, [WEDNESDAY])
+    columns = list(calendar.columns)
+    assert columns.index("filled_days") == columns.index("days_with_file") + 1
+    assert columns.index("missing_days") == columns.index("filled_days") + 1
+
+
+def test_calendar_filling_one_of_two_missing_days_leaves_the_week_missing():
+    days = [d for d in files_without_wednesday() if d != date(2026, 2, 5)]  # no Thursday
+    week = row(week_calendar(days, CALENDAR_ZERO, HOLIDAYS, [WEDNESDAY]), 0)
+    assert (week["days_with_file"], week["filled_days"], week["missing_days"]) == (3, 1, 1)
+    assert week["is_missing"]
+
+
+def test_calendar_a_whole_week_filled_is_complete():
+    calendar = week_calendar(three_weeks_with_a_gap(), CALENDAR_ZERO, HOLIDAYS,
+                             weekdays(CALENDAR_ZERO + timedelta(weeks=1)))
+    gap = row(calendar, 1)
+    assert (gap["days_with_file"], gap["filled_days"], gap["missing_days"]) == (0, 5, 0)
+    assert not gap["is_missing"]
+    assert not calendar["is_missing"].any()
+
+
+@pytest.mark.parametrize("as_given", [
+    datetime(2026, 2, 4), datetime(2026, 2, 4, 14, 30), pd.Timestamp("2026-02-04"),
+    pd.Timestamp("2026-02-04 23:59"),
+], ids=["datetime", "datetime-with-time", "timestamp", "late-timestamp"])
+def test_calendar_filled_days_as_datetimes_or_timestamps_work(as_given):
+    expected = week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, [WEDNESDAY])
+    result = week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, [as_given])
+    pd.testing.assert_frame_equal(result, expected)
+    assert row(result, 0)["filled_days"] == 1
+
+
+def test_calendar_default_filled_days_is_the_same_as_none_filled():
+    days = files_without_wednesday()
+    pd.testing.assert_frame_equal(week_calendar(days, CALENDAR_ZERO, HOLIDAYS),
+                                  week_calendar(days, CALENDAR_ZERO, HOLIDAYS, []))
+    pd.testing.assert_frame_equal(week_calendar(days, CALENDAR_ZERO, HOLIDAYS),
+                                  week_calendar(days, CALENDAR_ZERO, HOLIDAYS, ()))
+
+
+def test_calendar_default_behaves_as_before():
+    # Without filled days: no day is filled and every business day without a file is missing.
+    days = [date(2026, 2, 2), date(2026, 2, 5), date(2026, 2, 10), date(2026, 2, 27)]
+    calendar = week_calendar(days, CALENDAR_ZERO, HOLIDAYS)
+    assert (calendar["filled_days"] == 0).all()
+    assert (calendar["days_with_file"] + calendar["missing_days"]
+            == calendar["business_days"]).all()
+    assert calendar["missing_days"].tolist() == [3, 4, 5, 4]
+    assert calendar["is_missing"].tolist() == [True] * 4
+
+
+def test_calendar_a_filled_saturday_is_not_counted():
+    week = row(week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, [SATURDAY]), 0)
+    assert week["filled_days"] == 0
+    assert week["missing_days"] == 1
+    assert week["is_missing"]
+
+
+def test_calendar_a_filled_sunday_does_not_hide_a_missing_weekday():
+    week = row(week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS,
+                             [date(2026, 2, 8)]), 0)
+    assert (week["filled_days"], week["missing_days"], week["is_missing"]) == (0, 1, True)
+
+
+def test_calendar_a_filled_holiday_is_not_counted():
+    # 23 April 2026 is a Thursday and a public holiday; Wednesday 22 April has no file.
+    monday = date(2026, 4, 20)
+    days = [monday, date(2026, 4, 21), date(2026, 4, 24), date(2026, 4, 27)]
+    week = row(week_calendar(days, monday, HOLIDAYS, [date(2026, 4, 23)]), 0)
+    assert week["business_days"] == 4
+    assert week["filled_days"] == 0
+    assert week["missing_days"] == 1
+    assert week["is_missing"]
+
+
+def test_calendar_a_filled_day_that_also_has_a_file_counts_as_a_file_day():
+    days = weekdays(CALENDAR_ZERO)
+    week = row(week_calendar(days, CALENDAR_ZERO, HOLIDAYS, [WEDNESDAY]), 0)
+    assert (week["days_with_file"], week["filled_days"], week["missing_days"]) == (5, 0, 0)
+
+
+def test_calendar_with_file_plus_filled_plus_missing_equals_business_days():
+    days = [date(2026, 2, 2), date(2026, 2, 5), date(2026, 2, 10), date(2026, 2, 27)]
+    # Tue of week 0; Sat of week 0 (ignored); Wed and Thu of week 1; Fri of week 3 (has a
+    # file, ignored); Mon of week 2.
+    filled = [date(2026, 2, 3), date(2026, 2, 7), date(2026, 2, 11), date(2026, 2, 12),
+              date(2026, 2, 27), date(2026, 2, 16)]
+    calendar = week_calendar(days, CALENDAR_ZERO, HOLIDAYS, filled)
+    assert (calendar["days_with_file"] + calendar["filled_days"] + calendar["missing_days"]
+            == calendar["business_days"]).all()
+    assert calendar["filled_days"].tolist() == [1, 2, 1, 0]
+    assert (calendar["is_missing"] == (calendar["missing_days"] > 0)).all()
+
+
+def test_calendar_duplicate_filled_days_count_once():
+    week = row(week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS,
+                             [WEDNESDAY, WEDNESDAY, pd.Timestamp(WEDNESDAY)]), 0)
+    assert week["filled_days"] == 1
+
+
+def test_calendar_filled_days_after_the_last_file_do_not_extend_the_calendar():
+    days = weekdays(CALENDAR_ZERO)
+    with_late_fill = week_calendar(days, CALENDAR_ZERO, HOLIDAYS, [date(2026, 3, 4)])
+    pd.testing.assert_frame_equal(with_late_fill,
+                                  week_calendar(days, CALENDAR_ZERO, HOLIDAYS))
+
+
+def test_calendar_filled_days_before_week_zero_are_ignored():
+    days = weekdays(CALENDAR_ZERO)
+    pd.testing.assert_frame_equal(
+        week_calendar(days, CALENDAR_ZERO, HOLIDAYS, [date(2026, 1, 28)]),
+        week_calendar(days, CALENDAR_ZERO, HOLIDAYS))
+
+
+def test_calendar_does_not_modify_the_filled_days_list():
+    filled = [pd.Timestamp(WEDNESDAY), WEDNESDAY]
+    before = list(filled)
+    week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, filled)
+    assert filled == before
+    assert type(filled[0]) is pd.Timestamp
+
+
+def test_calendar_filled_days_may_be_a_set_or_tuple():
+    expected = week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, [WEDNESDAY])
+    for given in ({WEDNESDAY}, (WEDNESDAY,)):
+        pd.testing.assert_frame_equal(
+            week_calendar(files_without_wednesday(), CALENDAR_ZERO, HOLIDAYS, given), expected)
+
+
+# --- week_calendar: the synthetic corpus with its six missing days filled --------------
+
+SYNTHETIC_FILLED_DAYS = [date(2025, 9, 8), date(2025, 12, 17), date(2026, 2, 4),
+                         date(2026, 3, 13), date(2026, 4, 20), date(2026, 6, 1)]
+
+
+@pytest.fixture(scope="module")
+def synthetic_filled_calendar():
+    if not SYNTHETIC_CORPUS.is_dir():
+        pytest.skip("synthetic corpus not installed")
+    days = list(list_daily_files(SYNTHETIC_CORPUS, DATE_FORMAT))
+    return week_calendar(days, WEEK_ZERO, HOLIDAYS, SYNTHETIC_FILLED_DAYS)
+
+
+def test_synthetic_filled_calendar_has_no_missing_week(synthetic_filled_calendar):
+    assert not synthetic_filled_calendar["is_missing"].any()
+    assert synthetic_filled_calendar["missing_days"].sum() == 0
+
+
+def test_synthetic_filled_calendar_fills_the_six_days(synthetic_filled_calendar):
+    calendar = synthetic_filled_calendar
+    assert calendar["filled_days"].sum() == 6
+    assert calendar.loc[calendar["filled_days"] > 0, "week"].tolist() == [14, 28, 35, 40, 46, 52]
+    assert calendar["days_with_file"].sum() == 306
+    assert calendar["business_days"].sum() == 312

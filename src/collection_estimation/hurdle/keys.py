@@ -49,8 +49,10 @@ def add_keys(collections: pd.DataFrame, known_companies: list[str],
         customer_ids = customer_ids.map(lambda customer_id: clean_map.get(customer_id, customer_id))
 
     with_keys = collections.copy()
-    with_keys["customer_id"] = customer_ids
-    with_keys["key"] = with_keys["company_code"] + "-" + with_keys["customer_id"]
+    # Text columns use pandas' generic object type throughout the package (as the readers'
+    # do); left alone, pandas would give these two its own text type.
+    with_keys["customer_id"] = customer_ids.astype(object)
+    with_keys["key"] = (with_keys["company_code"] + "-" + with_keys["customer_id"]).astype(object)
     return with_keys
 
 

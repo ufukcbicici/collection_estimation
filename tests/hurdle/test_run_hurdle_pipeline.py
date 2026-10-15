@@ -1,8 +1,10 @@
-"""Import-only smoke test for `run_hurdle_pipeline.py` (the step-by-step script).
+"""Smoke tests for `run_hurdle_pipeline.py` (the step-by-step script).
 
-Running `main()` reads the whole synthetic corpus and writes to data/interim, so it is not run
-here. The import is done in a separate Python process: the script reconfigures sys.stdout and
-puts src/ on sys.path, which should not leak into the rest of the test session.
+Running the real `main()` reads the whole synthetic corpus and writes to data/interim, so it
+is not run here. The import checks, and the step-6 branch tests (main() with every reader
+stubbed and stopped right after step 6), run in a separate Python process: the script
+reconfigures sys.stdout and puts src/ on sys.path, which should not leak into the rest of the
+test session.
 """
 import subprocess
 import sys
@@ -43,8 +45,135 @@ inspect.signature(script.exchange_rates).bind("collections", "ledger")
 inspect.signature(script.receivables_by_week).bind(
     "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5, min_cleared=3,
     leak_check_weeks=(0, 30, 64))
+# Step 8: when each key becomes known, from the daily files and the ledger.
+inspect.signature(script.known_weeks).bind("collections", "ledger", "week_zero")
+# Step 6: days without a file filled from the ledger; the calendar takes the filled days.
+inspect.signature(script.fill_missing_days).bind("collections", "ledger", [])
+try:
+    inspect.signature(script.fill_missing_days).bind("collections", "ledger")
+except TypeError:
+    pass
+else:
+    raise AssertionError("fill_missing_days accepts a call without the days with a file")
+inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", [])
+inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", filled_days=[])
+assert callable(script.show_filled)
 print("ok")
 """
+
+
+# Step 6 of main(), with every reader before it replaced by a stub, so that no file is read
+# and nothing is written (no corpus, no ledger, no data/interim cache). main() is stopped at
+# week_calendar, the first call after step 6 that receives the filled days.
+STEP_6 = """
+import sys
+from datetime import date
+from types import SimpleNamespace
+import pandas as pd
+import run_hurdle_pipeline as script
+
+SWITCH = {switch}
+DAYS = [date(2026, 3, 2), date(2026, 3, 3), date(2026, 3, 5)]
+COLLECTIONS = pd.DataFrame({{"key": ["TR02-1", "TR02-2"], "amount_try": [100.0, 30.0],
+                            "document_date": pd.to_datetime(["2026-03-02", "2026-03-03"])}})
+LEDGER = pd.DataFrame({{"key": ["TR02-1"]}})
+FILLED = COLLECTIONS.assign(filled_from_ledger=[False, False])
+seen = {{}}
+
+class Stop(Exception):
+    pass
+
+settings = SimpleNamespace(
+    settings_file=script.REPO_ROOT / "settings" / "stub.toml",
+    data=SimpleNamespace(corpus_folder="stub-corpus", cache_folder="stub-cache",
+                         ledger_file="stub-ledger", ledger_as_of=date(2026, 3, 31),
+                         holidays_file="stub-holidays", fill_missing_days_from_ledger=SWITCH),
+    collections_layout=SimpleNamespace(file_name_date_format="%d%m%Y"),
+    ledger_layout="stub-layout",
+    debug=SimpleNamespace(one_day=DAYS[0]),
+    companies=SimpleNamespace(known={{"TR02": "stub"}}),
+)
+
+def fake_fill(collections, ledger, days):
+    seen["fill_args"] = (collections, ledger, days)
+    return FILLED, [date(2026, 3, 4)]
+
+def fake_show_filled(collections, filled_days, switched_on):
+    seen["show_filled"] = (collections, filled_days, switched_on)
+    real_show_filled(collections, filled_days, switched_on)
+
+def fake_add_week_index(collections, week_zero):
+    seen["week_index_input"] = collections
+    return collections.assign(week=0)
+
+def fake_week_calendar(days, week_zero, holidays, filled_days=None):
+    seen["calendar_filled_days"] = filled_days
+    raise Stop
+
+real_show_filled = script.show_filled
+script.load_settings = lambda path, root: settings
+script.list_daily_files = lambda folder, fmt: {{day: f"file-{{day}}" for day in DAYS}}
+script.read_one_file = lambda path, layout: COLLECTIONS.iloc[:1]
+script.load_collections = lambda files, layout, cache: COLLECTIONS
+script.add_keys = lambda table, companies: table
+script.load_ledger = lambda path, as_of, layout, cache: LEDGER
+script.check_ledger_against_collections = lambda ledger, collections, days: {{}}
+script.fill_missing_days = fake_fill
+script.show_filled = fake_show_filled
+script.add_week_index = fake_add_week_index
+script.load_holidays = lambda path: []
+script.week_calendar = fake_week_calendar
+for name in ("show_daily_files", "show_one_day", "show_collections", "show_keys",
+             "show_ledger", "show_tie"):
+    setattr(script, name, lambda *args, **kwargs: None)
+
+try:
+    script.main()
+except Stop:
+    pass
+else:
+    raise AssertionError("main() did not reach week_calendar")
+
+collections, filled_days, switched_on = seen["show_filled"]
+assert switched_on is SWITCH
+assert seen["week_index_input"] is collections
+assert seen["calendar_filled_days"] == filled_days
+if SWITCH:
+    assert seen["fill_args"][0] is COLLECTIONS
+    assert seen["fill_args"][1] is LEDGER
+    assert seen["fill_args"][2] == DAYS
+    assert collections is FILLED
+    assert filled_days == [date(2026, 3, 4)]
+else:
+    assert "fill_args" not in seen, "fill_missing_days ran although switched off"
+    assert filled_days == []
+    assert list(collections.columns) == list(COLLECTIONS.columns) + ["filled_from_ledger"]
+    assert collections["filled_from_ledger"].dtype == bool
+    assert not collections["filled_from_ledger"].any()
+    pd.testing.assert_frame_equal(collections.drop(columns="filled_from_ledger"), COLLECTIONS)
+    # assign gives a new table: the loaded collections are not modified.
+    assert "filled_from_ledger" not in COLLECTIONS.columns
+print("ok")
+"""
+
+
+def run_step_6(switch):
+    return subprocess.run([sys.executable, "-c", STEP_6.format(switch=switch)], cwd=REPO_ROOT,
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_step_6_switched_off_flags_every_line_false_and_fills_no_day():
+    result = run_step_6(False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    assert "filling from the ledger is switched off" in result.stdout
+
+
+def test_step_6_switched_on_takes_the_lines_and_days_from_fill_missing_days():
+    result = run_step_6(True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    assert "1 days without a daily file filled from the ledger" in result.stdout
 
 
 def test_the_pipeline_script_exists():

@@ -31,23 +31,26 @@ def add_week_index(collections: pd.DataFrame, week_zero: date) -> pd.DataFrame:
     return with_weeks
 
 
-def week_calendar(days_with_file: list[date], week_zero: date,
-                  holidays: HolidayTable) -> pd.DataFrame:
+def week_calendar(days_with_file: list[date], week_zero: date, holidays: HolidayTable,
+                  filled_days: list[date] = ()) -> pd.DataFrame:
     """One row per week, from week zero to the week of the last file.
 
     Columns: week, monday, business_days (weekdays that are not public holidays),
-    days_with_file (business days that have a daily file), missing_days (business days
-    without one) and is_missing.
+    days_with_file (business days that have a daily file), filled_days (business days
+    without a file whose payments were filled from the ledger, see `fill_missing_days`),
+    missing_days (business days with neither) and is_missing.
 
-    A week is missing if ANY of its business days has no file: one missing day can turn a
-    customer's payment into "did not pay", so the whole week is unknown. A file on a weekend
-    or a holiday does not count, so it cannot hide a missing business day.
+    A week is missing if ANY of its business days has neither a file nor filled payments:
+    one missing day can turn a customer's payment into "did not pay", so the whole week is
+    unknown. A file on a weekend or a holiday does not count, so it cannot hide a missing
+    business day.
     """
     if not days_with_file:
         raise ValueError("no days with a file")
     # Make every input a plain date: a datetime or Timestamp would not match the plain dates
     # of the day loop below, and its day would quietly count as missing.
     days_with_file = [pd.Timestamp(day).date() for day in days_with_file]
+    filled = {pd.Timestamp(day).date() for day in filled_days}
     week_zero = pd.Timestamp(week_zero).date()
     if min(days_with_file) < week_zero:
         raise ValueError(f"a file is dated {min(days_with_file)}, before week zero {week_zero}")
@@ -62,11 +65,14 @@ def week_calendar(days_with_file: list[date], week_zero: date,
     day = week_zero
     while day <= last_sunday:
         is_business_day = day.weekday() < 5 and day not in holiday_days
+        with_file = is_business_day and day in has_file
+        filled_from_ledger = is_business_day and not with_file and day in filled
         rows.append({
             "day": day,
             "is_business_day": is_business_day,
-            "is_business_day_with_file": is_business_day and day in has_file,
-            "is_missing_day": is_business_day and day not in has_file,
+            "is_business_day_with_file": with_file,
+            "is_filled_day": filled_from_ledger,
+            "is_missing_day": is_business_day and not with_file and not filled_from_ledger,
         })
         day += timedelta(days=1)
     days = pd.DataFrame(rows)
@@ -76,6 +82,7 @@ def week_calendar(days_with_file: list[date], week_zero: date,
         monday=("day", "first"),
         business_days=("is_business_day", "sum"),
         days_with_file=("is_business_day_with_file", "sum"),
+        filled_days=("is_filled_day", "sum"),
         missing_days=("is_missing_day", "sum"),
     ).reset_index()
     calendar["is_missing"] = calendar["missing_days"] > 0

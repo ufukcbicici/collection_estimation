@@ -47,6 +47,7 @@ from collection_estimation.hurdle.settings import (
     text_list_setting,
     week_list_setting,
     week_setting,
+    bool_setting,
 )
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
@@ -110,6 +111,7 @@ VALID = {
         "ledger_file": '"data/raw/ledger.xlsx"',
         "ledger_as_of": "2026-08-28",
         "holidays_file": '"settings/holidays.toml"',
+        "fill_missing_days_from_ledger": "true",
         "cache_folder": '"data/interim"',
     },
     "companies": {"known": '["TR02", "TR04"]'},
@@ -265,7 +267,8 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
 
 @pytest.mark.parametrize("part, attribute", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
-    ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
+    ("data", "holidays_file"), ("data", "fill_missing_days_from_ledger"),
+    ("data", "cache_folder"), ("companies", "known"),
     ("debug", "one_day"), ("debug", "sample_week"), ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
     ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
@@ -384,7 +387,8 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
 
 @pytest.mark.parametrize("section, key", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
-    ("data", "holidays_file"), ("data", "cache_folder"), ("companies", "known"),
+    ("data", "holidays_file"), ("data", "fill_missing_days_from_ledger"),
+    ("data", "cache_folder"), ("companies", "known"),
     ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
 ])
@@ -416,8 +420,8 @@ def test_a_typo_message_lists_the_expected_settings(tmp_path, repo):
     message = raises_naming(
         tmp_path, repo,
         changes={("data", "ledger_as_of"): REMOVE, ("data", "ledger_as_off"): "2026-08-28"})
-    for key in ["cache_folder", "corpus_folder", "holidays_file", "ledger_as_of",
-                "ledger_file"]:
+    for key in ["cache_folder", "corpus_folder", "fill_missing_days_from_ledger",
+                "holidays_file", "ledger_as_of", "ledger_file"]:
         assert key in message.split("expected")[-1]
 
 
@@ -906,6 +910,7 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()
     assert settings.settings_file == SYNTHETIC_SETTINGS.resolve()
+    assert settings.data.fill_missing_days_from_ledger is True
 
 
 
@@ -1608,3 +1613,57 @@ def test_document_types_setting_names_the_roles_in_role_order():
     with pytest.raises(ValueError) as error:
         document_types({"invoice": ["RV"], "payment": ["DZ"], "credit_memo": ["DZ"]})
     assert str(error.value) == "w.d: code 'DZ' is listed for both payment and credit_memo"
+
+
+# --- types: fill_missing_days_from_ledger (bool_setting) ------------------------------
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_fill_missing_days_from_ledger_accepts_true_and_false(tmp_path, repo, text, expected):
+    value = load(tmp_path, repo,
+                 changes={("data", "fill_missing_days_from_ledger"): text}
+                 ).data.fill_missing_days_from_ledger
+    assert value is expected
+
+
+@pytest.mark.parametrize("bad", ["1", "0", '"true"', '"false"', '"yes"', "1.0", "[true]",
+                                 "2026-08-28"],
+                         ids=["one", "zero", "string-true", "string-false", "string-yes",
+                              "float", "list", "date"])
+def test_fill_missing_days_from_ledger_that_is_not_a_bool_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[data]", "fill_missing_days_from_ledger",
+                            changes={("data", "fill_missing_days_from_ledger"): bad})
+    assert "true or false" in message
+
+
+def test_a_missing_fill_missing_days_from_ledger_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[data]", "fill_missing_days_from_ledger",
+                            changes={("data", "fill_missing_days_from_ledger"): REMOVE})
+    assert "missing" in message
+
+
+def test_fill_missing_days_from_ledger_is_a_field_of_data_settings():
+    names = [field.name for field in dataclasses.fields(DataSettings)]
+    assert "fill_missing_days_from_ledger" in names
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_bool_setting_returns_a_bool_unchanged(value):
+    assert bool_setting({"flag": value}, "flag", "f.toml [s]") is value
+
+
+@pytest.mark.parametrize("bad", [1, 0, "true", "false", None, 1.0, [True]],
+                         ids=["one", "zero", "string-true", "string-false", "none", "float",
+                              "list"])
+def test_bool_setting_rejects_anything_but_a_bool_naming_where_and_key(bad):
+    with pytest.raises(ValueError) as error:
+        bool_setting({"flag": bad}, "flag", "f.toml [s]")
+    message = str(error.value)
+    assert message.startswith("f.toml [s]")
+    assert "flag" in message
+    assert repr(bad) in message
+
+
+def test_bool_setting_with_the_key_absent_raises_key_error():
+    # load_settings checks the keys first, so a direct call without the key is a KeyError.
+    with pytest.raises(KeyError):
+        bool_setting({}, "flag", "f.toml [s]")
