@@ -47,6 +47,12 @@ inspect.signature(script.receivables_by_week).bind(
     leak_check_weeks=(0, 30, 64))
 # Step 8: when each key becomes known, from the daily files and the ledger.
 inspect.signature(script.known_weeks).bind("collections", "ledger", "week_zero")
+# Step 9: the panel's rows, from the known keys, the last week and the horizons.
+inspect.signature(script.panel_rows).bind("known", 64, 5)
+assert callable(script.show_panel_rows)
+# Step 9, U4.2: the labels, from the panel, the weekly amounts and the week calendar.
+inspect.signature(script.add_labels).bind("panel", "weekly", "weeks")
+assert callable(script.show_labels)
 # Step 6: days without a file filled from the ledger; the calendar takes the filled days.
 inspect.signature(script.fill_missing_days).bind("collections", "ledger", [])
 try:

@@ -48,6 +48,7 @@ from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # n
 from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
+from collection_estimation.hurdle.panel import add_labels, panel_rows  # noqa: E402
 from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
     exchange_rates,
     receivables_by_week,
@@ -156,6 +157,16 @@ def main():
     # it gets panel rows.
     known = known_weeks(collections, ledger, week_zero)
     show_known(known, collections, int(weeks["week"].max()))
+
+    # The panel's rows (no labels yet): for every forecast week t, every key known by then,
+    # once for each week ahead h = 1 ... horizons.
+    panel = panel_rows(known, int(weeks["week"].max()), settings.receivables.horizons)
+    show_panel_rows(panel)
+
+    # The labels: what each key paid in the target week (gross receipts, TRY), or unknown
+    # when the target week is missing or after the last week.
+    panel = add_labels(panel, weekly, weeks)
+    show_labels(panel, weekly)
 
     # Step 9 continues, and later steps follow, as each unit is built.
 
@@ -273,6 +284,30 @@ def show_filled(collections, filled_days, switched_on):
     print(f"Step 6: {len(filled_days)} days without a daily file filled from the ledger: "
           f"{len(filled):,} payment lines, {filled['amount_try'].sum():,.2f} TRY "
           f"({', '.join(str(day) for day in filled_days)})")
+
+
+def show_panel_rows(panel):
+    """A short printout of the panel's rows."""
+    per_origin = panel.groupby("origin_week")["key"].nunique()
+    print(f"        panel rows: {len(panel):,} (keys x forecast weeks {panel['origin_week'].min()}"
+          f"-{panel['origin_week'].max()} x horizons 1-{panel['h'].max()}); known keys per "
+          f"forecast week from {per_origin.iloc[0]:,} to {per_origin.iloc[-1]:,}")
+
+
+def show_labels(panel, weekly):
+    """A short printout of the panel's labels."""
+    print(f"        label status: {panel['label_status'].value_counts().to_dict()}")
+    labelled = panel[panel["label_status"] == "labelled"]
+    paid = labelled[labelled["paid"] == True]  # noqa: E712 (paid is a nullable boolean)
+    print(f"        labelled rows with a payment: {len(paid):,} of {len(labelled):,} "
+          f"({len(paid) / len(labelled):.1%}); median amount when paid "
+          f"{paid['amount'].median():,.0f} TRY")
+    # Cash in the target week from keys not yet known at the origin: the new-customer allowance.
+    one_horizon = labelled[labelled["h"] == 1]
+    in_panel = one_horizon.groupby("target_week")["amount"].sum()
+    receipts = weekly.groupby("week")["gross_receipts"].sum().reindex(in_panel.index)
+    print(f"        at h=1, the panel holds {in_panel.sum() / receipts.sum():.2%} of the target "
+          f"weeks' receipts; the rest is from keys not yet known (the allowance, U5)")
 
 
 if __name__ == "__main__":
