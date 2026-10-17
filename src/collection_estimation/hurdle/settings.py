@@ -25,8 +25,9 @@ class DataSettings:
 
 @dataclass(frozen=True)
 class CompanySettings:
-    """The company codes we expect; a line with any other code stops the run."""
-    known: tuple[str, ...]
+    """The company codes we expect, and the placeholder customers of unidentified cash."""
+    known: tuple[str, ...]                    # any other company code stops the run
+    unidentified_customers: tuple[str, ...]   # customer IDs that hold unidentified cash
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                       "fill_missing_days_from_ledger", "cache_folder"},
                f"{name} [data]")
     companies = raw["companies"]
-    check_keys(companies, {"known"}, f"{name} [companies]")
+    check_keys(companies, {"known", "unidentified_customers"}, f"{name} [companies]")
     receivables = raw["receivables"]
     check_keys(receivables, {"min_cleared_for_delay", "horizons", "leak_check_weeks"},
                f"{name} [receivables]")
@@ -120,6 +121,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         ),
         companies=CompanySettings(
             known=text_list_setting(companies, "known", f"{name} [companies]"),
+            unidentified_customers=text_list_setting(companies, "unidentified_customers",
+                                                     f"{name} [companies]", may_be_empty=True),
         ),
         collections_layout=read_collections_layout(collections_layout,
                                                    f"{name} [collections_layout]"),
@@ -196,11 +199,15 @@ def date_setting(table: dict, key: str, where: str) -> date:
     return value
 
 
-def text_list_setting(table: dict, key: str, where: str) -> tuple[str, ...]:
-    """A non-empty list of different, non-empty texts, e.g. ["TR02", "TR04"]."""
+def text_list_setting(table: dict, key: str, where: str,
+                      may_be_empty: bool = False) -> tuple[str, ...]:
+    """A list of different, non-empty texts, e.g. ["TR02", "TR04"]; it must have at least
+    one item unless `may_be_empty`."""
     value = table[key]
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{where}: {key} is {value!r}, not a non-empty list")
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} is {value!r}, not a list")
+    if not value and not may_be_empty:
+        raise ValueError(f"{where}: {key} is empty; it needs at least one item")
     for item in value:
         if not isinstance(item, str) or item.strip() == "":
             raise ValueError(f"{where}: {key} holds {item!r}, not a non-empty text")

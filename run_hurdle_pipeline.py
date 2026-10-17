@@ -49,6 +49,13 @@ from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import add_labels, panel_rows  # noqa: E402
+from collection_estimation.hurdle.side_tables import (  # noqa: E402
+    check_side_tables,
+    is_unidentified,
+    new_customer_cash,
+    refunds_by_week,
+    unidentified_cash_by_week,
+)
 from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
     exchange_rates,
     receivables_by_week,
@@ -158,6 +165,16 @@ def main():
     known = known_weeks(collections, ledger, week_zero)
     show_known(known, collections, int(weeks["week"].max()))
 
+    # Placeholder customers of unidentified cash ([companies] unidentified_customers) are not
+    # customers: they get no panel rows, and their cash goes to table G below.
+    unidentified_customers = settings.companies.unidentified_customers
+    known = known[~is_unidentified(known, unidentified_customers)]
+    unidentified_weekly = weekly[is_unidentified(weekly, unidentified_customers)]
+    identified_weekly = weekly[~is_unidentified(weekly, unidentified_customers)]
+    # The companies we expect (from the settings), not the ones left in `known`: a company
+    # whose only keys are placeholders must still get its rows in tables R and G.
+    companies = list(settings.companies.known)
+
     # The panel's rows (no labels yet): for every forecast week t, every key known by then,
     # once for each week ahead h = 1 ... horizons.
     panel = panel_rows(known, int(weeks["week"].max()), settings.receivables.horizons)
@@ -165,8 +182,30 @@ def main():
 
     # The labels: what each key paid in the target week (gross receipts, TRY), or unknown
     # when the target week is missing or after the last week.
-    panel = add_labels(panel, weekly, weeks)
-    show_labels(panel, weekly)
+    panel = add_labels(panel, identified_weekly, weeks)
+    show_labels(panel, identified_weekly)
+
+    # The side tables: the cash the panel does not hold. A: gross receipts in week t+h of keys
+    # not yet known at forecast week t.
+    new_cash = new_customer_cash(identified_weekly, known, weeks, settings.receivables.horizons,
+                                 companies)
+    show_new_customer_cash(new_cash, weekly)
+
+    # R: each company's refunds per week (negative), all keys together.
+    refunds = refunds_by_week(weekly, weeks, companies)
+    show_refunds(refunds)
+
+    # G: each company's cash per week with no identifiable customer.
+    unidentified = unidentified_cash_by_week(unidentified_weekly, weeks, companies)
+    print(f"        unidentified cash (G): {len(unidentified):,} rows, "
+          f"{unidentified['unidentified_cash'].sum():,.2f} TRY from "
+          f"{len(unidentified_customers)} placeholder customers")
+
+    # The tie-out: panel + A + G must equal every company's gross receipts in every labelled
+    # target week, and R its refunds, so no cash is lost or counted twice.
+    checked = check_side_tables(panel, new_cash, unidentified, refunds, weekly, companies)
+    print(f"        tie-out passed: {checked:,} company-week-horizon checks "
+          f"(panel + A + G = gross receipts; R = refunds)")
 
     # Step 9 continues, and later steps follow, as each unit is built.
 
@@ -308,6 +347,28 @@ def show_labels(panel, weekly):
     receipts = weekly.groupby("week")["gross_receipts"].sum().reindex(in_panel.index)
     print(f"        at h=1, the panel holds {in_panel.sum() / receipts.sum():.2%} of the target "
           f"weeks' receipts; the rest is from keys not yet known (the allowance, U5)")
+
+
+def show_new_customer_cash(new_cash, weekly):
+    """A short printout of table A: its share of the target weeks' cash, by horizon."""
+    week_receipts = weekly.groupby("week")["gross_receipts"].sum()
+    per_h = new_cash.groupby("h")["new_customer_cash"].sum()
+    # Each (origin, h) points at one target week: its cash, all companies together.
+    one_per_target = new_cash.drop_duplicates(["origin_week", "h"]).copy()
+    one_per_target["week_cash"] = one_per_target["target_week"].map(week_receipts)
+    cash_per_h = one_per_target.groupby("h")["week_cash"].sum()
+    shares = {h: f"{per_h[h] / cash_per_h[h]:.2%}" for h in per_h.index}
+    print(f"        new-customer cash (A): {len(new_cash):,} rows; share of the target weeks' "
+          f"cash by h: {shares}")
+
+
+def show_refunds(refunds):
+    """A short printout of table R."""
+    weeks_with_refunds = refunds.loc[refunds["refunds"] < 0, "week"].nunique()
+    per_company = refunds.groupby("company_code")["refunds"].sum().round().to_dict()
+    print(f"        refunds (R): {len(refunds):,} rows, {refunds['refunds'].sum():,.2f} TRY, "
+          f"in {weeks_with_refunds} of {refunds['week'].nunique()} weeks; per company: "
+          f"{per_company}")
 
 
 if __name__ == "__main__":

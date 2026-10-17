@@ -14,6 +14,9 @@ cache_folder  = "data/interim"  # rebuilt automatically when anything changes
 [companies]
 # EY's company codes; a line with any other code stops the run.
 known = ["TR02", "TR04", "TR05", "TR06", "TR91"]
+# Placeholder customer IDs under which unidentified cash is booked (e.g. a suspense account).
+# Their cash goes to the unidentified-cash table, not to the panel. None in the synthetic data.
+unidentified_customers = []
 
 [collections_layout]
 # How the daily collection files are laid out.

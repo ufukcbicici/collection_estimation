@@ -1,5 +1,5 @@
 """Tests for `hurdle/settings.py`: `load_settings` and its helpers `check_keys`,
-`path_setting`, `date_setting`, `text_list_setting`, `rows_setting`, `date_format_setting`,
+`path_setting`, `date_setting`, `text_list_setting` (with `may_be_empty`), `rows_setting`, `date_format_setting`,
 `headers_setting`, `document_types_setting`, `read_collections_layout` and
 `read_ledger_layout`.
 
@@ -114,7 +114,7 @@ VALID = {
         "fill_missing_days_from_ledger": "true",
         "cache_folder": '"data/interim"',
     },
-    "companies": {"known": '["TR02", "TR04"]'},
+    "companies": {"known": '["TR02", "TR04"]', "unidentified_customers": '["99999"]'},
     "collections_layout": {
         "file_name_date_format": '"%d%m%Y"',
         "header_row": "2",
@@ -268,7 +268,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
 @pytest.mark.parametrize("part, attribute", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "fill_missing_days_from_ledger"),
-    ("data", "cache_folder"), ("companies", "known"),
+    ("data", "cache_folder"), ("companies", "known"), ("companies", "unidentified_customers"),
     ("debug", "one_day"), ("debug", "sample_week"), ("collections_layout", "file_name_date_format"), ("collections_layout", "header_row"),
     ("collections_layout", "first_data_row"), ("collections_layout", "headers"),
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
@@ -388,7 +388,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
 @pytest.mark.parametrize("section, key", [
     ("data", "corpus_folder"), ("data", "ledger_file"), ("data", "ledger_as_of"),
     ("data", "holidays_file"), ("data", "fill_missing_days_from_ledger"),
-    ("data", "cache_folder"), ("companies", "known"),
+    ("data", "cache_folder"), ("companies", "known"), ("companies", "unidentified_customers"),
     ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
 ])
@@ -673,6 +673,78 @@ def test_a_bad_known_raises(tmp_path, repo, bad):
                   changes={("companies", "known"): bad})
 
 
+def test_an_empty_known_raises_with_the_is_empty_message(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[companies]", "known",
+                            changes={("companies", "known"): "[]"})
+    assert message.endswith("known is empty; it needs at least one item")
+
+
+def test_a_known_text_raises_with_the_not_a_list_message(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[companies]", "known",
+                            changes={("companies", "known"): '"TR02"'})
+    assert message.endswith("known is 'TR02', not a list")
+
+
+# --- types: unidentified_customers ------------------------------------------------------
+
+def test_unidentified_customers_is_a_tuple_of_texts_in_file_order(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("companies", "unidentified_customers"):
+                                             '["99999", "0000012345", "SUSPENSE"]'})
+    value = settings.companies.unidentified_customers
+    assert value == ("99999", "0000012345", "SUSPENSE")
+    assert type(value) is tuple
+
+
+def test_unidentified_customers_single_item(tmp_path, repo):
+    settings = load(tmp_path, repo)  # VALID has ["99999"]
+    assert settings.companies.unidentified_customers == ("99999",)
+
+
+def test_unidentified_customers_may_be_empty(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("companies", "unidentified_customers"): "[]"})
+    assert settings.companies.unidentified_customers == ()
+    assert type(settings.companies.unidentified_customers) is tuple
+    assert settings.companies.known == ("TR02", "TR04")
+
+
+def test_unidentified_customers_is_kept_as_written_not_normalised(tmp_path, repo):
+    # Pinned: settings keep the text as written; is_unidentified normalises when matching.
+    settings = load(tmp_path, repo, changes={("companies", "unidentified_customers"):
+                                             '["0099999", " ab12 "]'})
+    assert settings.companies.unidentified_customers == ("0099999", " ab12 ")
+
+
+def test_a_missing_unidentified_customers_names_the_setting(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[companies]", "unidentified_customers",
+                            changes={("companies", "unidentified_customers"): REMOVE})
+    assert "missing ['unidentified_customers']" in message
+
+
+@pytest.mark.parametrize("bad, expected", [
+    ('"99999"', "not a list"),
+    ("99999", "not a list"),
+    ("{ a = 1 }", "not a list"),
+    ('["99999", "99999"]', "more than once"),
+    ('["99999", ""]', "not a non-empty text"),
+    ('["99999", "   "]', "not a non-empty text"),
+    ('["99999", 99999]', "not a non-empty text"),
+    ('[["99999"]]', "not a non-empty text"),
+    ("[true]", "not a non-empty text"),
+], ids=["text", "number", "inline-table", "duplicate", "empty-item", "blank-item",
+        "number-item", "nested-list", "bool-item"])
+def test_a_bad_unidentified_customers_raises(tmp_path, repo, bad, expected):
+    raises_naming(tmp_path, repo, "[companies]", "unidentified_customers", expected,
+                  changes={("companies", "unidentified_customers"): bad})
+
+
+def test_unidentified_customers_duplicates_are_compared_as_written(tmp_path, repo):
+    # Pinned: "99999" and "0099999" are different texts, so the setting loads although
+    # both normalise to the same ID (harmless: is_unidentified builds a set).
+    settings = load(tmp_path, repo, changes={("companies", "unidentified_customers"):
+                                             '["99999", "0099999"]'})
+    assert settings.companies.unidentified_customers == ("99999", "0099999")
+
+
 # --- the file itself -----------------------------------------------------------------
 
 def test_a_toml_syntax_error_raises_the_toml_error(tmp_path, repo):
@@ -811,11 +883,54 @@ def test_text_list_setting_result_does_not_follow_later_changes_to_the_list():
     assert result == ("A",)
 
 
-@pytest.mark.parametrize("bad", ["AB", ("A",), [], None],
-                         ids=["text", "tuple", "empty", "none"])
-def test_text_list_setting_rejects_a_non_list_or_empty_list(bad):
-    with pytest.raises(ValueError, match="w: k is"):
+@pytest.mark.parametrize("bad", ["AB", ("A",), None, {"a": 1}],
+                         ids=["text", "tuple", "none", "dict"])
+def test_text_list_setting_rejects_a_non_list(bad):
+    with pytest.raises(ValueError) as error:
         text_list_setting({"k": bad}, "k", "w")
+    assert str(error.value) == f"w: k is {bad!r}, not a list"
+
+
+@pytest.mark.parametrize("bad", ["AB", ("A",), None, ()],
+                         ids=["text", "tuple", "none", "empty-tuple"])
+def test_text_list_setting_rejects_a_non_list_even_when_it_may_be_empty(bad):
+    with pytest.raises(ValueError) as error:
+        text_list_setting({"k": bad}, "k", "w", may_be_empty=True)
+    assert str(error.value) == f"w: k is {bad!r}, not a list"
+
+
+def test_text_list_setting_rejects_an_empty_list_by_default():
+    with pytest.raises(ValueError) as error:
+        text_list_setting({"k": []}, "k", "w")
+    assert str(error.value) == "w: k is empty; it needs at least one item"
+
+
+def test_text_list_setting_rejects_an_empty_list_when_may_be_empty_is_false():
+    with pytest.raises(ValueError, match="k is empty; it needs at least one item"):
+        text_list_setting({"k": []}, "k", "w", may_be_empty=False)
+
+
+def test_text_list_setting_accepts_an_empty_list_when_it_may_be_empty():
+    result = text_list_setting({"k": []}, "k", "w", may_be_empty=True)
+    assert result == ()
+    assert type(result) is tuple
+
+
+def test_text_list_setting_may_be_empty_still_reads_a_non_empty_list():
+    assert text_list_setting({"k": ["A", "B"]}, "k", "w", may_be_empty=True) == ("A", "B")
+
+
+@pytest.mark.parametrize("bad_item", [1, None, "", "  ", ["A"]],
+                         ids=["number", "none", "empty", "blank", "list"])
+def test_text_list_setting_may_be_empty_still_rejects_a_bad_item(bad_item):
+    with pytest.raises(ValueError, match="w: k holds"):
+        text_list_setting({"k": [bad_item]}, "k", "w", may_be_empty=True)
+
+
+def test_text_list_setting_may_be_empty_still_rejects_a_duplicate():
+    with pytest.raises(ValueError) as error:
+        text_list_setting({"k": ["99999", "99999"]}, "k", "w", may_be_empty=True)
+    assert str(error.value) == "w: k lists ['99999'] more than once"
 
 
 @pytest.mark.parametrize("bad_item", [1, None, "", "  "], ids=["number", "none", "empty", "blank"])
@@ -897,6 +1012,7 @@ def test_the_synthetic_settings_hold_the_expected_values():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.data.ledger_as_of == date(2026, 8, 28)
     assert settings.companies.known == ("TR02", "TR04", "TR05", "TR06", "TR91")
+    assert settings.companies.unidentified_customers == ()
     assert settings.debug.one_day == date(2025, 6, 2)
     assert settings.debug.sample_week == 30
     assert type(settings.debug.sample_week) is int

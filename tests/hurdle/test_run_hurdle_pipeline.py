@@ -53,6 +53,27 @@ assert callable(script.show_panel_rows)
 # Step 9, U4.2: the labels, from the panel, the weekly amounts and the week calendar.
 inspect.signature(script.add_labels).bind("panel", "weekly", "weeks")
 assert callable(script.show_labels)
+# Step 9, side table A: new-customer cash, from the weekly amounts, the known keys, the
+# calendar, the horizons and the companies (required: the grid is built from them).
+inspect.signature(script.new_customer_cash).bind("weekly", "known", "weeks", 5, ["TR02"])
+try:
+    inspect.signature(script.new_customer_cash).bind("weekly", "known", "weeks", 5)
+except TypeError:
+    pass
+else:
+    raise AssertionError("new_customer_cash still accepts the old four-argument call")
+assert callable(script.show_new_customer_cash)
+# Side table R: refunds per company and week, from the weekly amounts, the calendar and
+# the companies.
+inspect.signature(script.refunds_by_week).bind("weekly", "weeks", ["TR02"])
+assert callable(script.show_refunds)
+# Side table G: placeholder customers are split off by customer_id, and their gross
+# receipts summed per company and week.
+inspect.signature(script.is_unidentified).bind("table", ("99999",))
+inspect.signature(script.unidentified_cash_by_week).bind("unidentified", "weeks", ["TR02"])
+# The tie-out: the panel and the side tables A, G and R against all the weekly amounts.
+inspect.signature(script.check_side_tables).bind("panel", "new_cash", "unidentified",
+                                                 "refunds", "weekly", ["TR02"])
 # Step 6: days without a file filled from the ledger; the calendar takes the filled days.
 inspect.signature(script.fill_missing_days).bind("collections", "ledger", [])
 try:
