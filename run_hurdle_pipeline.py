@@ -46,13 +46,14 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     read_one_file,
 )
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
+from collection_estimation.hurdle.features_calendar import calendar_features  # noqa: E402
 from collection_estimation.hurdle.features_history import (  # noqa: E402
     first_history_week,
     history_features,
     ledger_receipts_before,
     weekly_matrix,
 )
-from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
+from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
@@ -250,6 +251,11 @@ def main():
     # The history features: per key and origin week, what its payments looked like up to t.
     history = history_features(matrix, known, last_week, settings.history.windows)
     show_history(history, matrix)
+
+    # The calendar features of every target week, up to the last week + the horizons.
+    calendar = calendar_features(week_zero, 0, last_week + settings.receivables.horizons,
+                                 holidays)
+    show_calendar(calendar, week_zero, holidays)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -471,6 +477,28 @@ def show_history(history, matrix):
     sample = history[(history["key"] == busiest) & history["origin_week"].isin([0, 13, 52])]
     print(f"        the key with the most receipts at origin weeks 0, 13 and 52:")
     print(sample.round(0).T.to_string(header=False))
+
+
+def show_calendar(calendar, week_zero, holidays):
+    """A short printout of the calendar features."""
+    print(f"        calendar features: weeks {calendar['week'].min()} to "
+          f"{calendar['week'].max()}; weeks with a month-end: "
+          f"{calendar['has_month_end'].sum()}, a quarter-end: "
+          f"{calendar['has_quarter_end'].sum()}, the 15th: {calendar['has_mid_month'].sum()}")
+    short = calendar[calendar["business_days"] < 5]
+    print(f"        weeks with fewer than 5 business days:")
+    for row in short.itertuples():
+        monday = week_zero + timedelta(days=7 * row.week)
+        names = sorted(set(public_holidays(monday, monday + timedelta(days=4),
+                                           holidays).values()))
+        print(f"          week {row.week} (Monday {monday}): {row.business_days} business days "
+              f"({', '.join(names)})")
+    quarter_ends = [week_zero + timedelta(days=7 * week)
+                    for week in calendar.loc[calendar["has_quarter_end"], "week"]]
+    print(f"        quarter-end weeks start on: {', '.join(str(day) for day in quarter_ends)}")
+    after = calendar[calendar["holidays_week_before"] > 0]
+    print(f"        weeks after a holiday week (holidays_week_before): "
+          f"{dict(zip(after['week'], after['holidays_week_before']))}")
 
 
 if __name__ == "__main__":

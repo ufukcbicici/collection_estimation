@@ -276,3 +276,51 @@ def test_history_features_are_wired_in_and_printed():
     assert "share NaN" in result.stdout
     assert "the key with the most receipts at origin weeks 0, 13 and 52" in result.stdout
     assert "median_payment_13" in result.stdout
+
+
+# Step 11, U7: the calendar features of every target week, from week zero, week 0 to the
+# last week + the horizons, and the holidays; and the printout of them. Run on the real
+# settings/holidays_tr.toml (read only), in a separate process like the checks above.
+CALENDAR = """
+import inspect
+from datetime import date
+import run_hurdle_pipeline as script
+
+inspect.signature(script.calendar_features).bind("week_zero", 0, 69, "holidays")
+try:
+    inspect.signature(script.calendar_features).bind("week_zero", 0, 69)
+except TypeError:
+    pass
+else:
+    raise AssertionError("calendar_features accepts a call without the holidays")
+inspect.signature(script.show_calendar).bind("calendar", "week_zero", "holidays")
+source = " ".join(inspect.getsource(script.main).split())
+call = ("calendar = calendar_features(week_zero, 0, last_week + settings.receivables.horizons,"
+        " holidays)")
+assert call in source, "calendar_features is not called as expected"
+assert "show_calendar(calendar, week_zero, holidays)" in source
+assert source.index("show_history(history, matrix)") < source.index("calendar_features(")
+assert source.index("calendar_features(") < source.index("show_calendar(")
+
+holidays = script.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
+week_zero = date(2025, 6, 2)
+calendar = script.calendar_features(week_zero, 0, 69, holidays)
+script.show_calendar(calendar, week_zero, holidays)
+print("ok")
+"""
+
+
+def test_calendar_features_are_wired_in_and_printed():
+    # The script writes UTF-8 (it reconfigures sys.stdout); the holiday names are Turkish.
+    result = subprocess.run([sys.executable, "-c", CALENDAR], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    assert ("calendar features: weeks 0 to 69; weeks with a month-end: 16, a quarter-end: 6, "
+            "the 15th: 16") in result.stdout
+    assert "weeks with fewer than 5 business days:" in result.stdout
+    assert "week 51 (Monday 2026-05-25): 2 business days (Kurban Bayramı)" in result.stdout
+    assert ("quarter-end weeks start on: 2025-06-30, 2025-09-29, 2025-12-29, 2026-03-30, "
+            "2026-06-29, 2026-09-28") in result.stdout
+    assert "52: 3" in result.stdout
+    assert "np.int64" not in result.stdout
