@@ -15,9 +15,10 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     7  weekly series   receipts per key and week, missing weeks    (U2)   <- built
     8  receivables     each key's receivables as known at each week (U9b)    <- built
     9  panel           rows customer x week x horizon, with labels (U3, U4, U5)  <- in progress
-   10  features        history, calendar, inflation, receivables   (U6-U9c)
-   11  models          stage 1, stage 2, top-ups                   (U10-U12)
-   12  forecast, evaluation, calibration                           (U13-U15)
+   10  prices          TÜFE price levels by week (copied inflation.py, U8)   <- built
+   11  features        history, calendar, receivables              (U6, U7, U9c)
+   12  models          stage 1, stage 2, top-ups                   (U10-U12)
+   13  forecast, evaluation, calibration                           (U13-U15)
 
 The settings (data paths, company codes, ...) are in settings/synthetic.toml. To run on
 other data (e.g. the real EY files), write another settings file and point the environment
@@ -46,6 +47,7 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
 )
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
 from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
+from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import add_labels, panel_rows  # noqa: E402
@@ -64,9 +66,11 @@ from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
     load_ledger,
 )
+from collection_estimation.hurdle.prices import price_weeks, published_levels  # noqa: E402
 from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 from collection_estimation.hurdle.series import (  # noqa: E402
     add_week_index,
+    week_numbers,
     week_calendar,
     weekly_amounts,
 )
@@ -207,7 +211,20 @@ def main():
     print(f"        tie-out passed: {checked:,} company-week-horizon checks "
           f"(panel + A + G = gross receipts; R = refunds)")
 
-    # Step 9 continues, and later steps follow, as each unit is built.
+    # Step 10: TÜFE price levels by week, from the first ledger line (history goes back that
+    # far) to the last week. The copied inflation.py is called directly here so it can be
+    # followed line by line; prices.py wraps it with our week numbers and a coverage guard.
+    last_week = int(weeks["week"].max())
+    first_price_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]),
+                                        week_zero).iloc[0])
+    weeks_for_prices = price_weeks(week_zero, first_price_week, last_week)
+    actual_level = inflation.weekly_price_level(weeks_for_prices)        # hindsight only
+    published_level = inflation.published_price_level(weeks_for_prices)  # known at the time
+    projected_level = inflation.projected_price_level(weeks_for_prices)  # P[origin, target]
+    levels = published_levels(week_zero, first_price_week, last_week)
+    show_prices(weeks_for_prices, actual_level, published_level, projected_level, levels)
+
+    # Step 11 onwards: added as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -369,6 +386,24 @@ def show_refunds(refunds):
     print(f"        refunds (R): {len(refunds):,} rows, {refunds['refunds'].sum():,.2f} TRY, "
           f"in {weeks_with_refunds} of {refunds['week'].nunique()} weeks; per company: "
           f"{per_company}")
+
+
+def show_prices(weeks_for_prices, actual_level, published_level, projected_level, levels):
+    """A short printout of the price levels."""
+    first, last = weeks_for_prices["week"].iloc[0], weeks_for_prices["week"].iloc[-1]
+    print(f"Step 10: price levels for weeks {first} to {last} "
+          f"({weeks_for_prices['week_start'].iloc[0]:%Y-%m-%d} to "
+          f"{weeks_for_prices['week_end'].iloc[-1]:%Y-%m-%d}), 1.0 = the last week")
+    table = pd.DataFrame({"week": weeks_for_prices["week"], "actual": actual_level,
+                          "published": published_level}).set_index("week")
+    print(table.iloc[::13].round(3).to_string())
+    # One week ahead, projected vs actual: how much the projection misses on average.
+    n = len(actual_level)
+    one_ahead = [projected_level[origin, origin + 1] / actual_level[origin + 1] - 1
+                 for origin in range(n - 1)]
+    print(f"        projected vs actual level one week ahead: mean error "
+          f"{sum(one_ahead) / len(one_ahead):+.2%}; published_levels() matches: "
+          f"{bool((abs(levels.to_numpy() - published_level) < 1e-12).all())}")
 
 
 if __name__ == "__main__":

@@ -85,6 +85,10 @@ else:
 inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", [])
 inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", filled_days=[])
 assert callable(script.show_filled)
+# Step 10: TÜFE price levels by week, from week zero and the first and last week numbers.
+inspect.signature(script.price_weeks).bind("week_zero", -32, 64)
+inspect.signature(script.published_levels).bind("week_zero", -32, 64)
+assert callable(script.show_prices)
 print("ok")
 """
 
