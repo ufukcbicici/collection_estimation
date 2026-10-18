@@ -38,6 +38,7 @@ from collection_estimation.hurdle.settings import (
     count_setting,
     date_format_setting,
     date_setting,
+    day_edges_setting,
     document_types_setting,
     headers_setting,
     load_settings,
@@ -130,7 +131,7 @@ VALID = {
         "document_types": inline(DOCUMENT_TYPES),
     },
     "receivables": {"min_cleared_for_delay": "3", "horizons": "5",
-                    "leak_check_weeks": "[0, 30]"},
+                    "leak_check_weeks": "[0, 30]", "overdue_age_days": "[30, 90]"},
     "history": {"windows": "[4, 13, 52]", "use_ledger_before_first_file": "true"},
     "debug": {"one_day": "2025-06-02", "sample_week": "30"},
 }
@@ -278,7 +279,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("ledger_layout", "header_row"), ("ledger_layout", "first_data_row"),
     ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
     ("receivables", "min_cleared_for_delay"), ("receivables", "horizons"),
-    ("receivables", "leak_check_weeks"),
+    ("receivables", "leak_check_weeks"), ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
@@ -396,6 +397,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("data", "cache_folder"), ("companies", "known"), ("companies", "unidentified_customers"),
     ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
+    ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
@@ -647,6 +649,98 @@ def test_week_list_setting_direct_calls():
         week_list_setting({"w": (0, 1)}, "w", "here")
     with pytest.raises(ValueError, match=r"here: w lists \[2\] more than once"):
         week_list_setting({"w": [2, 2]}, "w", "here")
+
+
+# --- types: overdue_age_days (day_edges_setting) ----------------------------------------
+
+def test_overdue_age_days_is_read_as_a_tuple_of_ints(tmp_path, repo):
+    value = load(tmp_path, repo).receivables.overdue_age_days
+    assert value == (30, 90)
+    assert type(value) is tuple
+    assert all(type(days) is int for days in value)
+
+
+@pytest.mark.parametrize("good, expected", [
+    ("[1]", (1,)), ("[30]", (30,)), ("[30, 90]", (30, 90)), ("[30, 60, 90]", (30, 60, 90)),
+    ("[1, 2]", (1, 2)), ("[7, 14, 30, 60, 90, 180, 365]", (7, 14, 30, 60, 90, 180, 365)),
+], ids=["one-day", "one-edge", "two", "three", "adjacent", "seven"])
+def test_overdue_age_days_accepts_increasing_day_counts(tmp_path, repo, good, expected):
+    settings = load(tmp_path, repo, changes={("receivables", "overdue_age_days"): good})
+    assert settings.receivables.overdue_age_days == expected
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("[0]", "0"), ("[-30, 90]", "-30"), ("[30, 1.5]", "1.5"), ("[30.0]", "30.0"),
+    ('["30"]', "'30'"), ("[true]", "True"), ("[30, false]", "False"), ("[[30]]", "[30]"),
+], ids=["zero", "negative", "fraction", "whole-float", "string", "true", "false", "nested"])
+def test_overdue_age_days_with_a_bad_item_raises_naming_it(tmp_path, repo, bad, shown):
+    message = raises_naming(tmp_path, repo, "[receivables]", "overdue_age_days", shown,
+                            changes={("receivables", "overdue_age_days"): bad})
+    assert "not a number of days (1 or more)" in message
+
+
+@pytest.mark.parametrize("bad", ["30", '"30, 90"', "true", "{ a = 1 }", "[]"],
+                         ids=["int", "string", "bool", "table", "empty"])
+def test_overdue_age_days_that_is_not_a_non_empty_list_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[receivables]", "overdue_age_days",
+                            changes={("receivables", "overdue_age_days"): bad})
+    assert "not a non-empty list of days" in message
+
+
+@pytest.mark.parametrize("bad", ["[90, 30]", "[30, 30]", "[30, 90, 60]", "[30, 90, 90]"],
+                         ids=["reversed", "repeated", "unsorted", "repeated-last"])
+def test_overdue_age_days_not_strictly_increasing_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[receivables]", "overdue_age_days",
+                            changes={("receivables", "overdue_age_days"): bad})
+    assert "give the days from smallest to largest, each once" in message
+
+
+def test_a_missing_overdue_age_days_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[receivables]", "overdue_age_days",
+                            changes={("receivables", "overdue_age_days"): REMOVE})
+    assert "missing" in message
+
+
+def test_an_overdue_age_days_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[receivables]", "'overdue_age_days'", "'overdue_age_day'",
+        changes={("receivables", "overdue_age_days"): REMOVE,
+                 ("receivables", "overdue_age_day"): "[30, 90]"})
+    assert "missing" in message and "unknown" in message
+
+
+def test_overdue_age_days_does_not_borrow_leak_check_weeks(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("receivables", "overdue_age_days"): "[15]",
+                                             ("receivables", "leak_check_weeks"): "[3, 1]"})
+    assert settings.receivables.overdue_age_days == (15,)
+    assert settings.receivables.leak_check_weeks == (3, 1)
+
+
+def test_day_edges_setting_direct_calls_and_exact_messages():
+    assert day_edges_setting({"d": [30, 90]}, "d", "here") == (30, 90)
+    assert type(day_edges_setting({"d": [5]}, "d", "here")) is tuple
+    with pytest.raises(ValueError) as error:
+        day_edges_setting({"d": []}, "d", "here")
+    assert str(error.value) == "here: d is [], not a non-empty list of days"
+    with pytest.raises(ValueError) as error:
+        day_edges_setting({"d": (30, 90)}, "d", "here")
+    assert str(error.value) == "here: d is (30, 90), not a non-empty list of days"
+    with pytest.raises(ValueError) as error:
+        day_edges_setting({"d": [30, True]}, "d", "here")
+    assert str(error.value) == "here: d holds True, not a number of days (1 or more)"
+    with pytest.raises(ValueError) as error:
+        day_edges_setting({"d": [0, 30]}, "d", "here")
+    assert str(error.value) == "here: d holds 0, not a number of days (1 or more)"
+    with pytest.raises(ValueError) as error:
+        day_edges_setting({"d": [90, 30]}, "d", "here")
+    assert str(error.value) == ("here: d is [90, 30]; give the days from smallest to largest, "
+                                "each once")
+
+
+def test_day_edges_setting_does_not_sort_or_modify_its_input():
+    table = {"d": [30, 90]}
+    day_edges_setting(table, "d", "here")
+    assert table == {"d": [30, 90]}
 
 
 def test_count_setting_accepts_one_and_more():
@@ -1028,6 +1122,8 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert type(settings.receivables.horizons) is int
     assert settings.receivables.leak_check_weeks == (0, 16, 32, 48)
     assert type(settings.receivables.leak_check_weeks) is tuple
+    assert settings.receivables.overdue_age_days == (30, 90)
+    assert type(settings.receivables.overdue_age_days) is tuple
     assert settings.data.cache_folder.parts[-2:] == ("data", "interim")
     assert settings.data.cache_folder == (REPO_ROOT / "data" / "interim").resolve()
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()

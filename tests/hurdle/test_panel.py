@@ -383,7 +383,8 @@ def synthetic_receivables(synthetic):
     rates = exchange_rates(collections, ledger)
     with contextlib.redirect_stdout(io.StringIO()):
         return receivables_by_week(ledger, rates, WEEK_ZERO, last_week=64, as_of=AS_OF,
-                                   horizons=5, min_cleared=3, leak_check_weeks=(0, 30, 64))
+                                   horizons=5, min_cleared=3, leak_check_weeks=(0, 30, 64),
+                                   age_edges=(30, 90))
 
 
 def test_slow_synthetic_panel_has_1159740_rows(synthetic):

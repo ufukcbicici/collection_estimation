@@ -5,6 +5,7 @@ that was known at the time. Amounts owed in a foreign currency are worked out in
 currency and converted to TRY at the last exchange rate known at t.
 """
 from datetime import date, timedelta
+from numbers import Integral
 
 import pandas as pd
 
@@ -204,22 +205,45 @@ def due_in_week_columns(horizons: int) -> list[str]:
     return [f"due_in_week_{h}" for h in range(1, horizons + 1)]
 
 
-def receivables_columns(horizons: int) -> list[str]:
+def receivables_columns(horizons: int, age_edges: tuple[int, ...]) -> list[str]:
     """The columns of the table `receivables_at` returns, in order."""
     return (["key", "week"] + due_in_week_columns(horizons)
-            + ["due_later", "overdue", "overdue_days", "open_invoices", "unapplied_cash",
-               "open_balance", "usual_delay_days", "cleared_invoices"])
+            + ["due_later", "overdue"] + overdue_age_columns(age_edges)
+            + ["overdue_days", "open_invoices", "unapplied_cash", "open_balance",
+               "usual_delay_days", "cleared_invoices"])
+
+
+def overdue_age_columns(age_edges: tuple[int, ...]) -> list[str]:
+    """The names of the aging buckets for the edges `age_edges` (days past due), e.g.
+    (30, 90) -> overdue_up_to_30, overdue_31_to_90, overdue_over_90. Raises ValueError
+    unless the edges are whole numbers of days (1 or more), from smallest to largest, each
+    once: repeated edges would give an always-empty bucket, unsorted ones overlapping
+    buckets."""
+    edges = list(age_edges)
+    if (not edges
+            or any(isinstance(edge, bool) or not isinstance(edge, Integral) or edge < 1
+                   for edge in edges)
+            or edges != sorted(set(edges))):
+        raise ValueError(f"age_edges are {age_edges}; give whole numbers of days (1 or more), "
+                         f"from smallest to largest, each once")
+    names = [f"overdue_up_to_{age_edges[0]}"]
+    for previous, edge in zip(age_edges, age_edges[1:]):
+        names.append(f"overdue_{previous + 1}_to_{edge}")
+    names.append(f"overdue_over_{age_edges[-1]}")
+    return names
 
 
 def receivables_at(ledger: pd.DataFrame, week: int, week_zero: date, rates: pd.DataFrame,
-                   horizons: int, min_cleared: int) -> pd.DataFrame:
+                   horizons: int, min_cleared: int, age_edges: tuple[int, ...]) -> pd.DataFrame:
     """Each customer's receivables at the end of `week` (its Sunday), as the ledger showed them.
 
     One row per key with at least one ledger line posted by then. Amounts are in TRY at the
     rates known at the end of the week. Columns (see `receivables_columns`):
     - due_in_week_1 ... due_in_week_<horizons>: outstanding on open invoices due in that week
       ahead; due_later: due after the last of them; overdue: due on or before the end of
-      `week`; overdue_days: the amount-weighted average days past due (0 if none);
+      `week`, and split by days past due at the edges `age_edges` into the aging buckets
+      (see `overdue_age_columns`); overdue_days: the amount-weighted average days past due
+      (0 if none);
       open_invoices: how many are open. These add up to the open invoices' outstanding total.
     - unapplied_cash: open payments not yet matched to an invoice (a positive amount);
       open_balance: the sum of all the customer's open lines (what it really owes).
@@ -231,7 +255,7 @@ def receivables_at(ledger: pd.DataFrame, week: int, week_zero: date, rates: pd.D
     invoices = open_invoices_at(ledger, cutoff)
     invoices["outstanding_try"] = to_try(invoices["outstanding"], invoices["currency"],
                                          rates_at_cutoff, cutoff)
-    buckets = due_buckets(invoices, week, week_zero, cutoff, horizons)
+    buckets = due_buckets(invoices, week, week_zero, cutoff, horizons, age_edges)
     balances = open_lines_at(ledger, cutoff, rates_at_cutoff)
     delays = payment_delays_at(ledger, cutoff, min_cleared)
 
@@ -245,13 +269,14 @@ def receivables_at(ledger: pd.DataFrame, week: int, week_zero: date, rates: pd.D
         table = table.merge(part, on="key", how="left")
 
     # A key with nothing open, or no cleared invoice yet, gets zeros; its usual delay stays NaN.
-    amounts = due_in_week_columns(horizons) + ["due_later", "overdue", "overdue_days",
-                                               "unapplied_cash", "open_balance"]
+    amounts = (due_in_week_columns(horizons) + ["due_later", "overdue"]
+               + overdue_age_columns(age_edges)
+               + ["overdue_days", "unapplied_cash", "open_balance"])
     table[amounts] = table[amounts].fillna(0.0)
     for count in ("open_invoices", "cleared_invoices"):
         table[count] = table[count].fillna(0).astype("int64")
     table["week"] = table["week"].astype("int64")
-    return table[receivables_columns(horizons)]
+    return table[receivables_columns(horizons, age_edges)]
 
 
 def to_try(amounts: pd.Series, currencies: pd.Series, rates_at_cutoff: dict[str, float],
@@ -271,13 +296,15 @@ def to_try(amounts: pd.Series, currencies: pd.Series, rates_at_cutoff: dict[str,
 
 
 def due_buckets(invoices: pd.DataFrame, week: int, week_zero: date, cutoff: date,
-                horizons: int) -> pd.DataFrame:
+                horizons: int, age_edges: tuple[int, ...]) -> pd.DataFrame:
     """Per key, the open invoices' outstanding TRY split by when it is due.
 
     `invoices` is `open_invoices_at` with an `outstanding_try` column. An invoice due in week
     t+h (h = 1 ... horizons) goes to due_in_week_<h>; due later, to due_later; due on or
-    before the end of week t, to overdue. Raises ValueError if the parts of a key do not add
-    up to its total (no invoice may be lost or counted twice).
+    before the end of week t, to overdue. Overdue is split again by days past due at the
+    cutoff, at the edges `age_edges` (e.g. (30, 90): 0-30, 31-90, over 90 days). Raises
+    ValueError if the parts of a key do not add up to its total, or the aging buckets to
+    its overdue (no invoice may be lost or counted twice).
     """
     no_due_date = invoices["net_due_date"].isna()
     if no_due_date.any():
@@ -293,6 +320,14 @@ def due_buckets(invoices: pd.DataFrame, week: int, week_zero: date, cutoff: date
         parts[column] = amount.where(weeks_ahead == h, 0.0)
     parts["due_later"] = amount.where(weeks_ahead > horizons, 0.0)
     parts["overdue"] = amount.where(is_overdue, 0.0)
+    # The aging buckets: each overdue invoice in the one bucket its days past due fall in.
+    lower = -1  # days past due are 0 or more for an overdue invoice
+    for column, upper in zip(overdue_age_columns(age_edges), list(age_edges) + [None]):
+        in_bucket = is_overdue & (days_past_due > lower)
+        if upper is not None:
+            in_bucket &= days_past_due <= upper
+        parts[column] = amount.where(in_bucket, 0.0)
+        lower = upper
     parts["overdue_amount_x_days"] = (amount * days_past_due).where(is_overdue, 0.0)
     parts["open_invoices"] = 1
 
@@ -309,7 +344,13 @@ def due_buckets(invoices: pd.DataFrame, week: int, week_zero: date, cutoff: date
         raise ValueError(f"at {cutoff}, the due-date split does not add up to the open "
                          f"invoices' total for {differs.sum()} keys "
                          f"(first: {per_key.loc[differs, 'key'].head(5).tolist()})")
-    return per_key[["key"] + columns + ["overdue_days", "open_invoices"]]
+    ages = overdue_age_columns(age_edges)
+    differs = (per_key[ages].sum(axis=1) - per_key["overdue"]).abs() > TIE_OUT_TOLERANCE
+    if differs.any():
+        raise ValueError(f"at {cutoff}, the aging buckets do not add up to the overdue amount "
+                         f"for {differs.sum()} keys "
+                         f"(first: {per_key.loc[differs, 'key'].head(5).tolist()})")
+    return per_key[["key"] + columns + ages + ["overdue_days", "open_invoices"]]
 
 
 def open_lines_at(ledger: pd.DataFrame, cutoff: date,
@@ -345,7 +386,8 @@ def end_of_week(week_zero: date, week: int) -> date:
 
 def receivables_by_week(ledger: pd.DataFrame, rates: pd.DataFrame, week_zero: date,
                         last_week: int, as_of: date, horizons: int, min_cleared: int,
-                        leak_check_weeks: tuple[int, ...]) -> pd.DataFrame:
+                        leak_check_weeks: tuple[int, ...],
+                        age_edges: tuple[int, ...]) -> pd.DataFrame:
     """`receivables_at` for every week from 0 to `last_week`, in one table (key x week).
 
     `as_of` is the date the ledger was extracted. The last week may end a few days after it
@@ -364,19 +406,20 @@ def receivables_by_week(ledger: pd.DataFrame, rates: pd.DataFrame, week_zero: da
 
     tables = []
     for week in range(last_week + 1):
-        tables.append(receivables_at(ledger, week, week_zero, rates, horizons, min_cleared))
+        tables.append(receivables_at(ledger, week, week_zero, rates, horizons, min_cleared,
+                                     age_edges))
         if (week + 1) % 10 == 0:
             print(f"  ... receivables for {week + 1} of {last_week + 1} weeks")
     by_week = pd.concat(tables, ignore_index=True)
 
     check_no_leak(by_week, ledger, rates, leak_check_weeks, last_week, week_zero, horizons,
-                  min_cleared)
+                  min_cleared, age_edges)
     return by_week
 
 
 def check_no_leak(by_week: pd.DataFrame, ledger: pd.DataFrame, rates: pd.DataFrame,
                   weeks: tuple[int, ...], last_week: int, week_zero: date, horizons: int,
-                  min_cleared: int) -> None:
+                  min_cleared: int, age_edges: tuple[int, ...]) -> None:
     """Rebuild each of `weeks` from data cut off at that week, and compare with `by_week`.
 
     The ledger is cut with `ledger_as_known_at`, and the rates to days on or before the
@@ -390,7 +433,8 @@ def check_no_leak(by_week: pd.DataFrame, ledger: pd.DataFrame, rates: pd.DataFra
                              f"(0 to {last_week})")
         cutoff = end_of_week(week_zero, week)
         rebuilt = receivables_at(ledger_as_known_at(ledger, cutoff), week, week_zero,
-                                 rates[rates["day"] <= cutoff], horizons, min_cleared)
+                                 rates[rates["day"] <= cutoff], horizons, min_cleared,
+                                 age_edges)
         stored = by_week[by_week["week"] == week].reset_index(drop=True)
         if not rebuilt.equals(stored):
             raise ValueError(f"leak check: week {week} differs when rebuilt from data cut off "

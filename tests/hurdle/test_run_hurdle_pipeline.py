@@ -44,7 +44,16 @@ else:
 inspect.signature(script.exchange_rates).bind("collections", "ledger")
 inspect.signature(script.receivables_by_week).bind(
     "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5, min_cleared=3,
-    leak_check_weeks=(0, 30, 64))
+    leak_check_weeks=(0, 30, 64), age_edges=(30, 90))
+# After U9c.1: the aging-bucket edges are required.
+try:
+    inspect.signature(script.receivables_by_week).bind(
+        "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5,
+        min_cleared=3, leak_check_weeks=(0, 30, 64))
+except TypeError:
+    pass
+else:
+    raise AssertionError("receivables_by_week accepts a call without the age edges")
 # Step 8: when each key becomes known, from the daily files and the ledger.
 inspect.signature(script.known_weeks).bind("collections", "ledger", "week_zero")
 # Step 9: the panel's rows, from the known keys, the last week and the horizons.
@@ -324,3 +333,109 @@ def test_calendar_features_are_wired_in_and_printed():
             "2026-06-29, 2026-09-28") in result.stdout
     assert "52: 3" in result.stdout
     assert "np.int64" not in result.stdout
+
+
+# Step 8, U9c.1: the receivables are built with the aging edges from the settings, and the
+# printout shows the aging table. Step 11, U9c.2: the receivables features, after the
+# calendar features, and their printout. Run on small hand-built tables, in a separate
+# process like the checks above.
+RECEIVABLES = """
+import inspect
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.receivables_asof import receivables_columns
+
+source = " ".join(inspect.getsource(script.main).split())
+assert ("leak_check_weeks=settings.receivables.leak_check_weeks, "
+        "age_edges=settings.receivables.overdue_age_days)") in source, "step 8 call"
+assert ("show_receivables_by_week(receivables, settings.receivables.leak_check_weeks, "
+        "settings.debug.sample_week, settings.receivables.overdue_age_days)") in source
+call = ("owed = receivables_features(panel, receivables, levels, "
+        "settings.receivables.horizons, settings.receivables.overdue_age_days)")
+assert call in source, "receivables_features is not called as expected"
+show = "show_owed(owed, int(before_first_ledger_week(panel, receivables).sum()))"
+assert show in source, "show_owed is not called with the not-yet-in-ledger count"
+assert source.index("show_calendar(") < source.index("receivables_features(")
+assert source.index("receivables_features(") < source.index("show_owed(owed")
+assert callable(script.before_first_ledger_week)
+inspect.signature(script.show_owed).bind("owed", 0)
+assert source.index("receivables_by_week(") < source.index("receivables_features(")
+inspect.signature(script.receivables_features).bind("panel", "receivables", "levels", 5, (30, 90))
+try:
+    inspect.signature(script.receivables_features).bind("panel", "receivables", "levels", 5)
+except TypeError:
+    pass
+else:
+    raise AssertionError("receivables_features accepts a call without the age edges")
+inspect.signature(script.show_receivables_by_week).bind("r", (0,), 30, (30, 90))
+assert callable(script.show_owed)
+
+columns = receivables_columns(5, (30, 90))
+rows = []
+for key in ["A", "B"]:
+    for week in range(0, 17):
+        row = dict.fromkeys(columns, 0.0)
+        row.update(key=key, week=week, open_invoices=1, cleared_invoices=0,
+                   usual_delay_days=float("nan"))
+        row["due_in_week_1"] = 1e6
+        row["overdue"] = 3e6
+        row["overdue_up_to_30"], row["overdue_31_to_90"], row["overdue_over_90"] = 1e6, 0.5e6, 1.5e6
+        rows.append(row)
+receivables = pd.DataFrame(rows, columns=columns)
+for column in ("week", "open_invoices", "cleared_invoices"):
+    receivables[column] = receivables[column].astype("int64")
+script.show_receivables_by_week(receivables, (0, 16), 8, (30, 90))
+
+# Key C is known but not yet in the ledger: its ledger starts in week 10, after its panel
+# weeks 3 and 4, so those two rows are filled as nothing owed. (A key with no receivables
+# row at all would make receivables_features raise.) Added after the aging printout so the
+# aging totals above stay those of A and B.
+c_rows = []
+for week in range(10, 17):
+    row = dict.fromkeys(columns, 0.0)
+    row.update(key="C", week=week, open_invoices=0, cleared_invoices=0,
+               usual_delay_days=float("nan"))
+    c_rows.append(row)
+c_table = pd.DataFrame(c_rows, columns=columns)
+for column in ("week", "open_invoices", "cleared_invoices"):
+    c_table[column] = c_table[column].astype("int64")
+receivables = pd.concat([receivables, c_table], ignore_index=True)
+panel = pd.DataFrame({"key": ["A", "A", "B", "C", "C"], "origin_week": [3, 3, 16, 3, 4],
+                      "h": [1, 2, 5, 1, 3]})
+levels = pd.Series(1.0, index=range(0, 17))
+owed = script.receivables_features(panel, receivables, levels, 5, (30, 90))
+filled = int(script.before_first_ledger_week(panel, receivables).sum())
+assert filled == 2, filled
+script.show_owed(owed, filled)
+# A key with no receivables row at all is refused, not filled.
+absent = pd.concat([panel, pd.DataFrame({"key": ["D"], "origin_week": [3], "h": [1]})],
+                   ignore_index=True)
+try:
+    script.receivables_features(absent, receivables, levels, 5, (30, 90))
+except ValueError as error:
+    assert str(error) == "1 panel keys have no receivables row at all (first: ['D'])", error
+else:
+    raise AssertionError("a key with no receivables row was filled")
+print("ok")
+"""
+
+
+def test_receivables_aging_and_features_are_wired_in_and_printed():
+    result = subprocess.run([sys.executable, "-c", RECEIVABLES], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    assert "overdue by days past due, million TRY (every 8th week):" in result.stdout
+    for column in ("overdue_up_to_30", "overdue_31_to_90", "overdue_over_90"):
+        assert column in result.stdout
+    # Two keys of 3.0 million overdue each: 6.0 million, split 2.0 / 1.0 / 3.0 per week.
+    aging = result.stdout.split("overdue by days past due")[1].splitlines()
+    assert aging[1].split() == ["overdue", "overdue_up_to_30", "overdue_31_to_90",
+                                "overdue_over_90"]
+    assert [line.split() for line in aging[3:6]] == [
+        [week, "6.0", "2.0", "1.0", "3.0"] for week in ("0", "8", "16")]
+    assert "receivables features: 5 rows (key x origin week x h), 12 features" in result.stdout
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    assert "rows of keys not yet in the ledger (filled as nothing owed): 2" in lines
+    assert "share NaN" in result.stdout
+    assert "due before / in / after the target week, by h" in result.stdout

@@ -36,6 +36,7 @@ class ReceivablesSettings:
     min_cleared_for_delay: int   # fewer cleared invoices than this: usual delay unknown (NaN)
     horizons: int                # how many weeks ahead the "due in week t+h" columns cover
     leak_check_weeks: tuple[int, ...]   # weeks rebuilt from a cut-off ledger and compared
+    overdue_age_days: tuple[int, ...]   # edges of the aging buckets, in days past due
 
 
 @dataclass(frozen=True)
@@ -104,8 +105,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     companies = raw["companies"]
     check_keys(companies, {"known", "unidentified_customers"}, f"{name} [companies]")
     receivables = raw["receivables"]
-    check_keys(receivables, {"min_cleared_for_delay", "horizons", "leak_check_weeks"},
-               f"{name} [receivables]")
+    check_keys(receivables, {"min_cleared_for_delay", "horizons", "leak_check_weeks",
+                             "overdue_age_days"}, f"{name} [receivables]")
     history = raw["history"]
     check_keys(history, {"windows", "use_ledger_before_first_file"}, f"{name} [history]")
     debug = raw["debug"]
@@ -142,6 +143,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                                 f"{name} [receivables]"),
             horizons=count_setting(receivables, "horizons", f"{name} [receivables]"),
             leak_check_weeks=week_list_setting(receivables, "leak_check_weeks",
+                                               f"{name} [receivables]"),
+            overdue_age_days=day_edges_setting(receivables, "overdue_age_days",
                                                f"{name} [receivables]"),
         ),
         history=HistorySettings(
@@ -393,3 +396,19 @@ def window_list_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
     if duplicates:
         raise ValueError(f"{where}: {key} lists {duplicates} more than once")
     return tuple(sorted(value))
+
+
+def day_edges_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
+    """A non-empty list of whole numbers of days (1 or more), given from smallest to largest
+    with no repeats, e.g. [30, 90]: the edges of buckets 0-30, 31-90 and over 90 days."""
+    value = table[key]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where}: {key} is {value!r}, not a non-empty list of days")
+    for item in value:
+        # bool is a subclass of int in Python, so it is excluded explicitly.
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError(f"{where}: {key} holds {item!r}, not a number of days (1 or more)")
+    if value != sorted(set(value)):
+        raise ValueError(f"{where}: {key} is {value}; give the days from smallest to largest, "
+                         f"each once")
+    return tuple(value)

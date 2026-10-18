@@ -47,6 +47,10 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
 )
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
 from collection_estimation.hurdle.features_calendar import calendar_features  # noqa: E402
+from collection_estimation.hurdle.features_receivables import (  # noqa: E402
+    before_first_ledger_week,
+    receivables_features,
+)
 from collection_estimation.hurdle.features_history import (  # noqa: E402
     first_history_week,
     history_features,
@@ -67,6 +71,7 @@ from collection_estimation.hurdle.side_tables import (  # noqa: E402
 )
 from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
     exchange_rates,
+    overdue_age_columns,
     receivables_by_week,
 )
 from collection_estimation.hurdle.read_ledger import (  # noqa: E402
@@ -166,9 +171,10 @@ def main():
         ledger, rates, week_zero, last_week=int(weeks["week"].max()),
         as_of=settings.data.ledger_as_of, horizons=settings.receivables.horizons,
         min_cleared=settings.receivables.min_cleared_for_delay,
-        leak_check_weeks=settings.receivables.leak_check_weeks)
+        leak_check_weeks=settings.receivables.leak_check_weeks,
+        age_edges=settings.receivables.overdue_age_days)
     show_receivables_by_week(receivables, settings.receivables.leak_check_weeks,
-                             settings.debug.sample_week)
+                             settings.debug.sample_week, settings.receivables.overdue_age_days)
 
     # Step 9: the panel. Built unit by unit; for now, when each key becomes known (the
     # week of its first interaction, in the ledger or the daily files). From that week on
@@ -257,6 +263,12 @@ def main():
                                  holidays)
     show_calendar(calendar, week_zero, holidays)
 
+    # The receivables features: per panel row, what the customer owed at t, split at its
+    # target week t+h (deflated, like the history features).
+    owed = receivables_features(panel, receivables, levels, settings.receivables.horizons,
+                                settings.receivables.overdue_age_days)
+    show_owed(owed, int(before_first_ledger_week(panel, receivables).sum()))
+
     # Step 11 continues, and later steps follow, as each unit is built.
 
 
@@ -334,7 +346,7 @@ def show_rates(rates):
               f"{rows['day'].max()}, {rows['rate'].min():.2f} to {rows['rate'].max():.2f} TRY")
 
 
-def show_receivables_by_week(receivables, leak_check_weeks, sample_week):
+def show_receivables_by_week(receivables, leak_check_weeks, sample_week, age_edges):
     """A short printout of the receivables of every week."""
     print(f"        receivables: {len(receivables):,} rows, {receivables['key'].nunique():,} "
           f"keys, weeks {receivables['week'].min()} to {receivables['week'].max()}; "
@@ -348,6 +360,10 @@ def show_receivables_by_week(receivables, leak_check_weeks, sample_week):
     print(f"        week {sample_week}: {len(one_week):,} keys, "
           f"{(one_week['open_invoices'] > 0).sum():,} with an open invoice, "
           f"{one_week['usual_delay_days'].notna().sum():,} with a usual delay")
+    ages = overdue_age_columns(age_edges)
+    aging = receivables.groupby("week")[["overdue"] + ages].sum() / 1e6
+    print("        overdue by days past due, million TRY (every 8th week):")
+    print(aging.loc[aging.index % 8 == 0].round(1).to_string())
 
 
 def show_known(known, collections, last_week):
@@ -499,6 +515,23 @@ def show_calendar(calendar, week_zero, holidays):
     after = calendar[calendar["holidays_week_before"] > 0]
     print(f"        weeks after a holiday week (holidays_week_before): "
           f"{dict(zip(after['week'], after['holidays_week_before']))}")
+
+
+def show_owed(owed, not_yet_in_ledger):
+    """A short printout of the receivables features."""
+    features = [column for column in owed.columns if column not in ("key", "origin_week", "h")]
+    print(f"        receivables features: {len(owed):,} rows (key x origin week x h), "
+          f"{len(features)} features; the due-date split adds up in every row")
+    print(f"        rows of keys not yet in the ledger (filled as nothing owed): "
+          f"{not_yet_in_ledger:,}")
+    summary = pd.DataFrame({"mean": owed[features].mean(),
+                            "share NaN": owed[features].isna().mean()})
+    print(summary.round(3).to_string())
+    due_by_h = owed.groupby("h")[["due_before_target_week", "due_in_target_week",
+                                  "due_after_target_week"]].sum() / 1e9
+    print("        due before / in / after the target week, by h (billion TRY of the last "
+          "week, summed over rows):")
+    print(due_by_h.round(2).to_string())
 
 
 if __name__ == "__main__":

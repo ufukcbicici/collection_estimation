@@ -75,6 +75,8 @@ min_cleared_for_delay = 3       # fewer cleared invoices: the usual delay is unk
 horizons = 5                    # the "due in week t+1 ... t+5" columns
 leak_check_weeks = [0, 16, 32, 48]  # rebuilt from a ledger cut off at the week and compared;
                                     # spread over the history (the last week proves little)
+overdue_age_days = [30, 90]     # aging buckets of the overdue amount: 0-30, 31-90 and over 90
+                                # days past due (to be confirmed with EY Finance)
 
 [history]
 # How each customer's payment history is summarised (the history features).

@@ -15,6 +15,7 @@ import io
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -32,6 +33,8 @@ from collection_estimation.hurdle.receivables_asof import (
     receivables_columns,
 )
 from tests.hurdle.test_receivables_at import (
+    AGE_COLUMNS,
+    AGE_EDGES,
     EUR_RATES,
     WEEK_ZERO,
     invoice,
@@ -64,14 +67,15 @@ def small_ledger():
 
 
 def by_week(table=None, last_week=5, as_of=FAR_AS_OF, horizons=5, min_cleared=3,
-            leak_check_weeks=(), rates=EUR_RATES):
+            leak_check_weeks=(), rates=EUR_RATES, age_edges=AGE_EDGES):
     table = small_ledger() if table is None else table
     return receivables_by_week(table, rates, WEEK_ZERO, last_week, as_of, horizons,
-                               min_cleared, leak_check_weeks)
+                               min_cleared, leak_check_weeks, age_edges=age_edges)
 
 
-def stacked_receivables_at(table, last_week, rates=EUR_RATES, horizons=5, min_cleared=3):
-    blocks = [receivables_at(table, week, WEEK_ZERO, rates, horizons, min_cleared)
+def stacked_receivables_at(table, last_week, rates=EUR_RATES, horizons=5, min_cleared=3,
+                           age_edges=AGE_EDGES):
+    blocks = [receivables_at(table, week, WEEK_ZERO, rates, horizons, min_cleared, age_edges)
               for week in range(last_week + 1)]
     return pd.concat(blocks, ignore_index=True)
 
@@ -102,7 +106,7 @@ def test_receivables_at_uses_end_of_week_as_its_cutoff():
     # A line posted on Sunday of week 2 counts in week 2; one posted on Monday of week 3 not.
     table = ledger([invoice("ON", 10, sunday(2), due=sunday(9)),
                     invoice("AFTER", 20, monday(3), due=sunday(9), customer="B")])
-    result = receivables_at(table, 2, WEEK_ZERO, EUR_RATES, 5, 3)
+    result = receivables_at(table, 2, WEEK_ZERO, EUR_RATES, 5, 3, AGE_EDGES)
     assert result["key"].tolist() == ["TR02-A"]
 
 
@@ -224,13 +228,13 @@ def test_by_week_index_is_0_to_n_minus_1():
 
 @pytest.mark.parametrize("horizons", [1, 3, 5])
 def test_by_week_columns_are_receivables_columns(horizons):
-    assert list(by_week(horizons=horizons).columns) == receivables_columns(horizons)
+    assert list(by_week(horizons=horizons).columns) == receivables_columns(horizons, AGE_EDGES)
 
 
 def test_by_week_last_week_0_gives_week_0_only():
     result = by_week(last_week=0)
     pd.testing.assert_frame_equal(result, receivables_at(small_ledger(), 0, WEEK_ZERO,
-                                                         EUR_RATES, 5, 3))
+                                                         EUR_RATES, 5, 3, AGE_EDGES))
 
 
 def test_by_week_follows_the_ledger_over_time():
@@ -252,7 +256,8 @@ def test_by_week_an_empty_first_week_keeps_the_dtypes():
     assert result["key"].dtype == object
     for column in ["week", "open_invoices", "cleared_invoices"]:
         assert result[column].dtype == "int64", column
-    for column in ["due_in_week_1", "overdue", "open_balance", "usual_delay_days"]:
+    for column in ["due_in_week_1", "overdue", *AGE_COLUMNS, "open_balance",
+                   "usual_delay_days"]:
         assert result[column].dtype == "float64", column
 
 
@@ -341,7 +346,7 @@ def test_the_as_of_rule_is_checked_before_any_week_is_built(monkeypatch):
 # --- check_no_leak --------------------------------------------------------------------
 
 def leak_check(table, stored, weeks, last_week=5):
-    check_no_leak(stored, table, EUR_RATES, weeks, last_week, WEEK_ZERO, 5, 3)
+    check_no_leak(stored, table, EUR_RATES, weeks, last_week, WEEK_ZERO, 5, 3, AGE_EDGES)
 
 
 def test_check_no_leak_passes_on_a_correct_table():
@@ -356,13 +361,16 @@ def test_by_week_runs_the_leak_check_on_every_named_week():
 def test_by_week_calls_check_no_leak_with_its_table_and_weeks(monkeypatch):
     seen = {}
 
-    def spy(stored, table, rates, weeks, last_week, week_zero, horizons, min_cleared):
+    def spy(stored, table, rates, weeks, last_week, week_zero, horizons, min_cleared,
+            age_edges):
         seen.update(stored=stored, weeks=weeks, last_week=last_week, week_zero=week_zero,
-                    horizons=horizons, min_cleared=min_cleared)
+                    horizons=horizons, min_cleared=min_cleared, age_edges=age_edges)
 
     monkeypatch.setattr(receivables_asof, "check_no_leak", spy)
-    result = by_week(last_week=5, horizons=3, min_cleared=2, leak_check_weeks=(1, 4))
+    result = by_week(last_week=5, horizons=3, min_cleared=2, leak_check_weeks=(1, 4),
+                     age_edges=(15, 45, 120))
     assert seen["stored"] is result
+    assert seen["age_edges"] == (15, 45, 120)
     assert seen["weeks"] == (1, 4)
     assert seen["last_week"] == 5
     assert (seen["week_zero"], seen["horizons"], seen["min_cleared"]) == (WEEK_ZERO, 3, 2)
@@ -499,6 +507,100 @@ def test_the_same_leaky_build_passes_when_only_the_last_week_is_checked(monkeypa
     by_week(with_a_future_invoice(), last_week=6, leak_check_weeks=(6,))   # no error
 
 
+# --- U9c.1: the aging buckets over the weeks ----------------------------------------
+
+def aging_ledger():
+    """One TRY invoice due Wednesday 2026-01-07 (week 0), never paid: at the end of week t it
+    is 4 + 7t days past due. Plus one for B due Wednesday 2026-01-28 (week 3), half paid in
+    week 1."""
+    return ledger([invoice("OLD", 100, "2025-12-01", due="2026-01-07"),
+                   invoice("B1", 60, "2026-01-02", due="2026-01-28", customer="B"),
+                   payment("BP", -30, "2026-01-13", reference="B1", customer="B")])
+
+
+def test_by_week_an_unpaid_invoice_moves_through_the_buckets():
+    result = by_week(aging_ledger(), last_week=14).set_index(["key", "week"])
+    for week in range(15):
+        days = 4 + 7 * week
+        expected = ("overdue_up_to_30" if days <= 30 else
+                    "overdue_31_to_90" if days <= 90 else "overdue_over_90")
+        row = result.loc[("TR02-A", week)]
+        for column in AGE_COLUMNS:
+            assert row[column] == (100.0 if column == expected else 0.0), (week, column)
+
+
+def test_by_week_buckets_hold_the_outstanding_after_a_partial_payment():
+    result = by_week(aging_ledger(), last_week=8).set_index(["key", "week"])
+    assert result.loc[("TR02-B", 2), "overdue"] == 0.0            # not yet due
+    assert result.loc[("TR02-B", 3), "overdue_up_to_30"] == 30.0  # due in week 3, half paid
+    # Week 6 ends Sunday 2026-02-22: 25 days; week 7 ends 2026-03-01: 32 days.
+    assert sunday(6) == date(2026, 2, 22) and sunday(7) == date(2026, 3, 1)
+    assert result.loc[("TR02-B", 6), "overdue_up_to_30"] == 30.0
+    assert result.loc[("TR02-B", 7), "overdue_31_to_90"] == 30.0
+    assert result.loc[("TR02-B", 7), "overdue_up_to_30"] == 0.0
+
+
+def test_by_week_passes_its_age_edges_on():
+    result = by_week(aging_ledger(), last_week=3, age_edges=(10, 20))
+    assert list(result.columns) == receivables_columns(5, (10, 20))
+    row = result.set_index(["key", "week"]).loc[("TR02-A", 2)]   # 18 days
+    assert row["overdue_11_to_20"] == 100.0
+
+
+def test_by_week_buckets_add_up_to_overdue_in_every_row():
+    result = by_week(aging_ledger(), last_week=20)
+    assert ((result[AGE_COLUMNS].sum(axis=1) - result["overdue"]).abs() <= 1e-9).all()
+
+
+def test_the_leak_check_passes_with_the_buckets_on_every_week():
+    by_week(aging_ledger(), last_week=14, leak_check_weeks=tuple(range(15)))   # no error
+    by_week(small_ledger(), last_week=5, leak_check_weeks=(0, 1, 2, 3, 4, 5),
+            age_edges=(7, 14, 21))   # no error
+
+
+def test_check_no_leak_catches_an_altered_bucket():
+    table = aging_ledger()
+    stored = stacked_receivables_at(table, 6)
+    altered = stored.index[(stored["week"] == 5) & (stored["key"] == "TR02-A")][0]
+    stored.loc[altered, "overdue_31_to_90"] += 0.01
+    with pytest.raises(ValueError, match="leak check: week 5 differs"):
+        check_no_leak(stored, table, EUR_RATES, (5,), 6, WEEK_ZERO, 5, 3, AGE_EDGES)
+
+
+def test_check_no_leak_rebuilds_with_its_own_age_edges():
+    """A table built with other edges has other columns: the rebuild does not match it."""
+    table = aging_ledger()
+    stored = stacked_receivables_at(table, 3, age_edges=(10, 20))
+    with pytest.raises(ValueError, match="leak check: week 2 differs"):
+        check_no_leak(stored, table, EUR_RATES, (2,), 3, WEEK_ZERO, 5, 3, AGE_EDGES)
+
+
+@pytest.mark.parametrize("bad", [(90, 30), (30, 30), (0, 30), (30.0,), ()],
+                         ids=["reversed", "repeated", "zero", "float", "empty"])
+def test_by_week_refuses_bad_edges_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        by_week(last_week=3, age_edges=bad)
+    assert str(error.value) == (f"age_edges are {bad}; give whole numbers of days (1 or more), "
+                                f"from smallest to largest, each once")
+
+
+def test_by_week_refuses_bad_edges_with_a_leak_check_too():
+    with pytest.raises(ValueError, match=r"age_edges are \(30, 30\);"):
+        by_week(last_week=3, leak_check_weeks=(1, 2), age_edges=(30, 30))
+
+
+def test_by_week_accepts_numpy_integer_edges():
+    plain = by_week(aging_ledger(), last_week=6, leak_check_weeks=(3,))
+    numpy_edges = by_week(aging_ledger(), last_week=6, leak_check_weeks=(3,),
+                          age_edges=(np.int64(30), np.int64(90)))
+    pd.testing.assert_frame_equal(plain, numpy_edges)
+
+
+def test_receivables_by_week_requires_age_edges():
+    with pytest.raises(TypeError):
+        receivables_by_week(small_ledger(), EUR_RATES, WEEK_ZERO, 5, FAR_AS_OF, 5, 3, ())
+
+
 # --- integration with the synthetic corpus and ledger (SLOW, ~20 s) -------------------
 
 RAW = Path(__file__).resolve().parents[2] / "data" / "raw"
@@ -522,7 +624,7 @@ def synthetic_by_week():
     with contextlib.redirect_stdout(printed):
         table = receivables_by_week(keyed, rates, SYNTHETIC_WEEK_ZERO, last_week=64,
                                     as_of=AS_OF, horizons=5, min_cleared=3,
-                                    leak_check_weeks=(0, 30, 64))
+                                    leak_check_weeks=(0, 30, 64), age_edges=AGE_EDGES)
     return keyed, rates, table, printed.getvalue()
 
 
@@ -532,7 +634,7 @@ def test_slow_by_week_synthetic_has_231948_rows_and_4590_keys(synthetic_by_week)
     assert table["key"].nunique() == 4_590
     assert sorted(table["week"].unique()) == list(range(65))
     assert not table.duplicated(["key", "week"]).any()
-    assert list(table.columns) == receivables_columns(5)
+    assert list(table.columns) == receivables_columns(5, AGE_EDGES)
     assert table.index.tolist() == list(range(len(table)))
 
 
@@ -546,6 +648,12 @@ def test_slow_by_week_synthetic_prints_the_week_64_note(synthetic_by_week):
 def test_slow_by_week_synthetic_week_30_equals_receivables_at(synthetic_by_week):
     keyed, rates, table, _ = synthetic_by_week
     week_30 = table[table["week"] == 30].reset_index(drop=True)
-    expected = receivables_at(keyed, 30, SYNTHETIC_WEEK_ZERO, rates, 5, 3)
+    expected = receivables_at(keyed, 30, SYNTHETIC_WEEK_ZERO, rates, 5, 3, AGE_EDGES)
     assert len(week_30) == 3_548
     pd.testing.assert_frame_equal(week_30, expected)
+
+
+def test_slow_by_week_synthetic_buckets_add_up_to_overdue(synthetic_by_week):
+    _, _, table, _ = synthetic_by_week
+    assert (table[AGE_COLUMNS].sum(axis=1) - table["overdue"]).abs().max() <= 0.01
+    assert (table[AGE_COLUMNS] >= 0).all().all()

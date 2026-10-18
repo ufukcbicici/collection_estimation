@@ -1,9 +1,11 @@
 """Tests for U9b.4 in `hurdle/receivables_asof.py`: `receivables_at` and its helpers.
 
-`receivables_at(ledger, week, week_zero, rates, horizons, min_cleared)` gives one row per key
+`receivables_at(ledger, week, week_zero, rates, horizons, min_cleared, age_edges)` gives one
+row per key
 with each customer's receivables at the end of week t (its Sunday): the open invoices'
 outstanding split by when it falls due (due_in_week_1 .. due_in_week_<horizons>, due_later,
-overdue), the amount-weighted days past due, the open invoice count, unapplied cash, the
+overdue, and the overdue split into aging buckets at `age_edges`), the amount-weighted days
+past due, the open invoice count, unapplied cash, the
 open balance of all open lines, and the usual delay from `payment_delays_at`.
 
 Week zero is Monday 2026-01-05, so week t runs Monday week_zero + 7t to Sunday
@@ -12,9 +14,11 @@ the synthetic corpus and ledger in `data/raw/` once and are skipped when absent;
 `data/interim/` cache is never used.
 """
 import math
+import random
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -29,6 +33,7 @@ from collection_estimation.hurdle.receivables_asof import (
     exchange_rates,
     open_invoices_at,
     open_lines_at,
+    overdue_age_columns,
     rates_known_at,
     receivables_at,
     receivables_columns,
@@ -37,6 +42,10 @@ from collection_estimation.hurdle.receivables_asof import (
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
 WEEK_ZERO = date(2026, 1, 5)  # a Monday
+
+# The aging-bucket edges (days past due) used throughout, as in settings/synthetic.toml.
+AGE_EDGES = (30, 90)
+AGE_COLUMNS = ["overdue_up_to_30", "overdue_31_to_90", "overdue_over_90"]
 
 LEDGER_COLUMNS = ["key", "company_code", "customer_id", "document_no", "document_role",
                   "invoice_reference", "posting_date", "net_due_date", "clearing_date",
@@ -132,8 +141,8 @@ def running_example():
     return ledger(running_example_lines())
 
 
-def run(table, week=WEEK, rates=EUR_RATES, horizons=5, min_cleared=3):
-    return receivables_at(table, week, WEEK_ZERO, rates, horizons, min_cleared)
+def run(table, week=WEEK, rates=EUR_RATES, horizons=5, min_cleared=3, age_edges=AGE_EDGES):
+    return receivables_at(table, week, WEEK_ZERO, rates, horizons, min_cleared, age_edges)
 
 
 def row_of(table, key="TR02-A"):
@@ -150,10 +159,10 @@ def open_invoices_with_try(table, cutoff, rates=EUR_RATES):
     return invoices
 
 
-def buckets(lines, week=WEEK, horizons=5, rates=EUR_RATES):
+def buckets(lines, week=WEEK, horizons=5, rates=EUR_RATES, age_edges=AGE_EDGES):
     cutoff = sunday(week)
     invoices = open_invoices_with_try(ledger(lines), cutoff, rates)
-    return due_buckets(invoices, week, WEEK_ZERO, cutoff, horizons)
+    return due_buckets(invoices, week, WEEK_ZERO, cutoff, horizons, age_edges)
 
 
 # --- the test calendar itself --------------------------------------------------------
@@ -180,14 +189,15 @@ def test_due_in_week_columns_for_one():
 
 
 def test_receivables_columns_for_three():
-    assert receivables_columns(3) == [
+    assert receivables_columns(3, AGE_EDGES) == [
         "key", "week", "due_in_week_1", "due_in_week_2", "due_in_week_3", "due_later",
-        "overdue", "overdue_days", "open_invoices", "unapplied_cash", "open_balance",
+        "overdue", "overdue_up_to_30", "overdue_31_to_90", "overdue_over_90",
+        "overdue_days", "open_invoices", "unapplied_cash", "open_balance",
         "usual_delay_days", "cleared_invoices"]
 
 
 def test_receivables_columns_length_grows_with_horizons():
-    assert len(receivables_columns(5)) == len(receivables_columns(1)) + 4
+    assert len(receivables_columns(5, AGE_EDGES)) == len(receivables_columns(1, AGE_EDGES)) + 4
 
 
 # --- to_try --------------------------------------------------------------------------
@@ -407,7 +417,8 @@ def test_due_buckets_columns_and_one_row_per_key():
     table = buckets([invoice("I1", 100, "2026-01-06", due="2026-01-28"),
                      invoice("I2", 100, "2026-01-06", due="2026-01-29")], horizons=3)
     assert list(table.columns) == (["key"] + due_in_week_columns(3)
-                                   + ["due_later", "overdue", "overdue_days", "open_invoices"])
+                                   + ["due_later", "overdue"] + AGE_COLUMNS
+                                   + ["overdue_days", "open_invoices"])
     assert len(table) == 1
 
 
@@ -432,7 +443,7 @@ def test_due_buckets_tie_out_raises_when_an_invoice_lands_in_no_bucket(monkeypat
     monkeypatch.setattr(receivables_asof, "week_numbers",
                         lambda dates, week_zero: pd.Series(float("nan"), index=dates.index))
     with pytest.raises(ValueError, match="does not add up") as error:
-        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
     assert "TR02-A" in str(error.value)
     assert str(CUTOFF) in str(error.value)
 
@@ -444,7 +455,7 @@ def test_due_buckets_tie_out_raises_when_an_invoice_lands_twice(monkeypatch):
     invoices = open_invoices_with_try(
         ledger([invoice("I", 100, "2026-01-06", due=monday(WEEK + 6))]), CUTOFF)
     with pytest.raises(ValueError, match="does not add up"):
-        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
 
 
 def test_due_buckets_tolerance_is_honoured(monkeypatch):
@@ -452,7 +463,7 @@ def test_due_buckets_tolerance_is_honoured(monkeypatch):
                                       CUTOFF)
     monkeypatch.setattr(receivables_asof, "TIE_OUT_TOLERANCE", -1.0)
     with pytest.raises(ValueError, match="does not add up"):
-        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
 
 
 def test_due_buckets_with_a_missing_due_date_raises_value_error():
@@ -462,7 +473,7 @@ def test_due_buckets_with_a_missing_due_date_raises_value_error():
     table.loc[0, "net_due_date"] = pd.NaT
     invoices = open_invoices_with_try(table, CUTOFF)
     with pytest.raises(ValueError) as error:
-        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
     assert str(error.value) == (f"at {CUTOFF}, 1 open invoices have no net due date "
                                 f"(first: ['I'])")
 
@@ -473,7 +484,7 @@ def test_due_buckets_missing_due_dates_list_at_most_five_documents():
     table["net_due_date"] = pd.NaT
     invoices = open_invoices_with_try(table, CUTOFF)
     with pytest.raises(ValueError) as error:
-        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
     message = str(error.value)
     assert message.startswith(f"at {CUTOFF}, 7 open invoices have no net due date (first: ")
     listed = message[message.index("[") + 1:message.index("]")].replace("'", "").split(", ")
@@ -491,8 +502,457 @@ def test_receivables_at_with_a_missing_due_date_raises_the_named_error():
 def test_due_buckets_does_not_modify_its_input():
     invoices = open_invoices_with_try(running_example(), CUTOFF)
     before = invoices.copy()
-    due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+    due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
     pd.testing.assert_frame_equal(invoices, before)
+
+
+# --- U9c.1: the aging buckets (overdue_age_columns, due_buckets) ---------------------
+
+def test_overdue_age_columns_for_two_edges():
+    assert overdue_age_columns((30, 90)) == AGE_COLUMNS
+
+
+def test_overdue_age_columns_for_one_edge():
+    assert overdue_age_columns((30,)) == ["overdue_up_to_30", "overdue_over_30"]
+
+
+def test_overdue_age_columns_for_three_edges():
+    assert overdue_age_columns((30, 60, 90)) == [
+        "overdue_up_to_30", "overdue_31_to_60", "overdue_61_to_90", "overdue_over_90"]
+
+
+def test_overdue_age_columns_for_adjacent_edges():
+    assert overdue_age_columns((1, 2)) == ["overdue_up_to_1", "overdue_2_to_2", "overdue_over_2"]
+
+
+def test_overdue_age_columns_has_one_more_name_than_edges():
+    for edges in [(5,), (5, 10), (5, 10, 20, 40, 80)]:
+        assert len(overdue_age_columns(edges)) == len(edges) + 1
+
+
+def test_receivables_columns_puts_the_buckets_right_after_overdue():
+    columns = receivables_columns(2, (30, 60, 90))
+    at = columns.index("overdue")
+    assert columns[at + 1:at + 5] == overdue_age_columns((30, 60, 90))
+    assert columns[at + 5] == "overdue_days"
+
+
+def test_receivables_columns_with_one_edge():
+    assert receivables_columns(1, (30,)) == [
+        "key", "week", "due_in_week_1", "due_later", "overdue", "overdue_up_to_30",
+        "overdue_over_30", "overdue_days", "open_invoices", "unapplied_cash", "open_balance",
+        "usual_delay_days", "cleared_invoices"]
+
+
+def overdue_by(days, amount=100, document_no=None, **kwargs):
+    """An invoice that is `days` past due at the cutoff of week WEEK."""
+    return invoice(document_no or f"D{days}", amount, "2025-06-01",
+                   due=CUTOFF - timedelta(days=days), **kwargs)
+
+
+@pytest.mark.parametrize("days, bucket", [
+    (0, "overdue_up_to_30"), (1, "overdue_up_to_30"), (29, "overdue_up_to_30"),
+    (30, "overdue_up_to_30"), (31, "overdue_31_to_90"), (60, "overdue_31_to_90"),
+    (89, "overdue_31_to_90"), (90, "overdue_31_to_90"), (91, "overdue_over_90"),
+    (92, "overdue_over_90"), (365, "overdue_over_90"),
+])
+def test_each_overdue_invoice_lands_in_the_one_bucket_of_its_days_past_due(days, bucket):
+    row = bucket_row([overdue_by(days)])
+    assert row["overdue"] == 100.0
+    for column in AGE_COLUMNS:
+        assert row[column] == (100.0 if column == bucket else 0.0), column
+
+
+@pytest.mark.parametrize("weekday", range(6))
+def test_due_earlier_in_week_t_is_up_to_30_whatever_the_day(weekday):
+    row = bucket_row([invoice("I", 100, "2026-01-06",
+                              due=monday(WEEK) + timedelta(days=weekday))])
+    assert row["overdue_up_to_30"] == 100.0
+
+
+def test_due_on_the_cutoff_sunday_is_in_the_first_bucket_with_zero_days():
+    row = bucket_row([invoice("I", 100, "2026-01-06", due=CUTOFF)])
+    assert row["overdue_up_to_30"] == 100.0
+    assert row["overdue_31_to_90"] == 0.0
+    assert row["overdue_over_90"] == 0.0
+    assert row["overdue_days"] == 0.0
+
+
+def test_an_invoice_not_yet_due_is_in_no_bucket():
+    row = bucket_row([invoice("I", 100, "2026-01-06", due=CUTOFF + timedelta(days=1)),
+                      invoice("J", 50, "2026-01-06", due="2027-01-01")])
+    for column in AGE_COLUMNS:
+        assert row[column] == 0.0, column
+    assert row["overdue"] == 0.0
+
+
+def test_buckets_hold_the_try_value_of_a_foreign_invoice():
+    row = bucket_row([overdue_by(10, amount=100, currency="EUR"),
+                      overdue_by(95, amount=2, currency="EUR")])
+    assert row["overdue_up_to_30"] == pytest.approx(100 * 36.0)
+    assert row["overdue_over_90"] == pytest.approx(2 * 36.0)
+    assert row["overdue_31_to_90"] == 0.0
+
+
+def test_buckets_use_the_rate_known_at_the_cutoff():
+    later = 4   # EUR is 37 from the end of week 4 on
+    cutoff = sunday(later)
+    row = bucket_row([invoice("E", 10, "2025-06-01", due=cutoff - timedelta(days=40),
+                              currency="EUR")], week=later)
+    assert row["overdue_31_to_90"] == pytest.approx(10 * 37.0)
+
+
+def test_buckets_hold_the_outstanding_not_the_original_amount():
+    row = bucket_row([
+        overdue_by(95, amount=1000),
+        payment("P", -900, "2026-01-02", reference="D95"),
+        overdue_by(40, amount=500),
+        payment("Q", -125, "2026-01-02", reference="D40"),
+    ])
+    assert row["overdue_over_90"] == pytest.approx(100.0)
+    assert row["overdue_31_to_90"] == pytest.approx(375.0)
+    assert row["overdue"] == pytest.approx(475.0)
+
+
+def test_a_partially_paid_foreign_invoice_buckets_its_outstanding_in_try():
+    row = bucket_row([overdue_by(31, amount=100, currency="EUR"),
+                      payment("P", -40, "2026-01-02", reference="D31", currency="EUR")])
+    assert row["overdue_31_to_90"] == pytest.approx(60 * 36.0)
+
+
+def test_buckets_add_amounts_of_invoices_in_the_same_bucket():
+    row = bucket_row([overdue_by(31, amount=10), overdue_by(60, amount=20),
+                      overdue_by(90, amount=30), overdue_by(5, amount=1)])
+    assert row["overdue_31_to_90"] == 60.0
+    assert row["overdue_up_to_30"] == 1.0
+
+
+def test_buckets_with_one_edge():
+    lines = [overdue_by(30, amount=1), overdue_by(31, amount=2), overdue_by(300, amount=4)]
+    table = buckets(lines, age_edges=(30,))
+    row = row_of(table)
+    assert row["overdue_up_to_30"] == 1.0
+    assert row["overdue_over_30"] == 6.0
+    assert "overdue_31_to_90" not in table.columns
+
+
+def test_buckets_with_three_edges():
+    days = [0, 30, 31, 60, 61, 90, 91]
+    lines = [overdue_by(d, amount=2 ** n) for n, d in enumerate(days)]
+    table = buckets(lines, age_edges=(30, 60, 90))
+    row = row_of(table)
+    assert row["overdue_up_to_30"] == 1 + 2
+    assert row["overdue_31_to_60"] == 4 + 8
+    assert row["overdue_61_to_90"] == 16 + 32
+    assert row["overdue_over_90"] == 64
+    assert list(table.columns) == (["key"] + due_in_week_columns(5) + ["due_later", "overdue"]
+                                   + overdue_age_columns((30, 60, 90))
+                                   + ["overdue_days", "open_invoices"])
+
+
+def test_buckets_with_a_one_day_first_edge():
+    row = bucket_row([overdue_by(0, amount=1), overdue_by(1, amount=2),
+                      overdue_by(2, amount=4)], age_edges=(1,))
+    assert row["overdue_up_to_1"] == 3.0
+    assert row["overdue_over_1"] == 4.0
+
+
+def test_buckets_add_up_to_overdue_for_every_key():
+    rng = random.Random(9031)
+    lines = []
+    for n in range(120):
+        customer = rng.choice("ABCDE")
+        days = rng.randint(-60, 400)   # negative: not yet due
+        lines.append(invoice(f"I{n}", rng.randint(1, 10_000) / 100, "2025-01-01",
+                             due=CUTOFF - timedelta(days=days), customer=customer,
+                             currency=rng.choice(["TRY", "EUR"])))
+    for edges in [(30,), (30, 90), (30, 60, 90), (7, 14, 21, 28, 180)]:
+        table = buckets(lines, age_edges=edges)
+        ages = overdue_age_columns(edges)
+        sums = table[ages].sum(axis=1)
+        assert ((sums - table["overdue"]).abs() <= 1e-6).all(), edges
+        assert (table[ages] >= 0).all().all()
+
+
+def test_buckets_match_a_per_invoice_reference():
+    rng = random.Random(4)
+    lines, expected = [], {column: 0.0 for column in AGE_COLUMNS}
+    for n in range(80):
+        days = rng.randint(-20, 200)
+        amount = float(rng.randint(1, 500))
+        lines.append(overdue_by(days, amount=amount, document_no=f"R{n}"))
+        if days < 0:
+            continue
+        column = ("overdue_up_to_30" if days <= 30 else
+                  "overdue_31_to_90" if days <= 90 else "overdue_over_90")
+        expected[column] += amount
+    row = bucket_row(lines)
+    for column in AGE_COLUMNS:
+        assert row[column] == pytest.approx(expected[column]), column
+
+
+def test_buckets_keep_keys_apart():
+    table = buckets([overdue_by(10, customer="A"), overdue_by(100, amount=7, customer="B")])
+    by_key = table.set_index("key")
+    assert by_key.loc["TR02-A", "overdue_up_to_30"] == 100.0
+    assert by_key.loc["TR02-A", "overdue_over_90"] == 0.0
+    assert by_key.loc["TR02-B", "overdue_over_90"] == 7.0
+    assert by_key.loc["TR02-B", "overdue_up_to_30"] == 0.0
+
+
+def test_aging_check_raises_when_an_overdue_invoice_has_negative_days(monkeypatch):
+    """Calling every invoice overdue (week number = t) while one is due after the cutoff
+    gives it negative days past due: it lands in no bucket. The due-date split still adds
+    up, so it is the aging check that catches it, naming only that key."""
+    invoices = open_invoices_with_try(ledger([
+        invoice("I", 100, "2026-01-06", due=CUTOFF + timedelta(days=10)),
+        invoice("J", 5, "2026-01-06", due=CUTOFF - timedelta(days=3), customer="B")]), CUTOFF)
+    monkeypatch.setattr(receivables_asof, "week_numbers",
+                        lambda dates, week_zero: pd.Series(WEEK, index=dates.index))
+    with pytest.raises(ValueError) as error:
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
+    assert str(error.value) == (f"at {CUTOFF}, the aging buckets do not add up to the overdue "
+                                f"amount for 1 keys (first: ['TR02-A'])")
+
+
+def test_edges_out_of_order_are_now_refused_by_due_buckets_up_front():
+    """Unsorted edges used to reach the aging tie-out (overlapping buckets); now
+    `overdue_age_columns` refuses them before any bucket is built."""
+    invoices = open_invoices_with_try(ledger([overdue_by(50)]), CUTOFF)
+    with pytest.raises(ValueError) as error:
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, (90, 30))
+    assert str(error.value) == edges_message((90, 30))
+
+
+def test_aging_check_raises_when_overlapping_buckets_count_an_invoice_twice(monkeypatch):
+    """With the edge guard bypassed, unsorted edges make buckets overlap: the aging tie-out
+    still catches it (it is the second line of defence)."""
+    def unchecked_names(age_edges):
+        names = [f"overdue_up_to_{age_edges[0]}"]
+        for previous, edge in zip(age_edges, age_edges[1:]):
+            names.append(f"overdue_{previous + 1}_to_{edge}")
+        return names + [f"overdue_over_{age_edges[-1]}"]
+
+    monkeypatch.setattr(receivables_asof, "overdue_age_columns", unchecked_names)
+    invoices = open_invoices_with_try(ledger([overdue_by(50)]), CUTOFF)
+    with pytest.raises(ValueError) as error:
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, (90, 30))
+    assert str(error.value) == (f"at {CUTOFF}, the aging buckets do not add up to the overdue "
+                                f"amount for 1 keys (first: ['TR02-A'])")
+
+
+def test_aging_check_lists_at_most_five_keys(monkeypatch):
+    lines = [invoice(f"I{n}", 10, "2026-01-06", due=CUTOFF + timedelta(days=3),
+                     customer=f"C{n}") for n in range(7)]
+    invoices = open_invoices_with_try(ledger(lines), CUTOFF)
+    monkeypatch.setattr(receivables_asof, "week_numbers",
+                        lambda dates, week_zero: pd.Series(WEEK, index=dates.index))
+    with pytest.raises(ValueError) as error:
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
+    message = str(error.value)
+    assert "for 7 keys (first: " in message
+    assert message.count("TR02-C") == 5
+
+
+def test_aging_buckets_of_kurus_amounts_add_up():
+    lines = [overdue_by(d, amount=0.01 * (n + 1), document_no=f"K{n}")
+             for n, d in enumerate(range(0, 200, 3))]
+    row = bucket_row(lines)   # no error
+    assert sum(row[c] for c in AGE_COLUMNS) == pytest.approx(row["overdue"])
+
+
+def test_the_due_split_check_runs_before_the_aging_check(monkeypatch):
+    invoices = open_invoices_with_try(ledger([overdue_by(10)]), CUTOFF)
+    monkeypatch.setattr(receivables_asof, "TIE_OUT_TOLERANCE", -1.0)
+    with pytest.raises(ValueError, match="the due-date split does not add up"):
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, AGE_EDGES)
+
+
+def test_due_buckets_with_buckets_does_not_modify_its_input():
+    invoices = open_invoices_with_try(ledger([overdue_by(10), overdue_by(100)]), CUTOFF)
+    before = invoices.copy()
+    due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, (30, 60, 90))
+    pd.testing.assert_frame_equal(invoices, before)
+
+
+def test_age_edges_is_required():
+    invoices = open_invoices_with_try(running_example(), CUTOFF)
+    with pytest.raises(TypeError):
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5)
+    with pytest.raises(TypeError):
+        receivables_at(running_example(), WEEK, WEEK_ZERO, EUR_RATES, 5, 3)
+    with pytest.raises(TypeError):
+        receivables_columns(5)
+
+
+# --- U9c.1: overdue_age_columns refuses bad edges -------------------------------------
+
+def edges_message(age_edges):
+    return (f"age_edges are {age_edges}; give whole numbers of days (1 or more), "
+            f"from smallest to largest, each once")
+
+
+BAD_EDGES = [
+    pytest.param((), id="empty"),
+    pytest.param((30.0, 90), id="float"),
+    pytest.param((30, 90.5), id="fractional-float"),
+    pytest.param(("30", "90"), id="str"),
+    pytest.param((True, 30), id="bool-true"),
+    pytest.param((False,), id="bool-false"),
+    pytest.param((np.float64(30.0),), id="numpy-float"),
+    pytest.param((0, 30), id="zero"),
+    pytest.param((-5, 30), id="negative"),
+    pytest.param((0,), id="zero-alone"),
+    pytest.param((90, 30), id="reversed"),
+    pytest.param((30, 90, 60), id="unsorted"),
+    pytest.param((30, 30), id="repeated"),
+    pytest.param((30, 90, 90), id="repeated-last"),
+    pytest.param((None,), id="none"),
+]
+
+
+@pytest.mark.parametrize("bad", BAD_EDGES)
+def test_overdue_age_columns_refuses_bad_edges_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        overdue_age_columns(bad)
+    assert str(error.value) == edges_message(bad)
+
+
+def test_repeated_edges_no_longer_give_an_always_empty_bucket():
+    """(30, 30) used to give the impossible column overdue_31_to_30; now it is refused."""
+    with pytest.raises(ValueError, match=r"age_edges are \(30, 30\);"):
+        overdue_age_columns((30, 30))
+
+
+def test_overdue_age_columns_accepts_numpy_integers():
+    edges = (np.int64(30), np.int64(90))
+    assert overdue_age_columns(edges) == AGE_COLUMNS
+    assert overdue_age_columns((np.int32(7),)) == ["overdue_up_to_7", "overdue_over_7"]
+
+
+def test_overdue_age_columns_accepts_a_mix_of_python_and_numpy_integers():
+    assert overdue_age_columns((30, np.int64(90))) == AGE_COLUMNS
+
+
+def test_overdue_age_columns_accepts_a_list_and_an_edge_of_one():
+    assert overdue_age_columns([30, 90]) == AGE_COLUMNS
+    assert overdue_age_columns((1,)) == ["overdue_up_to_1", "overdue_over_1"]
+
+
+def test_overdue_age_columns_accepts_large_edges():
+    assert overdue_age_columns((365, 3650)) == [
+        "overdue_up_to_365", "overdue_366_to_3650", "overdue_over_3650"]
+
+
+def test_numpy_integer_edges_give_the_same_buckets_as_python_ones():
+    lines = [overdue_by(d, amount=2 ** n, document_no=f"N{n}")
+             for n, d in enumerate([0, 30, 31, 90, 91, 400])]
+    plain = buckets(lines, age_edges=(30, 90))
+    numpy_edges = buckets(lines, age_edges=(np.int64(30), np.int64(90)))
+    pd.testing.assert_frame_equal(plain, numpy_edges)
+
+
+def test_receivables_at_with_numpy_integer_edges_matches_python_edges():
+    pd.testing.assert_frame_equal(run(running_example(), age_edges=(np.int64(30), np.int64(90))),
+                                  run(running_example()))
+
+
+@pytest.mark.parametrize("bad", [(90, 30), (30, 30), (0, 30), (30.0,), ()],
+                         ids=["reversed", "repeated", "zero", "float", "empty"])
+def test_receivables_columns_refuses_bad_edges(bad):
+    with pytest.raises(ValueError) as error:
+        receivables_columns(5, bad)
+    assert str(error.value) == edges_message(bad)
+
+
+@pytest.mark.parametrize("bad", [(90, 30), (30, 30), (0, 30), (30.0,), ()],
+                         ids=["reversed", "repeated", "zero", "float", "empty"])
+def test_due_buckets_refuses_bad_edges(bad):
+    invoices = open_invoices_with_try(running_example(), CUTOFF)
+    with pytest.raises(ValueError) as error:
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, bad)
+    assert str(error.value) == edges_message(bad)
+
+
+def test_due_buckets_refuses_bad_edges_even_with_nothing_overdue():
+    invoices = open_invoices_with_try(
+        ledger([invoice("I", 100, "2026-01-06", due=CUTOFF + timedelta(days=20))]), CUTOFF)
+    with pytest.raises(ValueError, match=r"age_edges are \(30, 30\);"):
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, (30, 30))
+
+
+def test_due_buckets_refuses_bad_edges_even_with_no_open_invoice():
+    invoices = open_invoices_with_try(ledger([payment("U", -80, "2026-01-12")]), CUTOFF)
+    assert invoices.empty
+    with pytest.raises(ValueError, match=r"age_edges are \(90, 30\);"):
+        due_buckets(invoices, WEEK, WEEK_ZERO, CUTOFF, 5, (90, 30))
+
+
+@pytest.mark.parametrize("bad", [(90, 30), (30, 30), (0, 30), (30.0,), ()],
+                         ids=["reversed", "repeated", "zero", "float", "empty"])
+def test_receivables_at_refuses_bad_edges(bad):
+    with pytest.raises(ValueError) as error:
+        run(running_example(), age_edges=bad)
+    assert str(error.value) == edges_message(bad)
+
+
+def test_receivables_at_refuses_bad_edges_for_a_ledger_with_only_unapplied_cash():
+    with pytest.raises(ValueError, match=r"age_edges are \(30, 30\);"):
+        run(ledger([payment("U", -80, "2026-01-12")]), age_edges=(30, 30))
+
+
+# --- U9c.1: the aging buckets in receivables_at ---------------------------------------
+
+def test_running_example_buckets():
+    row = row_of(run(running_example()))
+    assert row["overdue_up_to_30"] == pytest.approx(100 * 36.0)   # INV-2, 10 days
+    assert row["overdue_31_to_90"] == 0.0
+    assert row["overdue_over_90"] == 0.0
+
+
+def test_running_example_ages_into_later_buckets():
+    # Week 15 ends Sunday 2026-04-26: INV-1 (due 2026-02-04) is 81 days past due, INV-2
+    # (due 2026-01-15) 101 days, at the EUR rate 37.
+    assert sunday(15) == date(2026, 4, 26)
+    row = row_of(run(running_example(), week=15))
+    assert row["overdue_up_to_30"] == 0.0
+    assert row["overdue_31_to_90"] == pytest.approx(700.0)
+    assert row["overdue_over_90"] == pytest.approx(100 * 37.0)
+    assert row["overdue"] == pytest.approx(700 + 3700.0)
+
+
+def test_receivables_at_with_three_edges_has_their_columns():
+    table = run(running_example(), age_edges=(30, 60, 90))
+    assert list(table.columns) == receivables_columns(5, (30, 60, 90))
+    assert row_of(table)["overdue_up_to_30"] == pytest.approx(3600.0)
+
+
+def test_buckets_are_zero_for_a_key_with_only_unapplied_cash():
+    lines = running_example_lines() + [payment("U", -80, "2026-01-12", customer="B")]
+    row = row_of(run(ledger(lines)), "TR02-B")
+    for column in AGE_COLUMNS:
+        assert row[column] == 0.0, column
+        assert not math.isnan(row[column])
+
+
+def test_buckets_sum_to_overdue_in_receivables_at():
+    lines = running_example_lines() + [
+        invoice("B1", 50, "2025-06-01", due="2025-09-30", customer="B", currency="EUR"),
+        invoice("B2", 400, "2025-06-01", due="2025-12-01", customer="B"),
+        invoice("B3", 70, "2025-06-01", due="2026-01-20", customer="B"),
+    ]
+    table = run(ledger(lines))
+    assert ((table[AGE_COLUMNS].sum(axis=1) - table["overdue"]).abs() <= 1e-9).all()
+    row = row_of(table, "TR02-B")
+    assert row["overdue_over_90"] == pytest.approx(50 * 36.0)   # 117 days
+    assert row["overdue_31_to_90"] == pytest.approx(400.0)      # 55 days
+    assert row["overdue_up_to_30"] == pytest.approx(70.0)       # 5 days
+
+
+def test_bucket_dtypes_are_float64():
+    table = run(running_example())
+    for column in AGE_COLUMNS:
+        assert table[column].dtype == "float64", column
 
 
 # --- open_lines_at -------------------------------------------------------------------
@@ -629,12 +1089,12 @@ def test_running_example_row():
 
 
 def test_running_example_columns_are_exactly_receivables_columns():
-    assert list(run(running_example()).columns) == receivables_columns(5)
+    assert list(run(running_example()).columns) == receivables_columns(5, AGE_EDGES)
 
 
 def test_running_example_dtypes():
     table = run(running_example())
-    amounts = due_in_week_columns(5) + ["due_later", "overdue", "overdue_days",
+    amounts = due_in_week_columns(5) + ["due_later", "overdue", *AGE_COLUMNS, "overdue_days",
                                         "unapplied_cash", "open_balance", "usual_delay_days"]
     for column in amounts:
         assert table[column].dtype == "float64", column
@@ -644,7 +1104,7 @@ def test_running_example_dtypes():
 
 def test_horizons_3_gives_three_due_columns():
     table = run(running_example(), horizons=3)
-    assert list(table.columns) == receivables_columns(3)
+    assert list(table.columns) == receivables_columns(3, AGE_EDGES)
     assert row_of(table)["due_in_week_2"] == 700.0
 
 
@@ -720,7 +1180,7 @@ def test_a_key_with_only_cleared_lines_gets_a_row_of_zeros():
                 clearing_document="K1"),
     ]
     row = row_of(run(ledger(lines)), "TR02-B")
-    for column in due_in_week_columns(5) + ["due_later", "overdue", "overdue_days",
+    for column in due_in_week_columns(5) + ["due_later", "overdue", *AGE_COLUMNS, "overdue_days",
                                             "unapplied_cash", "open_balance"]:
         assert row[column] == 0.0, column
     assert row["open_invoices"] == 0
@@ -762,12 +1222,12 @@ def test_rows_are_sorted_by_key_and_index_is_fresh():
 def test_an_empty_week_before_any_line_gives_an_empty_table_with_the_columns():
     table = run(ledger([invoice("I", 1, "2026-03-01")]), week=0, rates=NO_RATES)
     assert table.empty
-    assert list(table.columns) == receivables_columns(5)
+    assert list(table.columns) == receivables_columns(5, AGE_EDGES)
 
 
 def test_an_empty_week_table_has_the_same_dtypes_as_a_full_one():
     table = run(ledger([invoice("I", 1, "2026-03-01")]), week=0, rates=NO_RATES)
-    amounts = due_in_week_columns(5) + ["due_later", "overdue", "overdue_days",
+    amounts = due_in_week_columns(5) + ["due_later", "overdue", *AGE_COLUMNS, "overdue_days",
                                         "unapplied_cash", "open_balance", "usual_delay_days"]
     for column in amounts:
         assert table[column].dtype == "float64", column
@@ -779,7 +1239,7 @@ def test_an_empty_week_table_has_the_same_dtypes_as_a_full_one():
 def test_an_empty_week_before_any_line_on_a_horizon_of_two():
     table = run(ledger([invoice("I", 1, "2026-03-01")]), week=0, rates=NO_RATES, horizons=2)
     assert table.empty
-    assert list(table.columns) == receivables_columns(2)
+    assert list(table.columns) == receivables_columns(2, AGE_EDGES)
 
 
 def test_due_parts_add_up_to_the_open_invoices_outstanding_in_try():
@@ -872,7 +1332,7 @@ def synthetic():
 @pytest.fixture(scope="module")
 def week_30(synthetic):
     _, keyed, rates = synthetic
-    return receivables_at(keyed, 30, SYNTHETIC_WEEK_ZERO, rates, 5, 3)
+    return receivables_at(keyed, 30, SYNTHETIC_WEEK_ZERO, rates, 5, 3, AGE_EDGES)
 
 
 def test_slow_week_30_cutoff_is_4_january_2026():
@@ -882,7 +1342,7 @@ def test_slow_week_30_cutoff_is_4_january_2026():
 def test_slow_week_30_has_3548_keys(week_30):
     assert len(week_30) == 3548
     assert week_30["key"].is_unique
-    assert list(week_30.columns) == receivables_columns(5)
+    assert list(week_30.columns) == receivables_columns(5, AGE_EDGES)
 
 
 def test_slow_week_30_key_tr02_11248642(synthetic, week_30):
@@ -914,7 +1374,7 @@ def test_slow_week_30_due_parts_tie_to_open_invoices_in_try(synthetic, week_30):
 
 
 def test_slow_week_30_dtypes_and_no_missing_amounts(week_30):
-    amounts = due_in_week_columns(5) + ["due_later", "overdue", "overdue_days",
+    amounts = due_in_week_columns(5) + ["due_later", "overdue", *AGE_COLUMNS, "overdue_days",
                                         "unapplied_cash", "open_balance"]
     for column in amounts:
         assert week_30[column].dtype == "float64"
@@ -943,7 +1403,14 @@ def test_slow_no_leak_from_later_lines_clearings_or_rates(synthetic, week):
     collections, keyed, rates = synthetic
     cutoff = SYNTHETIC_WEEK_ZERO + timedelta(days=7 * week + 6)
     cut, cut_rates = known_at(collections, keyed, cutoff)
-    full = receivables_at(keyed, week, SYNTHETIC_WEEK_ZERO, rates, 5, 3)
-    as_known = receivables_at(cut, week, SYNTHETIC_WEEK_ZERO, cut_rates, 5, 3)
+    full = receivables_at(keyed, week, SYNTHETIC_WEEK_ZERO, rates, 5, 3, AGE_EDGES)
+    as_known = receivables_at(cut, week, SYNTHETIC_WEEK_ZERO, cut_rates, 5, 3, AGE_EDGES)
     assert len(full) > 0
     pd.testing.assert_frame_equal(full, as_known)
+
+
+def test_slow_week_30_buckets_add_up_to_overdue(week_30):
+    sums = week_30[AGE_COLUMNS].sum(axis=1)
+    assert (sums - week_30["overdue"]).abs().max() <= TIE_OUT_TOLERANCE
+    assert (week_30[AGE_COLUMNS] >= 0).all().all()
+    assert week_30[AGE_COLUMNS].notna().all().all()
