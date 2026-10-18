@@ -39,6 +39,13 @@ class ReceivablesSettings:
 
 
 @dataclass(frozen=True)
+class HistorySettings:
+    """How the customers' payment-history features are built."""
+    windows: tuple[int, ...]             # look-back windows, in weeks, e.g. (4, 13, 52)
+    use_ledger_before_first_file: bool   # ledger payments before the daily files, as history
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -72,6 +79,7 @@ class Settings:
     collections_layout: CollectionsLayout
     ledger_layout: LedgerLayout
     receivables: ReceivablesSettings
+    history: HistorySettings
     debug: DebugSettings
 
 
@@ -87,7 +95,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "debug"}, name)
+                     "history", "debug"}, name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -98,6 +106,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     receivables = raw["receivables"]
     check_keys(receivables, {"min_cleared_for_delay", "horizons", "leak_check_weeks"},
                f"{name} [receivables]")
+    history = raw["history"]
+    check_keys(history, {"windows", "use_ledger_before_first_file"}, f"{name} [history]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -133,6 +143,11 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             horizons=count_setting(receivables, "horizons", f"{name} [receivables]"),
             leak_check_weeks=week_list_setting(receivables, "leak_check_weeks",
                                                f"{name} [receivables]"),
+        ),
+        history=HistorySettings(
+            windows=window_list_setting(history, "windows", f"{name} [history]"),
+            use_ledger_before_first_file=bool_setting(history, "use_ledger_before_first_file",
+                                                      f"{name} [history]"),
         ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
@@ -362,3 +377,19 @@ def bool_setting(table: dict, key: str, where: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{where}: {key} is {value!r}, not true or false")
     return value
+
+
+def window_list_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
+    """A non-empty list of different window lengths in weeks (whole numbers, 1 or more),
+    returned sorted from shortest to longest."""
+    value = table[key]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where}: {key} is {value!r}, not a non-empty list of window lengths")
+    for item in value:
+        # bool is a subclass of int in Python, so it is excluded explicitly.
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError(f"{where}: {key} holds {item!r}, not a window length (1 or more)")
+    duplicates = sorted({item for item in value if value.count(item) > 1})
+    if duplicates:
+        raise ValueError(f"{where}: {key} lists {duplicates} more than once")
+    return tuple(sorted(value))

@@ -16,7 +16,7 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
     8  receivables     each key's receivables as known at each week (U9b)    <- built
     9  panel           rows customer x week x horizon, with labels (U3, U4, U5)  <- in progress
    10  prices          TÜFE price levels by week (copied inflation.py, U8)   <- built
-   11  features        history, calendar, receivables              (U6, U7, U9c)
+   11  features        history, calendar, receivables (U6, U7, U9c)   <- in progress
    12  models          stage 1, stage 2, top-ups                   (U10-U12)
    13  forecast, evaluation, calibration                           (U13-U15)
 
@@ -46,6 +46,11 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     read_one_file,
 )
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
+from collection_estimation.hurdle.features_history import (  # noqa: E402
+    first_history_week,
+    ledger_receipts_before,
+    weekly_matrix,
+)
 from collection_estimation.hurdle.holidays import load_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
@@ -224,7 +229,24 @@ def main():
     levels = published_levels(week_zero, first_price_week, last_week)
     show_prices(weeks_for_prices, actual_level, published_level, projected_level, levels)
 
-    # Step 11 onwards: added as each unit is built.
+    # Step 11: the features. Built unit by unit; for now, the ledger's payments before the
+    # first daily file, used as payment history if [history] use_ledger_before_first_file.
+    if settings.history.use_ledger_before_first_file:
+        history_start = first_history_week(ledger, week_zero)
+        early_receipts = ledger_receipts_before(ledger, min(daily_files), week_zero)
+        early_receipts = early_receipts[early_receipts["week"] >= history_start]
+    else:
+        history_start = 0
+        early_receipts = ledger_receipts_before(ledger, min(daily_files), week_zero).iloc[0:0]
+    show_early_receipts(early_receipts, history_start)
+
+    # The weekly matrix: each key's deflated gross receipts per week (0.0 = paid nothing,
+    # NaN = no data that week), from the history start to the last week.
+    matrix = weekly_matrix(identified_weekly, early_receipts, known["key"], weeks, levels,
+                           history_start, last_week)
+    show_matrix(matrix)
+
+    # Step 11 continues, and later steps follow, as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -404,6 +426,32 @@ def show_prices(weeks_for_prices, actual_level, published_level, projected_level
     print(f"        projected vs actual level one week ahead: mean error "
           f"{sum(one_ahead) / len(one_ahead):+.2%}; published_levels() matches: "
           f"{bool((abs(levels.to_numpy() - published_level) < 1e-12).all())}")
+
+
+def show_early_receipts(early_receipts, history_start):
+    """A short printout of the payment history taken from the ledger."""
+    if early_receipts.empty:
+        print("Step 11: no payment history before the first daily file")
+        return
+    print(f"Step 11: payment history from the ledger: weeks {history_start} to "
+          f"{early_receipts['week'].max()}, {len(early_receipts):,} key-weeks, "
+          f"{early_receipts['key'].nunique():,} keys, "
+          f"{early_receipts['gross_receipts'].sum():,.2f} TRY (nominal)")
+
+
+def show_matrix(matrix):
+    """A short printout of the weekly matrix."""
+    before = [week for week in matrix.columns if week < 0]
+    after = [week for week in matrix.columns if week >= 0]
+    print(f"        weekly matrix: {matrix.shape[0]:,} keys x {matrix.shape[1]} weeks "
+          f"({matrix.columns.min()} to {matrix.columns.max()}); cells with no data: "
+          f"{matrix[before].isna().mean().mean() if before else 0:.1%} before week 0, "
+          f"{matrix[after].isna().mean().mean():.1%} from week 0")
+    busiest = matrix.sum(axis=1).idxmax()
+    paid_weeks = [week for week in matrix.columns if matrix.loc[busiest, week] > 0][:6]
+    print(f"        the key with the most receipts, its first weeks with a payment "
+          f"(TRY of the last week):")
+    print(matrix.loc[[busiest], paid_weeks].round(0).to_string())
 
 
 if __name__ == "__main__":

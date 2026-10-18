@@ -89,6 +89,21 @@ assert callable(script.show_filled)
 inspect.signature(script.price_weeks).bind("week_zero", -32, 64)
 inspect.signature(script.published_levels).bind("week_zero", -32, 64)
 assert callable(script.show_prices)
+# Step 11: the ledger's payments before the first daily file, as payment history.
+inspect.signature(script.first_history_week).bind("ledger", "week_zero")
+inspect.signature(script.ledger_receipts_before).bind("ledger", "first_file_day", "week_zero")
+assert callable(script.show_early_receipts)
+# Step 11, U6.1b: the weekly matrix, from the weekly amounts, the early receipts, the keys,
+# the calendar, the price levels and the first and last weeks.
+inspect.signature(script.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels",
+                                             -31, 64)
+try:
+    inspect.signature(script.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels")
+except TypeError:
+    pass
+else:
+    raise AssertionError("weekly_matrix accepts a call without the first and last weeks")
+assert callable(script.show_matrix)
 print("ok")
 """
 

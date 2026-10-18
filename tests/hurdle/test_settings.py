@@ -30,6 +30,7 @@ from collection_estimation.hurdle.settings import (
     CompanySettings,
     DataSettings,
     DebugSettings,
+    HistorySettings,
     LedgerLayout,
     ReceivablesSettings,
     Settings,
@@ -48,6 +49,7 @@ from collection_estimation.hurdle.settings import (
     week_list_setting,
     week_setting,
     bool_setting,
+    window_list_setting,
 )
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
@@ -129,6 +131,7 @@ VALID = {
     },
     "receivables": {"min_cleared_for_delay": "3", "horizons": "5",
                     "leak_check_weeks": "[0, 30]"},
+    "history": {"windows": "[4, 13, 52]", "use_ledger_before_first_file": "true"},
     "debug": {"one_day": "2025-06-02", "sample_week": "30"},
 }
 ALL_SECTIONS = list(VALID)
@@ -193,6 +196,7 @@ def test_returns_a_settings_object(tmp_path, repo):
     assert isinstance(settings.collections_layout, CollectionsLayout)
     assert isinstance(settings.ledger_layout, LedgerLayout)
     assert isinstance(settings.receivables, ReceivablesSettings)
+    assert isinstance(settings.history, HistorySettings)
 
 
 def test_paths_are_read_from_the_repo_root(tmp_path, repo):
@@ -258,7 +262,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "debug"])
+                                       "history", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -275,6 +279,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("ledger_layout", "headers"), ("ledger_layout", "document_types"),
     ("receivables", "min_cleared_for_delay"), ("receivables", "horizons"),
     ("receivables", "leak_check_weeks"),
+    ("history", "windows"), ("history", "use_ledger_before_first_file"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -391,6 +396,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("data", "cache_folder"), ("companies", "known"), ("companies", "unidentified_customers"),
     ("debug", "one_day"), ("debug", "sample_week"), ("receivables", "min_cleared_for_delay"),
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
+    ("history", "windows"), ("history", "use_ledger_before_first_file"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -1027,6 +1033,9 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.data.holidays_file == (REPO_ROOT / "settings" / "holidays_tr.toml").resolve()
     assert settings.settings_file == SYNTHETIC_SETTINGS.resolve()
     assert settings.data.fill_missing_days_from_ledger is True
+    assert settings.history.windows == (4, 13, 52)
+    assert type(settings.history.windows) is tuple
+    assert settings.history.use_ledger_before_first_file is True
 
 
 
@@ -1783,3 +1792,116 @@ def test_bool_setting_with_the_key_absent_raises_key_error():
     # load_settings checks the keys first, so a direct call without the key is a KeyError.
     with pytest.raises(KeyError):
         bool_setting({}, "flag", "f.toml [s]")
+
+
+# --- [history]: windows (window_list_setting) ----------------------------------------------
+
+def test_the_history_section_is_read(tmp_path, repo):
+    history = load(tmp_path, repo).history
+    assert history == HistorySettings(windows=(4, 13, 52), use_ledger_before_first_file=True)
+    assert type(history.windows) is tuple
+    assert all(type(window) is int for window in history.windows)
+
+
+def test_a_missing_history_section_names_it(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "history", drop_section="history")
+    assert "missing" in message
+
+
+@pytest.mark.parametrize("good, expected", [
+    ("[4, 13, 52]", (4, 13, 52)), ("[13, 4, 52]", (4, 13, 52)), ("[52, 13, 4]", (4, 13, 52)),
+    ("[1]", (1,)), ("[8]", (8,)), ("[104, 1]", (1, 104)),
+], ids=["sorted", "unsorted", "reversed", "one", "single", "two-unsorted"])
+def test_windows_are_returned_sorted(tmp_path, repo, good, expected):
+    settings = load(tmp_path, repo, changes={("history", "windows"): good})
+    assert settings.history.windows == expected
+    assert type(settings.history.windows) is tuple
+
+
+def test_an_empty_windows_list_raises(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[history]", "windows",
+                            changes={("history", "windows"): "[]"})
+    assert "non-empty list" in message
+
+
+@pytest.mark.parametrize("bad", ["4", '"4, 13"', "true", "{ a = 4 }"],
+                         ids=["int", "string", "bool", "table"])
+def test_windows_that_is_not_a_list_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[history]", "windows",
+                            changes={("history", "windows"): bad})
+    assert "non-empty list" in message
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("[4, 0]", "0"), ("[-1, 13]", "-1"), ("[4, 1.5]", "1.5"), ("[4.0]", "4.0"),
+    ('["4"]', "'4'"), ("[true]", "True"), ("[4, false]", "False"), ("[[4]]", "[4]"),
+], ids=["zero", "minus-one", "fraction", "whole-float", "string", "true", "false", "nested"])
+def test_windows_with_a_bad_item_raises_naming_it(tmp_path, repo, bad, shown):
+    message = raises_naming(tmp_path, repo, "[history]", "windows", f"holds {shown}",
+                            changes={("history", "windows"): bad})
+    assert "1 or more" in message
+
+
+def test_windows_with_duplicates_raises_naming_them(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[history]", "windows", "lists [4, 13] more than once",
+                            changes={("history", "windows"): "[13, 4, 52, 4, 13]"})
+    assert "52" not in message
+
+
+def test_a_windows_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = raises_naming(
+        tmp_path, repo, "[history]", "'windows'", "'window'",
+        changes={("history", "windows"): REMOVE, ("history", "window"): "[4]"})
+    assert "missing" in message and "unknown" in message
+
+
+def test_window_list_setting_direct_calls():
+    assert window_list_setting({"w": [13, 4, 52]}, "w", "here") == (4, 13, 52)
+    assert type(window_list_setting({"w": [3]}, "w", "here")) is tuple
+    with pytest.raises(ValueError, match="here: w is"):
+        window_list_setting({"w": []}, "w", "here")
+    with pytest.raises(ValueError, match="here: w is"):
+        window_list_setting({"w": (4, 13)}, "w", "here")
+    with pytest.raises(ValueError, match="here: w holds 0"):
+        window_list_setting({"w": [4, 0]}, "w", "here")
+    with pytest.raises(ValueError, match="here: w holds True"):
+        window_list_setting({"w": [True]}, "w", "here")
+    with pytest.raises(ValueError, match=r"here: w lists \[2\] more than once"):
+        window_list_setting({"w": [2, 2]}, "w", "here")
+
+
+def test_window_list_setting_does_not_modify_the_list():
+    value = [13, 4, 52]
+    window_list_setting({"w": value}, "w", "here")
+    assert value == [13, 4, 52]
+
+
+# --- [history]: use_ledger_before_first_file (bool_setting) -------------------------------
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_use_ledger_before_first_file_accepts_true_and_false(tmp_path, repo, text, expected):
+    value = load(tmp_path, repo, changes={("history", "use_ledger_before_first_file"): text}
+                 ).history.use_ledger_before_first_file
+    assert value is expected
+
+
+@pytest.mark.parametrize("bad", ["1", "0", '"true"', '"false"', "1.0", "[true]"],
+                         ids=["one", "zero", "string-true", "string-false", "float", "list"])
+def test_use_ledger_before_first_file_that_is_not_a_bool_raises(tmp_path, repo, bad):
+    message = raises_naming(tmp_path, repo, "[history]", "use_ledger_before_first_file",
+                            changes={("history", "use_ledger_before_first_file"): bad})
+    assert "true or false" in message
+
+
+def test_history_settings_do_not_borrow_from_data(tmp_path, repo):
+    settings = load(tmp_path, repo,
+                    changes={("history", "use_ledger_before_first_file"): "false",
+                             ("data", "fill_missing_days_from_ledger"): "true"})
+    assert settings.history.use_ledger_before_first_file is False
+    assert settings.data.fill_missing_days_from_ledger is True
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_history_settings():
+    history = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).history
+    assert history == HistorySettings(windows=(4, 13, 52), use_ledger_before_first_file=True)

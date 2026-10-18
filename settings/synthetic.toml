@@ -76,6 +76,12 @@ horizons = 5                    # the "due in week t+1 ... t+5" columns
 leak_check_weeks = [0, 16, 32, 48]  # rebuilt from a ledger cut off at the week and compared;
                                     # spread over the history (the last week proves little)
 
+[history]
+# How each customer's payment history is summarised (the history features).
+windows = [4, 13, 52]                 # look-back windows, in weeks
+use_ledger_before_first_file = true   # the ledger's payments before the first daily file
+                                      # count as history (false: those weeks are unknown)
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)
