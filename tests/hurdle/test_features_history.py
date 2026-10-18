@@ -1,5 +1,7 @@
 """Tests for `hurdle/features_history.py`: `ledger_receipts_before`, `first_history_week`,
-`EARLY_RECEIPT_COLUMNS`, `weekly_matrix`, `check_matrix_totals` and `MATRIX_TOLERANCE`.
+`EARLY_RECEIPT_COLUMNS`, `weekly_matrix`, `check_matrix_totals`, `MATRIX_TOLERANCE`, and
+the history features (`history_features`, `check_matrix_for_features`, `key_origins`,
+`trailing_sum`, `values_at`).
 
 Hand-built tables for the unit tests; slow integration blocks against the synthetic AR
 ledger and corpus in data/raw (skipped when they are absent). Nothing here reads or writes data/interim.
@@ -11,15 +13,21 @@ import pandas as pd
 import pytest
 
 import math
+import re
 
 import numpy as np
 
 from collection_estimation.hurdle.features_history import (
     EARLY_RECEIPT_COLUMNS,
     MATRIX_TOLERANCE,
+    check_matrix_for_features,
     check_matrix_totals,
     first_history_week,
+    history_features,
+    key_origins,
     ledger_receipts_before,
+    trailing_sum,
+    values_at,
     weekly_matrix,
 )
 
@@ -1004,3 +1012,1078 @@ def test_slow_synthetic_first_week_zero_without_history_has_65_columns(synthetic
     assert result.shape == (4590, 65)
     assert result.columns.tolist() == list(range(0, 65))
     pd.testing.assert_frame_equal(result, synthetic_pipeline["on"][list(range(0, 65))])
+
+
+# =========================================================================================
+# history_features (U6.2) and its helpers
+# =========================================================================================
+
+def feature_matrix(rows, first_week=0, last_week=10):
+    """rows: {key: {week: value}}; every other cell is 0.0. Shaped like `weekly_matrix`."""
+    columns = list(range(first_week, last_week + 1))
+    keys = sorted(rows)
+    matrix = pd.DataFrame(0.0, index=pd.Index(keys, name="key", dtype=object),
+                          columns=pd.Index(columns, name="week"))
+    for key, cells in rows.items():
+        for week, value in cells.items():
+            matrix.loc[key, week] = value
+    return matrix
+
+
+def known_table(pairs):
+    """pairs: {key: known_week}."""
+    return pd.DataFrame({"key": pd.Series(list(pairs), dtype=object),
+                         "known_week": pd.Series(list(pairs.values()), dtype="int64")})
+
+
+def feature_row(result, key, week):
+    selected = result[(result["key"] == key) & (result["origin_week"] == week)]
+    assert len(selected) == 1, f"expected one row for {key} at {week}, got {len(selected)}"
+    return selected.iloc[0]
+
+
+def history_columns(windows):
+    longest = max(windows)
+    columns = ["key", "origin_week", "customer_age_weeks", "weeks_since_last_payment",
+               "last_payment_amount", f"median_payment_{longest}"]
+    for window in sorted(windows):
+        columns += [f"observed_weeks_{window}", f"paying_weeks_{window}",
+                    f"mean_receipts_{window}"]
+    return columns
+
+
+NAN = float("nan")
+
+
+def history_features_example(windows=(4, 13)):
+    """The worked example: A pays 20 in week 2 and 50 in week 8, week 9 has no data; B is
+    known in week 9 (no data) and pays 30 in week 10."""
+    matrix = feature_matrix({"A": {2: 20.0, 8: 50.0, 9: NAN}, "B": {9: NAN, 10: 30.0}})
+    known = known_table({"A": -5, "B": 9})
+    return matrix, known, history_features(matrix, known, 10, windows)
+
+
+@pytest.fixture
+def worked_example():
+    return history_features_example((4, 13))
+
+
+# --- the worked example, value by value -------------------------------------------------
+
+def test_worked_example_key_a_at_week_10(worked_example):
+    row = feature_row(worked_example[2], "A", 10)
+    assert row["observed_weeks_4"] == 3
+    assert row["paying_weeks_4"] == 1
+    assert row["mean_receipts_4"] == pytest.approx(50.0 / 3)
+    assert row["observed_weeks_13"] == 10
+    assert row["paying_weeks_13"] == 2
+    assert row["mean_receipts_13"] == pytest.approx(7.0)
+    assert row["weeks_since_last_payment"] == 2
+    assert row["last_payment_amount"] == 50.0
+    assert row["median_payment_13"] == 35.0
+    assert row["customer_age_weeks"] == 15
+
+
+def test_worked_example_key_b_at_week_10(worked_example):
+    row = feature_row(worked_example[2], "B", 10)
+    assert row["observed_weeks_4"] == 3
+    assert row["paying_weeks_4"] == 1
+    assert row["mean_receipts_4"] == pytest.approx(10.0)
+    assert row["observed_weeks_13"] == 10
+    assert row["paying_weeks_13"] == 1
+    assert row["mean_receipts_13"] == pytest.approx(3.0)
+    assert row["weeks_since_last_payment"] == 0
+    assert row["last_payment_amount"] == 30.0
+    assert row["median_payment_13"] == 30.0
+    assert row["customer_age_weeks"] == 1
+
+
+def test_worked_example_key_b_has_rows_only_for_weeks_9_and_10(worked_example):
+    result = worked_example[2]
+    assert result.loc[result["key"] == "B", "origin_week"].tolist() == [9, 10]
+
+
+def test_worked_example_key_b_at_week_9_has_no_payment_features(worked_example):
+    row = feature_row(worked_example[2], "B", 9)
+    assert math.isnan(row["weeks_since_last_payment"])
+    assert math.isnan(row["last_payment_amount"])
+    assert math.isnan(row["median_payment_13"])
+    assert row["paying_weeks_4"] == 0
+    assert row["paying_weeks_13"] == 0
+    assert row["customer_age_weeks"] == 0
+    # Weeks 6, 7, 8 have data (zeros), week 9 has none.
+    assert row["observed_weeks_4"] == 3
+    assert row["mean_receipts_4"] == 0.0
+
+
+def test_worked_example_key_a_at_week_1_has_no_payment_features(worked_example):
+    row = feature_row(worked_example[2], "A", 1)
+    assert math.isnan(row["weeks_since_last_payment"])
+    assert math.isnan(row["last_payment_amount"])
+    assert math.isnan(row["median_payment_13"])
+    assert row["observed_weeks_4"] == 2      # weeks 0 and 1; -2 and -1 are not in the matrix
+    assert row["customer_age_weeks"] == 6
+
+
+def test_worked_example_key_a_at_week_2_paid_this_week(worked_example):
+    row = feature_row(worked_example[2], "A", 2)
+    assert row["weeks_since_last_payment"] == 0
+    assert row["last_payment_amount"] == 20.0
+    assert row["median_payment_13"] == 20.0
+    assert row["mean_receipts_4"] == pytest.approx(20.0 / 3)
+
+
+def test_worked_example_key_a_at_week_9_the_missing_week(worked_example):
+    row = feature_row(worked_example[2], "A", 9)
+    assert row["weeks_since_last_payment"] == 1
+    assert row["last_payment_amount"] == 50.0
+    assert row["observed_weeks_4"] == 3        # 6, 7, 8 (9 has no data)
+    assert row["mean_receipts_4"] == pytest.approx(50.0 / 3)
+
+
+def test_worked_example_row_count(worked_example):
+    # A: weeks 0..10 (11 rows), B: weeks 9 and 10.
+    assert len(worked_example[2]) == 13
+
+
+# --- missing week is not a zero ---------------------------------------------------------
+
+def test_a_missing_week_lowers_observed_weeks_and_does_not_pull_the_mean_down():
+    with_gap = feature_matrix({"A": {0: 10.0, 1: NAN, 2: 10.0, 3: 10.0}}, last_week=3)
+    with_zero = feature_matrix({"A": {0: 10.0, 1: 0.0, 2: 10.0, 3: 10.0}}, last_week=3)
+    known = known_table({"A": 0})
+    gap = feature_row(history_features(with_gap, known, 3, (4,)), "A", 3)
+    zero = feature_row(history_features(with_zero, known, 3, (4,)), "A", 3)
+    assert gap["observed_weeks_4"] == 3
+    assert gap["mean_receipts_4"] == pytest.approx(10.0)
+    assert zero["observed_weeks_4"] == 4
+    assert zero["mean_receipts_4"] == pytest.approx(7.5)
+    assert gap["paying_weeks_4"] == zero["paying_weeks_4"] == 3
+
+
+def test_a_missing_week_is_not_a_paying_week():
+    matrix = feature_matrix({"A": {0: 5.0, 1: NAN}}, last_week=1)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 1, (2,)), "A", 1)
+    assert row["paying_weeks_2"] == 1
+    assert row["weeks_since_last_payment"] == 1
+    assert row["last_payment_amount"] == 5.0
+
+
+def test_a_window_of_only_missing_weeks_has_observed_zero_and_mean_nan():
+    matrix = feature_matrix({"A": {0: 5.0, 1: NAN, 2: NAN}}, last_week=2)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 2, (2,)), "A", 2)
+    assert row["observed_weeks_2"] == 0
+    assert row["paying_weeks_2"] == 0
+    assert math.isnan(row["mean_receipts_2"])
+    # The payment two weeks back is still the last payment.
+    assert row["weeks_since_last_payment"] == 2
+    assert row["last_payment_amount"] == 5.0
+    assert math.isnan(row["median_payment_2"])
+
+
+def test_a_window_of_only_zero_weeks_has_mean_zero_not_nan():
+    matrix = feature_matrix({"A": {}}, last_week=3)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 3, (4,)), "A", 3)
+    assert row["observed_weeks_4"] == 4
+    assert row["paying_weeks_4"] == 0
+    assert row["mean_receipts_4"] == 0.0
+
+
+def test_a_zero_receipt_is_not_a_paying_week():
+    matrix = feature_matrix({"A": {0: 7.0, 1: 0.0}}, last_week=1)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 1, (2,)), "A", 1)
+    assert row["paying_weeks_2"] == 1
+    assert row["weeks_since_last_payment"] == 1
+    assert row["last_payment_amount"] == 7.0
+    assert row["median_payment_2"] == 7.0
+
+
+def test_a_negative_receipt_is_not_a_paying_week_but_enters_the_mean():
+    matrix = feature_matrix({"A": {0: 10.0, 1: -5.0}}, last_week=1)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 1, (2,)), "A", 1)
+    assert row["paying_weeks_2"] == 1
+    assert row["observed_weeks_2"] == 2
+    assert row["mean_receipts_2"] == pytest.approx(2.5)
+    assert row["weeks_since_last_payment"] == 1
+    assert row["last_payment_amount"] == 10.0
+    assert row["median_payment_2"] == 10.0
+
+
+def test_a_tiny_positive_receipt_is_a_paying_week():
+    matrix = feature_matrix({"A": {1: 1e-12}}, last_week=1)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 1, (2,)), "A", 1)
+    assert row["paying_weeks_2"] == 1
+    assert row["weeks_since_last_payment"] == 0
+    assert row["last_payment_amount"] == 1e-12
+
+
+# --- windows reaching before the matrix's first week -------------------------------------
+
+def test_weeks_before_the_first_column_count_as_no_data():
+    matrix = feature_matrix({"A": {1: 8.0}}, first_week=0, last_week=3)
+    result = history_features(matrix, known_table({"A": 0}), 3, (4,))
+    assert feature_row(result, "A", 0)["observed_weeks_4"] == 1
+    assert feature_row(result, "A", 1)["observed_weeks_4"] == 2
+    assert feature_row(result, "A", 1)["mean_receipts_4"] == pytest.approx(4.0)
+    assert feature_row(result, "A", 3)["observed_weeks_4"] == 4
+    assert feature_row(result, "A", 3)["mean_receipts_4"] == pytest.approx(2.0)
+
+
+def test_a_matrix_from_week_minus_31_fills_the_window_from_the_start():
+    matrix = feature_matrix({"A": {1: 8.0}}, first_week=-31, last_week=3)
+    result = history_features(matrix, known_table({"A": -40}), 3, (4, 52))
+    row0 = feature_row(result, "A", 0)
+    assert row0["observed_weeks_4"] == 4
+    assert row0["observed_weeks_52"] == 32          # weeks -31 .. 0
+    row1 = feature_row(result, "A", 1)
+    assert row1["observed_weeks_4"] == 4
+    assert row1["mean_receipts_4"] == pytest.approx(2.0)
+    assert row1["observed_weeks_52"] == 33
+
+
+def test_early_weeks_change_features_only_through_the_window():
+    # Weeks 0..10 with and without 31 earlier zero weeks: equal once the window no longer
+    # reaches before week 0.
+    late = feature_matrix({"A": {3: 4.0, 7: 9.0}}, first_week=0)
+    early = feature_matrix({"A": {3: 4.0, 7: 9.0}}, first_week=-31)
+    known = known_table({"A": 0})
+    from_zero = history_features(late, known, 10, (4,))
+    from_minus_31 = history_features(early, known, 10, (4,))
+    for week in range(3, 11):
+        assert (feature_row(from_zero, "A", week)["observed_weeks_4"]
+                == feature_row(from_minus_31, "A", week)["observed_weeks_4"])
+        assert (feature_row(from_zero, "A", week)["mean_receipts_4"]
+                == pytest.approx(feature_row(from_minus_31, "A", week)["mean_receipts_4"]))
+    assert feature_row(from_zero, "A", 2)["observed_weeks_4"] == 3
+    assert feature_row(from_minus_31, "A", 2)["observed_weeks_4"] == 4
+
+
+def test_a_payment_before_week_zero_is_the_last_payment():
+    matrix = feature_matrix({"A": {-31: 12.0}}, first_week=-31, last_week=5)
+    result = history_features(matrix, known_table({"A": -31}), 5, (4, 52))
+    row = feature_row(result, "A", 5)
+    assert row["weeks_since_last_payment"] == 36
+    assert row["last_payment_amount"] == 12.0
+    assert row["median_payment_52"] == 12.0      # week -31 is within the 52 weeks ending 5
+    assert row["paying_weeks_52"] == 1
+    assert row["paying_weeks_4"] == 0
+    assert row["customer_age_weeks"] == 36
+
+
+def test_the_median_covers_only_the_longest_window_but_the_last_payment_does_not():
+    matrix = feature_matrix({"A": {0: 100.0, 5: 10.0}}, last_week=8)
+    result = history_features(matrix, known_table({"A": 0}), 8, (2,))
+    assert feature_row(result, "A", 1)["median_payment_2"] == 100.0
+    assert math.isnan(feature_row(result, "A", 2)["median_payment_2"])
+    assert feature_row(result, "A", 5)["median_payment_2"] == 10.0
+    assert feature_row(result, "A", 6)["median_payment_2"] == 10.0
+    late = feature_row(result, "A", 7)
+    assert math.isnan(late["median_payment_2"])
+    assert late["weeks_since_last_payment"] == 2
+    assert late["last_payment_amount"] == 10.0
+
+
+def test_the_median_skips_zero_negative_and_missing_weeks():
+    matrix = feature_matrix({"A": {0: 3.0, 1: 0.0, 2: -50.0, 3: NAN, 4: 9.0, 5: 6.0}},
+                            last_week=5)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 5, (6,)), "A", 5)
+    assert row["median_payment_6"] == 6.0       # median of 3, 9, 6
+    assert row["paying_weeks_6"] == 3
+
+
+def test_a_window_of_one_week_is_that_week_alone():
+    matrix = feature_matrix({"A": {2: 5.0, 3: NAN}}, last_week=4)
+    result = history_features(matrix, known_table({"A": 0}), 4, (1,))
+    assert feature_row(result, "A", 2)["mean_receipts_1"] == 5.0
+    assert feature_row(result, "A", 2)["paying_weeks_1"] == 1
+    assert feature_row(result, "A", 3)["observed_weeks_1"] == 0
+    assert math.isnan(feature_row(result, "A", 3)["mean_receipts_1"])
+    assert feature_row(result, "A", 4)["mean_receipts_1"] == 0.0
+    assert math.isnan(feature_row(result, "A", 4)["median_payment_1"])
+
+
+def test_a_window_longer_than_the_matrix_uses_every_column_so_far():
+    matrix = feature_matrix({"A": {0: 2.0, 3: 4.0}}, last_week=3)
+    row = feature_row(history_features(matrix, known_table({"A": 0}), 3, (100,)), "A", 3)
+    assert row["observed_weeks_100"] == 4
+    assert row["mean_receipts_100"] == pytest.approx(1.5)
+    assert row["median_payment_100"] == 3.0
+
+
+# --- the row set, order, columns and dtypes ----------------------------------------------
+
+def test_rows_are_exactly_the_known_keys_at_their_known_origin_weeks():
+    matrix = feature_matrix({"A": {}, "B": {}, "C": {}, "D": {}}, first_week=-3, last_week=6)
+    known_at = {"A": -3, "B": 0, "C": 4, "D": 6}
+    result = history_features(matrix, known_table(known_at), 6, (4,))
+    expected = sorted([(key, t) for key, week in known_at.items() for t in range(0, 7)
+                       if week <= t], key=lambda pair: (pair[1], pair[0]))
+    assert list(zip(result["key"], result["origin_week"])) == expected
+
+
+def test_a_key_known_at_last_week_gets_one_row():
+    matrix = feature_matrix({"A": {}})
+    result = history_features(matrix, known_table({"A": 10}), 10, (4,))
+    assert result["origin_week"].tolist() == [10]
+
+
+def test_a_key_known_after_last_week_gets_no_rows():
+    matrix = feature_matrix({"A": {}, "B": {}}, last_week=12)
+    result = history_features(matrix, known_table({"A": 0, "B": 11}), 10, (4,))
+    assert set(result["key"]) == {"A"}
+    assert result["origin_week"].max() == 10
+
+
+def test_no_origin_week_beyond_last_week_even_when_the_matrix_goes_further():
+    matrix = feature_matrix({"A": {}}, last_week=20)
+    result = history_features(matrix, known_table({"A": 0}), 10, (4,))
+    assert result["origin_week"].tolist() == list(range(11))
+
+
+def test_a_key_in_the_matrix_but_not_known_gets_no_rows():
+    matrix = feature_matrix({"A": {3: 1.0}, "Z": {3: 99.0}})
+    result = history_features(matrix, known_table({"A": 0}), 10, (4,))
+    assert set(result["key"]) == {"A"}
+
+
+def test_a_negative_known_week_gives_rows_from_week_zero_and_its_age():
+    matrix = feature_matrix({"A": {}}, first_week=-10)
+    result = history_features(matrix, known_table({"A": -7}), 10, (4,))
+    assert result["origin_week"].tolist() == list(range(11))
+    assert result["customer_age_weeks"].tolist() == [t + 7 for t in range(11)]
+
+
+def test_rows_are_sorted_by_origin_week_then_key():
+    matrix = feature_matrix({"b": {}, "A": {}, "a": {}, "B": {}}, last_week=3)
+    known = known_table({"b": 0, "a": 1, "B": 0, "A": 2})
+    result = history_features(matrix, known, 3, (2,))
+    pairs = list(zip(result["origin_week"], result["key"]))
+    assert pairs == sorted(pairs)
+    assert [key for week, key in pairs if week == 3] == ["A", "B", "a", "b"]
+
+
+def test_the_index_is_a_fresh_range():
+    _, _, result = history_features_example()
+    assert result.index.equals(pd.RangeIndex(len(result)))
+
+
+def test_columns_are_in_the_documented_order():
+    _, _, result = history_features_example((4, 13))
+    assert list(result.columns) == history_columns((4, 13))
+
+
+def test_unsorted_windows_give_sorted_columns_and_the_median_uses_the_longest():
+    _, _, result = history_features_example((52, 4, 13))
+    assert list(result.columns) == [
+        "key", "origin_week", "customer_age_weeks", "weeks_since_last_payment",
+        "last_payment_amount", "median_payment_52",
+        "observed_weeks_4", "paying_weeks_4", "mean_receipts_4",
+        "observed_weeks_13", "paying_weeks_13", "mean_receipts_13",
+        "observed_weeks_52", "paying_weeks_52", "mean_receipts_52"]
+
+
+def test_unsorted_windows_give_the_same_values_as_sorted_ones():
+    _, _, unsorted = history_features_example((52, 4, 13))
+    _, _, ordered = history_features_example((4, 13, 52))
+    pd.testing.assert_frame_equal(unsorted, ordered)
+
+
+def test_windows_may_be_a_list():
+    _, _, as_list = history_features_example([13, 4])
+    _, _, as_tuple = history_features_example((4, 13))
+    pd.testing.assert_frame_equal(as_list, as_tuple)
+
+
+def test_a_single_window_gives_its_median_column():
+    _, _, result = history_features_example((4,))
+    assert list(result.columns) == history_columns((4,))
+
+
+def test_dtypes():
+    _, _, result = history_features_example((4, 13))
+    expected = {"key": "object", "origin_week": "int64", "customer_age_weeks": "int64",
+                "weeks_since_last_payment": "float64", "last_payment_amount": "float64",
+                "median_payment_13": "float64"}
+    for window in (4, 13):
+        expected[f"observed_weeks_{window}"] = "int64"
+        expected[f"paying_weeks_{window}"] = "int64"
+        expected[f"mean_receipts_{window}"] = "float64"
+    assert {column: str(dtype) for column, dtype in result.dtypes.items()} == expected
+
+
+def test_no_known_keys_gives_an_empty_table_with_the_columns_and_dtypes():
+    matrix = feature_matrix({"A": {}})
+    result = history_features(matrix, known_table({}), 10, (4, 13))
+    assert result.empty
+    assert list(result.columns) == history_columns((4, 13))
+    assert result["key"].dtype == object
+    assert result["origin_week"].dtype == "int64"
+    assert result["observed_weeks_4"].dtype == "int64"
+    assert result["mean_receipts_4"].dtype == "float64"
+
+
+def test_extra_known_columns_are_ignored():
+    matrix, known, result = history_features_example()
+    wider = known.assign(company_code="TR02", customer_id=["1", "2"],
+                         first_seen=pd.Timestamp("2025-06-02"))
+    pd.testing.assert_frame_equal(history_features(matrix, wider, 10, (4, 13)), result)
+
+
+def test_matrix_and_known_row_order_do_not_matter():
+    matrix, known, result = history_features_example()
+    shuffled = history_features(matrix.iloc[::-1], known.iloc[::-1].reset_index(drop=True),
+                                10, (4, 13))
+    pd.testing.assert_frame_equal(shuffled, result)
+
+
+def test_a_matrix_without_index_or_column_names_gives_the_same_result():
+    matrix, known, result = history_features_example()
+    plain = matrix.copy()
+    plain.index.name = None
+    plain.columns.name = None
+    pd.testing.assert_frame_equal(history_features(plain, known, 10, (4, 13)), result)
+
+
+def test_the_same_inputs_give_the_same_features():
+    matrix, known, result = history_features_example()
+    pd.testing.assert_frame_equal(history_features(matrix, known, 10, (4, 13)), result)
+
+
+def test_history_features_does_not_modify_its_inputs():
+    matrix = feature_matrix({"A": {2: 20.0, 8: 50.0, 9: NAN}, "B": {9: NAN, 10: 30.0}},
+                            first_week=-3)
+    known = known_table({"A": -5, "B": 9})
+    before = matrix.copy(), known.copy()
+    history_features(matrix, known, 10, (4, 13))
+    pd.testing.assert_frame_equal(matrix, before[0])
+    pd.testing.assert_frame_equal(known, before[1])
+    assert list(known.columns) == ["key", "known_week"]
+
+
+def test_the_windows_list_is_not_modified():
+    windows = [13, 4]
+    matrix, known, _ = history_features_example()
+    history_features(matrix, known, 10, windows)
+    assert windows == [13, 4]
+
+
+# --- random matrices: a brute-force reference --------------------------------------------
+
+def random_matrix(seed, n_keys=12, first_week=-6, last_week=25, missing_weeks=(3, 11)):
+    """Zeros, NaN cells, negative cells, whole missing weeks; two keys are not known and the
+    known weeks run from before the first column to after the last."""
+    rng = np.random.default_rng(seed)
+    columns = list(range(first_week, last_week + 1))
+    keys = [f"K{i:02d}" for i in range(n_keys)]
+    draw = rng.random((n_keys, len(columns)))
+    values = np.round(rng.lognormal(3.0, 1.0, (n_keys, len(columns))), 2)
+    values[draw < 0.5] = 0.0
+    values[(draw >= 0.5) & (draw < 0.6)] = np.nan
+    values[(draw >= 0.6) & (draw < 0.65)] *= -1.0
+    matrix = pd.DataFrame(values, index=pd.Index(keys, name="key", dtype=object),
+                          columns=pd.Index(columns, name="week"))
+    for week in missing_weeks:
+        matrix[week] = np.nan               # a week the calendar marks missing
+    known_at = rng.integers(first_week - 4, last_week + 4, n_keys)
+    known = known_table(dict(zip(keys[:-2], known_at[:-2].tolist())))
+    return matrix, known
+
+
+def reference_history(matrix, known, last_week, windows):
+    """The features by plain loops over the definitions."""
+    columns = list(matrix.columns)
+    longest = max(windows)
+    known_at = dict(zip(known["key"], known["known_week"]))
+    records = []
+    for t in range(last_week + 1):
+        for key in sorted(k for k, week in known_at.items() if week <= t):
+            row = matrix.loc[key]
+
+            def cell(week):
+                return row[week] if week in columns else NAN
+
+            paying = [week for week in columns if week <= t and cell(week) > 0]
+            record = {"key": key, "origin_week": t, "customer_age_weeks": t - known_at[key]}
+            if paying:
+                record["weeks_since_last_payment"] = float(t - paying[-1])
+                record["last_payment_amount"] = float(cell(paying[-1]))
+            else:
+                record["weeks_since_last_payment"] = NAN
+                record["last_payment_amount"] = NAN
+            recent = [cell(week) for week in paying if week > t - longest]
+            record[f"median_payment_{longest}"] = (float(np.median(recent)) if recent
+                                                   else NAN)
+            for window in sorted(windows):
+                weeks = range(t - window + 1, t + 1)
+                values = [cell(week) for week in weeks if not math.isnan(cell(week))]
+                record[f"observed_weeks_{window}"] = len(values)
+                record[f"paying_weeks_{window}"] = sum(1 for value in values if value > 0)
+                record[f"mean_receipts_{window}"] = (sum(values) / len(values) if values
+                                                     else NAN)
+            records.append(record)
+    table = pd.DataFrame(records, columns=history_columns(windows))
+    table["key"] = table["key"].astype(object)
+    for column in table.columns:
+        if column.startswith(("origin_week", "customer_age", "observed_", "paying_")):
+            table[column] = table[column].astype("int64")
+        elif column != "key":
+            table[column] = table[column].astype("float64")
+    return table
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("windows", [(4, 13, 52), (1,), (3, 8), (2, 5, 40)])
+def test_matches_a_brute_force_reference_on_random_matrices(seed, windows):
+    matrix, known = random_matrix(seed)
+    result = history_features(matrix, known, 25, windows)
+    expected = reference_history(matrix, known, 25, windows)
+    pd.testing.assert_frame_equal(result, expected, check_exact=False, rtol=1e-9, atol=1e-9)
+
+
+def test_matches_the_reference_when_the_matrix_starts_at_week_zero():
+    matrix, known = random_matrix(7, first_week=0, last_week=20, missing_weeks=(0, 9))
+    result = history_features(matrix, known, 20, (4, 13))
+    expected = reference_history(matrix, known, 20, (4, 13))
+    pd.testing.assert_frame_equal(result, expected, check_exact=False, rtol=1e-9, atol=1e-9)
+
+
+def test_matches_the_reference_with_last_week_short_of_the_matrix_end():
+    matrix, known = random_matrix(8)
+    result = history_features(matrix, known, 15, (4, 13))
+    expected = reference_history(matrix, known, 15, (4, 13))
+    pd.testing.assert_frame_equal(result, expected, check_exact=False, rtol=1e-9, atol=1e-9)
+
+
+# --- the leak test: nothing after t changes the features at t -----------------------------
+
+def scramble_after(matrix, week, seed):
+    """Every cell after `week` replaced: NaN, huge, negative, zero or a new amount."""
+    rng = np.random.default_rng(seed)
+    scrambled = matrix.copy()
+    later = [column for column in matrix.columns if column > week]
+    choices = np.array([NAN, 1e15, -1e6, 0.0, 123.45, 1e-9])
+    scrambled[later] = rng.choice(choices, size=(len(matrix), len(later)))
+    return scrambled
+
+
+@pytest.mark.parametrize("cut", [0, 1, 5, 12, 20, 24])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_scrambling_weeks_after_t_leaves_features_up_to_t_unchanged(cut, seed):
+    matrix, known = random_matrix(seed)
+    windows = (4, 13, 52)
+    original = history_features(matrix, known, 25, windows)
+    changed = history_features(scramble_after(matrix, cut, seed + 100), known, 25, windows)
+    keep = original["origin_week"] <= cut
+    pd.testing.assert_frame_equal(changed[keep], original[keep], check_exact=True)
+    # The scramble did take effect: the later origin weeks moved.
+    assert not changed[~keep].equals(original[~keep])
+
+
+@pytest.mark.parametrize("cut", [0, 3, 11, 19])
+def test_blanking_weeks_after_t_leaves_features_up_to_t_unchanged(cut):
+    matrix, known = random_matrix(5)
+    blanked = matrix.copy()
+    blanked[[column for column in matrix.columns if column > cut]] = NAN
+    original = history_features(matrix, known, 25, (4, 13))
+    changed = history_features(blanked, known, 25, (4, 13))
+    keep = original["origin_week"] <= cut
+    pd.testing.assert_frame_equal(changed[keep], original[keep], check_exact=True)
+
+
+@pytest.mark.parametrize("cut", [0, 2, 10, 17, 25])
+def test_a_matrix_cut_at_t_gives_the_same_features_up_to_t(cut):
+    matrix, known = random_matrix(9)
+    full = history_features(matrix, known, 25, (4, 13, 52))
+    truncated = matrix[[column for column in matrix.columns if column <= cut]]
+    cut_result = history_features(truncated, known, cut, (4, 13, 52))
+    expected = full[full["origin_week"] <= cut].reset_index(drop=True)
+    pd.testing.assert_frame_equal(cut_result, expected, check_exact=True)
+
+
+def test_a_huge_payment_after_t_does_not_reach_t():
+    matrix = feature_matrix({"A": {3: 10.0}})
+    later = matrix.copy()
+    later.loc["A", 4] = 1e12
+    known = known_table({"A": 0})
+    before = history_features(matrix, known, 10, (4,))
+    after = history_features(later, known, 10, (4,))
+    keep = before["origin_week"] <= 3
+    pd.testing.assert_frame_equal(after[keep], before[keep], check_exact=True)
+    assert feature_row(after, "A", 4)["last_payment_amount"] == 1e12
+
+
+# --- check_matrix_for_features ------------------------------------------------------------
+
+def test_check_passes_on_a_good_matrix():
+    matrix = feature_matrix({"A": {}}, first_week=-3)
+    check_matrix_for_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_a_known_key_without_a_matrix_row_raises():
+    matrix = feature_matrix({"A": {}})
+    with pytest.raises(ValueError, match=re.escape(
+            "1 known keys have no row in the weekly matrix (first: ['C'])")):
+        history_features(matrix, known_table({"A": 0, "C": 2}), 10, (4,))
+
+
+def test_missing_keys_are_counted_and_the_first_five_listed_sorted():
+    matrix = feature_matrix({"A": {}})
+    known = known_table({key: 0 for key in ["A", "G", "F", "E", "D", "C", "B", "H"]})
+    with pytest.raises(ValueError, match=re.escape(
+            "7 known keys have no row in the weekly matrix "
+            "(first: ['B', 'C', 'D', 'E', 'F'])")):
+        check_matrix_for_features(matrix, known, 10, (4,))
+
+
+def test_a_known_key_after_last_week_still_needs_a_matrix_row():
+    matrix = feature_matrix({"A": {}})
+    with pytest.raises(ValueError, match="1 known keys have no row"):
+        check_matrix_for_features(matrix, known_table({"A": 0, "B": 99}), 10, (4,))
+
+
+def test_a_gap_in_the_columns_raises():
+    matrix = feature_matrix({"A": {}}).drop(columns=5)
+    with pytest.raises(ValueError, match="columns must be consecutive week numbers"):
+        history_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_descending_columns_raise():
+    matrix = feature_matrix({"A": {}})
+    matrix = matrix[list(reversed(matrix.columns))]
+    with pytest.raises(ValueError, match="columns must be consecutive week numbers"):
+        history_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_shuffled_columns_raise():
+    matrix = feature_matrix({"A": {}})
+    matrix = matrix[[0, 2, 1] + list(range(3, 11))]
+    with pytest.raises(ValueError, match="columns must be consecutive week numbers"):
+        check_matrix_for_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_a_repeated_column_raises():
+    matrix = feature_matrix({"A": {}})
+    matrix = pd.concat([matrix, matrix[[10]]], axis=1)
+    with pytest.raises(ValueError, match="columns must be consecutive week numbers"):
+        check_matrix_for_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_no_columns_raise():
+    matrix = feature_matrix({"A": {}})[[]]
+    with pytest.raises(ValueError, match="columns must be consecutive week numbers"):
+        history_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+@pytest.mark.parametrize("labels", [
+    pytest.param([str(week) for week in range(11)], id="text"),
+    pytest.param([float(week) for week in range(11)], id="float"),
+    pytest.param([week + 0.5 for week in range(11)], id="fractional-float"),
+    pytest.param(pd.Index(list(range(10)) + ["10"], dtype=object), id="object-mixed"),
+    pytest.param(pd.Index(list(range(11)), dtype=object), id="object-all-int"),
+])
+def test_non_integer_columns_raise_value_error(labels):
+    matrix = feature_matrix({"A": {}})
+    matrix.columns = labels
+    with pytest.raises(ValueError, match=re.escape(
+            "the weekly matrix's columns must be consecutive week numbers")):
+        check_matrix_for_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_non_integer_columns_raise_through_history_features_too():
+    matrix = feature_matrix({"A": {}})
+    matrix.columns = [float(week) for week in range(11)]
+    with pytest.raises(ValueError, match="consecutive week numbers"):
+        history_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+@pytest.mark.parametrize("dtype", ["int64", "int32", "Int64"])
+def test_integer_columns_of_any_integer_dtype_pass(dtype):
+    matrix = feature_matrix({"A": {3: 5.0}})
+    matrix.columns = pd.Index(list(range(11)), dtype=dtype, name="week")
+    check_matrix_for_features(matrix, known_table({"A": 0}), 10, (4,))
+    result = history_features(matrix, known_table({"A": 0}), 10, (4,))
+    assert feature_row(result, "A", 3)["last_payment_amount"] == 5.0
+
+
+# --- check_matrix_for_features: a key repeated in `known` ---------------------------------
+
+def known_rows(pairs):
+    """pairs: [(key, known_week), ...]; unlike `known_table`, keys may repeat."""
+    return pd.DataFrame({"key": pd.Series([key for key, _ in pairs], dtype=object),
+                         "known_week": pd.Series([week for _, week in pairs], dtype="int64")})
+
+
+def test_a_repeated_known_key_raises_with_the_exact_message():
+    matrix = feature_matrix({"A": {}, "B": {}})
+    known = known_rows([("A", 0), ("B", 1), ("A", 0)])
+    with pytest.raises(ValueError, match=re.escape(
+            "1 keys appear more than once in the known table (first: ['A'])")):
+        check_matrix_for_features(matrix, known, 10, (4,))
+
+
+def test_a_repeated_known_key_raises_even_with_different_known_weeks():
+    matrix = feature_matrix({"A": {}})
+    with pytest.raises(ValueError, match=re.escape(
+            "1 keys appear more than once in the known table (first: ['A'])")):
+        check_matrix_for_features(matrix, known_rows([("A", 0), ("A", 3)]), 10, (4,))
+
+
+def test_a_key_three_times_counts_as_one_repeated_key():
+    matrix = feature_matrix({"A": {}, "B": {}})
+    known = known_rows([("A", 0), ("A", 0), ("B", 0), ("A", 0)])
+    with pytest.raises(ValueError, match=re.escape(
+            "1 keys appear more than once in the known table (first: ['A'])")):
+        check_matrix_for_features(matrix, known, 10, (4,))
+
+
+def test_repeated_keys_are_counted_distinct_and_the_first_five_listed_sorted():
+    keys = ["G", "F", "E", "D", "C", "B", "A", "H"]
+    matrix = feature_matrix({key: {} for key in keys})
+    # Seven distinct keys repeated (H is not), G three times; listed out of order.
+    pairs = [(key, 0) for key in keys] + [(key, 0) for key in keys[:7]] + [("G", 0)]
+    with pytest.raises(ValueError, match=re.escape(
+            "7 keys appear more than once in the known table "
+            "(first: ['A', 'B', 'C', 'D', 'E'])")):
+        check_matrix_for_features(matrix, known_rows(pairs), 10, (4,))
+
+
+def test_a_repeated_known_key_raises_through_history_features():
+    matrix = feature_matrix({"A": {2: 1.0}})
+    with pytest.raises(ValueError, match=re.escape(
+            "1 keys appear more than once in the known table (first: ['A'])")):
+        history_features(matrix, known_rows([("A", 0), ("A", 0)]), 10, (4,))
+
+
+def test_the_repeated_key_check_comes_before_the_missing_key_check():
+    matrix = feature_matrix({"A": {}})
+    # B repeats and also has no matrix row; C is only missing.
+    known = known_rows([("A", 0), ("B", 0), ("B", 0), ("C", 0)])
+    with pytest.raises(ValueError, match=re.escape(
+            "1 keys appear more than once in the known table (first: ['B'])")):
+        check_matrix_for_features(matrix, known, 10, (4,))
+
+
+def test_the_repeated_key_check_comes_before_the_column_and_window_checks():
+    matrix = feature_matrix({"A": {}})
+    matrix.columns = [str(week) for week in range(11)]
+    with pytest.raises(ValueError, match="keys appear more than once"):
+        check_matrix_for_features(matrix, known_rows([("A", 0), ("A", 0)]), 10, ())
+
+
+def test_distinct_known_keys_do_not_trip_the_repeated_key_check():
+    matrix = feature_matrix({"A": {}, "a": {}, "B": {}})
+    check_matrix_for_features(matrix, known_rows([("A", 0), ("a", 0), ("B", 5)]), 10, (4,))
+
+
+def test_columns_starting_after_week_zero_raise():
+    matrix = feature_matrix({"A": {}}, first_week=1)
+    with pytest.raises(ValueError, match=re.escape(
+            "the weekly matrix has weeks 1 to 10; it must cover weeks 0 to 10")):
+        history_features(matrix, known_table({"A": 1}), 10, (4,))
+
+
+def test_columns_ending_before_last_week_raise():
+    matrix = feature_matrix({"A": {}}, last_week=9)
+    with pytest.raises(ValueError, match=re.escape(
+            "the weekly matrix has weeks 0 to 9; it must cover weeks 0 to 10")):
+        history_features(matrix, known_table({"A": 0}), 10, (4,))
+
+
+def test_columns_exactly_zero_to_last_week_pass():
+    check_matrix_for_features(feature_matrix({"A": {}}), known_table({"A": 0}), 10, (4,))
+
+
+def test_a_matrix_entirely_before_week_zero_raises():
+    matrix = feature_matrix({"A": {}}, first_week=-5, last_week=-1)
+    with pytest.raises(ValueError, match="it must cover weeks 0 to 0"):
+        check_matrix_for_features(matrix, known_table({"A": 0}), 0, (4,))
+
+
+@pytest.mark.parametrize("windows", [(), [], (4, 0), (0,), (-1,), (13, -4, 52)])
+def test_bad_windows_raise(windows):
+    with pytest.raises(ValueError, match=re.escape(
+            f"windows are {windows}; give at least one, each 1 week or more")):
+        history_features(feature_matrix({"A": {}}), known_table({"A": 0}), 10, windows)
+
+
+def test_a_window_of_one_passes():
+    check_matrix_for_features(feature_matrix({"A": {}}), known_table({"A": 0}), 10, (1,))
+
+
+def test_the_check_does_not_modify_its_inputs():
+    matrix, known = feature_matrix({"A": {1: 3.0}}), known_table({"A": 0})
+    before = matrix.copy(), known.copy()
+    check_matrix_for_features(matrix, known, 10, (4,))
+    pd.testing.assert_frame_equal(matrix, before[0])
+    pd.testing.assert_frame_equal(known, before[1])
+
+
+# --- key_origins ---------------------------------------------------------------------------
+
+def test_key_origins_lists_each_key_from_its_known_week():
+    result = key_origins(known_table({"B": 1, "A": 2, "C": -4}), 2)
+    assert list(result.columns) == ["key", "origin_week"]
+    assert list(zip(result["key"], result["origin_week"])) == [
+        ("C", 0), ("B", 1), ("C", 1), ("A", 2), ("B", 2), ("C", 2)]
+
+
+def test_key_origins_drops_keys_known_after_last_week():
+    result = key_origins(known_table({"A": 0, "B": 3}), 2)
+    assert set(result["key"]) == {"A"}
+
+
+def test_key_origins_dtypes_and_index():
+    result = key_origins(known_table({"A": 0, "B": 1}), 3)
+    assert result["key"].dtype == object
+    assert result["origin_week"].dtype == "int64"
+    assert result.index.equals(pd.RangeIndex(len(result)))
+
+
+def test_key_origins_with_last_week_zero():
+    result = key_origins(known_table({"A": -2, "B": 0, "C": 1}), 0)
+    assert list(zip(result["key"], result["origin_week"])) == [("A", 0), ("B", 0)]
+
+
+def test_key_origins_of_no_keys_is_empty_with_the_columns():
+    result = key_origins(known_table({}), 5)
+    assert result.empty
+    assert list(result.columns) == ["key", "origin_week"]
+
+
+# --- trailing_sum ---------------------------------------------------------------------------
+
+def test_trailing_sum_sums_the_window_ending_at_each_column():
+    frame = pd.DataFrame([[1.0, 2.0, 3.0, 4.0]], index=["A"], columns=[0, 1, 2, 3])
+    result = trailing_sum(frame, 2)
+    assert result.loc["A"].tolist() == [1.0, 3.0, 5.0, 7.0]
+    assert list(result.columns) == [0, 1, 2, 3]
+    assert list(result.index) == ["A"]
+
+
+def test_trailing_sum_uses_fewer_columns_at_the_start():
+    frame = pd.DataFrame([[1.0, 2.0, 3.0]], index=["A"], columns=[5, 6, 7])
+    assert trailing_sum(frame, 10).loc["A"].tolist() == [1.0, 3.0, 6.0]
+
+
+def test_trailing_sum_window_one_is_the_frame():
+    frame = pd.DataFrame([[1.0, 0.0], [2.5, 4.0]], index=["A", "B"], columns=[0, 1])
+    pd.testing.assert_frame_equal(trailing_sum(frame, 1), frame)
+
+
+def test_trailing_sum_keeps_rows_apart():
+    frame = pd.DataFrame([[1.0, 1.0], [10.0, 10.0]], index=["A", "B"], columns=[0, 1])
+    result = trailing_sum(frame, 2)
+    assert result.loc["A"].tolist() == [1.0, 2.0]
+    assert result.loc["B"].tolist() == [10.0, 20.0]
+
+
+# --- values_at ------------------------------------------------------------------------------
+
+def test_values_at_picks_each_rows_cell_in_row_order():
+    wide = pd.DataFrame([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], index=["A", "B"],
+                        columns=[-1, 0, 1])
+    rows = pd.DataFrame({"key": ["B", "A", "B"], "origin_week": [1, 0, -1]},
+                        index=[7, 3, 5])
+    result = values_at(wide, rows)
+    assert result.tolist() == [6.0, 2.0, 4.0]
+    assert result.index.tolist() == [7, 3, 5]
+
+
+def test_values_at_keeps_nan():
+    wide = pd.DataFrame([[NAN, 2.0]], index=["A"], columns=[0, 1])
+    result = values_at(wide, pd.DataFrame({"key": ["A", "A"], "origin_week": [0, 1]}))
+    assert math.isnan(result.iloc[0])
+    assert result.iloc[1] == 2.0
+
+
+SENTINEL = 999.0
+
+
+def sentinel_wide():
+    """Keys A, B x weeks 0, 1, 2; the last cell (B, 2) holds a sentinel, the value a
+    get_indexer -1 on both axes would read."""
+    return pd.DataFrame([[1.0, 2.0, 3.0], [4.0, 5.0, SENTINEL]], index=["A", "B"],
+                        columns=[0, 1, 2])
+
+
+def lookup(keys, weeks, index=None):
+    return pd.DataFrame({"key": list(keys), "origin_week": list(weeks)}, index=index)
+
+
+def test_values_at_a_missing_key_raises_with_the_exact_message():
+    with pytest.raises(ValueError, match=r"^" + re.escape("keys ['Z'] are not in the table") + r"$"):
+        values_at(sentinel_wide(), lookup(["Z"], [2]))
+
+
+def test_values_at_a_missing_week_raises_with_the_exact_message():
+    with pytest.raises(ValueError, match=r"^" + re.escape("weeks [7] are not in the table") + r"$"):
+        values_at(sentinel_wide(), lookup(["A"], [7]))
+
+
+def test_values_at_a_missing_negative_week_raises():
+    with pytest.raises(ValueError, match=r"^" + re.escape("weeks [-1] are not in the table") + r"$"):
+        values_at(sentinel_wide(), lookup(["A"], [-1]))
+
+
+def test_values_at_a_missing_key_does_not_return_the_last_rows_value():
+    # Old behaviour: -1 row position read row B, so ("Z", 2) gave the sentinel.
+    with pytest.raises(ValueError):
+        values_at(sentinel_wide(), lookup(["Z"], [2]))
+
+
+def test_values_at_a_missing_week_does_not_return_the_last_columns_value():
+    # Old behaviour: -1 column position read week 2, so ("B", 7) gave the sentinel.
+    with pytest.raises(ValueError):
+        values_at(sentinel_wide(), lookup(["B"], [7]))
+
+
+def test_values_at_a_missing_key_among_valid_rows_still_raises():
+    with pytest.raises(ValueError, match=re.escape("keys ['Z']")):
+        values_at(sentinel_wide(), lookup(["A", "Z", "B"], [0, 2, 1]))
+
+
+def test_values_at_a_missing_week_among_valid_rows_still_raises():
+    with pytest.raises(ValueError, match=re.escape("weeks [3]")):
+        values_at(sentinel_wide(), lookup(["A", "B", "A"], [0, 3, 1]))
+
+
+def test_values_at_missing_keys_are_listed_sorted_distinct_at_most_five():
+    keys = ["K7", "K3", "A", "K1", "K3", "K9", "K5", "K2", "K7", "K8"]
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(keys, [0] * len(keys)))
+    assert str(caught.value) == "keys ['K1', 'K2', 'K3', 'K5', 'K7'] are not in the table"
+
+
+def test_values_at_missing_weeks_are_listed_sorted_distinct_at_most_five():
+    weeks = [40, 5, 0, -3, 5, 12, 40, 8, 30, 1]
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(["A"] * len(weeks), weeks))
+    assert str(caught.value) == "weeks [-3, 5, 8, 12, 30] are not in the table"
+
+
+def test_values_at_a_repeated_missing_key_is_listed_once():
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(["Z", "Z", "Z"], [0, 1, 2]))
+    assert str(caught.value) == "keys ['Z'] are not in the table"
+
+
+def test_values_at_exactly_five_missing_weeks_are_all_listed():
+    weeks = [9, 7, 5, 4, 3]
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(["A"] * 5, weeks))
+    assert str(caught.value) == "weeks [3, 4, 5, 7, 9] are not in the table"
+
+
+def test_values_at_the_key_check_runs_before_the_week_check():
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(["Z", "A"], [0, 7]))
+    assert str(caught.value) == "keys ['Z'] are not in the table"
+
+
+def test_values_at_a_row_missing_both_reports_the_key():
+    with pytest.raises(ValueError) as caught:
+        values_at(sentinel_wide(), lookup(["Z"], [7]))
+    assert str(caught.value) == "keys ['Z'] are not in the table"
+
+
+def test_values_at_empty_rows_give_an_empty_series():
+    result = values_at(sentinel_wide(), lookup([], []))
+    assert isinstance(result, pd.Series)
+    assert len(result) == 0
+
+
+def test_values_at_empty_rows_keep_their_empty_index():
+    rows = lookup([], [], index=pd.Index([], dtype="int64"))
+    result = values_at(sentinel_wide(), rows)
+    assert result.index.equals(rows.index)
+
+
+def test_values_at_valid_lookups_still_reach_the_last_cell():
+    result = values_at(sentinel_wide(), lookup(["B", "A", "B"], [2, 0, 0], index=[4, 8, 2]))
+    assert result.tolist() == [SENTINEL, 1.0, 4.0]
+    assert result.index.tolist() == [4, 8, 2]
+
+
+def test_values_at_every_cell_of_the_table():
+    wide = sentinel_wide()
+    keys = [k for k in wide.index for _ in wide.columns]
+    weeks = [w for _ in wide.index for w in wide.columns]
+    result = values_at(wide, lookup(keys, weeks))
+    assert result.tolist() == wide.to_numpy().ravel().tolist()
+
+
+def test_values_at_does_not_modify_its_inputs():
+    wide = sentinel_wide()
+    rows = lookup(["B", "A"], [2, 1])
+    wide_before, rows_before = wide.copy(), rows.copy()
+    values_at(wide, rows)
+    pd.testing.assert_frame_equal(wide, wide_before)
+    pd.testing.assert_frame_equal(rows, rows_before)
+
+
+def test_values_at_a_failed_lookup_does_not_modify_its_inputs():
+    wide = sentinel_wide()
+    rows = lookup(["Z", "A"], [0, 7])
+    wide_before, rows_before = wide.copy(), rows.copy()
+    with pytest.raises(ValueError):
+        values_at(wide, rows)
+    pd.testing.assert_frame_equal(wide, wide_before)
+    pd.testing.assert_frame_equal(rows, rows_before)
+
+
+# --- history features on the synthetic corpus and ledger (SLOW) ---------------------------
+
+SYNTHETIC_WINDOWS = (4, 13, 52)
+
+
+@pytest.fixture(scope="module")
+def synthetic_history(synthetic_pipeline):
+    matrix = synthetic_pipeline["off"]       # has the six missing weeks as NaN
+    known = synthetic_pipeline["known"]
+    last_week = synthetic_pipeline["last_off"]
+    return matrix, known, last_week, history_features(matrix, known, last_week,
+                                                      SYNTHETIC_WINDOWS)
+
+
+def test_slow_synthetic_history_row_count(synthetic_history):
+    _, known, last_week, result = synthetic_history
+    expected = sum(max(0, last_week - max(int(week), 0) + 1)
+                   for week in known["known_week"])
+    assert len(result) == expected
+    assert list(result.columns) == history_columns(SYNTHETIC_WINDOWS)
+
+
+def test_slow_synthetic_history_counts_are_consistent(synthetic_history):
+    result = synthetic_history[3]
+    counts = [column for column in result.columns
+              if column.startswith(("observed_", "paying_", "customer_age"))]
+    assert not result[counts].isna().any().any()
+    assert (result["customer_age_weeks"] >= 0).all()
+    for window in SYNTHETIC_WINDOWS:
+        assert (result[f"paying_weeks_{window}"] <= result[f"observed_weeks_{window}"]).all()
+        assert (result[f"observed_weeks_{window}"] <= window).all()
+
+
+def test_slow_synthetic_history_missing_week_14_lowers_observed_weeks(synthetic_history):
+    result = synthetic_history[3]
+    # Week 14 is missing; weeks 11 to 13 have data, so 3 of the 4 weeks are observed.
+    assert (result.loc[result["origin_week"] == 14, "observed_weeks_4"] == 3).all()
+
+
+@pytest.mark.parametrize("cut", [0, 16, 32, 48])
+def test_slow_synthetic_history_matrix_cut_at_t_gives_the_same_features(synthetic_history,
+                                                                       cut):
+    matrix, known, _, result = synthetic_history
+    truncated = matrix[[column for column in matrix.columns if column <= cut]]
+    cut_result = history_features(truncated, known, cut, SYNTHETIC_WINDOWS)
+    expected = result[result["origin_week"] <= cut].reset_index(drop=True)
+    pd.testing.assert_frame_equal(cut_result, expected, check_exact=True)
+
+
+def test_slow_synthetic_history_matches_the_reference_on_sampled_keys(synthetic_history):
+    matrix, known, last_week, result = synthetic_history
+    sample = sorted(known.sample(25, random_state=3)["key"])
+    sub_known = known[known["key"].isin(sample)][["key", "known_week"]]
+    expected = reference_history(matrix.loc[sample], sub_known, last_week, SYNTHETIC_WINDOWS)
+    got = result[result["key"].isin(sample)].reset_index(drop=True)
+    pd.testing.assert_frame_equal(got, expected, check_exact=False, rtol=1e-9, atol=1e-6)

@@ -231,3 +231,48 @@ def test_the_pipeline_script_imports_without_running():
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
+
+
+# Step 11, U6.2: the history features, from the weekly matrix, the known keys, the last week
+# and the windows from the settings; and the printout of them. Run on a small hand-built
+# matrix, in a separate process like the checks above.
+HISTORY = """
+import inspect
+import pandas as pd
+import run_hurdle_pipeline as script
+
+inspect.signature(script.history_features).bind("matrix", "known", 64, (4, 13, 52))
+try:
+    inspect.signature(script.history_features).bind("matrix", "known", 64)
+except TypeError:
+    pass
+else:
+    raise AssertionError("history_features accepts a call without the windows")
+assert callable(script.show_history)
+source = inspect.getsource(script.main)
+assert "history_features(matrix, known, last_week, settings.history.windows)" in source
+assert "show_history(history, matrix)" in source
+assert source.index("show_matrix(matrix)") < source.index("history_features(")
+
+matrix = pd.DataFrame(0.0, index=pd.Index(["A", "B"], name="key", dtype=object),
+                      columns=pd.Index(list(range(0, 14)), name="week"))
+matrix.loc["A", 2] = 20.0
+matrix.loc["A", 8] = 50.0
+matrix.loc["B", 13] = 30.0
+known = pd.DataFrame({"key": pd.Series(["A", "B"], dtype=object), "known_week": [-5, 9]})
+history = script.history_features(matrix, known, 13, (4, 13))
+script.show_history(history, matrix)
+print("ok")
+"""
+
+
+def test_history_features_are_wired_in_and_printed():
+    result = subprocess.run([sys.executable, "-c", HISTORY], cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    # A: origin weeks 0..13 (14 rows), B: 9..13 (5 rows); 12 columns less key and origin.
+    assert "history features: 19 rows (key x origin week), 10 features" in result.stdout
+    assert "share NaN" in result.stdout
+    assert "the key with the most receipts at origin weeks 0, 13 and 52" in result.stdout
+    assert "median_payment_13" in result.stdout

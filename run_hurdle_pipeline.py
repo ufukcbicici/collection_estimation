@@ -48,6 +48,7 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
 from collection_estimation.hurdle.features_history import (  # noqa: E402
     first_history_week,
+    history_features,
     ledger_receipts_before,
     weekly_matrix,
 )
@@ -245,6 +246,10 @@ def main():
     matrix = weekly_matrix(identified_weekly, early_receipts, known["key"], weeks, levels,
                            history_start, last_week)
     show_matrix(matrix)
+
+    # The history features: per key and origin week, what its payments looked like up to t.
+    history = history_features(matrix, known, last_week, settings.history.windows)
+    show_history(history, matrix)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -452,6 +457,20 @@ def show_matrix(matrix):
     print(f"        the key with the most receipts, its first weeks with a payment "
           f"(TRY of the last week):")
     print(matrix.loc[[busiest], paid_weeks].round(0).to_string())
+
+
+def show_history(history, matrix):
+    """A short printout of the history features."""
+    features = [column for column in history.columns if column not in ("key", "origin_week")]
+    print(f"        history features: {len(history):,} rows (key x origin week), "
+          f"{len(features)} features")
+    summary = pd.DataFrame({"mean": history[features].mean(),
+                            "share NaN": history[features].isna().mean()})
+    print(summary.round(3).to_string())
+    busiest = matrix.sum(axis=1).idxmax()
+    sample = history[(history["key"] == busiest) & history["origin_week"].isin([0, 13, 52])]
+    print(f"        the key with the most receipts at origin weeks 0, 13 and 52:")
+    print(sample.round(0).T.to_string(header=False))
 
 
 if __name__ == "__main__":
