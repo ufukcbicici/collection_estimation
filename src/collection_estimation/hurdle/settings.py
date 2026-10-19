@@ -56,8 +56,22 @@ class Stage1Settings:
     random_seed: int                  # makes a fit repeatable (0 or more)
     feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
     company_as_feature: bool          # the company code (an EY entity) as a categorical feature
-    diagnose_class_weights: bool      # also fit a class-weighted model, for diagnosis only
     baseline_c: float                 # the logistic baseline's C: smaller = stronger regularisation
+
+
+@dataclass(frozen=True)
+class DiagnosticSettings:
+    """The stage 1 diagnostic: a train / validation / test of stage 1 as a classifier, with a
+    grid per model. Diagnostic only: nothing from it reaches the forecast."""
+    run: bool                                 # run it at all (it takes about 15 minutes)
+    origin: int                               # T: train <= T < validation <= T+H < test <= T+2H
+    hgb_max_iter: tuple[int, ...]             # the grid of the HGB classifier
+    hgb_learning_rate: tuple[float, ...]
+    hgb_max_leaf_nodes: tuple[int, ...]
+    lr_c: tuple[float, ...]                   # the grid of the logistic regression
+    class_weights: tuple[str, ...]            # "none" and/or "balanced", for both models
+    importance_repeats: int                   # shuffles per feature for permutation importance
+    output_folder: Path                       # where the result tables are written as CSV
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,7 @@ class Settings:
     receivables: ReceivablesSettings
     history: HistorySettings
     stage1: Stage1Settings
+    diagnostic: DiagnosticSettings
     debug: DebugSettings
 
 
@@ -112,7 +127,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "stage1", "debug"}, name)
+                     "history", "stage1", "diagnostic", "debug"}, name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -128,7 +143,11 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
-                        "diagnose_class_weights", "baseline_c"}, f"{name} [stage1]")
+                        "baseline_c"}, f"{name} [stage1]")
+    diagnostic = raw["diagnostic"]
+    check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
+                            "hgb_max_leaf_nodes", "lr_c", "class_weights", "importance_repeats",
+                            "output_folder"}, f"{name} [diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -180,9 +199,25 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             random_seed=seed_setting(stage1, "random_seed", f"{name} [stage1]"),
             feature_blocks=feature_blocks_setting(stage1, "feature_blocks", f"{name} [stage1]"),
             company_as_feature=bool_setting(stage1, "company_as_feature", f"{name} [stage1]"),
-            diagnose_class_weights=bool_setting(stage1, "diagnose_class_weights",
-                                                f"{name} [stage1]"),
             baseline_c=positive_number_setting(stage1, "baseline_c", f"{name} [stage1]"),
+        ),
+        diagnostic=DiagnosticSettings(
+            run=bool_setting(diagnostic, "run", f"{name} [diagnostic]"),
+            origin=week_setting(diagnostic, "origin", f"{name} [diagnostic]"),
+            hgb_max_iter=grid_setting(diagnostic, "hgb_max_iter", f"{name} [diagnostic]",
+                                      count_setting),
+            hgb_learning_rate=grid_setting(diagnostic, "hgb_learning_rate",
+                                           f"{name} [diagnostic]", rate_setting),
+            hgb_max_leaf_nodes=grid_setting(diagnostic, "hgb_max_leaf_nodes",
+                                            f"{name} [diagnostic]", leaf_count_setting),
+            lr_c=grid_setting(diagnostic, "lr_c", f"{name} [diagnostic]",
+                              positive_number_setting),
+            class_weights=grid_setting(diagnostic, "class_weights", f"{name} [diagnostic]",
+                                       class_weight_setting),
+            importance_repeats=count_setting(diagnostic, "importance_repeats",
+                                             f"{name} [diagnostic]"),
+            output_folder=path_setting(diagnostic, "output_folder", repo_root,
+                                       f"{name} [diagnostic]"),
         ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
@@ -502,3 +537,27 @@ def positive_number_setting(table: dict, key: str, where: str) -> float:
             or value <= 0 or value == float("inf")):
         raise ValueError(f"{where}: {key} is {value!r}, not a number above 0")
     return float(value)
+
+
+# The class weightings a diagnostic grid can try.
+CLASS_WEIGHTS = ("none", "balanced")
+
+
+def class_weight_setting(table: dict, key: str, where: str) -> str:
+    """A class weighting: "none" or "balanced"."""
+    value = table[key]
+    if value not in CLASS_WEIGHTS:
+        raise ValueError(f"{where}: {key} is {value!r}, not one of {list(CLASS_WEIGHTS)}")
+    return value
+
+
+def grid_setting(table: dict, key: str, where: str, check) -> tuple:
+    """A non-empty list of values to try, each different, each checked by `check` (one of the
+    single-value checks above, e.g. count_setting), in the order given."""
+    value = table[key]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where}: {key} is {value!r}, not a non-empty list of values to try")
+    items = tuple(check({key: item}, key, f"{where} {key} item") for item in value)
+    if len(set(items)) != len(items):
+        raise ValueError(f"{where}: {key} lists a value more than once: {value}")
+    return items

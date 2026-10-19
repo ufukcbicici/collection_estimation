@@ -68,6 +68,11 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     add_labels,
     panel_rows,
 )
+from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    best_threshold,
+    classification_scores,
+    diagnostic_splits,
+)
 from collection_estimation.hurdle.stage1 import (  # noqa: E402
     feature_columns,
     fit_stage1,
@@ -182,6 +187,12 @@ def main():
                          f"reach week {settings.debug.demo_origin + settings.receivables.horizons}"
                          f", after the last week {int(weeks['week'].max())}, so step 12 would "
                          f"have no answers")
+    # The same for step 13's diagnostic, which needs answers up to origin + 2 horizons.
+    diagnostic_end = settings.diagnostic.origin + 2 * settings.receivables.horizons
+    if settings.diagnostic.run and diagnostic_end > int(weeks["week"].max()):
+        raise ValueError(f"[diagnostic] origin {settings.diagnostic.origin}: its test weeks "
+                         f"reach week {diagnostic_end}, after the last week "
+                         f"{int(weeks['week'].max())}")
 
     # The weekly amounts per key: gross receipts (the target), refunds, unapplied lines.
     # Checked inside: the weekly table holds every TRY and every line of steps 3 and 6.
@@ -330,6 +341,27 @@ def main():
         fit_seconds[name] = time.perf_counter() - started
         predictions[name] = predict_paid(model, forecast_x)
     show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
+
+    # Step 13: the stage 1 diagnostic (diagnostic only, never the forecast). Built unit by
+    # unit; for now, its splits, and the F1 threshold and scores on step 12's predictions.
+    if settings.diagnostic.run:
+        splits = diagnostic_splits(table, settings.diagnostic.origin,
+                                   settings.receivables.horizons)
+        show_diagnostic_splits(splits, settings.diagnostic.origin,
+                               settings.receivables.horizons)
+        labelled = forecast_rows["label_status"] == "labelled"
+        actual = forecast_rows.loc[labelled, "paid"].astype(bool)
+        for name, p in predictions.items():
+            if actual.nunique() < 2:
+                # best_threshold needs payers and non-payers among the rows.
+                print(f"        {name} at step 12's origin: too few outcomes to choose a "
+                      f"threshold")
+                continue
+            threshold, f1 = best_threshold(actual, p[labelled])
+            scores = classification_scores(actual, p[labelled], threshold)
+            print(f"        {name} at step 12's origin, best F1 threshold {threshold:.3f}: "
+                  + ", ".join(f"{key} {value:.3f}" for key, value in scores.items()
+                              if key != "threshold"))
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -672,6 +704,19 @@ def show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds):
     by_h["share paid"] = actual.groupby(h).mean()
     print("        per h, mean p vs share that actually paid:")
     print(by_h.round(4).to_string())
+
+
+def show_diagnostic_splits(splits, origin, horizons):
+    """A short printout of the diagnostic's four sets of rows."""
+    print(f"Step 13: stage 1 diagnostic at origin {origin} (diagnostic only, never the forecast)")
+    for name, (rows, weeks) in {
+            "train": (splits.train, f"target <= {origin}"),
+            "validation": (splits.validation, f"{origin} < target <= {origin + horizons}"),
+            "refit": (splits.refit, f"target <= {origin + horizons}"),
+            "test": (splits.test, f"{origin + horizons} < target <= {origin + 2 * horizons}"),
+    }.items():
+        print(f"        {name:<10} {len(rows):>9,} rows, {rows['paid'].astype(bool).mean():6.1%} "
+              f"paid ({weeks})")
 
 
 if __name__ == "__main__":

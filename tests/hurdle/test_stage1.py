@@ -543,8 +543,7 @@ def stage1_settings(max_iter=10, learning_rate=0.1, max_leaf_nodes=7, min_sample
     return Stage1Settings(max_iter=max_iter, learning_rate=learning_rate,
                           max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
                           random_seed=random_seed, feature_blocks=FEATURE_BLOCKS,
-                          company_as_feature=True, diagnose_class_weights=False,
-                          baseline_c=baseline_c)
+                          company_as_feature=True, baseline_c=baseline_c)
 
 
 def synthetic_xy(n=400, seed=0, signal=True, share=0.3, company=True, index_offset=1000):

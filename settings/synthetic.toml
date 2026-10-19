@@ -94,9 +94,22 @@ min_samples_leaf = 20           # rows per leaf, at least
 random_seed = 1
 feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
 company_as_feature = true       # the company code (one of the EY entities) as a category
-diagnose_class_weights = true   # also fit a class-weighted model, ONLY to compare F1 and AUC;
-                                # never used for the forecast
 baseline_c = 1.0                # the logistic-regression baseline's C (inverse regularisation)
+
+[diagnostic]
+# A train / validation / test of stage 1 as a CLASSIFIER, with a grid per model, chosen on
+# validation average precision (F1 threshold also chosen on validation) and tested once. Diagnostic only: nothing from it reaches
+# the forecast, whose setting is [stage1]. Splits by target week, H = [receivables] horizons:
+# train <= origin < validation <= origin + H < test <= origin + 2H.
+run = true                      # takes about 15 minutes
+origin = 40
+hgb_max_iter = [100, 300, 600]
+hgb_learning_rate = [0.05, 0.1]
+hgb_max_leaf_nodes = [15, 31, 63]
+lr_c = [0.01, 0.1, 1.0, 10.0]
+class_weights = ["none", "balanced"]   # tried for both models
+importance_repeats = 3          # shuffles per feature for the permutation importance
+output_folder = "data/interim/hurdle_diagnostic"   # the result tables, as CSV
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

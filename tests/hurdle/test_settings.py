@@ -29,7 +29,9 @@ from collection_estimation.hurdle.settings import (
     CollectionsLayout,
     CompanySettings,
     DataSettings,
+    CLASS_WEIGHTS,
     DebugSettings,
+    DiagnosticSettings,
     HistorySettings,
     LedgerLayout,
     FEATURE_BLOCKS,
@@ -37,6 +39,8 @@ from collection_estimation.hurdle.settings import (
     Settings,
     Stage1Settings,
     check_keys,
+    class_weight_setting,
+    grid_setting,
     feature_blocks_setting,
     leaf_count_setting,
     rate_setting,
@@ -145,8 +149,11 @@ VALID = {
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
-               "company_as_feature": "true", "diagnose_class_weights": "true",
-               "baseline_c": "1.0"},
+               "company_as_feature": "true", "baseline_c": "1.0"},
+    "diagnostic": {"run": "true", "origin": "40", "hgb_max_iter": "[100, 300, 600]",
+                   "hgb_learning_rate": "[0.05, 0.1]", "hgb_max_leaf_nodes": "[15, 31, 63]",
+                   "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
+                   "importance_repeats": "3", "output_folder": '"results/diagnostic"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -277,7 +284,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "stage1", "debug"])
+                                       "history", "stage1", "diagnostic", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -297,8 +304,11 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
-    ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
-    ("stage1", "baseline_c"),
+    ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
+    ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
+    ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
+    ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
+    ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
@@ -420,8 +430,11 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
-    ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
-    ("stage1", "baseline_c"),
+    ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
+    ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
+    ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
+    ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
+    ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
@@ -1161,7 +1174,7 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
+        company_as_feature=True, baseline_c=1.0)
 
 
 
@@ -2108,7 +2121,7 @@ def test_the_stage1_section_is_read(tmp_path, repo):
     assert stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
+        company_as_feature=True, baseline_c=1.0)
 
 
 def test_the_stage1_values_have_the_right_python_types(tmp_path, repo):
@@ -2118,14 +2131,13 @@ def test_the_stage1_values_have_the_right_python_types(tmp_path, repo):
     assert type(stage1.learning_rate) is float
     assert type(stage1.feature_blocks) is tuple
     assert stage1.company_as_feature is True
-    assert stage1.diagnose_class_weights is True
     assert type(stage1.baseline_c) is float
 
 
 def test_stage1_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(Stage1Settings)] == [
         "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf", "random_seed",
-        "feature_blocks", "company_as_feature", "diagnose_class_weights", "baseline_c"]
+        "feature_blocks", "company_as_feature", "baseline_c"]
 
 
 def test_settings_has_a_stage1_field_between_history_and_debug():
@@ -2139,7 +2151,8 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['collections_layout', "
-        f"'companies', 'data', 'debug', 'history', 'ledger_layout', 'receivables', 'stage1']")
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'receivables', 'stage1']")
 
 
 def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
@@ -2155,7 +2168,7 @@ def test_a_stage1_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo)
                                              ("stage1", "max_iters"): "300"})
     assert message == (
         f"{STAGE1}: missing ['max_iter']; unknown ['max_iters']; expected exactly "
-        f"['baseline_c', 'company_as_feature', 'diagnose_class_weights', 'feature_blocks', "
+        f"['baseline_c', 'company_as_feature', 'feature_blocks', "
         f"'learning_rate', "
         f"'max_iter', 'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
 
@@ -2397,16 +2410,16 @@ def test_feature_blocks_setting_does_not_modify_the_list():
     assert value == ["receivables", "history"]
 
 
-# --- [stage1] company_as_feature and diagnose_class_weights (bool_setting) -------------------
+# --- [stage1] company_as_feature (bool_setting) ----------------------------------------------
 
-@pytest.mark.parametrize("key", ["company_as_feature", "diagnose_class_weights"])
+@pytest.mark.parametrize("key", ["company_as_feature"])
 @pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
 def test_stage1_switches_accept_true_and_false(tmp_path, repo, key, text, expected):
     value = getattr(load(tmp_path, repo, changes={("stage1", key): text}).stage1, key)
     assert value is expected
 
 
-@pytest.mark.parametrize("key", ["company_as_feature", "diagnose_class_weights"])
+@pytest.mark.parametrize("key", ["company_as_feature"])
 @pytest.mark.parametrize("bad, shown", [("1", "1"), ("0", "0"), ('"true"', "'true'"),
                                         ("1.0", "1.0"), ("[true]", "[True]")],
                          ids=["one", "zero", "string", "float", "list"])
@@ -2416,15 +2429,28 @@ def test_stage1_switches_reject_non_bools_with_the_exact_message(tmp_path, repo,
     assert message == f"{STAGE1}: {key} is {shown}, not true or false"
 
 
-def test_stage1_switches_are_read_separately(tmp_path, repo):
-    stage1 = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "false",
-                                           ("stage1", "diagnose_class_weights"): "true"}).stage1
-    assert stage1.company_as_feature is False
-    assert stage1.diagnose_class_weights is True
-    stage1 = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "true",
-                                           ("stage1", "diagnose_class_weights"): "false"}).stage1
-    assert stage1.company_as_feature is True
-    assert stage1.diagnose_class_weights is False
+def test_company_as_feature_and_diagnostic_run_are_read_separately(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "false",
+                                             ("diagnostic", "run"): "true"})
+    assert settings.stage1.company_as_feature is False
+    assert settings.diagnostic.run is True
+    settings = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "true",
+                                             ("diagnostic", "run"): "false"})
+    assert settings.stage1.company_as_feature is True
+    assert settings.diagnostic.run is False
+
+
+def test_diagnose_class_weights_is_gone_from_stage1(tmp_path, repo):
+    # Removed in U10.4a: an old file that still has it stops with an unknown setting.
+    message = exact_message(tmp_path, repo, {("stage1", "diagnose_class_weights"): "true"})
+    assert message == (
+        f"{STAGE1}: unknown ['diagnose_class_weights']; expected exactly "
+        f"['baseline_c', 'company_as_feature', 'feature_blocks', 'learning_rate', 'max_iter', "
+        f"'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
+
+
+def test_stage1_settings_has_no_diagnose_class_weights_field():
+    assert "diagnose_class_weights" not in [f.name for f in dataclasses.fields(Stage1Settings)]
 
 
 # --- [stage1] baseline_c (positive_number_setting) -------------------------------------------
@@ -2468,7 +2494,7 @@ def test_a_missing_baseline_c_has_the_exact_message(tmp_path, repo):
     message = exact_message(tmp_path, repo, {("stage1", "baseline_c"): REMOVE})
     assert message == (
         f"{STAGE1}: missing ['baseline_c']; expected exactly "
-        f"['baseline_c', 'company_as_feature', 'diagnose_class_weights', 'feature_blocks', "
+        f"['baseline_c', 'company_as_feature', 'feature_blocks', "
         f"'learning_rate', 'max_iter', 'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
 
 
@@ -2571,6 +2597,353 @@ def test_the_synthetic_stage1_and_demo_origin_settings():
     assert settings.stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
+        company_as_feature=True, baseline_c=1.0)
     assert settings.debug.demo_origin == 40
     assert type(settings.debug.demo_origin) is int
+
+
+# --- [diagnostic] (U10.4a) ---------------------------------------------------------------------
+# The stage 1 diagnostic's settings. Every value is checked through the file (the message names
+# the file and the section, exactly); grid_setting and class_weight_setting also by direct calls.
+
+DIAG = f"{FILE_NAME} [diagnostic]"
+DIAGNOSTIC_KEYS = ['class_weights', 'hgb_learning_rate', 'hgb_max_iter', 'hgb_max_leaf_nodes',
+                   'importance_repeats', 'lr_c', 'origin', 'output_folder', 'run']
+
+
+def test_the_diagnostic_section_is_read(tmp_path, repo):
+    diagnostic = load(tmp_path, repo).diagnostic
+    assert isinstance(diagnostic, DiagnosticSettings)
+    assert diagnostic == DiagnosticSettings(
+        run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
+        hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
+        class_weights=("none", "balanced"), importance_repeats=3,
+        output_folder=(repo / "results" / "diagnostic").resolve())
+
+
+def test_the_diagnostic_values_have_the_right_python_types(tmp_path, repo):
+    diagnostic = load(tmp_path, repo).diagnostic
+    assert diagnostic.run is True
+    assert type(diagnostic.origin) is int
+    assert type(diagnostic.importance_repeats) is int
+    for name, item_type in (("hgb_max_iter", int), ("hgb_learning_rate", float),
+                            ("hgb_max_leaf_nodes", int), ("lr_c", float),
+                            ("class_weights", str)):
+        grid = getattr(diagnostic, name)
+        assert type(grid) is tuple, name
+        assert all(type(item) is item_type for item in grid), (name, grid)
+    assert isinstance(diagnostic.output_folder, Path)
+    assert diagnostic.output_folder.is_absolute()
+
+
+def test_diagnostic_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(DiagnosticSettings)] == [
+        "run", "origin", "hgb_max_iter", "hgb_learning_rate", "hgb_max_leaf_nodes", "lr_c",
+        "class_weights", "importance_repeats", "output_folder"]
+
+
+def test_settings_has_a_diagnostic_field_between_stage1_and_debug():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert (names.index("history") < names.index("stage1") < names.index("diagnostic")
+            < names.index("debug"))
+
+
+def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
+    with pytest.raises(ValueError) as error:
+        load(tmp_path, repo, drop_section="diagnostic")
+    assert str(error.value) == (
+        f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['collections_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'receivables', 'stage1']")
+
+
+def test_a_diagnostic_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "lr_c"): REMOVE,
+                                             ("diagnostic", "lr_C"): "[1.0]"})
+    assert message == (f"{DIAG}: missing ['lr_c']; unknown ['lr_C']; expected exactly "
+                       f"{DIAGNOSTIC_KEYS}")
+
+
+def test_an_empty_diagnostic_section_names_every_setting(tmp_path, repo):
+    changes = {("diagnostic", key): REMOVE for key in VALID["diagnostic"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == (f"{DIAG}: missing {DIAGNOSTIC_KEYS}; expected exactly "
+                       f"{DIAGNOSTIC_KEYS}")
+
+
+def test_diagnose_class_weights_in_the_diagnostic_section_is_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "diagnose_class_weights"): "true"})
+    assert message.startswith(f"{DIAG}: unknown ['diagnose_class_weights']; ")
+
+
+# run (bool_setting)
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_diagnostic_run_accepts_true_and_false(tmp_path, repo, text, expected):
+    assert load(tmp_path, repo, changes={("diagnostic", "run"): text}).diagnostic.run is expected
+
+
+@pytest.mark.parametrize("bad, shown", [("1", "1"), ("0", "0"), ('"true"', "'true'"),
+                                        ("[true]", "[True]")])
+def test_diagnostic_run_rejects_non_bools_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "run"): bad})
+    assert message == f"{DIAG}: run is {shown}, not true or false"
+
+
+def test_the_other_diagnostic_settings_are_still_checked_when_run_is_false(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "run"): "false",
+                                             ("diagnostic", "lr_c"): "[]"})
+    assert message == f"{DIAG}: lr_c is [], not a non-empty list of values to try"
+
+
+# origin (week_setting)
+
+@pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("49", 49)])
+def test_diagnostic_origin_accepts_week_numbers(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("diagnostic", "origin"): good}).diagnostic.origin
+    assert value == expected and type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [("-1", "-1"), ("40.0", "40.0"), ('"40"', "'40'"),
+                                        ("true", "True"), ("[40]", "[40]")])
+def test_diagnostic_origin_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "origin"): bad})
+    assert message == f"{DIAG}: origin is {shown}, not a week number (0 or more)"
+
+
+def test_diagnostic_origin_does_not_borrow_demo_origin(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("diagnostic", "origin"): "33",
+                                             ("debug", "demo_origin"): "12"})
+    assert (settings.diagnostic.origin, settings.debug.demo_origin) == (33, 12)
+
+
+# importance_repeats (count_setting)
+
+@pytest.mark.parametrize("bad, shown", [("0", "0"), ("-2", "-2"), ("3.0", "3.0"),
+                                        ('"3"', "'3'"), ("false", "False"), ("[3]", "[3]")])
+def test_importance_repeats_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "importance_repeats"): bad})
+    assert message == f"{DIAG}: importance_repeats is {shown}, not a whole number of 1 or more"
+
+
+def test_importance_repeats_accepts_1(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("diagnostic", "importance_repeats"): "1"})
+    value = settings.diagnostic.importance_repeats
+    assert value == 1 and type(value) is int
+
+
+# output_folder (path_setting)
+
+def test_output_folder_is_taken_from_the_repo_root(tmp_path, repo, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    folder = load(tmp_path, repo).diagnostic.output_folder
+    assert folder == (repo / "results" / "diagnostic").resolve()
+
+
+def test_an_absolute_output_folder_is_kept(tmp_path, repo):
+    absolute = (tmp_path / "out" / "diag").resolve()
+    settings = load(tmp_path, repo, changes={("diagnostic", "output_folder"): f"'{absolute}'"})
+    assert settings.diagnostic.output_folder == absolute
+
+
+def test_output_folder_need_not_exist_and_is_not_created(tmp_path, repo):
+    folder = load(tmp_path, repo).diagnostic.output_folder
+    assert not folder.exists()
+
+
+@pytest.mark.parametrize("bad, shown", [("5", "5"), ('""', "''"), ('"  "', "'  '"),
+                                        ("true", "True"), ('["a"]', "['a']")])
+def test_output_folder_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "output_folder"): bad})
+    assert message == f"{DIAG}: output_folder is {shown}, not a path"
+
+
+# the grids, through the file
+
+GRIDS = {   # key -> (good TOML, expected tuple)
+    "hgb_max_iter": ("[600, 100]", (600, 100)),
+    "hgb_learning_rate": ("[0.1, 1, 0.05]", (0.1, 1.0, 0.05)),
+    "hgb_max_leaf_nodes": ("[2, 63, 15]", (2, 63, 15)),
+    "lr_c": ("[10, 0.01, 1e3]", (10.0, 0.01, 1000.0)),
+    "class_weights": ('["balanced", "none"]', ("balanced", "none")),
+}
+
+
+@pytest.mark.parametrize("key", list(GRIDS))
+def test_a_grid_keeps_the_given_order_and_converts_each_item(tmp_path, repo, key):
+    text, expected = GRIDS[key]
+    value = getattr(load(tmp_path, repo, changes={("diagnostic", key): text}).diagnostic, key)
+    assert value == expected
+    assert [type(item) for item in value] == [type(item) for item in expected]
+    assert type(value) is tuple
+
+
+@pytest.mark.parametrize("key, single", [("hgb_max_iter", "300"), ("hgb_learning_rate", "0.1"),
+                                         ("hgb_max_leaf_nodes", "31"), ("lr_c", "1.0"),
+                                         ("class_weights", '"none"')])
+def test_a_grid_of_one_item_is_fine(tmp_path, repo, key, single):
+    settings = load(tmp_path, repo, changes={("diagnostic", key): f"[{single}]"})
+    assert len(getattr(settings.diagnostic, key)) == 1
+
+
+@pytest.mark.parametrize("key", list(GRIDS))
+@pytest.mark.parametrize("bad, shown", [("[]", "[]"), ("5", "5"), ('"none"', "'none'"),
+                                        ("true", "True"), ("{ a = 1 }", "{'a': 1}")],
+                         ids=["empty", "number", "text", "bool", "table"])
+def test_a_grid_that_is_not_a_non_empty_list_has_the_exact_message(tmp_path, repo, key, bad,
+                                                                   shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", key): bad})
+    assert message == f"{DIAG}: {key} is {shown}, not a non-empty list of values to try"
+
+
+@pytest.mark.parametrize("key, bad, item, reason", [
+    ("hgb_max_iter", "[100, 0]", "0", "not a whole number of 1 or more"),
+    ("hgb_max_iter", "[100, 3.0]", "3.0", "not a whole number of 1 or more"),
+    ("hgb_max_iter", "[true]", "True", "not a whole number of 1 or more"),
+    ("hgb_max_iter", "[[100]]", "[100]", "not a whole number of 1 or more"),
+    ("hgb_learning_rate", "[0.05, 1.5]", "1.5", "not a number above 0 and at most 1"),
+    ("hgb_learning_rate", "[0]", "0", "not a number above 0 and at most 1"),
+    ("hgb_learning_rate", '["0.1"]', "'0.1'", "not a number above 0 and at most 1"),
+    ("hgb_max_leaf_nodes", "[15, 1]", "1", "not a whole number of 2 or more"),
+    ("hgb_max_leaf_nodes", "[31.0]", "31.0", "not a whole number of 2 or more"),
+    ("lr_c", "[1.0, 0]", "0", "not a number above 0"),
+    ("lr_c", "[-1.0]", "-1.0", "not a number above 0"),
+    ("lr_c", "[inf]", "inf", "not a number above 0"),
+    ("lr_c", "[nan]", "nan", "not a number above 0"),
+    ("class_weights", '["none", "Balanced"]', "'Balanced'", "not one of ['none', 'balanced']"),
+    ("class_weights", '["None"]', "'None'", "not one of ['none', 'balanced']"),
+    ("class_weights", '[""]', "''", "not one of ['none', 'balanced']"),
+    ("class_weights", "[1]", "1", "not one of ['none', 'balanced']"),
+    ("class_weights", "[true]", "True", "not one of ['none', 'balanced']"),
+])
+def test_a_bad_grid_item_has_the_exact_message(tmp_path, repo, key, bad, item, reason):
+    message = exact_message(tmp_path, repo, {("diagnostic", key): bad})
+    assert message == f"{DIAG} {key} item: {key} is {item}, {reason}"
+
+
+@pytest.mark.parametrize("key, bad, shown", [
+    ("hgb_max_iter", "[100, 300, 100]", "[100, 300, 100]"),
+    ("hgb_learning_rate", "[0.1, 0.1]", "[0.1, 0.1]"),
+    ("hgb_learning_rate", "[1, 1.0]", "[1, 1.0]"),
+    ("hgb_max_leaf_nodes", "[31, 31]", "[31, 31]"),
+    ("lr_c", "[1.0, 10, 1]", "[1.0, 10, 1]"),
+    ("class_weights", '["none", "balanced", "none"]', "['none', 'balanced', 'none']"),
+])
+def test_a_grid_with_a_repeat_has_the_exact_message(tmp_path, repo, key, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", key): bad})
+    assert message == f"{DIAG}: {key} lists a value more than once: {shown}"
+
+
+def test_a_bad_item_is_reported_before_a_repeat(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "hgb_max_iter"): "[0, 0]"})
+    assert message == (f"{DIAG} hgb_max_iter item: hgb_max_iter is 0, not a whole number of "
+                       f"1 or more")
+
+
+def test_the_first_bad_item_is_the_one_reported(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "lr_c"): "[1.0, -2, 0]"})
+    assert message == f"{DIAG} lr_c item: lr_c is -2, not a number above 0"
+
+
+def test_the_grids_are_read_separately(tmp_path, repo):
+    diagnostic = load(tmp_path, repo, changes={("diagnostic", "hgb_max_iter"): "[7]",
+                                               ("diagnostic", "hgb_max_leaf_nodes"): "[9]",
+                                               ("diagnostic", "lr_c"): "[0.5]",
+                                               ("diagnostic", "hgb_learning_rate"): "[0.25]"}
+                      ).diagnostic
+    assert (diagnostic.hgb_max_iter, diagnostic.hgb_max_leaf_nodes, diagnostic.lr_c,
+            diagnostic.hgb_learning_rate) == ((7,), (9,), (0.5,), (0.25,))
+
+
+# grid_setting and class_weight_setting, by direct calls
+
+def test_class_weights_constant():
+    assert CLASS_WEIGHTS == ("none", "balanced")
+
+
+@pytest.mark.parametrize("good", ["none", "balanced"])
+def test_class_weight_setting_accepts_none_and_balanced(good):
+    value = class_weight_setting({"w": good}, "w", "here")
+    assert value == good and type(value) is str
+
+
+@pytest.mark.parametrize("bad", ["None", "BALANCED", " none", "", None, True, 1, 0.5,
+                                 ["none"], ("none",), {"none": 1}])
+def test_class_weight_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        class_weight_setting({"w": bad}, "w", "here")
+    assert str(error.value) == f"here: w is {bad!r}, not one of ['none', 'balanced']"
+
+
+def test_grid_setting_returns_a_tuple_in_the_given_order():
+    assert grid_setting({"g": [3, 1, 2]}, "g", "here", count_setting) == (3, 1, 2)
+
+
+def test_grid_setting_converts_with_the_check():
+    value = grid_setting({"g": [1, 2]}, "g", "here", positive_number_setting)
+    assert value == (1.0, 2.0)
+    assert [type(item) for item in value] == [float, float]
+
+
+def test_grid_setting_uses_the_given_check():
+    # 1 is a count but not a leaf count.
+    assert grid_setting({"g": [1]}, "g", "here", count_setting) == (1,)
+    with pytest.raises(ValueError) as error:
+        grid_setting({"g": [1]}, "g", "here", leaf_count_setting)
+    assert str(error.value) == "here g item: g is 1, not a whole number of 2 or more"
+
+
+@pytest.mark.parametrize("bad", [[], 5, "abc", (1, 2), {"a": 1}, None, True])
+def test_grid_setting_rejects_a_non_list_or_empty_list_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        grid_setting({"g": bad}, "g", "here", count_setting)
+    assert str(error.value) == f"here: g is {bad!r}, not a non-empty list of values to try"
+
+
+def test_grid_setting_item_message_names_where_key_and_item():
+    with pytest.raises(ValueError) as error:
+        grid_setting({"g": [5, 0]}, "g", "here", count_setting)
+    assert str(error.value) == "here g item: g is 0, not a whole number of 1 or more"
+
+
+def test_grid_setting_repeat_message_shows_the_list_as_written():
+    with pytest.raises(ValueError) as error:
+        grid_setting({"g": [1, 2.0, 2]}, "g", "here", positive_number_setting)
+    assert str(error.value) == "here: g lists a value more than once: [1, 2.0, 2]"
+
+
+def test_grid_setting_with_class_weights():
+    assert grid_setting({"g": ["balanced"]}, "g", "here", class_weight_setting) == ("balanced",)
+    with pytest.raises(ValueError) as error:
+        grid_setting({"g": ["none", "none"]}, "g", "here", class_weight_setting)
+    assert str(error.value) == "here: g lists a value more than once: ['none', 'none']"
+
+
+def test_grid_setting_does_not_change_the_table():
+    table = {"g": [3, 1], "other": "x"}
+    grid_setting(table, "g", "here", count_setting)
+    assert table == {"g": [3, 1], "other": "x"}
+
+
+def test_grid_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        grid_setting({}, "g", "here", count_setting)
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_diagnostic_settings():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.diagnostic == DiagnosticSettings(
+        run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
+        hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
+        class_weights=("none", "balanced"), importance_repeats=3,
+        output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_diagnostic").resolve())
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_file_has_no_diagnose_class_weights():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert "diagnose_class_weights" not in raw["stage1"]
+    assert "diagnostic" in raw

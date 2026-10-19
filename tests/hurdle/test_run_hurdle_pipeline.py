@@ -1404,8 +1404,7 @@ STAGE1_FIT = STAGE1.replace('print("ok")', """
 from collection_estimation.hurdle.settings import Stage1Settings
 settings = Stage1Settings(max_iter=5, learning_rate=0.1, max_leaf_nodes=3, min_samples_leaf=1,
                           random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-                          company_as_feature=COMPANY_AS_FEATURE, diagnose_class_weights=False,
-                          baseline_c=1.0)
+                          company_as_feature=COMPANY_AS_FEATURE, baseline_c=1.0)
 forecast_x = script.stage1_features(forecast_rows, columns, companies, COMPANY_AS_FEATURE)
 predictions = {}
 for name, fit in (("stage 1 (HGB)", script.fit_stage1),
@@ -1580,3 +1579,470 @@ def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
     assert "no labelled forecast rows to score" not in result.stdout
     assert result.stdout.splitlines()[0] == (
         "        fitted in stage 1 (HGB) 1.0 s; scored on 1 forecast rows (100.0% paid)")
+
+
+# Step 7's second guard (U10.4a): when [diagnostic] run is on, its test weeks (up to origin +
+# 2 horizons) must have answers. Run from main()'s own syntax tree, like the demo_origin guard.
+DIAGNOSTIC_END = "settings.diagnostic.origin + 2 * settings.receivables.horizons"
+DIAGNOSTIC_GUARD_TEST = "settings.diagnostic.run and diagnostic_end > int(weeks['week'].max())"
+
+
+def is_diagnostic_guard(node):
+    return isinstance(node, ast.If) and ast.unparse(node.test) == DIAGNOSTIC_GUARD_TEST
+
+
+def is_diagnostic_end(node):
+    return (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "diagnostic_end"
+            and ast.unparse(node.value) == DIAGNOSTIC_END)
+
+
+def diagnostic_guard_statements():
+    """main()'s top-level `diagnostic_end = ...` and the `if` that follows it."""
+    body = main_tree().body
+    ends = [i for i, node in enumerate(body) if is_diagnostic_end(node)]
+    assert len(ends) == 1
+    assert is_diagnostic_guard(body[ends[0] + 1]), ast.unparse(body[ends[0] + 1])
+    return body[ends[0]], body[ends[0] + 1]
+
+
+def run_diagnostic_guard(run, origin, horizons, last_week, demo_origin=0, week_dtype="int64",
+                         weeks=None, with_demo_guard=False):
+    """Run the diagnostic guard (and, if asked, the demo_origin guard before it) with
+    settings and a week calendar whose weeks run 0..last_week."""
+    from types import SimpleNamespace
+    import pandas as pd
+    statements = list(diagnostic_guard_statements())
+    if with_demo_guard:
+        statements = [demo_origin_guard()] + statements
+    module = ast.Module(body=statements, type_ignores=[])
+    code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
+    settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=demo_origin),
+                               diagnostic=SimpleNamespace(run=run, origin=origin),
+                               receivables=SimpleNamespace(horizons=horizons))
+    if weeks is None:
+        weeks = pd.DataFrame({"week": pd.Series(range(0, last_week + 1), dtype=week_dtype)})
+    exec(code, {"settings": settings, "weeks": weeks})
+
+
+def diagnostic_guard_message(origin, end, last_week):
+    return (f"[diagnostic] origin {origin}: its test weeks reach week {end}, after the last "
+            f"week {last_week}")
+
+
+def test_diagnostic_guard_raises_with_the_exact_message():
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin=50, horizons=5, last_week=59)
+    assert str(error.value) == diagnostic_guard_message(50, 60, 59)
+
+
+@pytest.mark.parametrize("origin, horizons, last_week", [(50, 5, 59), (55, 5, 64), (0, 1, 1),
+                                                          (100, 5, 64), (60, 3, 64)])
+def test_diagnostic_guard_raises_once_a_test_week_is_after_the_last_week(origin, horizons,
+                                                                         last_week):
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin, horizons, last_week)
+    assert str(error.value) == diagnostic_guard_message(origin, origin + 2 * horizons,
+                                                        last_week)
+
+
+@pytest.mark.parametrize("origin, horizons, last_week", [(49, 5, 59), (40, 5, 64), (54, 5, 64),
+                                                          (0, 1, 2), (0, 0, 0)])
+def test_diagnostic_guard_allows_test_weeks_up_to_the_last_week(origin, horizons, last_week):
+    run_diagnostic_guard(True, origin, horizons, last_week)
+
+
+@pytest.mark.parametrize("origin", [50, 60, 1000])
+def test_diagnostic_guard_does_not_raise_when_run_is_false(origin):
+    run_diagnostic_guard(False, origin, horizons=5, last_week=59)
+
+
+def test_diagnostic_guard_counts_two_horizons_not_one():
+    # 55 + 5 = 60 <= 64 (step 12's rule would pass), but 55 + 10 = 65 > 64.
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin=55, horizons=5, last_week=64)
+    assert str(error.value) == diagnostic_guard_message(55, 65, 64)
+
+
+def test_diagnostic_guard_message_shows_plain_ints_for_numpy_weeks():
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin=100, horizons=3, last_week=64, week_dtype="int32")
+    assert str(error.value) == diagnostic_guard_message(100, 106, 64)
+
+
+def test_diagnostic_guard_uses_the_largest_week_not_the_last_row():
+    import pandas as pd
+    run_diagnostic_guard(True, origin=54, horizons=5, last_week=None,
+                         weeks=pd.DataFrame({"week": [64, 0, 10]}))
+
+
+def test_diagnostic_guard_does_not_use_demo_origin():
+    run_diagnostic_guard(True, origin=40, horizons=5, last_week=64, demo_origin=63)
+    with pytest.raises(ValueError):
+        run_diagnostic_guard(True, origin=60, horizons=5, last_week=64, demo_origin=0)
+
+
+def test_the_demo_origin_guard_runs_first_when_both_fail():
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin=60, horizons=5, last_week=64, demo_origin=62,
+                             with_demo_guard=True)
+    assert str(error.value).startswith("[debug] demo_origin 62: ")
+
+
+def test_with_both_guards_a_good_demo_origin_and_a_bad_diagnostic_raise_the_diagnostic():
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(True, origin=60, horizons=5, last_week=64, demo_origin=40,
+                             with_demo_guard=True)
+    assert str(error.value) == diagnostic_guard_message(60, 70, 64)
+
+
+def test_diagnostic_guard_comes_right_after_the_demo_origin_guard():
+    body = main_tree().body
+    guards = [i for i, node in enumerate(body) if is_demo_origin_guard(node)]
+    assert len(guards) == 1
+    assert is_diagnostic_end(body[guards[0] + 1]), ast.unparse(body[guards[0] + 1])
+    assert is_diagnostic_guard(body[guards[0] + 2]), ast.unparse(body[guards[0] + 2])
+
+
+def test_diagnostic_guard_is_a_single_top_level_statement_of_main():
+    assert sum(is_diagnostic_guard(node) for node in main_tree().body) == 1
+    assert sum(is_diagnostic_guard(node) for node in ast.walk(main_tree())) == 1
+
+
+def test_diagnostic_guard_body_is_a_single_raise_of_value_error():
+    _, guard = diagnostic_guard_statements()
+    assert len(guard.body) == 1 and isinstance(guard.body[0], ast.Raise)
+    assert ast.unparse(guard.body[0].exc.func) == "ValueError"
+    assert guard.orelse == []
+
+
+def test_diagnostic_guard_comes_before_the_long_steps():
+    source = main_source()
+    guard = source.index("if settings.diagnostic.run and diagnostic_end")
+    assert source.index("show_weeks(weeks)") < guard
+    for later in ("weekly = weekly_amounts(", "exchange_rates(", "receivables_by_week(",
+                  "table = join_features(", "diagnostic_splits("):
+        assert guard < source.index(later), later
+
+
+# Step 13 (U10.4a): the diagnostic's splits, and best_threshold + classification_scores on
+# step 12's predictions. Wiring checked on main()'s syntax tree; the block itself is run in a
+# separate process (exec of main()'s own `if settings.diagnostic.run:` statement) on hand-made
+# frames.
+# The table: T = 2, H = 2. Target weeks 0, 1, 2 (paid T, F, T) -> train 3 rows, 66.7% paid;
+# 3 (T) and 4 (F) -> validation 2 rows, 50.0% (a missing_week row at week 3 is left out);
+# refit 5 rows, 60.0%; 5, 6 (T, T) -> test 2 rows, 100.0%; week 7 is after the test weeks.
+# The forecast rows and predictions are step 12's SCORES frame (four labelled rows, one
+# missing_week row and one future row whose p would move every score if used):
+#   model A labelled p .8 T, .4 F, .6 T, .2 F -> best threshold .6, F1 1; AUC 1, AP 1,
+#     log loss -(ln .8 + ln .6)/2 = 0.367.
+#   model B labelled p .3 T, .9 F, .6 T, .4 F -> thresholds .3: F1 2/3, .4: 0.4, .6: 0.5,
+#     .9: 0 -> best .3, precision .5, recall 1; AUC 1 of 4 pairs = .25; AP .5*.5 + .5*.5 = .5;
+#     log loss -(ln .3 + ln .1 + ln .6 + ln .6)/4 = 1.132.
+STEP_13 = """
+import ast
+import inspect
+import textwrap
+from types import SimpleNamespace
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
+blocks = [node for node in tree.body[0].body
+          if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
+assert len(blocks) == 1, len(blocks)
+code = compile(ast.fix_missing_locations(ast.Module(body=blocks, type_ignores=[])),
+               "step13", "exec")
+
+weeks = [0, 1, 2, 3, 3, 4, 5, 6, 7]
+statuses = ["labelled"] * 4 + ["missing_week"] + ["labelled"] * 4
+table = pd.DataFrame({
+    "key": [f"TR02-{i}" for i in range(len(weeks))],
+    "target_week": np.array(weeks, dtype="int64"),
+    "label_status": np.array(statuses, dtype=object),
+    "paid": pd.array([True, False, True, True, None, False, True, True, False],
+                     dtype="boolean"),
+}, index=pd.Index(range(100, 100 + len(weeks))))
+forecast_rows = pd.DataFrame({
+    "key": ["TR02-A", "TR04-B", "TR02-C", "TR02-A", "TR04-B", "TR02-C"],
+    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
+    "label_status": ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"],
+    "paid": pd.array([True, False, None, True, False, None], dtype="boolean"),
+}, index=pd.Index([10, 11, 12, 13, 14, 15]))
+predictions = {name: pd.Series(values, index=forecast_rows.index, name="p")
+               for name, values in MODELS}
+settings = SimpleNamespace(diagnostic=SimpleNamespace(run=RUN, origin=2),
+                           receivables=SimpleNamespace(horizons=2))
+copies = (table.copy(deep=True), forecast_rows.copy(deep=True),
+          {n: p.copy() for n, p in predictions.items()})
+namespace = dict(vars(script))
+namespace.update(settings=settings, table=table, forecast_rows=forecast_rows,
+                 predictions=predictions)
+STUBS
+exec(code, namespace)
+pd.testing.assert_frame_equal(table, copies[0])
+pd.testing.assert_frame_equal(forecast_rows, copies[1])
+for name in predictions:
+    pd.testing.assert_series_equal(predictions[name], copies[2][name])
+print("ok")
+"""
+
+NO_CALLS = """
+def refuse(*args, **kwargs):
+    raise AssertionError("called although [diagnostic] run is false")
+namespace.update(diagnostic_splits=refuse, show_diagnostic_splits=refuse,
+                 best_threshold=refuse, classification_scores=refuse)
+"""
+
+STEP_13_SPLIT_LINES = [
+    "Step 13: stage 1 diagnostic at origin 2 (diagnostic only, never the forecast)",
+    "        train              3 rows,  66.7% paid (target <= 2)",
+    "        validation         2 rows,  50.0% paid (2 < target <= 4)",
+    "        refit              5 rows,  60.0% paid (target <= 4)",
+    "        test               2 rows, 100.0% paid (4 < target <= 6)",
+]
+STEP_13_MODEL_A = ("        stage 1 (HGB) at step 12's origin, best F1 threshold 0.600: F1 1.000, "
+                   "precision 1.000, recall 1.000, AUC 1.000, avg precision 1.000, "
+                   "log loss 0.367")
+STEP_13_MODEL_B = ("        baseline (LR) at step 12's origin, best F1 threshold 0.300: F1 0.667, "
+                   "precision 0.500, recall 1.000, AUC 0.250, avg precision 0.500, "
+                   "log loss 1.132")
+
+
+def run_step_13(models=None, run=True, stubs=""):
+    models = TWO_MODELS if models is None else models
+    models_text = "[" + ", ".join(f"({name!r}, {values})" for name, values in models) + "]"
+    script = (STEP_13.replace("MODELS", models_text).replace("RUN", str(run))
+              .replace("STUBS", stubs))
+    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
+                          text=True, encoding="utf-8", timeout=120)
+
+
+def test_step_13_prints_the_splits_then_one_line_per_model_by_hand():
+    result = run_step_13()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A,
+                                                                STEP_13_MODEL_B, "ok"]
+
+
+def test_step_13_one_model():
+    result = run_step_13(ONE_MODEL)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A, "ok"]
+
+
+def test_step_13_models_follow_the_order_of_the_predictions_dict():
+    result = run_step_13(list(reversed(TWO_MODELS)))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[5:] == [STEP_13_MODEL_B, STEP_13_MODEL_A, "ok"]
+
+
+def test_step_13_scores_each_model_on_its_own_p():
+    result = run_step_13([("stage 1 (HGB)", MODEL_B), ("baseline (LR)", MODEL_A)])
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[5] == STEP_13_MODEL_B.replace("baseline (LR)", "stage 1 (HGB)")
+    assert lines[6] == STEP_13_MODEL_A.replace("stage 1 (HGB)", "baseline (LR)")
+
+
+def test_step_13_does_not_print_the_threshold_twice():
+    result = run_step_13()
+    assert result.returncode == 0, result.stderr
+    for line in result.stdout.splitlines()[5:7]:
+        assert line.count("threshold") == 1, line
+
+
+def test_step_13_with_run_false_prints_and_calls_nothing():
+    result = run_step_13(run=False, stubs=NO_CALLS)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["ok"]
+
+
+def test_step_13_with_run_true_calls_go_through_the_stubs_check():
+    # The NO_CALLS stubs do bite when run is true (so the run-false test is meaningful).
+    result = run_step_13(run=True, stubs=NO_CALLS)
+    assert result.returncode != 0
+    assert "called although [diagnostic] run is false" in result.stderr
+
+
+STEP_13_WIRING = """
+import ast
+import inspect
+import textwrap
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import diagnostic
+
+assert script.diagnostic_splits is diagnostic.diagnostic_splits
+assert script.best_threshold is diagnostic.best_threshold
+assert script.classification_scores is diagnostic.classification_scores
+inspect.signature(script.show_diagnostic_splits).bind("splits", 40, 5)
+
+body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
+statements = [ast.unparse(node) for node in body]
+blocks = [i for i, node in enumerate(body)
+          if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
+assert len(blocks) == 1, blocks
+block = body[blocks[0]]
+scores = statements.index(
+    "show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)")
+assert scores < blocks[0], (scores, blocks)
+assert block.orelse == []
+inner = [ast.unparse(node) for node in block.body]
+assert inner[:4] == [
+    "splits = diagnostic_splits(table, settings.diagnostic.origin, "
+    "settings.receivables.horizons)",
+    "show_diagnostic_splits(splits, settings.diagnostic.origin, settings.receivables.horizons)",
+    "labelled = forecast_rows['label_status'] == 'labelled'",
+    "actual = forecast_rows.loc[labelled, 'paid'].astype(bool)",
+], inner[:4]
+assert len(block.body) == 5 and isinstance(block.body[4], ast.For)
+loop = block.body[4]
+assert ast.unparse(loop.target) == "(name, p)"
+assert ast.unparse(loop.iter) == "predictions.items()"
+loop_body = [ast.unparse(node) for node in loop.body]
+# First, the skip: fewer than two outcomes among the labelled rows -> print, next model.
+skip = loop.body[0]
+assert isinstance(skip, ast.If), loop_body
+assert ast.unparse(skip.test) == "actual.nunique() < 2", ast.unparse(skip.test)
+assert skip.orelse == []
+assert len(skip.body) == 2, [ast.unparse(node) for node in skip.body]
+assert isinstance(skip.body[0], ast.Expr) and isinstance(skip.body[0].value, ast.Call)
+assert ast.unparse(skip.body[0].value.func) == "print"
+assert isinstance(skip.body[1], ast.Continue)
+assert "best_threshold" not in ast.unparse(skip)
+assert "classification_scores" not in ast.unparse(skip)
+assert loop_body[1] == "threshold, f1 = best_threshold(actual, p[labelled])", loop_body
+assert loop_body[2] == ("scores = classification_scores(actual, p[labelled], threshold)"), \\
+    loop_body
+# The diagnostic uses its own origin, never step 12's demo origin.
+assert "demo_origin" not in ast.unparse(block)
+print("ok")
+"""
+
+
+def test_step_13_is_wired_in_after_step_12s_scores():
+    result = subprocess.run([sys.executable, "-c", STEP_13_WIRING], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_13_block_is_the_only_use_of_the_diagnostic_functions():
+    tree = main_tree()
+    for name in ("diagnostic_splits", "show_diagnostic_splits", "best_threshold",
+                 "classification_scores"):
+        assert len(calls_to(tree, name)) == 1, name
+
+
+# Step 13's skip: when step 12's labelled forecast rows hold one outcome only (all paid, all
+# unpaid) or none at all (no labelled rows, so actual is empty), best_threshold cannot choose a
+# threshold. The loop prints one skip line per model, in model order, and goes on; it calls
+# neither best_threshold nor classification_scores (stubbed here to raise). The splits are
+# still printed (they come from the table, which is unchanged). The forecast rows are changed
+# in place before the block runs, and the no-mutation check's copy is taken again after that.
+ONE_OUTCOME_ROWS = {
+    "all paid": (
+        '["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]',
+        "[True, True, None, True, True, None]"),
+    "all unpaid": (
+        '["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]',
+        "[False, False, None, False, False, None]"),
+    "no labelled rows": (
+        '["missing_week", "future", "missing_week", "future", "missing_week", "future"]',
+        "[True, False, None, True, False, None]"),
+}
+
+REFUSE_SCORING = """
+def refuse_scoring(*args, **kwargs):
+    raise AssertionError("scoring called although there are too few outcomes")
+namespace.update(best_threshold=refuse_scoring, classification_scores=refuse_scoring)
+"""
+
+
+def one_outcome_stubs(case, refuse=True):
+    statuses, paid = ONE_OUTCOME_ROWS[case]
+    stubs = (f"forecast_rows['label_status'] = {statuses}\n"
+             f"forecast_rows['paid'] = pd.array({paid}, dtype='boolean')\n"
+             "copies = (copies[0], forecast_rows.copy(deep=True), copies[2])\n")
+    return stubs + (REFUSE_SCORING if refuse else "")
+
+
+def skip_line(name):
+    return f"        {name} at step 12's origin: too few outcomes to choose a threshold"
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_does_not_raise(case):
+    result = run_step_13(stubs=one_outcome_stubs(case))
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_prints_the_splits_then_one_skip_line_per_model(case):
+    result = run_step_13(stubs=one_outcome_stubs(case))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [
+        skip_line("stage 1 (HGB)"), skip_line("baseline (LR)"), "ok"]
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_skip_lines_follow_the_model_order(case):
+    result = run_step_13(list(reversed(TWO_MODELS)), stubs=one_outcome_stubs(case))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[5:] == [
+        skip_line("baseline (LR)"), skip_line("stage 1 (HGB)"), "ok"]
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_one_model_prints_one_skip_line(case):
+    result = run_step_13(ONE_MODEL, stubs=one_outcome_stubs(case))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[5:] == [skip_line("stage 1 (HGB)"), "ok"]
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_prints_no_threshold_or_score(case):
+    result = run_step_13(stubs=one_outcome_stubs(case))
+    assert result.returncode == 0, result.stderr
+    for line in result.stdout.splitlines()[5:]:
+        assert "best F1 threshold" not in line, line
+        assert "log loss" not in line, line
+    assert result.stdout.count("too few outcomes") == 2
+
+
+@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
+def test_step_13_too_few_outcomes_without_stubs_gives_the_same_output(case):
+    # The real best_threshold / classification_scores are not reached either.
+    stubbed = run_step_13(stubs=one_outcome_stubs(case))
+    real = run_step_13(stubs=one_outcome_stubs(case, refuse=False))
+    assert real.returncode == 0, real.stderr
+    assert real.stdout == stubbed.stdout
+
+
+def test_step_13_refuse_scoring_stubs_bite_with_two_outcomes():
+    # The stubs do raise once the loop reaches best_threshold (so the skip tests mean something).
+    result = run_step_13(stubs=REFUSE_SCORING)
+    assert result.returncode != 0
+    assert "scoring called although there are too few outcomes" in result.stderr
+
+
+def test_step_13_two_outcomes_prints_no_skip_line():
+    result = run_step_13()
+    assert result.returncode == 0, result.stderr
+    assert "too few outcomes" not in result.stdout
+    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A,
+                                                                STEP_13_MODEL_B, "ok"]
+
+
+def test_step_13_one_paid_and_one_unpaid_labelled_row_is_scored_not_skipped():
+    # Two outcomes is enough: labelled rows 10 (paid, p .8) and 11 (unpaid, p .4) only.
+    stubs = ("forecast_rows['label_status'] = "
+             "['labelled', 'labelled', 'missing_week', 'future', 'future', 'future']\n"
+             "copies = (copies[0], forecast_rows.copy(deep=True), copies[2])\n")
+    result = run_step_13(ONE_MODEL, stubs=stubs)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert "too few outcomes" not in result.stdout
+    assert lines[5].startswith("        stage 1 (HGB) at step 12's origin, best F1 threshold "
+                               "0.800: F1 1.000"), lines[5]
