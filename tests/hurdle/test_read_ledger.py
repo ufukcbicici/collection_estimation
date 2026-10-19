@@ -298,8 +298,10 @@ def test_extra_unknown_column_is_ignored(tmp_path):
 
 
 def test_optional_columns_absent_come_back_none(tmp_path):
+    # The four optional columns all absent. 'Clearing Document' stays in the header (it is
+    # required); its cells are empty because nothing in five_lines() is cleared.
     header = without(LEDGER_HEADER, 'Customer Name', 'Document Date', 'Baseline Date',
-                     'Terms of Payment', 'Clearing Document')
+                     'Terms of Payment')
     ledger = read(tmp_path, five_lines(), header=header)
     assert list(ledger.columns) == LEDGER_COLUMNS
     assert ledger['customer_name'].tolist() == [None] * 5
@@ -310,6 +312,30 @@ def test_optional_columns_absent_come_back_none(tmp_path):
     assert pd.api.types.is_datetime64_any_dtype(ledger['document_date'])
 
 
+OPTIONAL_HEADER_TEXTS = [('Customer Name', 'customer_name'), ('Document Date', 'document_date'),
+                         ('Baseline Date', 'baseline_date'),
+                         ('Terms of Payment', 'payment_terms')]
+
+
+def test_the_optional_ledger_fields_are_exactly_the_four():
+    assert LEDGER_OPTIONAL_FIELDS == {'customer_name', 'document_date', 'baseline_date',
+                                      'payment_terms'}
+    assert 'clearing_document' not in LEDGER_OPTIONAL_FIELDS
+    assert {field for _, field in OPTIONAL_HEADER_TEXTS} == LEDGER_OPTIONAL_FIELDS
+
+
+@pytest.mark.parametrize('header_text, field', OPTIONAL_HEADER_TEXTS)
+def test_each_optional_column_alone_may_be_absent(tmp_path, header_text, field):
+    ledger = read(tmp_path, five_lines(), header=without(LEDGER_HEADER, header_text))
+    assert list(ledger.columns) == LEDGER_COLUMNS
+    assert ledger[field].isna().all()
+    # The other columns still read as with the full header.
+    other = tmp_path / 'full'
+    other.mkdir()
+    full = read(other, five_lines())
+    pd.testing.assert_frame_equal(ledger.drop(columns=field), full.drop(columns=field))
+
+
 @pytest.mark.parametrize('header_text, field', [
     ('Net Due Date', 'net_due_date'),
     ('Amount in Doc. Curr.', 'amount_document'),
@@ -317,11 +343,108 @@ def test_optional_columns_absent_come_back_none(tmp_path):
     ('Customer', 'customer'),
     ('Clearing Date', 'clearing_date'),
     ('Invoice Reference', 'invoice_reference'),
+    ('Clearing Document', 'clearing_document'),
 ])
 def test_required_column_absent_raises_naming_it(tmp_path, header_text, field):
     header = without(LEDGER_HEADER, header_text)
     with pytest.raises(ValueError, match=f"missing columns.*'{field}'"):
         read(tmp_path, [invoice()], header=header)
+
+
+# --- the Clearing Document column is required ----------------------------------------------
+# The receivables step links lines that cleared together by their clearing document, so a
+# ledger without that column fails at reading rather than loading with it all empty.
+
+def test_a_ledger_without_the_clearing_document_column_raises_the_exact_message(tmp_path):
+    header = without(LEDGER_HEADER, 'Clearing Document')
+    with pytest.raises(ValueError) as error:
+        read(tmp_path, five_lines(), header=header)
+    assert str(error.value) == (f"missing columns ['clearing_document']; "
+                                f"the header row reads {header}")
+
+
+def test_a_ledger_without_the_clearing_document_column_raises_even_with_no_lines(tmp_path):
+    header = without(LEDGER_HEADER, 'Clearing Document')
+    with pytest.raises(ValueError, match=r"^missing columns \['clearing_document'\]; "):
+        read(tmp_path, [], header=header)
+
+
+def test_a_ledger_without_clearing_document_and_optional_columns_names_only_it(tmp_path):
+    # The optional columns absent beside it are not named: only the required one is missing.
+    header = without(LEDGER_HEADER, 'Clearing Document', 'Customer Name', 'Document Date',
+                     'Baseline Date', 'Terms of Payment')
+    with pytest.raises(ValueError) as error:
+        read(tmp_path, five_lines(), header=header)
+    assert str(error.value) == (f"missing columns ['clearing_document']; "
+                                f"the header row reads {header}")
+
+
+def test_clearing_document_missing_with_another_required_column_lists_both_sorted(tmp_path):
+    header = without(LEDGER_HEADER, 'Clearing Document', 'Clearing Date')
+    with pytest.raises(ValueError) as error:
+        read(tmp_path, five_lines(), header=header)
+    assert str(error.value) == (f"missing columns ['clearing_date', 'clearing_document']; "
+                                f"the header row reads {header}")
+
+
+def test_a_turkish_ledger_without_denklestirme_belgesi_raises(tmp_path):
+    layout = dataclasses.replace(LAYOUT, headers=TURKISH_HEADERS)
+    header = without(tuple(TURKISH_HEADERS), 'Denkleştirme Belgesi')
+    lines = [as_turkish(row) for row in five_lines()]
+    with pytest.raises(ValueError) as error:
+        read(tmp_path, lines, layout=layout, header=header)
+    assert str(error.value) == (f"missing columns ['clearing_document']; "
+                                f"the header row reads {header}")
+
+
+def test_the_clearing_document_header_is_matched_ignoring_case_and_spaces(tmp_path):
+    header = tuple('  CLEARING   document ' if text == 'Clearing Document' else text
+                   for text in LEDGER_HEADER)
+    line = invoice(clearing_date=datetime(2026, 3, 20), clearing_document='1400000001')
+    ledger = read(tmp_path, [list(line.values())], header=header)
+    assert ledger.loc[0, 'clearing_document'] == '1400000001'
+
+
+@pytest.mark.parametrize('empty', [None, '', '   '])
+def test_an_empty_clearing_document_on_an_open_line_reads_as_none(tmp_path, empty):
+    line = invoice()  # open: no clearing date
+    line['Clearing Document'] = empty
+    ledger = read(tmp_path, [line])
+    assert ledger.loc[0, 'clearing_document'] is None
+    assert pd.isna(ledger.loc[0, 'clearing_date'])
+    assert ledger['clearing_document'].dtype == object
+
+
+def test_open_and_cleared_lines_side_by_side_keep_their_clearing_documents(tmp_path):
+    cleared = invoice('9000000001', clearing_date=datetime(2026, 3, 20),
+                      clearing_document='1400000001')
+    paid = payment(clearing_date=datetime(2026, 3, 20), clearing_document='1400000001')
+    still_open = invoice('9000000002', e_number='GIB2026000002')
+    ledger = read(tmp_path, [cleared, paid, still_open])
+    assert ledger['clearing_document'].tolist() == ['1400000001', '1400000001', None]
+    assert ledger.loc[2, 'clearing_document'] is None
+
+
+def test_a_clearing_document_given_as_a_number_raises(tmp_path):
+    # An ID read as a number may have lost its leading zeros; text only, as for other IDs.
+    line = invoice(clearing_date=datetime(2026, 3, 20))
+    line['Clearing Document'] = 1400000001
+    with pytest.raises(ValueError,
+                       match=r'row 2: clearing_document is 1400000001, not text'):
+        read(tmp_path, [line])
+
+
+def test_a_hand_built_layout_with_no_clearing_document_mapping_reads_it_as_none(tmp_path):
+    # PINNED, not endorsed: read_ledger only requires the fields the layout maps. A layout
+    # built by hand (not through the settings file, whose headers_setting demands a header
+    # for clearing_document) that leaves it out reads a file without the column, all None.
+    # The guard for this case is in settings.py (see test_settings.py).
+    headers = {text: field for text, field in SYNTHETIC_LEDGER_HEADERS.items()
+               if field != 'clearing_document'}
+    layout = dataclasses.replace(LAYOUT, headers=headers)
+    ledger = read(tmp_path, five_lines(), layout=layout,
+                  header=without(LEDGER_HEADER, 'Clearing Document'))
+    assert ledger['clearing_document'].tolist() == [None] * 5
 
 
 def test_duplicate_column_raises(tmp_path):
@@ -416,6 +539,7 @@ def test_empty_posting_date_raises(tmp_path):
 
 
 def test_empty_optional_and_unrequired_fields_are_fine(tmp_path):
+    # The Clearing Document column must be present, but its cell may be empty (an open line).
     line = unapplied_payment()
     for text in ('Customer Name', 'Reference', 'Invoice Reference', 'Document Date',
                  'Baseline Date', 'Terms of Payment', 'Net Due Date', 'Clearing Date',

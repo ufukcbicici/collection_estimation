@@ -27,9 +27,11 @@ if TYPE_CHECKING:
 # How the ledger is laid out (header texts, rows, document-type codes) is in the settings file:
 # see [ledger_layout] in settings/synthetic.toml.
 
-# Kept when present, for reconciliation; the model does not need them.
+# Kept when present, for reconciliation; the model does not need them. (clearing_document is
+# NOT optional: the receivables step links the lines that cleared together by it, and finds
+# from them when the money arrived.)
 LEDGER_OPTIONAL_FIELDS = {
-    "customer_name", "document_date", "baseline_date", "payment_terms", "clearing_document",
+    "customer_name", "document_date", "baseline_date", "payment_terms",
 }
 
 # The fields of a ledger line, in order: the code's own contract. The settings file says

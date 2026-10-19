@@ -413,6 +413,34 @@ def test_a_layout_whose_codes_miss_a_type_raises_and_never_serves_the_cache(ledg
     pd.testing.assert_frame_equal(load_ledger(ledger_file, AS_OF, LAYOUT, cache_folder), good)
 
 
+LEDGER_HEADER_WITHOUT_CLEARING_DOCUMENT = tuple(
+    text for text in SYNTHETIC_LEDGER_HEADERS if text != 'Clearing Document')
+
+
+def test_a_ledger_without_the_clearing_document_column_raises_and_writes_no_cache(
+        ledger_folder, cache_folder):
+    path = make_ledger_workbook(ledger_folder, five_lines(),
+                                header=LEDGER_HEADER_WITHOUT_CLEARING_DOCUMENT,
+                                name='no_clearing_document.xlsx')
+    with pytest.raises(ValueError, match=r"^missing columns \['clearing_document'\]; "
+                                         r"the header row reads "):
+        load_ledger(path, AS_OF, LAYOUT, cache_folder)
+    assert not (cache_folder / CACHE_FILE).exists()
+
+
+def test_a_cached_ledger_rewritten_without_clearing_document_raises_not_the_old_cache(
+        ledger_folder, cache_folder):
+    path = make_ledger_workbook(ledger_folder, five_lines(), name='ledger.xlsx')
+    load_ledger(path, AS_OF, LAYOUT, cache_folder)
+    stat = os.stat(path)
+    make_ledger_workbook(ledger_folder, five_lines(),
+                         header=LEDGER_HEADER_WITHOUT_CLEARING_DOCUMENT, name='ledger.xlsx')
+    # Make sure the file's fingerprint moves even if the save lands in the same second.
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    with pytest.raises(ValueError, match=r"^missing columns \['clearing_document'\]"):
+        load_ledger(path, AS_OF, LAYOUT, cache_folder)
+
+
 def test_a_renamed_header_reads_again_for_the_same_file(ledger_folder, cache_folder, spy,
                                                        capsys):
     # One file whose header has both 'Document Type' and a 'Belge Türü' copy of it. The

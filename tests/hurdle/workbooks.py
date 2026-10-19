@@ -120,6 +120,8 @@ LEDGER_HEADER = ('Company Code', 'Customer', 'Customer Name', 'Document Number',
 # The layout of the ledgers `make_ledger_workbook` writes, as [ledger_layout] in
 # settings/synthetic.toml gives it: the header on row 1, ledger lines from row 2, the 17
 # headers of LEDGER_HEADER, and RV / DZ / DG as invoice / payment / credit memo.
+# 'Clearing Document' is a required column (its cells may be empty on open lines); only
+# Customer Name, Document Date, Baseline Date and Terms of Payment may be left out.
 SYNTHETIC_LEDGER_HEADERS = {
     'Company Code': 'company_code',
     'Customer': 'customer',

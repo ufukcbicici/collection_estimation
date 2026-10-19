@@ -99,8 +99,10 @@ LEDGER_HEADERS = {
     "Document Currency": "document_currency",
     "Amount in Local Currency": "amount_local",
     "Clearing Date": "clearing_date",
+    # Required since the receivables step links lines that cleared together by it.
+    "Clearing Document": "clearing_document",
 }
-DOCUMENT_TYPES = {"invoice": '["RV"]', "payment": '["DZ"]', "credit_memo": '["DG"]'}
+DOCUMENT_TYPES ={"invoice": '["RV"]', "payment": '["DZ"]', "credit_memo": '["DG"]'}
 
 
 def headers_toml(headers):
@@ -1703,6 +1705,61 @@ def test_every_required_ledger_field_must_have_a_header(tmp_path, repo, field):
 def test_the_ledger_headers_in_the_test_file_cover_exactly_the_required_fields():
     # Guards this file's own sample: LEDGER_HEADERS is meant to be the minimal valid mapping.
     assert set(LEDGER_HEADERS.values()) == set(LEDGER_FIELDS) - LEDGER_OPTIONAL_FIELDS
+
+
+def test_the_ledger_optional_fields_are_the_four_and_not_clearing_document():
+    assert LEDGER_OPTIONAL_FIELDS == {"customer_name", "document_date", "baseline_date",
+                                      "payment_terms"}
+    assert "clearing_document" in set(LEDGER_FIELDS) - LEDGER_OPTIONAL_FIELDS
+
+
+def test_ledger_headers_without_clearing_document_raise_the_exact_message(tmp_path, repo):
+    without = {h: f for h, f in LEDGER_HEADERS.items() if f != "clearing_document"}
+    message = raises_naming(tmp_path, repo, "[ledger_layout].headers",
+                            changes={("ledger_layout", "headers"): headers_toml(without)})
+    assert message.endswith(
+        "[ledger_layout].headers: no header for the required fields ['clearing_document']")
+
+
+def test_headers_setting_with_the_ledger_fields_requires_clearing_document():
+    without = {h: f for h, f in LEDGER_HEADERS.items() if f != "clearing_document"}
+    with pytest.raises(ValueError) as error:
+        headers_setting({"h": without}, "h", LEDGER_FIELDS, LEDGER_OPTIONAL_FIELDS, "w")
+    assert str(error.value) == "w.h: no header for the required fields ['clearing_document']"
+
+
+def test_ledger_headers_without_clearing_date_and_document_name_both_in_field_order(tmp_path,
+                                                                                    repo):
+    without = {h: f for h, f in LEDGER_HEADERS.items()
+               if f not in ("clearing_date", "clearing_document")}
+    message = raises_naming(tmp_path, repo, "[ledger_layout].headers",
+                            changes={("ledger_layout", "headers"): headers_toml(without)})
+    assert message.endswith(
+        "no header for the required fields ['clearing_date', 'clearing_document']")
+
+
+@pytest.mark.parametrize("field", sorted(LEDGER_OPTIONAL_FIELDS))
+def test_each_optional_ledger_field_may_be_mapped(tmp_path, repo, field):
+    # The minimal mapping plus one optional field still loads.
+    header = next(h for h, f in EXPECTED_LEDGER_HEADERS.items() if f == field)
+    with_one = dict(LEDGER_HEADERS, **{header: field})
+    settings = load(tmp_path, repo,
+                    changes={("ledger_layout", "headers"): headers_toml(with_one)})
+    assert settings.ledger_layout.headers == with_one
+
+
+def test_ledger_headers_with_all_four_optional_fields_absent_load(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    mapped = set(settings.ledger_layout.headers.values())
+    assert mapped.isdisjoint(LEDGER_OPTIONAL_FIELDS)
+    assert "clearing_document" in mapped
+
+
+def test_a_clearing_document_header_mapped_twice_loads(tmp_path, repo):
+    # An English and a Turkish header for the same field are allowed, as for other fields.
+    both = dict(LEDGER_HEADERS, **{"Denkleştirme Belgesi": "clearing_document"})
+    settings = load(tmp_path, repo, changes={("ledger_layout", "headers"): headers_toml(both)})
+    assert list(settings.ledger_layout.headers.values()).count("clearing_document") == 2
 
 
 # --- document_types_setting ------------------------------------------------------------
