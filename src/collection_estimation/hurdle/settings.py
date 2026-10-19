@@ -47,10 +47,24 @@ class HistorySettings:
 
 
 @dataclass(frozen=True)
+class Stage1Settings:
+    """Stage 1, the "will it pay?" classifier."""
+    max_iter: int                     # number of trees
+    learning_rate: float              # how much each tree adds (above 0, at most 1)
+    max_leaf_nodes: int               # leaves per tree (2 or more)
+    min_samples_leaf: int             # rows per leaf, at least
+    random_seed: int                  # makes a fit repeatable (0 or more)
+    feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
+    company_as_feature: bool          # the company code (an EY entity) as a categorical feature
+    diagnose_class_weights: bool      # also fit a class-weighted model, for diagnosis only
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
     sample_week: int      # the week step 7 shows in detail (0 = the week of the first file)
+    demo_origin: int      # the forecast week step 12 fits and checks stage 1 at
 
 
 @dataclass(frozen=True)
@@ -81,6 +95,7 @@ class Settings:
     ledger_layout: LedgerLayout
     receivables: ReceivablesSettings
     history: HistorySettings
+    stage1: Stage1Settings
     debug: DebugSettings
 
 
@@ -96,7 +111,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "debug"}, name)
+                     "history", "stage1", "debug"}, name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -109,8 +124,12 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                              "overdue_age_days"}, f"{name} [receivables]")
     history = raw["history"]
     check_keys(history, {"windows", "use_ledger_before_first_file"}, f"{name} [history]")
+    stage1 = raw["stage1"]
+    check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
+                        "random_seed", "feature_blocks", "company_as_feature",
+                        "diagnose_class_weights"}, f"{name} [stage1]")
     debug = raw["debug"]
-    check_keys(debug, {"one_day", "sample_week"}, f"{name} [debug]")
+    check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
     check_keys(collections_layout,
                {"file_name_date_format", "header_row", "first_data_row", "headers"},
@@ -152,9 +171,21 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             use_ledger_before_first_file=bool_setting(history, "use_ledger_before_first_file",
                                                       f"{name} [history]"),
         ),
+        stage1=Stage1Settings(
+            max_iter=count_setting(stage1, "max_iter", f"{name} [stage1]"),
+            learning_rate=rate_setting(stage1, "learning_rate", f"{name} [stage1]"),
+            max_leaf_nodes=leaf_count_setting(stage1, "max_leaf_nodes", f"{name} [stage1]"),
+            min_samples_leaf=count_setting(stage1, "min_samples_leaf", f"{name} [stage1]"),
+            random_seed=seed_setting(stage1, "random_seed", f"{name} [stage1]"),
+            feature_blocks=feature_blocks_setting(stage1, "feature_blocks", f"{name} [stage1]"),
+            company_as_feature=bool_setting(stage1, "company_as_feature", f"{name} [stage1]"),
+            diagnose_class_weights=bool_setting(stage1, "diagnose_class_weights",
+                                                f"{name} [stage1]"),
+        ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
+            demo_origin=week_setting(debug, "demo_origin", f"{name} [debug]"),
         ),
     )
 
@@ -412,3 +443,49 @@ def day_edges_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
         raise ValueError(f"{where}: {key} is {value}; give the days from smallest to largest, "
                          f"each once")
     return tuple(value)
+
+
+# The feature blocks a model can use, in the order their columns are taken.
+FEATURE_BLOCKS = ("history", "calendar", "receivables")
+
+
+def rate_setting(table: dict, key: str, where: str) -> float:
+    """A rate above 0 and at most 1, e.g. a learning rate of 0.05."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly.
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise ValueError(f"{where}: {key} is {value!r}, not a number above 0 and at most 1")
+    return float(value)
+
+
+def leaf_count_setting(table: dict, key: str, where: str) -> int:
+    """A number of leaves per tree: a whole number, 2 or more (one leaf would not split)."""
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError(f"{where}: {key} is {value!r}, not a whole number of 2 or more")
+    return value
+
+
+def feature_blocks_setting(table: dict, key: str, where: str) -> tuple[str, ...]:
+    """A non-empty list of feature blocks, each once, from FEATURE_BLOCKS; returned in the
+    order of FEATURE_BLOCKS."""
+    value = table[key]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where}: {key} is {value!r}, not a non-empty list of feature blocks")
+    unknown = [item for item in value if item not in FEATURE_BLOCKS]
+    if unknown:
+        raise ValueError(f"{where}: {key} holds {unknown}; the feature blocks are "
+                         f"{list(FEATURE_BLOCKS)}")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{where}: {key} lists a feature block more than once: {value}")
+    return tuple(block for block in FEATURE_BLOCKS if block in value)
+
+
+def seed_setting(table: dict, key: str, where: str) -> int:
+    """A random seed: a whole number, 0 or more."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{where}: {key} is {value!r}, not a random seed (a whole number, "
+                         f"0 or more)")
+    return value

@@ -58,3 +58,28 @@ def check_no_shared_columns(panel: pd.DataFrame, blocks: list) -> None:
                 raise ValueError(f"the {name} features and {seen[column]} both have a column "
                                  f"'{column}'")
             seen[column] = f"the {name} features"
+
+
+def block_feature_columns(history: pd.DataFrame, calendar: pd.DataFrame,
+                          owed: pd.DataFrame) -> dict[str, list[str]]:
+    """{block name: its feature columns}: every column of each block but its join keys."""
+    return {
+        "history": [column for column in history.columns
+                    if column not in ("key", "origin_week")],
+        "calendar": [column for column in calendar.columns if column != "week"],
+        "receivables": [column for column in owed.columns
+                        if column not in ("key", "origin_week", "h")],
+    }
+
+
+def rows_known_at(table: pd.DataFrame, origin: int) -> pd.DataFrame:
+    """The rows a model fitted at the end of week `origin` may learn from: labelled rows whose
+    target week has ended (t + h <= origin), so their answers were known by then."""
+    usable = (table["label_status"] == "labelled") & (table["target_week"] <= origin)
+    return table[usable]
+
+
+def rows_at_origin(table: pd.DataFrame, origin: int) -> pd.DataFrame:
+    """The rows a forecast made at the end of week `origin` predicts: every customer known at
+    `origin`, for each h. Their labels are not known at `origin`."""
+    return table[table["origin_week"] == origin]

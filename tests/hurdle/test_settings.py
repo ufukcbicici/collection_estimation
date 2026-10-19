@@ -32,9 +32,15 @@ from collection_estimation.hurdle.settings import (
     DebugSettings,
     HistorySettings,
     LedgerLayout,
+    FEATURE_BLOCKS,
     ReceivablesSettings,
     Settings,
+    Stage1Settings,
     check_keys,
+    feature_blocks_setting,
+    leaf_count_setting,
+    rate_setting,
+    seed_setting,
     count_setting,
     date_format_setting,
     date_setting,
@@ -135,7 +141,11 @@ VALID = {
     "receivables": {"min_cleared_for_delay": "3", "horizons": "5",
                     "leak_check_weeks": "[0, 30]", "overdue_age_days": "[30, 90]"},
     "history": {"windows": "[4, 13, 52]", "use_ledger_before_first_file": "true"},
-    "debug": {"one_day": "2025-06-02", "sample_week": "30"},
+    "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
+               "min_samples_leaf": "20", "random_seed": "1",
+               "feature_blocks": '["history", "calendar", "receivables"]',
+               "company_as_feature": "true", "diagnose_class_weights": "true"},
+    "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
 
@@ -265,7 +275,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "debug"])
+                                       "history", "stage1", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -283,6 +293,10 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("receivables", "min_cleared_for_delay"), ("receivables", "horizons"),
     ("receivables", "leak_check_weeks"), ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
+    ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
+    ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
+    ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
+    ("debug", "demo_origin"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -401,6 +415,10 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
     ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
+    ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
+    ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
+    ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
+    ("debug", "demo_origin"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -1134,6 +1152,12 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.history.windows == (4, 13, 52)
     assert type(settings.history.windows) is tuple
     assert settings.history.use_ledger_before_first_file is True
+    assert settings.debug.demo_origin == 40
+    assert type(settings.debug.demo_origin) is int
+    assert settings.stage1 == Stage1Settings(
+        max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+        random_seed=1, feature_blocks=("history", "calendar", "receivables"),
+        company_as_feature=True, diagnose_class_weights=True)
 
 
 
@@ -2058,3 +2082,393 @@ def test_history_settings_do_not_borrow_from_data(tmp_path, repo):
 def test_the_synthetic_history_settings():
     history = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).history
     assert history == HistorySettings(windows=(4, 13, 52), use_ledger_before_first_file=True)
+
+
+# --- [stage1] ---------------------------------------------------------------------------
+# Every value is checked through the file (the message names the file and the section,
+# exactly) and, for the new helpers, by direct calls.
+
+STAGE1 = f"{FILE_NAME} [stage1]"
+DEBUG = f"{FILE_NAME} [debug]"
+
+
+def exact_message(tmp_path, repo, changes):
+    with pytest.raises(ValueError) as error:
+        load(tmp_path, repo, changes=changes)
+    return str(error.value)
+
+
+def test_the_stage1_section_is_read(tmp_path, repo):
+    stage1 = load(tmp_path, repo).stage1
+    assert isinstance(stage1, Stage1Settings)
+    assert stage1 == Stage1Settings(
+        max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+        random_seed=1, feature_blocks=("history", "calendar", "receivables"),
+        company_as_feature=True, diagnose_class_weights=True)
+
+
+def test_the_stage1_values_have_the_right_python_types(tmp_path, repo):
+    stage1 = load(tmp_path, repo).stage1
+    for name in ("max_iter", "max_leaf_nodes", "min_samples_leaf", "random_seed"):
+        assert type(getattr(stage1, name)) is int, name
+    assert type(stage1.learning_rate) is float
+    assert type(stage1.feature_blocks) is tuple
+    assert stage1.company_as_feature is True
+    assert stage1.diagnose_class_weights is True
+
+
+def test_stage1_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(Stage1Settings)] == [
+        "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf", "random_seed",
+        "feature_blocks", "company_as_feature", "diagnose_class_weights"]
+
+
+def test_settings_has_a_stage1_field_between_history_and_debug():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert "stage1" in names
+    assert names.index("history") < names.index("stage1") < names.index("debug")
+
+
+def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
+    with pytest.raises(ValueError) as error:
+        load(tmp_path, repo, drop_section="stage1")
+    assert str(error.value) == (
+        f"{FILE_NAME}: missing ['stage1']; expected exactly ['collections_layout', "
+        f"'companies', 'data', 'debug', 'history', 'ledger_layout', 'receivables', 'stage1']")
+
+
+def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
+    changes = {("stage1", key): REMOVE for key in VALID["stage1"]}
+    message = raises_naming(tmp_path, repo, "[stage1]", changes=changes)
+    for key in VALID["stage1"]:
+        assert key in message
+    assert "missing" in message
+
+
+def test_a_stage1_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "max_iter"): REMOVE,
+                                             ("stage1", "max_iters"): "300"})
+    assert message == (
+        f"{STAGE1}: missing ['max_iter']; unknown ['max_iters']; expected exactly "
+        f"['company_as_feature', 'diagnose_class_weights', 'feature_blocks', 'learning_rate', "
+        f"'max_iter', 'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
+
+
+# --- [stage1] max_iter and min_samples_leaf (count_setting) ------------------------------
+
+@pytest.mark.parametrize("key", ["max_iter", "min_samples_leaf"])
+@pytest.mark.parametrize("good, expected", [("1", 1), ("2", 2), ("1_000", 1000)])
+def test_stage1_counts_accept_a_whole_number_of_1_or_more(tmp_path, repo, key, good, expected):
+    value = getattr(load(tmp_path, repo, changes={("stage1", key): good}).stage1, key)
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("key", ["max_iter", "min_samples_leaf"])
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("-1", "-1"), ("1.5", "1.5"), ("300.0", "300.0"), ('"300"', "'300'"),
+    ("true", "True"), ("false", "False"), ("[300]", "[300]"),
+], ids=["zero", "negative", "fraction", "whole-float", "string", "true", "false", "list"])
+def test_stage1_counts_reject_non_counts_with_the_exact_message(tmp_path, repo, key, bad,
+                                                                 shown):
+    message = exact_message(tmp_path, repo, {("stage1", key): bad})
+    assert message == f"{STAGE1}: {key} is {shown}, not a whole number of 1 or more"
+
+
+def test_max_iter_and_min_samples_leaf_are_read_separately(tmp_path, repo):
+    stage1 = load(tmp_path, repo, changes={("stage1", "max_iter"): "7",
+                                           ("stage1", "min_samples_leaf"): "3"}).stage1
+    assert (stage1.max_iter, stage1.min_samples_leaf) == (7, 3)
+
+
+# --- [stage1] learning_rate (rate_setting) --------------------------------------------------
+
+@pytest.mark.parametrize("good, expected", [
+    ("0.05", 0.05), ("1", 1.0), ("1.0", 1.0), ("0.5", 0.5), ("1e-9", 1e-9), ("0.999", 0.999),
+], ids=["usual", "one-int", "one-float", "half", "tiny", "just-below-one"])
+def test_learning_rate_accepts_numbers_above_0_and_at_most_1(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("stage1", "learning_rate"): good}).stage1.learning_rate
+    assert value == expected
+    assert type(value) is float
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("0.0", "0.0"), ("-0.05", "-0.05"), ("1.0000001", "1.0000001"), ("2", "2"),
+    ("inf", "inf"), ("nan", "nan"), ("-inf", "-inf"), ('"0.05"', "'0.05'"), ("true", "True"),
+    ("false", "False"), ("[0.05]", "[0.05]"),
+], ids=["zero", "zero-float", "negative", "just-above-one", "two", "inf", "nan", "minus-inf",
+        "string", "true", "false", "list"])
+def test_learning_rate_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "learning_rate"): bad})
+    assert message == f"{STAGE1}: learning_rate is {shown}, not a number above 0 and at most 1"
+
+
+def test_rate_setting_direct_calls():
+    assert rate_setting({"r": 0.05}, "r", "here") == 0.05
+    assert rate_setting({"r": 1}, "r", "here") == 1.0
+    assert type(rate_setting({"r": 1}, "r", "here")) is float
+    assert rate_setting({"r": 5e-324}, "r", "here") == 5e-324
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1, 1.01, True, False, None, "0.1", [0.1],
+                                 float("nan"), float("inf")])
+def test_rate_setting_rejects_naming_where_and_key(bad):
+    with pytest.raises(ValueError) as error:
+        rate_setting({"r": bad}, "r", "here")
+    assert str(error.value) == f"here: r is {bad!r}, not a number above 0 and at most 1"
+
+
+def test_rate_setting_true_is_rejected_although_it_equals_1():
+    # True == 1 in Python and 0 < True <= 1 holds: only the explicit bool check stops it.
+    with pytest.raises(ValueError, match="here: r is True"):
+        rate_setting({"r": True}, "r", "here")
+
+
+# --- [stage1] max_leaf_nodes (leaf_count_setting) -------------------------------------------
+
+@pytest.mark.parametrize("good, expected", [("2", 2), ("3", 3), ("31", 31), ("1_024", 1024)])
+def test_max_leaf_nodes_accepts_a_whole_number_of_2_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage1", "max_leaf_nodes"): good}).stage1.max_leaf_nodes
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("1", "1"), ("0", "0"), ("-31", "-31"), ("31.0", "31.0"), ("2.5", "2.5"), ('"31"', "'31'"),
+    ("true", "True"), ("false", "False"), ("[31]", "[31]"),
+], ids=["one", "zero", "negative", "whole-float", "fraction", "string", "true", "false",
+        "list"])
+def test_max_leaf_nodes_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "max_leaf_nodes"): bad})
+    assert message == f"{STAGE1}: max_leaf_nodes is {shown}, not a whole number of 2 or more"
+
+
+def test_leaf_count_setting_direct_calls():
+    assert leaf_count_setting({"n": 2}, "n", "here") == 2
+    assert type(leaf_count_setting({"n": 31}, "n", "here")) is int
+    for bad in (1, 0, -2, 2.0, True, None, "2"):
+        with pytest.raises(ValueError) as error:
+            leaf_count_setting({"n": bad}, "n", "here")
+        assert str(error.value) == f"here: n is {bad!r}, not a whole number of 2 or more"
+
+
+# --- [stage1] random_seed (seed_setting) ----------------------------------------------------
+
+@pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("123_456", 123456),
+                                            ("4294967295", 4294967295)])
+def test_random_seed_accepts_a_whole_number_of_0_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("stage1", "random_seed"): good}).stage1.random_seed
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("-1", "-1"), ("-42", "-42"), ("1.0", "1.0"), ("1.5", "1.5"), ('"1"', "'1'"),
+    ("true", "True"), ("false", "False"), ("[1]", "[1]"),
+    ("2025-06-02", "datetime.date(2025, 6, 2)"), ("{ seed = 1 }", "{'seed': 1}"),
+], ids=["negative", "very-negative", "whole-float", "fraction", "string", "true", "false",
+        "list", "date", "table"])
+def test_random_seed_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "random_seed"): bad})
+    assert message == (f"{STAGE1}: random_seed is {shown}, not a random seed (a whole number, "
+                       f"0 or more)")
+
+
+def test_random_seed_message_no_longer_says_week_number(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "random_seed"): "-1"})
+    assert "week number" not in message
+
+
+def test_seed_setting_accepts_0_and_positive_ints():
+    assert seed_setting({"s": 0}, "s", "here") == 0
+    assert seed_setting({"s": 1}, "s", "here") == 1
+    assert seed_setting({"s": 2**40}, "s", "here") == 2**40
+    assert type(seed_setting({"s": 7}, "s", "here")) is int
+
+
+@pytest.mark.parametrize("bad", [-1, -2**40, True, False, 1.0, 0.0, 1.5, float("nan"), None,
+                                 "1", [1], (1,), {"s": 1}],
+                         ids=["minus-one", "very-negative", "true", "false", "one-float",
+                              "zero-float", "fraction", "nan", "none", "string", "list",
+                              "tuple", "dict"])
+def test_seed_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        seed_setting({"s": bad}, "s", "here")
+    assert str(error.value) == (f"here: s is {bad!r}, not a random seed (a whole number, "
+                                f"0 or more)")
+
+
+def test_seed_setting_false_is_rejected_although_it_equals_0():
+    # False == 0 and isinstance(False, int): only the explicit bool check stops it.
+    with pytest.raises(ValueError, match="^here: s is False, not a random seed"):
+        seed_setting({"s": False}, "s", "here")
+
+
+def test_seed_setting_does_not_change_week_setting_wording():
+    # demo_origin and sample_week keep week_setting's own message.
+    with pytest.raises(ValueError) as error:
+        week_setting({"w": -1}, "w", "here")
+    assert "week number" in str(error.value)
+    assert "random seed" not in str(error.value)
+
+
+# --- [stage1] feature_blocks (feature_blocks_setting) ---------------------------------------
+
+def test_feature_blocks_constant():
+    assert FEATURE_BLOCKS == ("history", "calendar", "receivables")
+    assert type(FEATURE_BLOCKS) is tuple
+
+
+@pytest.mark.parametrize("good, expected", [
+    ('["history", "calendar", "receivables"]', ("history", "calendar", "receivables")),
+    ('["receivables", "calendar", "history"]', ("history", "calendar", "receivables")),
+    ('["calendar", "history", "receivables"]', ("history", "calendar", "receivables")),
+    ('["receivables", "history"]', ("history", "receivables")),
+    ('["calendar"]', ("calendar",)),
+    ('["receivables"]', ("receivables",)),
+    ('["history"]', ("history",)),
+], ids=["in-order", "reversed", "shuffled", "two-out-of-order", "calendar-only",
+        "receivables-only", "history-only"])
+def test_feature_blocks_are_returned_in_feature_blocks_order(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage1", "feature_blocks"): good}).stage1.feature_blocks
+    assert value == expected
+    assert type(value) is tuple
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("[]", "[]"), ('"history"', "'history'"), ("1", "1"), ("true", "True"),
+    ("{ history = true }", "{'history': True}"),
+], ids=["empty", "text", "number", "bool", "table"])
+def test_feature_blocks_not_a_non_empty_list_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "feature_blocks"): bad})
+    assert message == (f"{STAGE1}: feature_blocks is {shown}, not a non-empty list of feature "
+                       f"blocks")
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ('["history", "weather"]', "['weather']"),
+    ('["History"]', "['History']"),
+    ('[" history"]', "[' history']"),
+    ('["history", 1]', "[1]"),
+    ('["history", true]', "[True]"),
+    ('[["history"]]', "[['history']]"),
+    ('["weather", "calendar", "sales"]', "['weather', 'sales']"),
+    ('["weather", "weather"]', "['weather', 'weather']"),
+], ids=["one-unknown", "case", "space", "number", "bool", "nested", "two-unknown-in-order",
+        "unknown-repeated"])
+def test_feature_blocks_with_an_unknown_block_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "feature_blocks"): bad})
+    assert message == (f"{STAGE1}: feature_blocks holds {shown}; the feature blocks are "
+                       f"['history', 'calendar', 'receivables']")
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ('["history", "history"]', "['history', 'history']"),
+    ('["calendar", "history", "calendar"]', "['calendar', 'history', 'calendar']"),
+], ids=["twice", "twice-apart"])
+def test_feature_blocks_listing_a_block_twice_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "feature_blocks"): bad})
+    assert message == (f"{STAGE1}: feature_blocks lists a feature block more than once: "
+                       f"{shown}")
+
+
+def test_feature_blocks_setting_direct_calls():
+    assert feature_blocks_setting({"b": ["receivables", "history"]}, "b", "here") == (
+        "history", "receivables")
+    with pytest.raises(ValueError) as error:
+        feature_blocks_setting({"b": ("history",)}, "b", "here")
+    assert str(error.value) == "here: b is ('history',), not a non-empty list of feature blocks"
+    with pytest.raises(ValueError) as error:
+        feature_blocks_setting({"b": None}, "b", "here")
+    assert str(error.value) == "here: b is None, not a non-empty list of feature blocks"
+
+
+def test_feature_blocks_setting_does_not_modify_the_list():
+    value = ["receivables", "history"]
+    feature_blocks_setting({"b": value}, "b", "here")
+    assert value == ["receivables", "history"]
+
+
+# --- [stage1] company_as_feature and diagnose_class_weights (bool_setting) -------------------
+
+@pytest.mark.parametrize("key", ["company_as_feature", "diagnose_class_weights"])
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_stage1_switches_accept_true_and_false(tmp_path, repo, key, text, expected):
+    value = getattr(load(tmp_path, repo, changes={("stage1", key): text}).stage1, key)
+    assert value is expected
+
+
+@pytest.mark.parametrize("key", ["company_as_feature", "diagnose_class_weights"])
+@pytest.mark.parametrize("bad, shown", [("1", "1"), ("0", "0"), ('"true"', "'true'"),
+                                        ("1.0", "1.0"), ("[true]", "[True]")],
+                         ids=["one", "zero", "string", "float", "list"])
+def test_stage1_switches_reject_non_bools_with_the_exact_message(tmp_path, repo, key, bad,
+                                                                 shown):
+    message = exact_message(tmp_path, repo, {("stage1", key): bad})
+    assert message == f"{STAGE1}: {key} is {shown}, not true or false"
+
+
+def test_stage1_switches_are_read_separately(tmp_path, repo):
+    stage1 = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "false",
+                                           ("stage1", "diagnose_class_weights"): "true"}).stage1
+    assert stage1.company_as_feature is False
+    assert stage1.diagnose_class_weights is True
+    stage1 = load(tmp_path, repo, changes={("stage1", "company_as_feature"): "true",
+                                           ("stage1", "diagnose_class_weights"): "false"}).stage1
+    assert stage1.company_as_feature is True
+    assert stage1.diagnose_class_weights is False
+
+
+# --- [debug] demo_origin (week_setting) -----------------------------------------------------
+
+def test_demo_origin_is_read_as_an_int(tmp_path, repo):
+    value = load(tmp_path, repo).debug.demo_origin
+    assert value == 40
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("59", 59), ("1_000", 1000)])
+def test_demo_origin_accepts_a_whole_number_of_0_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("debug", "demo_origin"): good}).debug.demo_origin
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("-1", "-1"), ("40.0", "40.0"), ("40.5", "40.5"), ('"40"', "'40'"), ("true", "True"),
+    ("[40]", "[40]"), ("2025-06-02", "datetime.date(2025, 6, 2)"),
+], ids=["negative", "whole-float", "fraction", "string", "true", "list", "date"])
+def test_demo_origin_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("debug", "demo_origin"): bad})
+    assert message == f"{DEBUG}: demo_origin is {shown}, not a week number (0 or more)"
+
+
+def test_demo_origin_does_not_borrow_sample_week(tmp_path, repo):
+    debug = load(tmp_path, repo, changes={("debug", "demo_origin"): "12",
+                                          ("debug", "sample_week"): "30"}).debug
+    assert (debug.demo_origin, debug.sample_week) == (12, 30)
+
+
+def test_a_demo_origin_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("debug", "demo_origin"): REMOVE,
+                                             ("debug", "demo_orign"): "40"})
+    assert message == (f"{DEBUG}: missing ['demo_origin']; unknown ['demo_orign']; expected "
+                       f"exactly ['demo_origin', 'one_day', 'sample_week']")
+
+
+def test_debug_settings_fields():
+    assert [field.name for field in dataclasses.fields(DebugSettings)] == [
+        "one_day", "sample_week", "demo_origin"]
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_stage1_and_demo_origin_settings():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.stage1 == Stage1Settings(
+        max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+        random_seed=1, feature_blocks=("history", "calendar", "receivables"),
+        company_as_feature=True, diagnose_class_weights=True)
+    assert settings.debug.demo_origin == 40
+    assert type(settings.debug.demo_origin) is int

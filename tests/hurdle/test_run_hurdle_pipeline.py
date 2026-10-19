@@ -880,3 +880,260 @@ def test_training_table_printout_with_a_paid_row_does_not_say_none_to_show():
     result = run_table()
     assert result.returncode == 0, result.stderr
     assert NO_PAID_LINE.strip() not in [line.strip() for line in result.stdout.splitlines()]
+
+
+# Step 12 (U10.1): stage 1's rows and model input at [debug] demo_origin. The wiring is
+# checked on main()'s source; the guard on demo_origin (in step 7, right after
+# show_weeks(weeks)) is run from main()'s own syntax tree; the printout is run on a small hand-built training table in a separate process.
+# The table: keys TR02-A (always paid) and TR04-B (never paid), origins 0..3, h = 1, 2, last
+# week 3 (targets 4 and 5 are future). At origin 2 the training rows are (0,1), (0,2), (1,1)
+# per key = 6 rows, half of them paid; the forecast rows are 2 keys x 2 h = 4 rows. Features:
+# h, mean_receipts_4 (NaN for B), has_month_end (bool), open_invoices (int).
+STAGE1 = """
+import inspect
+import pandas as pd
+import run_hurdle_pipeline as script
+
+source = " ".join(inspect.getsource(script.main).split())
+steps = [
+    "show_table(table, panel)",
+    "origin = settings.debug.demo_origin",
+    ("columns = feature_columns(block_feature_columns(history, calendar, owed), "
+     "settings.stage1.feature_blocks)"),
+    "train_rows = rows_known_at(table, origin)",
+    "forecast_rows = rows_at_origin(table, origin)",
+    ("train_x = stage1_features(train_rows, columns, companies, "
+     "settings.stage1.company_as_feature)"),
+    ("forecast_x = stage1_features(forecast_rows, columns, companies, "
+     "settings.stage1.company_as_feature)"),
+    "show_stage1_rows(origin, train_rows, forecast_rows, train_x)",
+]
+for step in steps:
+    assert step in source, step
+positions = [source.index(step) for step in steps]
+assert positions == sorted(positions), positions
+assert source.index("table = join_features(") < source.index("train_rows = rows_known_at(")
+assert source.index("companies = list(settings.companies.known)") < source.index(
+    "train_x = stage1_features(")
+inspect.signature(script.show_stage1_rows).bind("origin", "train", "forecast", "train_x")
+inspect.signature(script.feature_columns).bind({}, ())
+inspect.signature(script.block_feature_columns).bind("history", "calendar", "owed")
+inspect.signature(script.rows_known_at).bind("table", 40)
+inspect.signature(script.rows_at_origin).bind("table", 40)
+inspect.signature(script.stage1_features).bind("rows", [], [], True)
+
+nan = float("nan")
+rows = [(key, t, h) for key in ("TR02-A", "TR04-B") for t in range(0, 4) for h in (1, 2)]
+table = pd.DataFrame({
+    "key": pd.Series([r[0] for r in rows], dtype=object),
+    "company_code": pd.Series([r[0][:4] for r in rows], dtype=object),
+    "customer_id": pd.Series([r[0][5:] for r in rows], dtype=object),
+    "origin_week": pd.Series([r[1] for r in rows], dtype="int64"),
+    "h": pd.Series([r[2] for r in rows], dtype="int64"),
+})
+table["target_week"] = table["origin_week"] + table["h"]
+future = table["target_week"] > 3
+table["label_status"] = pd.Series(["future" if f else "labelled" for f in future], dtype=object)
+is_a = table["key"] == "TR02-A"
+table["amount"] = [nan if f else (100.0 if a else 0.0) for f, a in zip(future, is_a)]
+table["amount_deflated"] = table["amount"]
+table["paid"] = pd.array([None if f else bool(a) for f, a in zip(future, is_a)],
+                         dtype="boolean")
+table["mean_receipts_4"] = [1.0 if a else nan for a in is_a]
+table["has_month_end"] = table["target_week"] % 2 == 1
+table["open_invoices"] = pd.Series(table["origin_week"] * 2, dtype="int64")
+
+history = table[["key", "origin_week", "mean_receipts_4"]].drop_duplicates(["key", "origin_week"])
+calendar = (table[["target_week", "has_month_end"]].drop_duplicates("target_week")
+            .rename(columns={"target_week": "week"}))
+owed = table[["key", "origin_week", "h", "open_invoices"]]
+columns = script.feature_columns(script.block_feature_columns(history, calendar, owed),
+                                 ("history", "calendar", "receivables"))
+assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices"], columns
+origin = ORIGIN
+train_rows = script.rows_known_at(table, origin)
+forecast_rows = script.rows_at_origin(table, origin)
+companies = ["TR02", "TR04", "TR05"]
+train_x = script.stage1_features(train_rows, columns, companies, COMPANY_AS_FEATURE)
+script.show_stage1_rows(origin, train_rows, forecast_rows, train_x)
+print("ok")
+"""
+
+
+def run_stage1(company=True, origin=2):
+    # str.replace, not str.format: the script holds dict literals.
+    script = STAGE1.replace("COMPANY_AS_FEATURE", str(company)).replace("ORIGIN", str(origin))
+    return subprocess.run([sys.executable, "-c", script],
+                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                          timeout=120)
+
+
+def test_step_12_is_wired_in_after_the_training_table():
+    result = run_stage1()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_12_printout_rows_and_paid_share():
+    result = run_stage1()
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == ("Step 12: stage 1 at forecast week 2: 6 training rows (labelled, "
+                        "target week <= 2; 50.0% paid), 4 forecast rows (origin 2, "
+                        "2 customers x h)")
+
+
+def test_step_12_printout_model_input_with_the_company():
+    result = run_stage1()
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[1] == ("        model input: 5 columns {'float64': 4, 'category': 1}; "
+                        "columns with NaN: 1")
+    assert lines[2] == "        company_code categories: ['TR02', 'TR04', 'TR05']"
+    assert lines[3:] == ["ok"]
+
+
+def test_step_12_printout_model_input_without_the_company():
+    result = run_stage1(company=False)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[1] == "        model input: 4 columns {'float64': 4}; columns with NaN: 1"
+    assert "company_code categories" not in result.stdout
+    assert lines[2:] == ["ok"]
+
+
+GUARD_TEST = ("settings.debug.demo_origin + settings.receivables.horizons > "
+              "int(weeks['week'].max())")
+
+
+def is_demo_origin_guard(node):
+    return isinstance(node, ast.If) and ast.unparse(node.test) == GUARD_TEST
+
+
+def demo_origin_guard():
+    """The `if settings.debug.demo_origin + ... > int(weeks['week'].max()):` statement, which
+    since the move sits in step 7 of main()."""
+    found = [node for node in ast.walk(main_tree()) if is_demo_origin_guard(node)]
+    assert len(found) == 1
+    return found[0]
+
+
+def run_guard(origin, horizons, last_week, first_week=0, week_dtype="int64"):
+    """Run main()'s guard statement on its own, with the two names it reads: settings and a
+    week calendar whose weeks run first_week..last_week."""
+    from types import SimpleNamespace
+    import pandas as pd
+    module = ast.Module(body=[demo_origin_guard()], type_ignores=[])
+    code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
+    settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=origin),
+                               receivables=SimpleNamespace(horizons=horizons))
+    weeks = pd.DataFrame({"week": pd.Series(range(first_week, last_week + 1), dtype=week_dtype)})
+    exec(code, {"settings": settings, "weeks": weeks})
+
+
+def test_step_12_origin_is_read_from_debug_demo_origin():
+    found = assignments_to(main_tree(), "origin")
+    assert len(found) == 1
+    assert ast.unparse(found[0].value) == "settings.debug.demo_origin"
+
+
+def test_demo_origin_guard_sits_right_after_show_weeks():
+    body = main_tree().body
+    shows = [i for i, node in enumerate(body)
+             if isinstance(node, ast.Expr) and ast.unparse(node) == "show_weeks(weeks)"]
+    assert len(shows) == 1
+    assert is_demo_origin_guard(body[shows[0] + 1]), ast.unparse(body[shows[0] + 1])
+
+
+def test_demo_origin_guard_is_a_top_level_statement_of_main():
+    # Not nested in a branch: it runs on every call of main().
+    assert sum(is_demo_origin_guard(node) for node in main_tree().body) == 1
+
+
+def test_demo_origin_guard_comes_before_step_8_receivables():
+    source = main_source()
+    guard = source.index("if settings.debug.demo_origin + settings.receivables.horizons")
+    assert source.index("show_weeks(weeks)") < guard
+    assert guard < source.index("receivables = receivables_by_week(")
+    assert guard < source.index("exchange_rates(")
+
+
+def test_demo_origin_guard_comes_before_any_stage_1_work():
+    source = main_source()
+    guard = source.index("if settings.debug.demo_origin + settings.receivables.horizons")
+    for later in ("table = join_features(", "origin = settings.debug.demo_origin",
+                  "feature_columns(", "rows_known_at(", "rows_at_origin(", "stage1_features(",
+                  "show_stage1_rows("):
+        assert guard < source.index(later), later
+
+
+def test_step_12_has_no_guard_of_its_own_any_more():
+    # The old step-12 guard compared `origin` with a `last_week` name; it must be gone.
+    tree = main_tree()
+    old = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+           and "origin" in ast.unparse(node.test) and not is_demo_origin_guard(node)]
+    assert old == [], [ast.unparse(node.test) for node in old]
+    assert "so the check would have no answers" not in main_source()
+
+
+def test_demo_origin_guard_body_is_a_single_raise_of_value_error():
+    guard = demo_origin_guard()
+    assert len(guard.body) == 1 and isinstance(guard.body[0], ast.Raise)
+    assert ast.unparse(guard.body[0].exc.func) == "ValueError"
+    assert guard.orelse == []
+
+
+def test_demo_origin_guard_raises_with_the_exact_message():
+    with pytest.raises(ValueError) as error:
+        run_guard(origin=60, horizons=5, last_week=64)
+    assert str(error.value) == ("[debug] demo_origin 60: its target weeks reach week 65, "
+                                "after the last week 64, so step 12 would have no answers")
+
+
+def test_demo_origin_guard_message_shows_plain_ints_for_numpy_weeks():
+    # weeks['week'].max() is a numpy integer; int() keeps "64", not "np.int64(64)".
+    with pytest.raises(ValueError) as error:
+        run_guard(origin=100, horizons=3, last_week=64, week_dtype="int32")
+    assert str(error.value) == ("[debug] demo_origin 100: its target weeks reach week 103, "
+                                "after the last week 64, so step 12 would have no answers")
+
+
+def test_demo_origin_guard_allows_targets_up_to_the_last_week():
+    run_guard(origin=59, horizons=5, last_week=64)     # 59 + 5 = 64: the last week has data
+    run_guard(origin=40, horizons=5, last_week=64)
+    run_guard(origin=0, horizons=1, last_week=1)
+    run_guard(origin=0, horizons=0, last_week=0)
+
+
+def test_demo_origin_guard_uses_the_largest_week_not_the_last_row():
+    # Weeks out of order: max() is 64 although the last row is 10.
+    from types import SimpleNamespace
+    import pandas as pd
+    module = ast.Module(body=[demo_origin_guard()], type_ignores=[])
+    code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
+    settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=59),
+                               receivables=SimpleNamespace(horizons=5))
+    weeks = pd.DataFrame({"week": [64, 0, 10]})
+    exec(code, {"settings": settings, "weeks": weeks})
+
+
+@pytest.mark.parametrize("origin, horizons, last_week", [(60, 5, 64), (64, 5, 64),
+                                                          (100, 5, 64), (0, 2, 1)])
+def test_demo_origin_guard_raises_once_a_target_is_after_the_last_week(origin, horizons,
+                                                                       last_week):
+    with pytest.raises(ValueError) as error:
+        run_guard(origin, horizons, last_week)
+    assert str(error.value) == (f"[debug] demo_origin {origin}: its target weeks reach week "
+                                f"{origin + horizons}, after the last week {last_week}, so "
+                                f"step 12 would have no answers")
+
+
+def test_step_12_printout_with_no_training_rows_does_not_crash():
+    # Origin 0: the earliest target is week 1, so nothing is known yet. The printout must
+    # still run (main()'s guard only bounds demo_origin from above).
+    result = run_stage1(origin=0)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("Step 12: stage 1 at forecast week 0: 0 training rows ")
+    assert "4 forecast rows (origin 0, 2 customers x h)" in lines[0]
+    assert lines[-1] == "ok"

@@ -84,6 +84,21 @@ windows = [4, 13, 52]                 # look-back windows, in weeks
 use_ledger_before_first_file = true   # the ledger's payments before the first daily file
                                       # count as history (false: those weeks are unknown)
 
+[stage1]
+# Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
+# weights, early stopping off). Starting values; the settings grid (U16) tries others.
+max_iter = 300                  # number of trees
+learning_rate = 0.05
+max_leaf_nodes = 31             # leaves per tree
+min_samples_leaf = 20           # rows per leaf, at least
+random_seed = 1
+feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
+company_as_feature = true       # the company code (one of the EY entities) as a category
+diagnose_class_weights = true   # also fit a class-weighted model, ONLY to compare F1 and AUC;
+                                # never used for the forecast
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)
+demo_origin = 40                # the forecast week step 12 fits and checks stage 1 at; its
+                                # target weeks (up to demo_origin + horizons) must have data

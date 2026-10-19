@@ -66,7 +66,13 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     add_labels,
     panel_rows,
 )
-from collection_estimation.hurdle.training_table import join_features  # noqa: E402
+from collection_estimation.hurdle.stage1 import feature_columns, stage1_features  # noqa: E402
+from collection_estimation.hurdle.training_table import (  # noqa: E402
+    block_feature_columns,
+    join_features,
+    rows_at_origin,
+    rows_known_at,
+)
 from collection_estimation.hurdle.side_tables import (  # noqa: E402
     check_side_tables,
     is_unidentified,
@@ -161,6 +167,13 @@ def main():
     holidays = load_holidays(settings.data.holidays_file)
     weeks = week_calendar(list(daily_files), week_zero, holidays, filled_days)
     show_weeks(weeks)
+    # Step 12 checks stage 1 at [debug] demo_origin: its target weeks must have answers.
+    # Checked here, before the long steps, rather than when step 12 is reached.
+    if settings.debug.demo_origin + settings.receivables.horizons > int(weeks["week"].max()):
+        raise ValueError(f"[debug] demo_origin {settings.debug.demo_origin}: its target weeks "
+                         f"reach week {settings.debug.demo_origin + settings.receivables.horizons}"
+                         f", after the last week {int(weeks['week'].max())}, so step 12 would "
+                         f"have no answers")
 
     # The weekly amounts per key: gross receipts (the target), refunds, unapplied lines.
     # Checked inside: the weekly table holds every TRY and every line of steps 3 and 6.
@@ -286,6 +299,18 @@ def main():
     # The training table: one row per panel row, with its label and every feature block.
     table = join_features(panel, history, calendar, owed)
     show_table(table, panel)
+
+    # Step 12: stage 1, "will it pay?", checked at one forecast week ([debug] demo_origin).
+    # Built unit by unit; for now, the rows and the model's input.
+    origin = settings.debug.demo_origin   # checked in step 7: its answers are known
+    columns = feature_columns(block_feature_columns(history, calendar, owed),
+                              settings.stage1.feature_blocks)
+    train_rows = rows_known_at(table, origin)
+    forecast_rows = rows_at_origin(table, origin)
+    train_x = stage1_features(train_rows, columns, companies, settings.stage1.company_as_feature)
+    forecast_x = stage1_features(forecast_rows, columns, companies,
+                                 settings.stage1.company_as_feature)
+    show_stage1_rows(origin, train_rows, forecast_rows, train_x)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -584,6 +609,19 @@ def show_table(table, panel):
         return
     print("        one labelled, paid row:")
     print(paid_rows.iloc[0].to_string())
+
+
+def show_stage1_rows(origin, train_rows, forecast_rows, train_x):
+    """A short printout of step 12's rows and model input."""
+    print(f"Step 12: stage 1 at forecast week {origin}: {len(train_rows):,} training rows "
+          f"(labelled, target week <= {origin}; {train_rows['paid'].astype(bool).mean():.1%} "
+          f"paid), {len(forecast_rows):,} forecast rows (origin {origin}, "
+          f"{forecast_rows['key'].nunique():,} customers x h)")
+    kinds = train_x.dtypes.astype(str).value_counts().to_dict()
+    print(f"        model input: {train_x.shape[1]} columns {kinds}; columns with NaN: "
+          f"{int(train_x.isna().any().sum())}")
+    if "company_code" in train_x.columns:
+        print(f"        company_code categories: {list(train_x['company_code'].cat.categories)}")
 
 
 if __name__ == "__main__":

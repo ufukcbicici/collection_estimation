@@ -1,4 +1,5 @@
-"""Tests for `hurdle/training_table.py`: `join_features` and `check_no_shared_columns`.
+"""Tests for `hurdle/training_table.py`: `join_features` and `check_no_shared_columns`; and
+the row filters `rows_known_at` / `rows_at_origin` and `block_feature_columns` (at the end).
 
 `join_features(panel, history, calendar, owed)` left-joins the three feature blocks onto the
 panel (from `add_deflated_label`): history on (key, origin_week), the calendar on its `week`
@@ -46,7 +47,13 @@ from collection_estimation.hurdle.series import (
     week_numbers,
     weekly_amounts,
 )
-from collection_estimation.hurdle.training_table import check_no_shared_columns, join_features
+from collection_estimation.hurdle.training_table import (
+    block_feature_columns,
+    check_no_shared_columns,
+    join_features,
+    rows_at_origin,
+    rows_known_at,
+)
 from tests.hurdle.workbooks import SYNTHETIC_HOLIDAYS
 
 nan = float("nan")
@@ -1051,3 +1058,302 @@ def test_leak_with_a_file_day_missing_after_t_only_labels_move():
     new_up = new[new["origin_week"] <= T].reset_index(drop=True)
     pd.testing.assert_frame_equal(old_up[keep], new_up[keep])
     assert (new.loc[new["target_week"] == 10, "label_status"] == "missing_week").all()
+
+
+
+# --- block_feature_columns, rows_known_at, rows_at_origin (U10.1) --------------------------
+
+def test_block_feature_columns_of_the_hand_blocks():
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed())
+    assert columns == {"history": HISTORY_FEATURES, "calendar": CALENDAR_FEATURES,
+                       "receivables": OWED_FEATURES}
+
+
+def test_block_feature_columns_keys_are_the_three_blocks_in_order():
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed())
+    assert list(columns) == ["history", "calendar", "receivables"]
+    assert all(type(value) is list for value in columns.values())
+
+
+def test_block_feature_columns_keep_each_blocks_column_order():
+    history = hand_history()[["observed_weeks_4", "key", "mean_receipts_4", "origin_week",
+                              "customer_age_weeks", "weeks_since_last_payment"]]
+    calendar = hand_calendar()[["has_mid_month", "week", "business_days", "has_month_end",
+                                "has_quarter_end", "holidays_week_before"]]
+    owed = hand_owed()[["usual_delay_days", "h", "key", "open_invoices", "origin_week",
+                        "due_in_target_week"]]
+    columns = block_feature_columns(history, calendar, owed)
+    assert columns["history"] == ["observed_weeks_4", "mean_receipts_4", "customer_age_weeks",
+                                  "weeks_since_last_payment"]
+    assert columns["calendar"] == ["has_mid_month", "business_days", "has_month_end",
+                                   "has_quarter_end", "holidays_week_before"]
+    assert columns["receivables"] == ["usual_delay_days", "open_invoices", "due_in_target_week"]
+
+
+def test_block_feature_columns_drop_only_each_blocks_own_join_keys():
+    # history's join keys are key and origin_week; an "h" or "week" column in it is a feature
+    # by this function (join_features would refuse "h" as shared with the panel).
+    history = hand_history().assign(week=1, h=2)
+    calendar = hand_calendar().assign(key="x", origin_week=0)
+    owed = hand_owed().assign(week=3)
+    columns = block_feature_columns(history, calendar, owed)
+    assert columns["history"] == HISTORY_FEATURES + ["week", "h"]
+    assert columns["calendar"] == CALENDAR_FEATURES + ["key", "origin_week"]
+    assert columns["receivables"] == OWED_FEATURES + ["week"]
+
+
+def test_block_feature_columns_of_blocks_with_only_join_keys_are_empty():
+    columns = block_feature_columns(hand_history()[["key", "origin_week"]],
+                                    hand_calendar()[["week"]],
+                                    hand_owed()[["key", "origin_week", "h"]])
+    assert columns == {"history": [], "calendar": [], "receivables": []}
+
+
+def test_block_feature_columns_does_not_change_its_inputs():
+    blocks = (hand_history(), hand_calendar(), hand_owed())
+    copies = [block.copy(deep=True) for block in blocks]
+    block_feature_columns(*blocks)
+    for block, copy in zip(blocks, copies):
+        pd.testing.assert_frame_equal(block, copy)
+
+
+def test_block_feature_columns_with_the_join_are_exactly_the_tables_extra_columns():
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed())
+    table = joined()
+    extra = [c for c in table.columns if c not in hand_panel().columns]
+    assert extra == columns["history"] + columns["calendar"] + columns["receivables"]
+
+
+# A grid table: one key, origins 30..45, h = 1..5, the last week 42 and a missing week 38.
+# label_status follows the panel's rules: future if target > 42, missing_week if target is
+# 38, labelled otherwise. Every row carries a feature f naming it (100 * origin + h).
+GRID_LAST_WEEK = 42
+GRID_MISSING_WEEK = 38
+
+
+def grid_table(index=None):
+    rows = [(t, h) for t in range(30, 46) for h in range(1, 6)]
+    table = pd.DataFrame({
+        "key": pd.Series(["TR02-A"] * len(rows), dtype=object),
+        "company_code": pd.Series(["TR02"] * len(rows), dtype=object),
+        "origin_week": pd.Series([t for t, _ in rows], dtype="int64"),
+        "h": pd.Series([h for _, h in rows], dtype="int64"),
+    })
+    table["target_week"] = (table["origin_week"] + table["h"]).astype("int64")
+    status = []
+    for target in table["target_week"]:
+        if target > GRID_LAST_WEEK:
+            status.append("future")
+        elif target == GRID_MISSING_WEEK:
+            status.append("missing_week")
+        else:
+            status.append("labelled")
+    table["label_status"] = pd.Series(status, dtype=object)
+    labelled = table["label_status"] == "labelled"
+    table["amount"] = np.where(labelled, 10.0 * table["origin_week"], np.nan)
+    table["paid"] = pd.array([True if s == "labelled" else None for s in status],
+                             dtype="boolean")
+    table["f"] = (100 * table["origin_week"] + table["h"]).astype("float64")
+    if index is not None:
+        table.index = index
+    return table
+
+
+def pairs(rows):
+    return set(zip(rows["origin_week"].tolist(), rows["h"].tolist()))
+
+
+def test_rows_known_at_t36_h5_is_out_and_t35_h5_is_in():
+    rows = rows_known_at(grid_table(), 40)
+    assert (35, 5) in pairs(rows)        # target 40 = T: its week has ended
+    assert (36, 5) not in pairs(rows)    # target 41 > T
+    assert (36, 4) in pairs(rows)
+    assert (39, 1) in pairs(rows)
+    assert (40, 1) not in pairs(rows)    # target 41
+
+
+def test_rows_known_at_is_exactly_the_labelled_rows_with_target_at_most_t():
+    rows = rows_known_at(grid_table(), 40)
+    expected = {(t, h) for t in range(30, 46) for h in range(1, 6)
+                if t + h <= 40 and t + h != GRID_MISSING_WEEK}
+    assert pairs(rows) == expected
+    assert (rows["target_week"] <= 40).all()
+    assert (rows["label_status"] == "labelled").all()
+
+
+@pytest.mark.parametrize("origin", [30, 31, 35, 38, 39, 40, 41, 42, 45, 60])
+def test_rows_known_at_follows_t_plus_h_at_most_t_for_every_origin(origin):
+    rows = rows_known_at(grid_table(), origin)
+    expected = {(t, h) for t in range(30, 46) for h in range(1, 6)
+                if t + h <= min(origin, GRID_LAST_WEEK) and t + h != GRID_MISSING_WEEK}
+    assert pairs(rows) == expected
+
+
+def test_rows_known_at_never_takes_missing_week_or_future_rows():
+    for origin in (35, 40, 42, 50, 100):
+        rows = rows_known_at(grid_table(), origin)
+        assert not rows["label_status"].isin(["missing_week", "future"]).any()
+        assert GRID_MISSING_WEEK not in set(rows["target_week"])
+        assert rows["paid"].notna().all()
+        assert rows["amount"].notna().all()
+
+
+def test_rows_known_at_a_late_origin_still_excludes_future_rows():
+    # T = 100: every target <= 100, but the future rows (target > last week 42) carry no label.
+    rows = rows_known_at(grid_table(), 100)
+    assert rows["target_week"].max() == GRID_LAST_WEEK
+
+
+def test_rows_known_at_before_any_target_is_empty_with_every_column():
+    table = grid_table()
+    rows = rows_known_at(table, 30)     # smallest target is 31
+    assert len(rows) == 0
+    assert list(rows.columns) == list(table.columns)
+    assert rows.dtypes.to_dict() == table.dtypes.to_dict()
+
+
+def test_rows_known_at_includes_rows_whose_origin_is_before_t_but_not_t_itself_at_h1():
+    rows = rows_known_at(grid_table(), 40)
+    assert set(rows["origin_week"]) == set(range(30, 40))
+
+
+def test_rows_known_at_keeps_the_index_and_the_order():
+    index = pd.Index(range(1000, 1000 - 80, -1))
+    table = grid_table(index=index)
+    rows = rows_known_at(table, 40)
+    expected = table[(table["label_status"] == "labelled") & (table["target_week"] <= 40)]
+    pd.testing.assert_frame_equal(rows, expected)
+    assert list(rows.index) == [i for i in index
+                                if table.loc[i, "label_status"] == "labelled"
+                                and table.loc[i, "target_week"] <= 40]
+
+
+def test_rows_known_at_keeps_every_column_and_value():
+    table = grid_table()
+    rows = rows_known_at(table, 40)
+    pd.testing.assert_frame_equal(rows, table.loc[rows.index])
+    assert (rows["f"] == 100 * rows["origin_week"] + rows["h"]).all()
+
+
+def test_rows_known_at_does_not_change_its_input():
+    table = grid_table()
+    copy = table.copy(deep=True)
+    rows_known_at(table, 40)
+    pd.testing.assert_frame_equal(table, copy)
+
+
+def test_rows_known_at_label_status_is_compared_exactly():
+    table = grid_table()
+    table.loc[0, "label_status"] = "Labelled"
+    rows = rows_known_at(table, 40)
+    assert 0 not in rows.index
+
+
+def test_rows_at_origin_has_every_h_even_if_the_labels_are_unknown():
+    rows = rows_at_origin(grid_table(), 40)
+    assert rows["h"].tolist() == [1, 2, 3, 4, 5]
+    assert (rows["origin_week"] == 40).all()
+    # Targets 41, 42 are labelled in the table, 43..45 are future: all are forecast rows.
+    assert rows["label_status"].tolist() == ["labelled", "labelled", "future", "future",
+                                             "future"]
+
+
+def test_rows_at_origin_keeps_missing_week_rows():
+    rows = rows_at_origin(grid_table(), 35)     # h = 3 reaches the missing week 38
+    assert rows["h"].tolist() == [1, 2, 3, 4, 5]
+    assert rows.loc[rows["h"] == 3, "label_status"].tolist() == ["missing_week"]
+
+
+def test_rows_at_origin_after_the_last_week_takes_future_rows():
+    rows = rows_at_origin(grid_table(), 45)
+    assert len(rows) == 5
+    assert (rows["label_status"] == "future").all()
+    assert rows["paid"].isna().all()
+
+
+def test_rows_at_origin_with_no_such_origin_is_empty_with_every_column():
+    table = grid_table()
+    rows = rows_at_origin(table, 99)
+    assert len(rows) == 0
+    assert list(rows.columns) == list(table.columns)
+
+
+def test_rows_at_origin_keeps_the_index_and_values():
+    index = pd.Index([f"r{i}" for i in range(80)])
+    table = grid_table(index=index)
+    rows = rows_at_origin(table, 40)
+    pd.testing.assert_frame_equal(rows, table[table["origin_week"] == 40])
+    assert list(rows.index) == ["r50", "r51", "r52", "r53", "r54"]
+
+
+def test_rows_at_origin_does_not_change_its_input():
+    table = grid_table()
+    copy = table.copy(deep=True)
+    rows_at_origin(table, 40)
+    pd.testing.assert_frame_equal(table, copy)
+
+
+def test_rows_at_origin_and_rows_known_at_never_share_a_row():
+    # A training row's target has ended by T; a forecast row's target is after T.
+    table = grid_table()
+    for origin in range(30, 46):
+        known = rows_known_at(table, origin)
+        forecast = rows_at_origin(table, origin)
+        assert not set(known.index) & set(forecast.index), origin
+        assert (forecast["target_week"] > origin).all()
+
+
+def test_rows_at_origin_takes_every_key_at_that_origin():
+    table = pd.concat([grid_table(), grid_table().assign(key="TR04-B", company_code="TR04")],
+                      ignore_index=True)
+    rows = rows_at_origin(table, 40)
+    assert len(rows) == 10
+    assert sorted(set(rows["key"])) == ["TR02-A", "TR04-B"]
+
+
+# --- end to end, on the chain of the leak test ---------------------------------------------
+
+def test_chain_block_feature_columns_are_the_tables_feature_columns(base):
+    columns = block_feature_columns(base["history"], base["calendar"], base["owed"])
+    table = base["table"]
+    features = columns["history"] + columns["calendar"] + columns["receivables"]
+    assert features == [c for c in table.columns if c not in base["panel"].columns]
+    for name in ("key", "origin_week", "h", "target_week", "week"):
+        assert name not in features
+
+
+def test_chain_rows_known_at_t(base):
+    table = base["table"]
+    rows = rows_known_at(table, T)
+    assert len(rows) > 0
+    assert (rows["target_week"] <= T).all()
+    assert (rows["label_status"] == "labelled").all()
+    assert rows["paid"].notna().all()
+    expected = table[(table["label_status"] == "labelled") & (table["target_week"] <= T)]
+    pd.testing.assert_frame_equal(rows, expected)
+
+
+def test_chain_rows_known_at_t_do_not_move_when_the_data_after_t_changes(base, altered):
+    # The leak test for the training rows: changing every receipt and ledger line after T
+    # leaves the rows a model fitted at T learns from exactly as they were.
+    old = rows_known_at(base["table"], T).reset_index(drop=True)
+    new = rows_known_at(altered["table"], T).reset_index(drop=True)
+    pd.testing.assert_frame_equal(old, new)
+
+
+def test_chain_rows_at_origin_has_every_known_key_times_every_h(base):
+    rows = rows_at_origin(base["table"], T)
+    known = base["known"]
+    keys = set(known.loc[known["known_week"] <= T, "key"])
+    assert set(rows["key"]) == keys
+    assert len(rows) == len(keys) * HORIZONS
+    assert sorted(rows.groupby("key")["h"].apply(sorted).tolist()) == [
+        list(range(1, HORIZONS + 1))] * len(keys)
+
+
+def test_chain_rows_at_origin_features_do_not_move_when_the_data_after_t_changes(base, altered):
+    old = rows_at_origin(base["table"], T).reset_index(drop=True)
+    new = rows_at_origin(altered["table"], T).reset_index(drop=True)
+    allowed = LABEL_COLUMNS + ["label_status"]
+    keep = [c for c in old.columns if c not in allowed]
+    pd.testing.assert_frame_equal(old[keep], new[keep])
