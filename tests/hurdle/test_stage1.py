@@ -1,5 +1,6 @@
 """Tests for `hurdle/stage1.py`: U10.1 (`NOT_FEATURES`, `feature_columns`,
-`stage1_features`) and, at the end, U10.2 (`fit_stage1`, `predict_paid`).
+`stage1_features`), U10.2 (`fit_stage1`, `predict_paid`) and, at the end, U10.3
+(`check_labels`, `is_amount_column`, `signed_log1p`, `fit_stage1_baseline`).
 
 `feature_columns(block_columns, blocks)` gives ["h"] + the columns of each block in the order
 of `blocks`, and raises ValueError for an unknown block (checked first) or for a column in
@@ -538,11 +539,12 @@ from collection_estimation.hurdle.stage1 import fit_stage1, predict_paid  # noqa
 
 
 def stage1_settings(max_iter=10, learning_rate=0.1, max_leaf_nodes=7, min_samples_leaf=5,
-                    random_seed=3):
+                    random_seed=3, baseline_c=1.0):
     return Stage1Settings(max_iter=max_iter, learning_rate=learning_rate,
                           max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
                           random_seed=random_seed, feature_blocks=FEATURE_BLOCKS,
-                          company_as_feature=True, diagnose_class_weights=False)
+                          company_as_feature=True, diagnose_class_weights=False,
+                          baseline_c=baseline_c)
 
 
 def synthetic_xy(n=400, seed=0, signal=True, share=0.3, company=True, index_offset=1000):
@@ -873,3 +875,843 @@ def test_no_class_weights_keep_mean_p_at_the_share_paid_with_a_signal_too():
     x, paid = synthetic_xy(n=2000, seed=13, share=0.1)
     plain = predict_paid(fit_stage1(x, paid, stage1_settings(max_iter=30)), x)
     assert abs(plain.mean() - paid.mean()) < 0.01
+
+
+# --- U10.3: check_labels, is_amount_column, signed_log1p, fit_stage1_baseline -------------
+
+import warnings  # noqa: E402
+
+from sklearn.compose import ColumnTransformer  # noqa: E402
+from sklearn.exceptions import ConvergenceWarning  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.pipeline import Pipeline  # noqa: E402
+
+from collection_estimation.hurdle import stage1 as stage1_module  # noqa: E402
+from collection_estimation.hurdle.features_receivables import NON_AMOUNT_COLUMNS  # noqa: E402
+from collection_estimation.hurdle.stage1 import (  # noqa: E402
+    AMOUNT_COLUMNS,
+    AMOUNT_PATTERN,
+    check_labels,
+    fit_stage1_baseline,
+    is_amount_column,
+    signed_log1p,
+)
+
+
+# check_labels: what it returns
+
+def test_check_labels_returns_bool_on_the_same_index():
+    x, paid = synthetic_xy()
+    result = check_labels(x, paid)
+    assert result.dtype == bool
+    pd.testing.assert_index_equal(result.index, x.index)
+    assert result.tolist() == paid.tolist()
+
+
+@pytest.mark.parametrize("dtype", ["boolean", "int64", "float64", "object"])
+def test_check_labels_turns_every_label_dtype_into_bool(dtype):
+    x, paid = synthetic_xy()
+    result = check_labels(x, paid.astype(dtype))
+    assert result.dtype == bool
+    assert result.tolist() == paid.tolist()
+
+
+def test_check_labels_keeps_the_name():
+    x, paid = synthetic_xy()
+    assert check_labels(x, paid).name == "paid"
+
+
+def test_check_labels_does_not_change_its_inputs():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    x_copy, paid_copy = x.copy(deep=True), paid.copy(deep=True)
+    check_labels(x, paid)
+    pd.testing.assert_frame_equal(x, x_copy)
+    pd.testing.assert_series_equal(paid, paid_copy)
+
+
+def test_check_labels_two_rows_one_of_each_is_enough():
+    x, _ = synthetic_xy(n=2)
+    paid = pd.Series([True, False], index=x.index)
+    assert check_labels(x, paid).tolist() == [True, False]
+
+
+# check_labels: the guards, with the same messages fit_stage1 had
+
+def test_check_labels_index_mismatch_exact_message():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError) as error:
+        check_labels(x, paid.reset_index(drop=True))
+    assert str(error.value) == "paid and train_x must have the same rows (the same index)"
+
+
+def test_check_labels_same_rows_in_another_order_is_a_mismatch():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError, match=r"the same rows \(the same index\)"):
+        check_labels(x, paid.iloc[::-1])
+
+
+def test_check_labels_different_lengths_is_a_mismatch():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError, match=r"the same rows \(the same index\)"):
+        check_labels(x, paid.iloc[:-1])
+
+
+def test_check_labels_na_exact_message():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    paid.iloc[[3, 8, 9]] = pd.NA
+    with pytest.raises(ValueError) as error:
+        check_labels(x, paid)
+    assert str(error.value) == "paid has 3 missing values: training rows must all be labelled"
+
+
+def test_check_labels_none_in_object_labels_is_missing():
+    # astype(bool) would turn None into False: the NA check must come first.
+    x, paid = synthetic_xy(n=10)
+    paid = paid.astype(object)
+    paid.iloc[0] = None
+    with pytest.raises(ValueError, match="paid has 1 missing values"):
+        check_labels(x, paid)
+
+
+def test_check_labels_nan_in_float_labels_is_missing():
+    # astype(bool) would turn NaN into True: the NA check must come first.
+    x, paid = synthetic_xy(n=10)
+    paid = paid.astype("float64")
+    paid.iloc[0] = np.nan
+    with pytest.raises(ValueError, match="paid has 1 missing values"):
+        check_labels(x, paid)
+
+
+def test_check_labels_index_is_checked_before_na():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    paid.iloc[0] = pd.NA
+    with pytest.raises(ValueError, match="the same index"):
+        check_labels(x, paid.reset_index(drop=True))
+
+
+def test_check_labels_na_is_checked_before_one_class():
+    x, _ = synthetic_xy(n=5)
+    paid = pd.array([True, True, None, True, True], dtype="boolean")
+    with pytest.raises(ValueError, match="missing values"):
+        check_labels(x, pd.Series(paid, index=x.index))
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_check_labels_one_class_exact_message(value):
+    x, _ = synthetic_xy(n=30)
+    with pytest.raises(ValueError) as error:
+        check_labels(x, pd.Series(value, index=x.index))
+    assert str(error.value) == (f"paid is {value} in every row; the classifier needs both "
+                                f"outcomes")
+
+
+def test_check_labels_one_class_given_as_ints_names_the_bool():
+    x, _ = synthetic_xy(n=30)
+    with pytest.raises(ValueError) as error:
+        check_labels(x, pd.Series(0, index=x.index))
+    assert str(error.value) == "paid is False in every row; the classifier needs both outcomes"
+
+
+def test_check_labels_one_row_is_one_class():
+    x, _ = synthetic_xy(n=1)
+    with pytest.raises(ValueError, match="paid is True in every row"):
+        check_labels(x, pd.Series([True], index=x.index))
+
+
+def test_check_labels_empty_exact_message():
+    x, paid = synthetic_xy(n=10)
+    with pytest.raises(ValueError) as error:
+        check_labels(x.iloc[0:0], paid.iloc[0:0])
+    assert str(error.value) == "paid is empty in every row; the classifier needs both outcomes"
+
+
+# Both fits run check_labels, and with its result.
+
+@pytest.mark.parametrize("fit", [fit_stage1, fit_stage1_baseline],
+                         ids=["fit_stage1", "fit_stage1_baseline"])
+def test_both_fits_call_check_labels(monkeypatch, fit):
+    x, paid = synthetic_xy()
+    calls = []
+
+    def fake_check_labels(train_x, labels):
+        calls.append((train_x, labels))
+        raise RuntimeError("check_labels was called")
+
+    monkeypatch.setattr(stage1_module, "check_labels", fake_check_labels)
+    with pytest.raises(RuntimeError, match="check_labels was called"):
+        fit(x, paid, stage1_settings())
+    assert len(calls) == 1
+    assert calls[0][0] is x and calls[0][1] is paid
+
+
+@pytest.mark.parametrize("fit", [fit_stage1, fit_stage1_baseline],
+                         ids=["fit_stage1", "fit_stage1_baseline"])
+def test_both_fits_learn_from_what_check_labels_returns(monkeypatch, fit):
+    # check_labels' result is what is fitted on: replace it by its opposite and the model's
+    # p ranks the rows the other way round.
+    x, paid = synthetic_xy(n=600)
+    real = stage1_module.check_labels
+    monkeypatch.setattr(stage1_module, "check_labels", lambda tx, labels: ~real(tx, labels))
+    p = predict_paid(fit(x, paid, stage1_settings(max_iter=30)), x)
+    assert roc_auc_score(paid, p) < 0.1
+
+
+@pytest.mark.parametrize("fit", [fit_stage1, fit_stage1_baseline],
+                         ids=["fit_stage1", "fit_stage1_baseline"])
+@pytest.mark.parametrize("case", ["mismatch", "na", "one_class", "empty"])
+def test_both_fits_raise_the_check_labels_messages(fit, case):
+    x, paid = synthetic_xy(n=40)
+    if case == "mismatch":
+        paid = paid.reset_index(drop=True)
+    elif case == "na":
+        paid = paid.astype("boolean")
+        paid.iloc[0] = pd.NA
+    elif case == "one_class":
+        paid = pd.Series(True, index=x.index)
+    else:
+        x, paid = x.iloc[0:0], paid.iloc[0:0]
+    with pytest.raises(ValueError) as expected:
+        check_labels(x, paid)
+    with pytest.raises(ValueError) as error:
+        fit(x, paid, stage1_settings())
+    assert str(error.value) == str(expected.value)
+
+
+# is_amount_column
+
+def test_amount_columns_is_the_documented_set():
+    assert AMOUNT_COLUMNS == {"last_payment_amount", "due_before_target_week",
+                              "due_in_target_week", "due_after_target_week", "unapplied_cash",
+                              "open_balance"}
+
+
+@pytest.mark.parametrize("column", [
+    "last_payment_amount", "due_before_target_week", "due_in_target_week",
+    "due_after_target_week", "unapplied_cash", "open_balance",
+    "mean_receipts_4", "mean_receipts_13", "mean_receipts_52", "mean_receipts_0",
+    "median_payment_52", "median_payment_1",
+    "overdue_up_to_30", "overdue_up_to_1", "overdue_31_to_90", "overdue_91_to_180",
+    "overdue_over_90", "overdue_over_365",
+])
+def test_is_amount_column_true_for_amounts(column):
+    assert is_amount_column(column) is True
+
+
+@pytest.mark.parametrize("column", [
+    # numbers of days, counts, weeks, flags, the horizon and the company
+    "overdue_days", "observed_weeks_4", "observed_weeks_52", "paying_weeks_4",
+    "paying_weeks_13", "weeks_since_last_payment", "customer_age_weeks", "h",
+    "business_days", "has_month_end", "has_mid_month", "has_quarter_end",
+    "holidays_week_before", "open_invoices", "cleared_invoices", "usual_delay_days",
+    "company_code",
+    # the receivables' intermediate columns, which are not features
+    "overdue", "due_later",
+    # near misses: a missing number, a missing part, a prefix or a suffix
+    "mean_receipts_", "mean_receipts", "median_payment_", "overdue_up_to_", "overdue_over_",
+    "overdue_30_to", "overdue_30_to_", "overdue__to_90", "overdue_to_90", "overdue_30_90",
+    "overdue_a_to_b", "mean_receipts_4x", "xmean_receipts_4", "mean_receipts_4_",
+    "mean_receipts_-4", "mean_receipts_4.0", "mean_receipts_ 4", "overdue_31_to_90_days",
+    "old_overdue_over_90", "open_balance_", "_open_balance", "open_balance2",
+    "Open_balance", "OPEN_BALANCE", " open_balance", "open_balance ",
+    "mean_receipts_4\n", "open_balance\n", "Mean_receipts_4", "mean_receipts_4|h",
+    "",
+])
+def test_is_amount_column_false_for_everything_else(column):
+    assert is_amount_column(column) is False
+
+
+def test_amount_pattern_must_match_the_whole_name():
+    # The pattern is used with fullmatch: a search or a match would accept these.
+    assert AMOUNT_PATTERN.search("old_mean_receipts_4") is not None
+    assert AMOUNT_PATTERN.match("mean_receipts_4_extra") is not None
+    assert is_amount_column("old_mean_receipts_4") is False
+    assert is_amount_column("mean_receipts_4_extra") is False
+
+
+def test_is_amount_column_on_the_chain_columns(chain):
+    # Every feature column the real chain makes, classified: amounts are TRY, the rest are
+    # counts, days, weeks or flags.
+    from tests.hurdle.test_training_table import AGE_EDGES, WINDOWS
+    columns = chain_columns(chain)
+    amounts = [column for column in columns if is_amount_column(column)]
+    expected = ({"last_payment_amount", f"median_payment_{max(WINDOWS)}",
+                 "due_before_target_week", "due_in_target_week", "due_after_target_week",
+                 "unapplied_cash", "open_balance"}
+                | {f"mean_receipts_{window}" for window in WINDOWS}
+                | {f"overdue_up_to_{AGE_EDGES[0]}", f"overdue_{AGE_EDGES[0] + 1}_to_{AGE_EDGES[1]}",
+                   f"overdue_over_{AGE_EDGES[1]}"})
+    assert set(amounts) == expected
+    assert len(amounts) == len(expected)
+
+
+def test_is_amount_column_agrees_with_what_the_receivables_block_deflates(chain):
+    # features_receivables deflates every column but NON_AMOUNT_COLUMNS: the baseline's
+    # log-scaling must pick exactly the deflated ones.
+    receivables = [column for column in chain_columns(chain, ("receivables",)) if column != "h"]
+    assert receivables, "the chain has no receivables columns"
+    for column in receivables:
+        assert is_amount_column(column) == (column not in NON_AMOUNT_COLUMNS), column
+
+
+# signed_log1p
+
+def test_signed_log1p_values():
+    values = np.array([0.0, 1.0, -1.0, np.e - 1, -(np.e - 1), 1e6, -1e6])
+    expected = np.array([0.0, np.log(2), -np.log(2), 1.0, -1.0, np.log1p(1e6), -np.log1p(1e6)])
+    np.testing.assert_allclose(signed_log1p(values), expected, rtol=1e-15, atol=0)
+
+
+def test_signed_log1p_zero_stays_zero():
+    assert signed_log1p(0.0) == 0.0
+    assert signed_log1p(np.array([0.0, -0.0])).tolist() == [0.0, 0.0]
+
+
+def test_signed_log1p_nan_stays_nan():
+    result = signed_log1p(np.array([np.nan, 1.0, np.nan]))
+    assert np.isnan(result[0]) and np.isnan(result[2])
+    assert result[1] == np.log(2)
+
+
+def test_signed_log1p_infinities_keep_their_sign():
+    assert signed_log1p(np.array([np.inf, -np.inf])).tolist() == [np.inf, -np.inf]
+
+
+def test_signed_log1p_is_odd_and_increasing():
+    values = np.linspace(-1e7, 1e7, 2001)
+    result = signed_log1p(values)
+    np.testing.assert_array_equal(signed_log1p(-values), -result)
+    assert (np.diff(result) > 0).all()
+
+
+def test_signed_log1p_keeps_tiny_values_exact_enough():
+    # log1p, not log(1 + x): for tiny x the result is ~x, not 0.
+    assert signed_log1p(np.array([1e-20]))[0] == pytest.approx(1e-20, rel=1e-12)
+    assert signed_log1p(np.array([-1e-20]))[0] == pytest.approx(-1e-20, rel=1e-12)
+
+
+def test_signed_log1p_on_a_dataframe_keeps_index_and_columns():
+    frame = pd.DataFrame({"a": [0.0, 9.0, np.nan], "b": [-9.0, 99.0, 0.5]}, index=[7, 3, 5])
+    result = signed_log1p(frame)
+    assert isinstance(result, pd.DataFrame)
+    pd.testing.assert_index_equal(result.index, frame.index)
+    pd.testing.assert_index_equal(result.columns, frame.columns)
+    np.testing.assert_allclose(result.to_numpy(),
+                               [[0.0, -np.log(10)], [np.log(10), np.log(100)],
+                                [np.nan, np.log1p(0.5)]], rtol=1e-15)
+
+
+def test_signed_log1p_on_a_series_keeps_the_index():
+    series = pd.Series([-3.0, 3.0], index=["x", "y"])
+    result = signed_log1p(series)
+    assert isinstance(result, pd.Series)
+    assert list(result.index) == ["x", "y"]
+    assert result.tolist() == [-np.log(4), np.log(4)]
+
+
+def test_signed_log1p_does_not_change_its_input():
+    frame = pd.DataFrame({"a": [-5.0, 0.0, np.nan, 1e9]})
+    copy = frame.copy(deep=True)
+    signed_log1p(frame)
+    pd.testing.assert_frame_equal(frame, copy)
+    array = np.array([-5.0, 2.0])
+    signed_log1p(array)
+    assert array.tolist() == [-5.0, 2.0]
+
+
+# fit_stage1_baseline: a small, realistic input
+
+COMPANY_CATEGORIES = ["TR02", "TR04", "TR05", "TR06", "TR91"]
+
+
+def baseline_xy(n=1500, seed=0, company=True, receivables=True, signal="amount",
+                company_codes=("TR02", "TR04")):
+    """Columns as stage1_features gives them: h; history (mean_receipts_4: lognormal TRY,
+    NaN for a never-paying fifth; paying_weeks_4: a count; weeks_since_last_payment: NaN
+    where never paid); calendar (has_month_end 0/1); receivables (open_balance with a few
+    negatives, overdue_days, usual_delay_days with NaN); company_code a categorical.
+
+    signal "amount": paid when mean_receipts_4 is large; "company": TR02 pays 90%, the
+    others 10%; "none": a coin with p 0.3."""
+    rng = np.random.default_rng(seed)
+    never = rng.random(n) < 0.2
+    receipts = rng.lognormal(mean=10, sigma=2, size=n)
+    x = pd.DataFrame({
+        "h": rng.integers(1, 6, size=n).astype("float64"),
+        "mean_receipts_4": np.where(never, np.nan, receipts),
+        "paying_weeks_4": rng.integers(0, 5, size=n).astype("float64"),
+        "weeks_since_last_payment": np.where(never, np.nan,
+                                             rng.integers(0, 30, size=n).astype("float64")),
+        "has_month_end": rng.integers(0, 2, size=n).astype("float64"),
+    })
+    if receivables:
+        x["open_balance"] = rng.lognormal(mean=11, sigma=2, size=n) * np.where(
+            rng.random(n) < 0.05, -1, 1)
+        x["overdue_days"] = rng.integers(0, 200, size=n).astype("float64")
+        x["usual_delay_days"] = np.where(rng.random(n) < 0.3, np.nan,
+                                         rng.normal(20, 10, size=n))
+    codes = rng.choice(list(company_codes), size=n)
+    if company:
+        x["company_code"] = pd.Categorical(codes, categories=COMPANY_CATEGORIES)
+    if signal == "amount":
+        paid = np.where(never, False, receipts > np.quantile(receipts, 0.6))
+    elif signal == "company":
+        paid = np.where(codes == "TR02", rng.random(n) < 0.9, rng.random(n) < 0.1)
+    else:
+        paid = rng.random(n) < 0.3
+    x.index = pd.RangeIndex(500, 500 + n)
+    return x, pd.Series(paid, index=x.index, name="paid")
+
+
+def parts_of(model):
+    """{part name: its columns} of the fitted ColumnTransformer, without the remainder."""
+    prepare = model.named_steps["prepare"]
+    return {name: list(columns) for name, _, columns in prepare.transformers_
+            if name != "remainder"}
+
+
+# fit_stage1_baseline: the structure
+
+def test_baseline_is_a_fitted_pipeline_prepare_then_regression():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    assert isinstance(model, Pipeline)
+    assert list(model.named_steps) == ["prepare", "regression"]
+    assert isinstance(model.named_steps["prepare"], ColumnTransformer)
+    assert isinstance(model.named_steps["regression"], LogisticRegression)
+    assert list(model.feature_names_in_) == list(x.columns)
+    assert list(model.classes_) == [False, True]
+
+
+def test_baseline_sends_each_column_to_the_right_part():
+    x, paid = baseline_xy()
+    parts = parts_of(fit_stage1_baseline(x, paid, stage1_settings()))
+    assert parts == {
+        "amounts": ["mean_receipts_4", "open_balance"],
+        "others": ["h", "paying_weeks_4", "weeks_since_last_payment", "has_month_end",
+                   "overdue_days", "usual_delay_days"],
+        "company": ["company_code"],
+    }
+
+
+def test_baseline_drops_no_column():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    used = [column for columns in parts_of(model).values() for column in columns]
+    assert sorted(used) == sorted(x.columns)
+    assert len(used) == len(set(used))
+
+
+def test_baseline_part_steps():
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    named = model.named_steps["prepare"].named_transformers_
+    amounts = [step for _, step in named["amounts"].steps]
+    assert [type(step) for step in amounts] == [FunctionTransformer, SimpleImputer,
+                                                StandardScaler]
+    assert amounts[0].func is signed_log1p
+    assert amounts[1].strategy == "median" and amounts[1].add_indicator is True
+    others = [step for _, step in named["others"].steps]
+    assert [type(step) for step in others] == [SimpleImputer, StandardScaler]
+    assert others[0].strategy == "median" and others[0].add_indicator is True
+    assert isinstance(named["company"], OneHotEncoder)
+
+
+def test_baseline_without_company_has_no_company_part():
+    x, paid = baseline_xy(company=False)
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    assert "company" not in parts_of(model)
+    assert "company_code" not in model.feature_names_in_
+
+
+def test_baseline_without_receivables_columns():
+    # Only the history and calendar blocks: one amount column, the rest others.
+    x, paid = baseline_xy(receivables=False)
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    parts = parts_of(model)
+    assert parts["amounts"] == ["mean_receipts_4"]
+    assert parts["others"] == ["h", "paying_weeks_4", "weeks_since_last_payment",
+                               "has_month_end"]
+    p = predict_paid(model, x)
+    assert p.between(0, 1).all() and p.notna().all()
+
+
+def test_baseline_with_no_amount_column_at_all():
+    # The calendar block alone: the amounts part is empty and the fit still works.
+    x, paid = baseline_xy(receivables=False, signal="company")
+    x = x[["h", "has_month_end", "company_code"]]
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    assert parts_of(model).get("amounts", []) == []
+    p = predict_paid(model, x)
+    assert p.between(0, 1).all() and p.notna().all()
+
+
+def test_baseline_with_only_h_and_the_company():
+    x, paid = baseline_xy(signal="company")
+    x = x[["h", "company_code"]]
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    assert p.notna().all()
+
+
+# fit_stage1_baseline: what the preparation does to the numbers
+
+def transformed(model, x):
+    return model.named_steps["prepare"].transform(x)
+
+
+def test_baseline_amounts_are_signed_logged_then_standardised():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    # open_balance has no NaN; it is the second amount column (after mean_receipts_4).
+    logged = signed_log1p(x["open_balance"].to_numpy())
+    expected = (logged - logged.mean()) / logged.std()
+    np.testing.assert_allclose(out[:, 1], expected, rtol=1e-9, atol=1e-12)
+
+
+def test_baseline_others_are_not_logged():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    others = parts_of(model)["others"]
+    # the amounts part gives 2 columns + 1 indicator (mean_receipts_4 has NaN)
+    start = 3
+    column = out[:, start + others.index("overdue_days")]
+    raw = x["overdue_days"].to_numpy()
+    np.testing.assert_allclose(column, (raw - raw.mean()) / raw.std(), rtol=1e-9, atol=1e-12)
+
+
+def test_baseline_nan_is_filled_with_the_median_of_the_logged_amount():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    imputer = model.named_steps["prepare"].named_transformers_["amounts"].steps[1][1]
+    logged = signed_log1p(x["mean_receipts_4"].to_numpy())
+    assert imputer.statistics_[0] == pytest.approx(np.nanmedian(logged), rel=1e-12)
+
+
+def test_baseline_adds_a_was_missing_column_for_each_column_with_nan():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    named = model.named_steps["prepare"].named_transformers_
+    amounts, others = parts_of(model)["amounts"], parts_of(model)["others"]
+    amount_flags = [amounts[i] for i in named["amounts"].steps[1][1].indicator_.features_]
+    other_flags = [others[i] for i in named["others"].steps[0][1].indicator_.features_]
+    assert amount_flags == ["mean_receipts_4"]
+    assert other_flags == ["weeks_since_last_payment", "usual_delay_days"]
+
+
+def test_baseline_was_missing_column_marks_exactly_the_nan_rows():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    # amounts: [mean_receipts_4, open_balance, missing(mean_receipts_4)], standardised.
+    flag = out[:, 2]
+    missing = x["mean_receipts_4"].isna().to_numpy()
+    assert len(np.unique(flag)) == 2
+    assert (flag[missing] > flag[~missing].max()).all()
+
+
+def test_baseline_no_nan_means_no_was_missing_column():
+    x, paid = baseline_xy()
+    x = x.fillna(0.0)
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    n_numeric = len(x.columns) - 1   # all but company_code
+    assert out.shape[1] == n_numeric + len(COMPANY_CATEGORIES)
+
+
+def test_baseline_output_width_counts_columns_flags_and_companies():
+    x, paid = baseline_xy()
+    out = transformed(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    # 8 numeric columns + 3 was-missing flags + 5 companies
+    assert out.shape == (len(x), 8 + 3 + 5)
+
+
+def test_baseline_nan_at_prediction_in_a_column_without_nan_in_training():
+    # No indicator was made for open_balance; a NaN later is still filled, not an error.
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    new = x.copy()
+    new.loc[new.index[:5], "open_balance"] = np.nan
+    p = predict_paid(model, new)
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+def test_baseline_a_column_with_nan_only_in_training_still_fits_and_predicts():
+    x, paid = baseline_xy()
+    x["usual_delay_days"] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)   # sklearn: "Skipping features ..."
+        model = fit_stage1_baseline(x, paid, stage1_settings())
+        p = predict_paid(model, x)
+        new = x.assign(usual_delay_days=12.0)
+        q = predict_paid(model, new)
+    assert p.notna().all() and q.notna().all()
+
+
+def test_baseline_accepts_nan_and_predicts_finite_probabilities():
+    x, paid = baseline_xy()
+    assert x.isna().any().any()
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+# fit_stage1_baseline: the company one-hot
+
+def test_baseline_company_one_hot_has_every_category_even_if_unseen():
+    x, paid = baseline_xy(company_codes=("TR02", "TR04"))
+    assert set(x["company_code"].unique()) == {"TR02", "TR04"}
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    encoder = model.named_steps["prepare"].named_transformers_["company"]
+    assert [list(c) for c in encoder.categories_] == [COMPANY_CATEGORIES]
+
+
+def test_baseline_predicts_a_company_unseen_in_training():
+    x, paid = baseline_xy(company_codes=("TR02", "TR04"))
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    new = x.iloc[:6].copy()
+    new["company_code"] = pd.Categorical(["TR05", "TR06", "TR91", "TR05", "TR06", "TR91"],
+                                         categories=COMPANY_CATEGORIES)
+    p = predict_paid(model, new)
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+def test_baseline_company_columns_are_one_hot_in_category_order():
+    x, paid = baseline_xy(company_codes=("TR02", "TR04", "TR91"))
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    one_hot = out[:, -len(COMPANY_CATEGORIES):]
+    assert np.isin(one_hot, [0.0, 1.0]).all()
+    assert (one_hot.sum(axis=1) == 1).all()
+    for position, code in enumerate(COMPANY_CATEGORIES):
+        np.testing.assert_array_equal(one_hot[:, position] == 1,
+                                      (x["company_code"] == code).to_numpy())
+
+
+def test_baseline_company_categories_follow_the_categorical_not_the_rows():
+    x, paid = baseline_xy(company_codes=("TR02", "TR04"))
+    x["company_code"] = pd.Categorical(x["company_code"].astype(str),
+                                       categories=["TR02", "TR04", "ZZ99"])
+    assert x["company_code"].notna().all()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    encoder = model.named_steps["prepare"].named_transformers_["company"]
+    assert [list(c) for c in encoder.categories_] == [["TR02", "TR04", "ZZ99"]]
+
+
+# fit_stage1_baseline: the regression's parameters
+
+def test_baseline_c_comes_from_the_settings():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings(baseline_c=0.37))
+    assert model.named_steps["regression"].C == 0.37
+
+
+def test_baseline_fixed_regression_parameters():
+    x, paid = baseline_xy()
+    regression = fit_stage1_baseline(x, paid, stage1_settings()).named_steps["regression"]
+    assert regression.max_iter == 1000
+    assert regression.class_weight is None
+
+
+def test_baseline_balanced_class_weight_passes_through():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings(), class_weight="balanced")
+    assert model.named_steps["regression"].class_weight == "balanced"
+
+
+def test_baseline_smaller_c_shrinks_the_coefficients():
+    x, paid = baseline_xy()
+    strong = fit_stage1_baseline(x, paid, stage1_settings(baseline_c=1e-3))
+    weak = fit_stage1_baseline(x, paid, stage1_settings(baseline_c=10.0))
+    norm = lambda model: np.abs(model.named_steps["regression"].coef_).sum()  # noqa: E731
+    assert norm(strong) < norm(weak) / 5
+
+
+def test_baseline_ignores_the_hgb_settings():
+    x, paid = baseline_xy()
+    one = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    two = predict_paid(fit_stage1_baseline(x, paid, stage1_settings(
+        max_iter=99, learning_rate=0.9, max_leaf_nodes=2, min_samples_leaf=50,
+        random_seed=123)), x)
+    pd.testing.assert_series_equal(one, two)
+
+
+def test_baseline_balanced_pushes_mean_p_up_unweighted_keeps_it_at_the_share():
+    x, paid = baseline_xy(n=3000, signal="none")
+    plain = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    balanced = predict_paid(fit_stage1_baseline(x, paid, stage1_settings(),
+                                                class_weight="balanced"), x)
+    assert abs(plain.mean() - paid.mean()) < 0.01
+    assert balanced.mean() > paid.mean() + 0.1
+
+
+# fit_stage1_baseline: it learns
+
+def test_baseline_learns_an_amount_signal():
+    x, paid = baseline_xy(n=1500, signal="amount")
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    new_x, new_paid = baseline_xy(n=800, seed=1, signal="amount")
+    assert roc_auc_score(new_paid, predict_paid(model, new_x)) > 0.9
+
+
+def test_baseline_learns_a_signal_carried_only_by_the_company():
+    x, paid = baseline_xy(n=1500, signal="company")
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    codes = x["company_code"].astype(str)
+    assert p[codes == "TR02"].mean() > 0.75
+    assert p[codes == "TR04"].mean() < 0.25
+
+
+def test_baseline_company_signal_is_lost_without_the_company_column():
+    x, paid = baseline_xy(n=1500, signal="company")
+    p = predict_paid(fit_stage1_baseline(x.drop(columns="company_code"), paid,
+                                         stage1_settings()), x.drop(columns="company_code"))
+    codes = x["company_code"].astype(str)
+    assert abs(p[codes == "TR02"].mean() - p[codes == "TR04"].mean()) < 0.1
+
+
+def test_baseline_amount_signal_survives_huge_amounts():
+    # A handful of customers 1e6 times larger than the rest: without the log they would
+    # flatten every other row's standardised value.
+    x, paid = baseline_xy(n=1500, signal="amount")
+    x.loc[x.index[:5], "mean_receipts_4"] *= 1e6
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    assert roc_auc_score(paid, predict_paid(model, x)) > 0.9
+
+
+def test_baseline_no_signal_mean_p_is_the_base_rate():
+    x, paid = baseline_xy(n=3000, signal="none")
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    assert abs(p.mean() - paid.mean()) < 0.01
+
+
+@pytest.mark.parametrize("signal", ["amount", "company", "none"])
+@pytest.mark.parametrize("c", [0.01, 1.0, 100.0])
+def test_baseline_converges_without_a_convergence_warning(signal, c):
+    x, paid = baseline_xy(n=2000, signal=signal)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        model = fit_stage1_baseline(x, paid, stage1_settings(baseline_c=c))
+    assert model.named_steps["regression"].n_iter_.max() < 1000
+
+
+def test_baseline_converges_on_the_chain(chain):
+    from tests.hurdle.test_training_table import T
+    columns = chain_columns(chain)
+    rows = rows_known_at(chain["table"], T)
+    x = stage1_features(rows, columns, COMPANIES, True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        model = fit_stage1_baseline(x, rows["paid"], stage1_settings())
+    forecast = stage1_features(rows_at_origin(chain["table"], T), columns, COMPANIES, True)
+    p = predict_paid(model, forecast)
+    assert p.notna().all() and p.between(0, 1).all()
+    pd.testing.assert_index_equal(p.index, forecast.index)
+
+
+def test_baseline_is_deterministic():
+    x, paid = baseline_xy()
+    one = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    two = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    pd.testing.assert_series_equal(one, two)
+
+
+def test_baseline_does_not_depend_on_the_index():
+    x, paid = baseline_xy()
+    one = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    shifted_x, shifted_paid = x.set_axis(x.index + 10_000), paid.set_axis(paid.index + 10_000)
+    two = predict_paid(fit_stage1_baseline(shifted_x, shifted_paid, stage1_settings()),
+                       shifted_x)
+    np.testing.assert_array_equal(one.to_numpy(), two.to_numpy())
+
+
+# fit_stage1_baseline: the labels it accepts and its inputs
+
+def test_baseline_accepts_nullable_boolean_and_int_labels():
+    x, paid = baseline_xy()
+    plain = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    for labels in (paid.astype("boolean"), paid.astype("int64")):
+        model = fit_stage1_baseline(x, labels, stage1_settings())
+        assert list(model.classes_) == [False, True]
+        pd.testing.assert_series_equal(predict_paid(model, x), plain)
+
+
+def test_baseline_does_not_change_its_inputs():
+    x, paid = baseline_xy()
+    paid = paid.astype("boolean")
+    x_copy, paid_copy = x.copy(deep=True), paid.copy(deep=True)
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    predict_paid(model, x)
+    pd.testing.assert_frame_equal(x, x_copy)
+    pd.testing.assert_series_equal(paid, paid_copy)
+
+
+def test_baseline_index_mismatch_exact_message():
+    x, paid = baseline_xy(n=50)
+    with pytest.raises(ValueError) as error:
+        fit_stage1_baseline(x, paid.reset_index(drop=True), stage1_settings())
+    assert str(error.value) == "paid and train_x must have the same rows (the same index)"
+
+
+def test_baseline_one_class_exact_message():
+    x, _ = baseline_xy(n=50)
+    with pytest.raises(ValueError) as error:
+        fit_stage1_baseline(x, pd.Series(False, index=x.index), stage1_settings())
+    assert str(error.value) == "paid is False in every row; the classifier needs both outcomes"
+
+
+# predict_paid with the baseline Pipeline
+
+def test_predict_paid_on_the_baseline_is_a_series_named_p():
+    x, paid = baseline_xy()
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    assert p.name == "p"
+    assert p.dtype == np.float64
+    pd.testing.assert_index_equal(p.index, x.index)
+    assert ((p >= 0.0) & (p <= 1.0)).all()
+
+
+def test_predict_paid_on_the_baseline_is_the_true_column_of_predict_proba():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    true_column = list(model.classes_).index(True)
+    np.testing.assert_array_equal(predict_paid(model, x).to_numpy(),
+                                  model.predict_proba(x)[:, true_column])
+
+
+def test_predict_paid_on_the_baseline_on_a_shuffled_subset_keeps_each_row():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    full = predict_paid(model, x)
+    part = x.sample(n=40, random_state=3)
+    pd.testing.assert_series_equal(predict_paid(model, part), full.loc[part.index])
+
+
+def test_predict_paid_on_the_baseline_column_order_mismatch_exact_message():
+    x, paid = synthetic_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    with pytest.raises(ValueError) as error:
+        predict_paid(model, x[["s", "h", "z", "company_code"]])
+    assert str(error.value) == ("x has columns ['s', 'h', 'z', 'company_code'], but the model "
+                                "was fitted on ['h', 's', 'z', 'company_code']")
+
+
+def test_predict_paid_on_the_baseline_missing_or_extra_column_raises():
+    x, paid = synthetic_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    with pytest.raises(ValueError, match="but the model was fitted on"):
+        predict_paid(model, x.drop(columns="company_code"))
+    with pytest.raises(ValueError, match="but the model was fitted on"):
+        predict_paid(model, x.assign(extra=1.0))
+
+
+def test_predict_paid_on_the_baseline_does_not_change_x():
+    x, paid = baseline_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    copy = x.copy(deep=True)
+    predict_paid(model, x)
+    pd.testing.assert_frame_equal(x, copy)

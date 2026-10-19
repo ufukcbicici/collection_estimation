@@ -1139,17 +1139,20 @@ def test_step_12_printout_with_no_training_rows_does_not_crash():
     assert lines[-1] == "ok"
 
 
-# Step 12 (U10.2): fit stage 1 at the demo origin, predict its forecast rows, score them.
-# The wiring is checked on main()'s source; the printout runs in a separate process on a
-# hand-made frame with a hand-made p, so every number can be worked out by hand:
-# six forecast rows, of which four are labelled (h=1: paid, not paid; h=2: paid, not paid)
-# with p 0.8, 0.4, 0.6, 0.2; one "missing_week" row (p 0.99) and one "future" row (p 0.01),
-# both with paid = NA, must be left out. Training share paid: 1 of 4 = 0.25.
-#   stage 1:   log loss = -(ln .8 + ln .6)/2 = 0.3670, Brier = (.04+.16+.16+.04)/4 = 0.1,
-#              AUC = 1 (both payers above both non-payers)
-#   base rate: log loss = -(ln .25 + ln .75)/2 = 0.8370, Brier = (.5625+.0625)/2 = 0.3125,
-#              AUC = 0.5
-#   per h:     h=1 mean p 0.6, share paid 0.5; h=2 mean p 0.4, share paid 0.5
+# Step 12 (U10.2, U10.3): fit stage 1 (HGB) and the logistic-regression baseline at the demo
+# origin, predict its forecast rows, score them. The wiring is checked on main()'s source; the
+# printout runs in a separate process on a hand-made frame with hand-made p's, so every number
+# can be worked out by hand: six forecast rows, of which four are labelled (h=1: paid, not
+# paid; h=2: paid, not paid); one "missing_week" row and one "future" row, both with
+# paid = NA, must be left out. Training share paid: 1 of 4 = 0.25.
+# Model A ("stage 1 (HGB)"), p = 0.8, 0.4, [0.99], 0.6, 0.2, [0.01]:
+#   log loss = -(ln .8 + ln .6)/2 = 0.3670, Brier = (.04+.16+.16+.04)/4 = 0.1,
+#   AUC = 1 (both payers above both non-payers); per h: h=1 mean p 0.6, h=2 0.4
+# Model B ("baseline (LR)"), p = 0.3, 0.9, [0.01], 0.6, 0.4, [0.99]:
+#   log loss = -(ln .3 + ln .1 + ln .6 + ln .6)/4 = 1.1321,
+#   Brier = (.49+.81+.16+.16)/4 = 0.405, AUC = 1 of 4 pairs = 0.25; per h: h=1 0.6, h=2 0.5
+# Base rate: log loss = -(ln .25 + ln .75)/2 = 0.8370, Brier = (.5625+.0625)/2 = 0.3125,
+#   AUC = 0.5.  Share paid per h: 0.5, 0.5.
 SCORES_WIRING = """
 import inspect
 import time
@@ -1162,29 +1165,61 @@ assert script.brier_score_loss is sklearn.metrics.brier_score_loss
 assert script.roc_auc_score is sklearn.metrics.roc_auc_score
 from collection_estimation.hurdle import stage1
 assert script.fit_stage1 is stage1.fit_stage1
+assert script.fit_stage1_baseline is stage1.fit_stage1_baseline
 assert script.predict_paid is stage1.predict_paid
-inspect.signature(script.show_stage1_scores).bind("forecast_rows", "p", "train_rows", 1.0)
+inspect.signature(script.show_stage1_scores).bind("forecast_rows", {}, "train_rows", {})
 
 source = " ".join(inspect.getsource(script.main).split())
 steps = [
     "show_stage1_rows(origin, train_rows, forecast_rows, train_x)",
+    "predictions, fit_seconds = {}, {}",
+    ('for name, fit in (("stage 1 (HGB)", fit_stage1), ("baseline (LR)", '
+     'fit_stage1_baseline)):'),
     "started = time.perf_counter()",
-    'stage1 = fit_stage1(train_x, train_rows["paid"], settings.stage1)',
-    "fit_seconds = time.perf_counter() - started",
-    "p = predict_paid(stage1, forecast_x)",
-    "show_stage1_scores(forecast_rows, p, train_rows, fit_seconds)",
+    'model = fit(train_x, train_rows["paid"], settings.stage1)',
+    "fit_seconds[name] = time.perf_counter() - started",
+    "predictions[name] = predict_paid(model, forecast_x)",
+    "show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)",
 ]
 for step in steps:
     assert step in source, step
     assert source.count(step) == 1, step
 positions = [source.index(step) for step in steps]
 assert positions == sorted(positions), positions
-# The fit is timed alone: nothing else between the two clock reads.
+# The old single-model wiring is gone.
+assert "stage1 = fit_stage1(" not in source
+assert "p = predict_paid(stage1" not in source
+# Each fit is timed alone: nothing else between the two clock reads.
 between = source[source.index("started = time.perf_counter()"):
-                 source.index("fit_seconds = time.perf_counter() - started")]
-assert between.count("(") == 2, between   # perf_counter() and fit_stage1(...)
+                 source.index("fit_seconds[name] = time.perf_counter() - started")]
+assert between.count("(") == 2, between   # perf_counter() and fit(...)
 print("ok")
 """
+
+SCORES_WIRING_LOOP = """
+import ast
+import inspect
+import textwrap
+import run_hurdle_pipeline as script
+
+tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
+loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
+         and ast.unparse(node.target) == "(name, fit)"]
+assert len(loops) == 1, len(loops)
+loop = loops[0]
+pairs = [(item.elts[0].value, ast.unparse(item.elts[1])) for item in loop.iter.elts]
+assert pairs == [("stage 1 (HGB)", "fit_stage1"), ("baseline (LR)", "fit_stage1_baseline")]
+body = [ast.unparse(statement) for statement in loop.body]
+assert body == ["started = time.perf_counter()",
+                "model = fit(train_x, train_rows['paid'], settings.stage1)",
+                "fit_seconds[name] = time.perf_counter() - started",
+                "predictions[name] = predict_paid(model, forecast_x)"], body
+assert loop.orelse == []
+print("ok")
+"""
+
+MODEL_A = "[0.8, 0.4, 0.99, 0.6, 0.2, 0.01]"
+MODEL_B = "[0.3, 0.9, 0.01, 0.6, 0.4, 0.99]"
 
 SCORES = """
 import numpy as np
@@ -1197,31 +1232,46 @@ forecast_rows = pd.DataFrame({
     "label_status": ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"],
     "paid": pd.array([True, False, None, True, False, None], dtype="boolean"),
 }, index=pd.Index([10, 11, 12, 13, 14, 15]))
-p = pd.Series([0.8, 0.4, 0.99, 0.6, 0.2, 0.01], index=forecast_rows.index, name="p")
+predictions = {name: pd.Series(values, index=forecast_rows.index, name="p")
+               for name, values in MODELS}
+fit_seconds = FIT_SECONDS
 train_rows = pd.DataFrame({"paid": pd.array([True, False, False, False], dtype="boolean")},
                           index=pd.Index([1, 2, 3, 4]))
-copies = forecast_rows.copy(deep=True), p.copy(), train_rows.copy(deep=True)
-script.show_stage1_scores(forecast_rows, p, train_rows, FIT_SECONDS)
+copies = (forecast_rows.copy(deep=True), {n: p.copy() for n, p in predictions.items()},
+          train_rows.copy(deep=True), dict(fit_seconds))
+returned = script.show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
+assert returned is None
 pd.testing.assert_frame_equal(forecast_rows, copies[0])
-pd.testing.assert_series_equal(p, copies[1])
+assert list(predictions) == list(copies[1])
+for name in predictions:
+    pd.testing.assert_series_equal(predictions[name], copies[1][name])
 pd.testing.assert_frame_equal(train_rows, copies[2])
+assert fit_seconds == copies[3]
 print("ok")
 """
 
-
-def run_scores(fit_seconds=1.23):
-    return subprocess.run([sys.executable, "-c",
-                           SCORES.replace("FIT_SECONDS", repr(fit_seconds))],
-                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-                          timeout=120)
+ONE_MODEL = [("stage 1 (HGB)", MODEL_A)]
+TWO_MODELS = [("stage 1 (HGB)", MODEL_A), ("baseline (LR)", MODEL_B)]
 
 
-def score_table(lines):
-    """The header words of the score table and its two rows as {name: [log loss, Brier,
-    AUC]}."""
+def run_scores(models=None, fit_seconds=None):
+    """Run SCORES with `models` [(name, p list text)] (default: model A alone) and
+    `fit_seconds` {name: seconds} (default: 1.23 s per model)."""
+    models = ONE_MODEL if models is None else models
+    if fit_seconds is None:
+        fit_seconds = {name: 1.23 for name, _ in models}
+    models_text = "[" + ", ".join(f"({name!r}, {values})" for name, values in models) + "]"
+    script = SCORES.replace("MODELS", models_text).replace("FIT_SECONDS", repr(fit_seconds))
+    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
+                          text=True, encoding="utf-8", timeout=120)
+
+
+def score_table(lines, n_rows):
+    """The header words of the score table and its `n_rows` rows as {name: [log loss, Brier,
+    AUC]}, in printed order."""
     header = lines[1].split()
     table = {}
-    for line in lines[2:4]:
+    for line in lines[2:2 + n_rows]:
         parts = line.rsplit(maxsplit=3)
         table[parts[0].strip()] = [float(n) for n in parts[1:]]
     return header, table
@@ -1234,8 +1284,15 @@ def test_step_12_fit_predict_and_scores_are_wired_in_after_the_rows():
     assert result.stdout.strip().endswith("ok")
 
 
+def test_step_12_loops_over_hgb_then_the_baseline_and_collects_both_dicts():
+    result = subprocess.run([sys.executable, "-c", SCORES_WIRING_LOOP], cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
 def test_step_12_scores_runs_and_does_not_change_its_inputs():
-    result = run_scores()
+    result = run_scores(TWO_MODELS)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "ok"
 
@@ -1243,24 +1300,65 @@ def test_step_12_scores_runs_and_does_not_change_its_inputs():
 def test_step_12_scores_first_line_counts_only_labelled_rows():
     result = run_scores()
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == ("        fitted in 1.2 s; scored on 4 forecast "
-                                             "rows (50.0% paid)")
+    assert result.stdout.splitlines()[0] == ("        fitted in stage 1 (HGB) 1.2 s; scored on 4 "
+                                             "forecast rows (50.0% paid)")
+
+
+def test_step_12_scores_first_line_names_every_model_time_in_order():
+    result = run_scores(TWO_MODELS, {"stage 1 (HGB)": 12.34, "baseline (LR)": 0.26})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == (
+        "        fitted in stage 1 (HGB) 12.3 s, baseline (LR) 0.3 s; scored on 4 forecast "
+        "rows (50.0% paid)")
 
 
 def test_step_12_scores_fit_time_has_one_decimal():
-    result = run_scores(fit_seconds=0.04)
+    result = run_scores(fit_seconds={"stage 1 (HGB)": 0.04})
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0].startswith("        fitted in 0.0 s; ")
+    assert result.stdout.splitlines()[0].startswith("        fitted in stage 1 (HGB) 0.0 s; ")
 
 
 def test_step_12_scores_table_by_hand():
     result = run_scores()
     assert result.returncode == 0, result.stderr
-    header, table = score_table(result.stdout.splitlines())
+    header, table = score_table(result.stdout.splitlines(), 2)
     assert header == ["log", "loss", "Brier", "AUC"]
-    assert list(table) == ["stage 1", "base rate"]
-    assert table["stage 1"] == [0.367, 0.1, 1.0]
+    assert list(table) == ["stage 1 (HGB)", "base rate"]
+    assert table["stage 1 (HGB)"] == [0.367, 0.1, 1.0]
     assert table["base rate"] == [0.837, 0.3125, 0.5]
+
+
+def test_step_12_scores_table_with_two_models_by_hand():
+    result = run_scores(TWO_MODELS)
+    assert result.returncode == 0, result.stderr
+    header, table = score_table(result.stdout.splitlines(), 3)
+    assert header == ["log", "loss", "Brier", "AUC"]
+    assert list(table) == ["stage 1 (HGB)", "baseline (LR)", "base rate"]
+    assert table["stage 1 (HGB)"] == [0.367, 0.1, 1.0]
+    assert table["baseline (LR)"] == [1.1321, 0.405, 0.25]
+    assert table["base rate"] == [0.837, 0.3125, 0.5]
+
+
+def test_step_12_scores_rows_follow_the_order_of_the_predictions_dict():
+    result = run_scores(list(reversed(TWO_MODELS)))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("        fitted in baseline (LR) 1.2 s, stage 1 (HGB) 1.2 s; ")
+    _, table = score_table(lines, 3)
+    assert list(table) == ["baseline (LR)", "stage 1 (HGB)", "base rate"]
+    assert lines[6].split() == ["mean", "p,", "baseline", "(LR)", "mean", "p,", "stage", "1",
+                                "(HGB)", "share", "paid"]
+
+
+def test_step_12_scores_a_model_is_not_scored_on_another_models_p():
+    # Two models, each scored on its own p: swapping them swaps their rows.
+    one = run_scores(TWO_MODELS)
+    two = run_scores([("stage 1 (HGB)", MODEL_B), ("baseline (LR)", MODEL_A)])
+    assert one.returncode == 0 and two.returncode == 0, (one.stderr, two.stderr)
+    _, first = score_table(one.stdout.splitlines(), 3)
+    _, second = score_table(two.stdout.splitlines(), 3)
+    assert first["stage 1 (HGB)"] == second["baseline (LR)"]
+    assert first["baseline (LR)"] == second["stage 1 (HGB)"]
 
 
 def test_step_12_scores_per_h_table_by_hand():
@@ -1269,26 +1367,55 @@ def test_step_12_scores_per_h_table_by_hand():
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     assert lines[4] == "        per h, mean p vs share that actually paid:"
-    assert lines[5].split() == ["mean", "p", "share", "paid"]
+    assert lines[5].split() == ["mean", "p,", "stage", "1", "(HGB)", "share", "paid"]
     assert lines[6].split() == ["h"]
     assert lines[7].split() == ["1", "0.6", "0.5"]
     assert lines[8].split() == ["2", "0.4", "0.5"]
     assert lines[9:] == ["ok"]
 
 
-# The real chain on the tiny STAGE1 table: fit_stage1 -> predict_paid -> show_stage1_scores.
-# At origin 2 the forecast targets are weeks 3 (labelled) and 4 (future, last week 3): two
-# labelled rows, TR02-A paid and TR04-B not, so the score table is defined.
+def test_step_12_scores_per_h_table_with_two_models_by_hand():
+    # Model B's unscored rows are 0.01 and 0.99, the other way round from A's: if either
+    # were included, its h's mean p would move.
+    result = run_scores(TWO_MODELS)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[5] == "        per h, mean p vs share that actually paid:"
+    assert lines[6].split() == ["mean", "p,", "stage", "1", "(HGB)", "mean", "p,", "baseline",
+                                "(LR)", "share", "paid"]
+    assert lines[7].split() == ["h"]
+    assert lines[8].split() == ["1", "0.6", "0.6", "0.5"]
+    assert lines[9].split() == ["2", "0.4", "0.5", "0.5"]
+    assert lines[10:] == ["ok"]
+
+
+def test_step_12_scores_per_h_table_has_no_base_rate_column():
+    result = run_scores(TWO_MODELS)
+    assert result.returncode == 0, result.stderr
+    per_h = result.stdout.split("per h, mean p vs share that actually paid:")[1]
+    assert "base rate" not in per_h
+
+
+# The real chain on the tiny STAGE1 table: fit_stage1 and fit_stage1_baseline -> predict_paid
+# -> show_stage1_scores. At origin 2 the forecast targets are weeks 3 (labelled) and 4
+# (future, last week 3): two labelled rows, TR02-A paid and TR04-B not, so the score table
+# is defined.
 STAGE1_FIT = STAGE1.replace('print("ok")', """
 from collection_estimation.hurdle.settings import Stage1Settings
 settings = Stage1Settings(max_iter=5, learning_rate=0.1, max_leaf_nodes=3, min_samples_leaf=1,
                           random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-                          company_as_feature=COMPANY_AS_FEATURE, diagnose_class_weights=False)
+                          company_as_feature=COMPANY_AS_FEATURE, diagnose_class_weights=False,
+                          baseline_c=1.0)
 forecast_x = script.stage1_features(forecast_rows, columns, companies, COMPANY_AS_FEATURE)
-model = script.fit_stage1(train_x, train_rows["paid"], settings)
-p = script.predict_paid(model, forecast_x)
-assert list(p.index) == list(forecast_rows.index)
-script.show_stage1_scores(forecast_rows, p, train_rows, 0.5)
+predictions = {}
+for name, fit in (("stage 1 (HGB)", script.fit_stage1),
+                  ("baseline (LR)", script.fit_stage1_baseline)):
+    model = fit(train_x, train_rows["paid"], settings)
+    predictions[name] = script.predict_paid(model, forecast_x)
+    assert list(predictions[name].index) == list(forecast_rows.index)
+    assert predictions[name].between(0, 1).all()
+script.show_stage1_scores(forecast_rows, predictions, train_rows,
+                          {"stage 1 (HGB)": 0.5, "baseline (LR)": 0.25})
 print("ok")
 """)
 
@@ -1301,9 +1428,11 @@ def test_step_12_real_fit_predict_and_scores_on_the_tiny_table(company):
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     scores = [line for line in lines if line.startswith("        fitted in")]
-    assert scores == ["        fitted in 0.5 s; scored on 2 forecast rows (50.0% paid)"]
-    # Only h=1 is labelled at origin 2 (h=2 targets week 4, after the last week 3).
+    assert scores == ["        fitted in stage 1 (HGB) 0.5 s, baseline (LR) 0.2 s; scored on 2 "
+                      "forecast rows (50.0% paid)"]
     start = lines.index("        per h, mean p vs share that actually paid:")
+    assert [line.split()[0] for line in lines[start - 3:start]] == ["stage", "baseline", "base"]
+    # Only h=1 is labelled at origin 2 (h=2 targets week 4, after the last week 3).
     assert [line.split()[0] for line in lines[start + 3:-1]] == ["1"]
     assert lines[-1] == "ok"
 
@@ -1317,23 +1446,27 @@ forecast_rows = pd.DataFrame({"key": list("abcd"), "h": np.array([1, 1, 2, 2]),
                               "label_status": ["labelled"] * 3 + ["missing_week"],
                               "paid": pd.array([True, True, True, None], dtype="boolean")},
                              index=[5, 6, 7, 8])
-p = pd.Series([0.7, 0.3, 0.6, 0.2], index=forecast_rows.index, name="p")
+predictions = {"stage 1 (HGB)": pd.Series([0.7, 0.3, 0.6, 0.2], index=forecast_rows.index),
+               "baseline (LR)": pd.Series([0.5, 0.5, 0.5, 0.5], index=forecast_rows.index)}
 train_rows = pd.DataFrame({"paid": pd.array([True, False], dtype="boolean")})
-script.show_stage1_scores(forecast_rows, p, train_rows, 0.1)
+script.show_stage1_scores(forecast_rows, predictions, train_rows,
+                          {"stage 1 (HGB)": 0.1, "baseline (LR)": 0.1})
 print("ok")
 """
 
 
 def test_step_12_scores_with_one_class_among_labelled_rows_shows_nan_auc_and_runs():
     # sklearn 1.9's roc_auc_score warns and returns NaN for a single class; the printout
-    # must still finish.
+    # must still finish, for every model.
     result = subprocess.run([sys.executable, "-c", ONE_CLASS], cwd=REPO_ROOT,
                             capture_output=True, text=True, encoding="utf-8", timeout=120)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
-    assert lines[0] == "        fitted in 0.1 s; scored on 3 forecast rows (100.0% paid)"
-    assert lines[2].split()[-1] == "NaN" and lines[2].startswith("stage 1")
-    assert lines[3].split()[-1] == "0.5"
+    assert lines[0] == ("        fitted in stage 1 (HGB) 0.1 s, baseline (LR) 0.1 s; scored on 3 "
+                        "forecast rows (100.0% paid)")
+    assert lines[2].split()[-1] == "NaN" and lines[2].startswith("stage 1 (HGB)")
+    assert lines[3].split()[-1] == "NaN" and lines[3].startswith("baseline (LR)")
+    assert lines[4].split()[-1] == "0.5" and lines[4].startswith("base rate")
     assert lines[-1] == "ok"
 
 
@@ -1352,15 +1485,20 @@ forecast_rows = pd.DataFrame({
     "label_status": pd.array(statuses, dtype=object),
     "paid": pd.array([None] * len(statuses), dtype="boolean"),
 }, index=pd.Index(range(20, 20 + len(statuses))))
-p = pd.Series(np.linspace(0.1, 0.9, len(statuses)), index=forecast_rows.index, name="p")
+fit_seconds = FIT_SECONDS
+predictions = {name: pd.Series(np.linspace(0.1, 0.9, len(statuses)), index=forecast_rows.index,
+                               name="p") for name in fit_seconds}
 train_rows = pd.DataFrame({"paid": pd.array([True, False, False], dtype="boolean")})
-copies = forecast_rows.copy(deep=True), p.copy(), train_rows.copy(deep=True)
+copies = (forecast_rows.copy(deep=True), {n: p.copy() for n, p in predictions.items()},
+          train_rows.copy(deep=True), dict(fit_seconds))
 assert list(forecast_rows["label_status"]) == statuses  # the frame holds what we meant
-returned = script.show_stage1_scores(forecast_rows, p, train_rows, FIT_SECONDS)
+returned = script.show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
 assert returned is None
 pd.testing.assert_frame_equal(forecast_rows, copies[0])
-pd.testing.assert_series_equal(p, copies[1])
+for name in predictions:
+    pd.testing.assert_series_equal(predictions[name], copies[1][name])
 pd.testing.assert_frame_equal(train_rows, copies[2])
+assert fit_seconds == copies[3]
 print("ok")
 """
 
@@ -1371,8 +1509,11 @@ NO_LABELLED_CASES = {
     "empty": [],
 }
 
+TWO_TIMES = {"stage 1 (HGB)": 2.345, "baseline (LR)": 0.06}
 
-def run_no_labelled(case, fit_seconds=2.345):
+
+def run_no_labelled(case, fit_seconds=None):
+    fit_seconds = TWO_TIMES if fit_seconds is None else fit_seconds
     script = (NO_LABELLED.replace("STATUSES", repr(NO_LABELLED_CASES[case]))
               .replace("FIT_SECONDS", repr(fit_seconds)))
     return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
@@ -1392,7 +1533,8 @@ def test_step_12_scores_without_labelled_rows_prints_only_the_one_line(case):
     result = run_no_labelled(case)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
-        "        fitted in 2.3 s; no labelled forecast rows to score", "ok"]
+        "        fitted in stage 1 (HGB) 2.3 s, baseline (LR) 0.1 s; no labelled forecast "
+        "rows to score", "ok"]
 
 
 @pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
@@ -1404,29 +1546,32 @@ def test_step_12_scores_without_labelled_rows_prints_no_table(case):
 
 
 def test_step_12_scores_without_labelled_rows_fit_time_has_one_decimal():
-    result = run_no_labelled("all_missing_week", fit_seconds=0.04)
+    result = run_no_labelled("all_missing_week", fit_seconds={"stage 1 (HGB)": 0.04})
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[0] == (
-        "        fitted in 0.0 s; no labelled forecast rows to score")
+        "        fitted in stage 1 (HGB) 0.0 s; no labelled forecast rows to score")
 
 
 def test_step_12_scores_with_labelled_rows_does_not_print_the_no_rows_line():
-    # The normal case (SCORES: four labelled rows) keeps its full printout, unchanged.
-    result = run_scores()
+    # The normal case (SCORES: four labelled rows) keeps its full printout.
+    result = run_scores(TWO_MODELS)
     assert result.returncode == 0, result.stderr
     assert "no labelled forecast rows to score" not in result.stdout
     lines = result.stdout.splitlines()
-    assert lines[0] == "        fitted in 1.2 s; scored on 4 forecast rows (50.0% paid)"
+    assert lines[0] == ("        fitted in stage 1 (HGB) 1.2 s, baseline (LR) 1.2 s; scored on 4 "
+                        "forecast rows (50.0% paid)")
     assert lines[1].split() == ["log", "loss", "Brier", "AUC"]
-    assert lines[2].startswith("stage 1") and lines[3].startswith("base rate")
-    assert lines[4] == "        per h, mean p vs share that actually paid:"
-    assert len(lines) == 10 and lines[-1] == "ok"
+    assert lines[2].startswith("stage 1 (HGB)") and lines[3].startswith("baseline (LR)")
+    assert lines[4].startswith("base rate")
+    assert lines[5] == "        per h, mean p vs share that actually paid:"
+    assert len(lines) == 11 and lines[-1] == "ok"
 
 
 def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
     # The guard is on "no labelled row", not on "any unlabelled row".
     script = NO_LABELLED.replace(
-        "STATUSES", repr(["missing_week", "labelled", "future"])).replace("FIT_SECONDS", "1.0")
+        "STATUSES", repr(["missing_week", "labelled", "future"])).replace(
+        "FIT_SECONDS", repr({"stage 1 (HGB)": 1.0}))
     script = script.replace('"paid": pd.array([None] * len(statuses), dtype="boolean")',
                             '"paid": pd.array([None, True, None], dtype="boolean")')
     result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
@@ -1434,4 +1579,4 @@ def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
     assert result.returncode == 0, result.stderr
     assert "no labelled forecast rows to score" not in result.stdout
     assert result.stdout.splitlines()[0] == (
-        "        fitted in 1.0 s; scored on 1 forecast rows (100.0% paid)")
+        "        fitted in stage 1 (HGB) 1.0 s; scored on 1 forecast rows (100.0% paid)")

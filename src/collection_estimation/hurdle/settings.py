@@ -57,6 +57,7 @@ class Stage1Settings:
     feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
     company_as_feature: bool          # the company code (an EY entity) as a categorical feature
     diagnose_class_weights: bool      # also fit a class-weighted model, for diagnosis only
+    baseline_c: float                 # the logistic baseline's C: smaller = stronger regularisation
 
 
 @dataclass(frozen=True)
@@ -127,7 +128,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
-                        "diagnose_class_weights"}, f"{name} [stage1]")
+                        "diagnose_class_weights", "baseline_c"}, f"{name} [stage1]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -181,6 +182,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             company_as_feature=bool_setting(stage1, "company_as_feature", f"{name} [stage1]"),
             diagnose_class_weights=bool_setting(stage1, "diagnose_class_weights",
                                                 f"{name} [stage1]"),
+            baseline_c=positive_number_setting(stage1, "baseline_c", f"{name} [stage1]"),
         ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
@@ -489,3 +491,14 @@ def seed_setting(table: dict, key: str, where: str) -> int:
         raise ValueError(f"{where}: {key} is {value!r}, not a random seed (a whole number, "
                          f"0 or more)")
     return value
+
+
+def positive_number_setting(table: dict, key: str, where: str) -> float:
+    """A number above 0 (whole or not, finite), returned as a float."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly. value == value is False
+    # only for NaN, and inf is not a usable setting either.
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or value != value
+            or value <= 0 or value == float("inf")):
+        raise ValueError(f"{where}: {key} is {value!r}, not a number above 0")
+    return float(value)

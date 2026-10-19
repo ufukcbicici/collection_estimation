@@ -41,6 +41,7 @@ from collection_estimation.hurdle.settings import (
     leaf_count_setting,
     rate_setting,
     seed_setting,
+    positive_number_setting,
     count_setting,
     date_format_setting,
     date_setting,
@@ -144,7 +145,8 @@ VALID = {
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
-               "company_as_feature": "true", "diagnose_class_weights": "true"},
+               "company_as_feature": "true", "diagnose_class_weights": "true",
+               "baseline_c": "1.0"},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -296,6 +298,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
+    ("stage1", "baseline_c"),
     ("debug", "demo_origin"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
@@ -418,6 +421,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "diagnose_class_weights"),
+    ("stage1", "baseline_c"),
     ("debug", "demo_origin"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
@@ -1157,7 +1161,7 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True)
+        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
 
 
 
@@ -2104,7 +2108,7 @@ def test_the_stage1_section_is_read(tmp_path, repo):
     assert stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True)
+        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
 
 
 def test_the_stage1_values_have_the_right_python_types(tmp_path, repo):
@@ -2115,12 +2119,13 @@ def test_the_stage1_values_have_the_right_python_types(tmp_path, repo):
     assert type(stage1.feature_blocks) is tuple
     assert stage1.company_as_feature is True
     assert stage1.diagnose_class_weights is True
+    assert type(stage1.baseline_c) is float
 
 
 def test_stage1_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(Stage1Settings)] == [
         "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf", "random_seed",
-        "feature_blocks", "company_as_feature", "diagnose_class_weights"]
+        "feature_blocks", "company_as_feature", "diagnose_class_weights", "baseline_c"]
 
 
 def test_settings_has_a_stage1_field_between_history_and_debug():
@@ -2150,7 +2155,8 @@ def test_a_stage1_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo)
                                              ("stage1", "max_iters"): "300"})
     assert message == (
         f"{STAGE1}: missing ['max_iter']; unknown ['max_iters']; expected exactly "
-        f"['company_as_feature', 'diagnose_class_weights', 'feature_blocks', 'learning_rate', "
+        f"['baseline_c', 'company_as_feature', 'diagnose_class_weights', 'feature_blocks', "
+        f"'learning_rate', "
         f"'max_iter', 'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
 
 
@@ -2421,7 +2427,103 @@ def test_stage1_switches_are_read_separately(tmp_path, repo):
     assert stage1.diagnose_class_weights is False
 
 
-# --- [debug] demo_origin (week_setting) -----------------------------------------------------
+# --- [stage1] baseline_c (positive_number_setting) -------------------------------------------
+
+@pytest.mark.parametrize("good, expected", [
+    ("1.0", 1.0), ("1", 1.0), ("0.01", 0.01), ("1e-9", 1e-9), ("5e-324", 5e-324),
+    ("1000", 1000.0), ("1e300", 1e300), ("1_000", 1000.0),
+], ids=["one-float", "one-int", "small", "tiny", "smallest-subnormal", "large-int", "huge",
+        "underscored-int"])
+def test_baseline_c_accepts_numbers_above_0(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("stage1", "baseline_c"): good}).stage1.baseline_c
+    assert value == expected
+    assert type(value) is float
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("0.0", "0.0"), ("-0.0", "-0.0"), ("-1", "-1"), ("-1e-9", "-1e-09"),
+    ("inf", "inf"), ("+inf", "inf"), ("-inf", "-inf"), ("nan", "nan"), ('"1.0"', "'1.0'"),
+    ("true", "True"), ("false", "False"), ("[1.0]", "[1.0]"),
+    ("2025-06-02", "datetime.date(2025, 6, 2)"), ("{ c = 1 }", "{'c': 1}"),
+], ids=["zero", "zero-float", "minus-zero", "negative", "tiny-negative", "inf", "plus-inf",
+        "minus-inf", "nan", "string", "true", "false", "list", "date", "table"])
+def test_baseline_c_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage1", "baseline_c"): bad})
+    assert message == f"{STAGE1}: baseline_c is {shown}, not a number above 0"
+
+
+def test_baseline_c_has_no_upper_bound_unlike_learning_rate(tmp_path, repo):
+    # C is an inverse regularisation strength: above 1 is ordinary, not an error.
+    stage1 = load(tmp_path, repo, changes={("stage1", "baseline_c"): "50"}).stage1
+    assert stage1.baseline_c == 50.0
+
+
+def test_baseline_c_is_read_separately_from_learning_rate(tmp_path, repo):
+    stage1 = load(tmp_path, repo, changes={("stage1", "baseline_c"): "3.5",
+                                           ("stage1", "learning_rate"): "0.2"}).stage1
+    assert (stage1.baseline_c, stage1.learning_rate) == (3.5, 0.2)
+
+
+def test_a_missing_baseline_c_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "baseline_c"): REMOVE})
+    assert message == (
+        f"{STAGE1}: missing ['baseline_c']; expected exactly "
+        f"['baseline_c', 'company_as_feature', 'diagnose_class_weights', 'feature_blocks', "
+        f"'learning_rate', 'max_iter', 'max_leaf_nodes', 'min_samples_leaf', 'random_seed']")
+
+
+def test_a_baseline_c_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "baseline_c"): REMOVE,
+                                             ("stage1", "baseline_C"): "1.0"})
+    assert message.startswith(f"{STAGE1}: missing ['baseline_c']; unknown ['baseline_C']; ")
+
+
+def test_positive_number_setting_direct_calls():
+    assert positive_number_setting({"c": 1.0}, "c", "here") == 1.0
+    assert positive_number_setting({"c": 0.25}, "c", "here") == 0.25
+    assert positive_number_setting({"c": 5e-324}, "c", "here") == 5e-324
+    assert positive_number_setting({"c": 1e308}, "c", "here") == 1e308
+    assert positive_number_setting({"c": 2**80}, "c", "here") == float(2**80)
+
+
+@pytest.mark.parametrize("value", [1, 7, 2**40])
+def test_positive_number_setting_returns_an_int_as_a_float(value):
+    result = positive_number_setting({"c": value}, "c", "here")
+    assert type(result) is float
+    assert result == float(value)
+
+
+def test_positive_number_setting_returns_a_float_as_a_float():
+    assert type(positive_number_setting({"c": 0.5}, "c", "here")) is float
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -0.0, -1, -1.5, -5e-324, float("nan"), float("inf"),
+                                 float("-inf"), True, False, None, "1.0", "1", [1.0], (1.0,),
+                                 {"c": 1}])
+def test_positive_number_setting_rejects_naming_where_and_key(bad):
+    with pytest.raises(ValueError) as error:
+        positive_number_setting({"c": bad}, "c", "here")
+    assert str(error.value) == f"here: c is {bad!r}, not a number above 0"
+
+
+def test_positive_number_setting_true_is_rejected_although_it_equals_1():
+    # True == 1 and True > 0 in Python: only the explicit bool check stops it.
+    with pytest.raises(ValueError, match="here: c is True"):
+        positive_number_setting({"c": True}, "c", "here")
+
+
+def test_positive_number_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        positive_number_setting({}, "c", "here")
+
+
+def test_positive_number_setting_does_not_modify_the_table():
+    table = {"c": 2, "other": "x"}
+    positive_number_setting(table, "c", "here")
+    assert table == {"c": 2, "other": "x"}
+
+
+# --- [debug] demo_origin (week_setting)-----------------------------------------------------
 
 def test_demo_origin_is_read_as_an_int(tmp_path, repo):
     value = load(tmp_path, repo).debug.demo_origin
@@ -2469,6 +2571,6 @@ def test_the_synthetic_stage1_and_demo_origin_settings():
     assert settings.stage1 == Stage1Settings(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, diagnose_class_weights=True)
+        company_as_feature=True, diagnose_class_weights=True, baseline_c=1.0)
     assert settings.debug.demo_origin == 40
     assert type(settings.debug.demo_origin) is int

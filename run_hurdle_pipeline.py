@@ -71,6 +71,7 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
 from collection_estimation.hurdle.stage1 import (  # noqa: E402
     feature_columns,
     fit_stage1,
+    fit_stage1_baseline,
     predict_paid,
     stage1_features,
 )
@@ -321,11 +322,14 @@ def main():
 
     # Fit at the demo origin, predict its forecast rows, and score them: their target weeks
     # have data, so the answers are known here (only because this is a check of the past).
-    started = time.perf_counter()
-    stage1 = fit_stage1(train_x, train_rows["paid"], settings.stage1)
-    fit_seconds = time.perf_counter() - started
-    p = predict_paid(stage1, forecast_x)
-    show_stage1_scores(forecast_rows, p, train_rows, fit_seconds)
+    # The logistic-regression baseline is fitted and scored the same way, for comparison.
+    predictions, fit_seconds = {}, {}
+    for name, fit in (("stage 1 (HGB)", fit_stage1), ("baseline (LR)", fit_stage1_baseline)):
+        started = time.perf_counter()
+        model = fit(train_x, train_rows["paid"], settings.stage1)
+        fit_seconds[name] = time.perf_counter() - started
+        predictions[name] = predict_paid(model, forecast_x)
+    show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -639,29 +643,33 @@ def show_stage1_rows(origin, train_rows, forecast_rows, train_x):
         print(f"        company_code categories: {list(train_x['company_code'].cat.categories)}")
 
 
-def show_stage1_scores(forecast_rows, p, train_rows, fit_seconds):
-    """Stage 1's scores on the demo origin's forecast rows, against the base rate (every row
-    gets the training share of paid rows). Log loss and Brier score: lower is better. AUC:
-    0.5 is a coin toss, 1 a perfect ranking of payers above non-payers."""
+def show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds):
+    """The scores of each model's p ({name: p per forecast row}) on the demo origin's
+    forecast rows, against the base rate (every row gets the training share of paid rows).
+    Log loss and Brier score: lower is better. AUC: 0.5 is a coin toss, 1 a perfect ranking
+    of payers above non-payers. `fit_seconds` is {name: seconds}."""
     labelled = forecast_rows["label_status"] == "labelled"
     actual = forecast_rows.loc[labelled, "paid"].astype(bool)
-    predicted = p[labelled]
+    times = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in fit_seconds.items())
     if actual.empty:
         # Every target week of this origin is a missing week: nothing can be scored.
-        print(f"        fitted in {fit_seconds:.1f} s; no labelled forecast rows to score")
+        print(f"        fitted in {times}; no labelled forecast rows to score")
         return
-    base_rate = pd.Series(train_rows["paid"].astype(bool).mean(), index=actual.index)
-    print(f"        fitted in {fit_seconds:.1f} s; scored on {len(actual):,} forecast rows "
+    guesses = {name: p[labelled] for name, p in predictions.items()}
+    guesses["base rate"] = pd.Series(train_rows["paid"].astype(bool).mean(), index=actual.index)
+    print(f"        fitted in {times}; scored on {len(actual):,} forecast rows "
           f"({actual.mean():.1%} paid)")
     scores = pd.DataFrame({
         name: {"log loss": log_loss(actual, guess, labels=[False, True]),
                "Brier": brier_score_loss(actual, guess),
                "AUC": roc_auc_score(actual, guess) if name != "base rate" else 0.5}
-        for name, guess in (("stage 1", predicted), ("base rate", base_rate))
+        for name, guess in guesses.items()
     }).T
     print(scores.round(4).to_string())
-    by_h = pd.DataFrame({"mean p": predicted.groupby(forecast_rows.loc[labelled, "h"]).mean(),
-                         "share paid": actual.groupby(forecast_rows.loc[labelled, "h"]).mean()})
+    h = forecast_rows.loc[labelled, "h"]
+    by_h = pd.DataFrame({f"mean p, {name}": predicted.groupby(h).mean()
+                         for name, predicted in guesses.items() if name != "base rate"})
+    by_h["share paid"] = actual.groupby(h).mean()
     print("        per h, mean p vs share that actually paid:")
     print(by_h.round(4).to_string())
 

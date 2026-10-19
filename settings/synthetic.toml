@@ -96,6 +96,7 @@ feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is alw
 company_as_feature = true       # the company code (one of the EY entities) as a category
 diagnose_class_weights = true   # also fit a class-weighted model, ONLY to compare F1 and AUC;
                                 # never used for the forecast
+baseline_c = 1.0                # the logistic-regression baseline's C (inverse regularisation)
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
