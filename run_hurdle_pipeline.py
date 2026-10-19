@@ -66,6 +66,7 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     add_labels,
     panel_rows,
 )
+from collection_estimation.hurdle.training_table import join_features  # noqa: E402
 from collection_estimation.hurdle.side_tables import (  # noqa: E402
     check_side_tables,
     is_unidentified,
@@ -281,6 +282,10 @@ def main():
     # The label in TRY of week 0, like the features: divided by its target week's level.
     panel = add_deflated_label(panel, levels)
     show_deflated_label(panel, levels)
+
+    # The training table: one row per panel row, with its label and every feature block.
+    table = join_features(panel, history, calendar, owed)
+    show_table(table, panel)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -563,6 +568,22 @@ def show_deflated_label(panel, levels):
     per_week["level"] = per_week.index.map(levels)
     print("        at h=1, label per target week, million TRY (nominal / of week 0), every 16th:")
     print((per_week.loc[per_week.index % 16 == 0] / [1e6, 1e6, 1, 1]).round(3).to_string())
+
+
+def show_table(table, panel):
+    """A short printout of the training table."""
+    print(f"        training table: {len(table):,} rows (panel: {len(panel):,}), "
+          f"{table.shape[1]} columns, about {table.memory_usage(deep=True).sum() / 1e6:,.0f} MB")
+    with_nan = table.isna().mean()
+    with_nan = with_nan[with_nan > 0].sort_values(ascending=False)
+    print("        share NaN, columns that have any:")
+    print(with_nan.round(3).to_string())
+    paid_rows = table[(table["label_status"] == "labelled") & table["paid"].fillna(False)]
+    if paid_rows.empty:
+        print("        no labelled, paid row to show")
+        return
+    print("        one labelled, paid row:")
+    print(paid_rows.iloc[0].to_string())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "run_hurdle_pipeline.py"
 
@@ -717,3 +719,164 @@ def test_deflated_label_printout_h1_table_every_16th_week():
         [32, 8.0, 5.0, 1.6, 1.6],
     ]
     assert table[5] == "ok"
+
+
+# Step 11: the training table, joined after the deflated label and printed. The wiring is
+# checked on main()'s source; the printout is run on a small hand-built panel and blocks in a
+# separate process: 4 panel rows (2 labelled, one of them paid; one missing week; one
+# future), one NaN in a history feature, none in the calendar or receivables features.
+TABLE = """
+import inspect
+import pandas as pd
+import run_hurdle_pipeline as script
+
+source = " ".join(inspect.getsource(script.main).split())
+assert "table = join_features(panel, history, calendar, owed)" in source, "join_features"
+assert "show_table(table, panel)" in source, "show_table not called"
+assert (source.index("show_deflated_label(panel, levels)")
+        < source.index("table = join_features(panel, history, calendar, owed)")
+        < source.index("show_table(table, panel)"))
+# Every block is built before the join, and the panel has its deflated label by then.
+for built in ("history = history_features(", "calendar = calendar_features(",
+              "owed = receivables_features(", "panel = add_deflated_label("):
+    assert source.index(built) < source.index("table = join_features("), built
+inspect.signature(script.join_features).bind("panel", "history", "calendar", "owed")
+inspect.signature(script.show_table).bind("table", "panel")
+
+nan = float("nan")
+panel = pd.DataFrame({
+    "key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], dtype=object),
+    "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
+    "h": pd.Series([1, 2, 1, 2], dtype="int64"),
+    "label_status": pd.Series(["labelled", "missing_week", "labelled", "future"],
+                              dtype=object),
+    "amount": [250.0, nan, 0.0, nan],
+})
+panel["target_week"] = panel["origin_week"] + panel["h"]
+panel["amount_deflated"] = panel["amount"] / 2
+panel["paid"] = pd.array([True, None, False, None], dtype="boolean")
+history = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-B"], dtype=object),
+                        "origin_week": pd.Series([0, 1], dtype="int64"),
+                        "weeks_since_last_payment": [3.0, nan]})
+calendar = pd.DataFrame({"week": pd.Series([1, 2, 3], dtype="int64"),
+                         "business_days": pd.Series([5, 4, 5], dtype="int64")})
+owed = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], dtype=object),
+                     "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
+                     "h": pd.Series([1, 2, 1, 2], dtype="int64"),
+                     "open_balance": [10.0, 10.0, 20.0, 20.0]})
+table = script.join_features(panel, history, calendar, owed)
+assert len(table) == 4 and table.shape[1] == 11, table.shape
+script.show_table(table, panel)
+print("ok")
+"""
+
+
+def run_table():
+    return subprocess.run([sys.executable, "-c", TABLE], cwd=REPO_ROOT,
+                          capture_output=True, text=True, encoding="utf-8", timeout=120)
+
+
+def test_training_table_is_wired_in_after_the_deflated_label():
+    result = run_table()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_training_table_printout_rows_columns_and_size():
+    result = run_table()
+    assert result.returncode == 0, result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    assert "training table: 4 rows (panel: 4), 11 columns, about 0 MB" in lines
+
+
+def test_training_table_printout_nan_shares_of_columns_with_any():
+    result = run_table()
+    assert result.returncode == 0, result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    title = "share NaN, columns that have any:"
+    assert title in lines
+    shares = {}
+    for line in lines[lines.index(title) + 1:]:
+        if line == "one labelled, paid row:":
+            break
+        name, value = line.split()
+        shares[name] = float(value)
+    # amount, amount_deflated and paid: 2 of 4 rows; weeks_since_last_payment: B's 2 rows.
+    assert shares == {"amount": 0.5, "amount_deflated": 0.5, "paid": 0.5,
+                      "weeks_since_last_payment": 0.5}
+
+
+def test_training_table_printout_shows_one_labelled_paid_row():
+    result = run_table()
+    assert result.returncode == 0, result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    title = "one labelled, paid row:"
+    assert title in lines
+    row = dict(line.split(maxsplit=1) for line in lines[lines.index(title) + 1:-1])
+    assert row["key"] == "TR02-A"
+    assert row["label_status"] == "labelled"
+    assert row["paid"] == "True"
+    assert float(row["amount"]) == 250.0
+    assert float(row["open_balance"]) == 10.0
+    assert int(row["business_days"]) == 5
+
+
+# show_table on a table with no labelled, paid row: it says so and returns (it used to raise
+# IndexError on .iloc[0]). Run in a separate process on hand-built tables; the variant picks
+# which label_status / paid values the four rows carry.
+NO_PAID = """
+import pandas as pd
+import run_hurdle_pipeline as script
+
+variants = {{
+    "no_labelled": (["missing_week", "future", "missing_week", "future"],
+                    [None, None, None, None]),
+    "all_unpaid": (["labelled", "labelled", "missing_week", "future"],
+                   [False, False, None, None]),
+    "paid_but_not_labelled": (["future", "missing_week", "labelled", "future"],
+                              [True, True, False, None]),
+    "labelled_with_na_paid": (["labelled", "labelled", "future", "future"],
+                              [None, False, True, None]),
+    "empty": ([], []),
+}}
+status, paid = variants["{variant}"]
+n = len(status)
+table = pd.DataFrame({{
+    "key": pd.Series(["TR02-A"] * n, dtype=object),
+    "origin_week": pd.Series(range(n), dtype="int64"),
+    "h": pd.Series([1] * n, dtype="int64"),
+    "label_status": pd.Series(status, dtype=object),
+    "amount": pd.Series([0.0 if p is False else float("nan") for p in paid], dtype="float64"),
+    "paid": pd.array(paid, dtype="boolean"),
+    "business_days": pd.Series([5] * n, dtype="int64"),
+}})
+script.show_table(table, table)
+print("ok")
+"""
+
+
+def run_no_paid(variant):
+    return subprocess.run([sys.executable, "-c", NO_PAID.format(variant=variant)],
+                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                          timeout=120)
+
+
+NO_PAID_LINE = "        no labelled, paid row to show"
+
+
+@pytest.mark.parametrize("variant", ["no_labelled", "all_unpaid", "paid_but_not_labelled",
+                                     "labelled_with_na_paid", "empty"])
+def test_training_table_printout_without_a_labelled_paid_row_says_so_and_returns(variant):
+    result = run_no_paid(variant)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    # The exact line (8-space indent), last before "ok", and no row is shown.
+    assert lines[-2:] == [NO_PAID_LINE, "ok"], lines
+    assert "one labelled, paid row:" not in [line.strip() for line in lines]
+    assert lines[0].strip().startswith("training table:")
+
+
+def test_training_table_printout_with_a_paid_row_does_not_say_none_to_show():
+    result = run_table()
+    assert result.returncode == 0, result.stderr
+    assert NO_PAID_LINE.strip() not in [line.strip() for line in result.stdout.splitlines()]
