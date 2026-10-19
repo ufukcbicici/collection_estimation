@@ -2,7 +2,9 @@
 deflation.
 
 Week zero is Monday 2025-06-02 throughout, as in the synthetic settings. The synthetic range
-is weeks -32 (Monday 2024-10-21) to 64 (Monday 2026-08-24).
+is weeks -32 (Monday 2024-10-21) to 64 (Monday 2026-08-24). Published levels are normalised
+to 1.0 at week 0 (not at the last week, as the copied module does), so they must not depend
+on where the range stops.
 """
 from datetime import date
 
@@ -185,6 +187,28 @@ def test_coverage_does_not_modify_the_weeks():
 
 
 # ---------------------------------------------------------------------- published_levels
+#
+# published_levels is the copied module's published level (which that module normalises to
+# the ACTUAL level of the range's last week) divided by its value at week 0, so it reads 1.0
+# at week 0. Week 0 (Mon 2025-06-02) publishes May 2025's TÜFE.
+
+GUARD_MESSAGE = ("weeks {first} to {last} do not include week 0, the week the price levels "
+                 "are normalised to")
+WEEK_ZERO_PUBLISHED_MONTH = (2025, 5)
+
+
+def copied_levels(first, last):
+    """The copied module's published level as a Series by week: the OLD normalisation."""
+    weeks = price_weeks(WEEK_ZERO, first, last)
+    return pd.Series(inflation.published_price_level(weeks), index=weeks["week"].to_numpy())
+
+
+def lagged_month(start):
+    year, month = start.year, start.month - 1
+    if month == 0:
+        year, month = year - 1, 12
+    return year, month
+
 
 @pytest.fixture(scope="module")
 def synthetic_levels():
@@ -206,17 +230,46 @@ def test_published_levels_synthetic_range_has_97_values(synthetic_levels):
     assert len(synthetic_levels) == 97
 
 
-def test_published_levels_equal_the_copied_published_price_level(synthetic_levels):
-    expected = inflation.published_price_level(price_weeks(WEEK_ZERO, FIRST, LAST))
-    np.testing.assert_array_equal(synthetic_levels.to_numpy(), expected)
+def test_published_levels_are_exactly_one_at_week_zero(synthetic_levels):
+    assert synthetic_levels.loc[0] == 1.0
 
 
-@pytest.mark.parametrize("first,last", [(-32, -32), (-21, 10), (0, 64), (30, 40)])
-def test_published_levels_equal_the_copied_function_on_sub_ranges(first, last):
-    expected = inflation.published_price_level(price_weeks(WEEK_ZERO, first, last))
+@pytest.mark.parametrize("first,last", [(-32, 0), (0, 0), (0, 64), (-21, 10), (-1, 1),
+                                        (-5, 30)])
+def test_published_levels_are_exactly_one_at_week_zero_on_any_range(first, last):
+    assert published_levels(WEEK_ZERO, first, last).loc[0] == 1.0
+
+
+def test_published_levels_equal_the_copied_level_divided_by_its_week_zero_value(
+        synthetic_levels):
+    old = copied_levels(FIRST, LAST)
+    np.testing.assert_allclose(synthetic_levels.to_numpy(), (old / old.loc[0]).to_numpy(),
+                               rtol=1e-15, atol=0)
+
+
+@pytest.mark.parametrize("first,last", [(-32, 0), (-21, 10), (0, 64), (0, 0), (-5, 30)])
+def test_published_levels_equal_the_rescaled_copied_function_on_sub_ranges(first, last):
+    old = copied_levels(first, last)
     got = published_levels(WEEK_ZERO, first, last)
-    np.testing.assert_array_equal(got.to_numpy(), expected)
+    np.testing.assert_allclose(got.to_numpy(), (old / old.loc[0]).to_numpy(),
+                               rtol=1e-15, atol=0)
     assert list(got.index) == list(range(first, last + 1))
+
+
+def test_published_levels_keep_the_copied_ratios_between_weeks(synthetic_levels):
+    # Rescaling by one constant leaves every ratio between two weeks unchanged.
+    old = copied_levels(FIRST, LAST)
+    for a, b in [(-32, 0), (-32, 64), (0, 64), (-1, 5), (20, 40)]:
+        assert synthetic_levels.loc[a] / synthetic_levels.loc[b] == pytest.approx(
+            old.loc[a] / old.loc[b], rel=1e-14)
+
+
+def test_published_levels_differ_from_the_copied_levels_by_one_constant(synthetic_levels):
+    old = copied_levels(FIRST, LAST)
+    factor = (old / synthetic_levels).to_numpy()
+    np.testing.assert_allclose(factor, old.loc[0], rtol=1e-14)
+    # And the constant is not 1: the copied module's level at week 0 is about 0.72.
+    assert old.loc[0] == pytest.approx(0.720, abs=5e-4)
 
 
 def test_published_levels_are_constant_within_a_calendar_month(synthetic_levels):
@@ -232,44 +285,136 @@ def test_published_levels_step_at_month_boundaries(synthetic_levels):
     assert synthetic_levels.loc[-30] > synthetic_levels.loc[-31]
 
 
-def test_published_levels_follow_tufe_of_the_lagged_month(synthetic_levels):
+def test_published_levels_follow_tufe_of_the_lagged_month_relative_to_week_zero(
+        synthetic_levels):
     weeks = price_weeks(WEEK_ZERO, FIRST, LAST)
-    raw_last = inflation._raw_weekly_level(weeks)[-1]
+    base = inflation.TUFE[WEEK_ZERO_PUBLISHED_MONTH]
     for week, start in zip(weeks["week"], weeks["week_start"]):
-        year, month = start.year, start.month - 1
-        if month == 0:
-            year, month = year - 1, 12
         assert synthetic_levels.loc[week] == pytest.approx(
-            inflation.TUFE[(year, month)] / raw_last, rel=1e-12)
+            inflation.TUFE[lagged_month(start)] / base, rel=1e-12)
 
 
-def test_published_levels_last_week_is_relative_to_last_weeks_actual_level(synthetic_levels):
-    weeks = price_weeks(WEEK_ZERO, FIRST, LAST)
-    raw_last = inflation._raw_weekly_level(weeks)[-1]
+def test_published_levels_at_the_last_week_are_tufe_july_2026_over_may_2025(synthetic_levels):
     assert synthetic_levels.loc[LAST] == pytest.approx(
-        inflation.TUFE[(2026, 7)] / raw_last, rel=1e-12)
-    # Same basis as the actual (hindsight) level, which is exactly 1.0 at the last week.
-    assert inflation.weekly_price_level(weeks)[-1] == pytest.approx(1.0)
+        inflation.TUFE[(2026, 7)] / inflation.TUFE[(2025, 5)], rel=1e-12)
 
 
 def test_published_levels_are_non_decreasing(synthetic_levels):
     assert synthetic_levels.is_monotonic_increasing
 
 
-def test_published_levels_last_value_below_one(synthetic_levels):
-    # Published lags actual, and prices rose: the last week's published level is below 1.
-    assert synthetic_levels.iloc[-1] < 1.0
+def test_published_levels_before_week_zero_are_below_one(synthetic_levels):
+    # Prices rose: every week before 0 published an earlier, lower TÜFE than week 0 did.
+    assert (synthetic_levels.loc[:-1] < 1.0).all()
 
 
-def test_published_levels_never_exceed_the_actual_level(synthetic_levels):
-    actual = inflation.weekly_price_level(price_weeks(WEEK_ZERO, FIRST, LAST))
-    assert (synthetic_levels.to_numpy() <= actual + 1e-12).all()
+def test_published_levels_in_week_zeros_publication_month_are_one(synthetic_levels):
+    # Weeks 1-4 start in June 2025 (week 4 on Mon 30 June), so they publish May, like week 0.
+    assert (synthetic_levels.loc[0:4] == 1.0).all()
+
+
+def test_published_levels_after_the_first_monthly_step_are_above_one(synthetic_levels):
+    # Week 5 starts Mon 7 July 2025 and publishes June: the first step above week 0.
+    assert (synthetic_levels.loc[5:] > 1.0).all()
+
+
+def test_published_levels_last_value_above_one(synthetic_levels):
+    # Under the old normalisation (1.0 = the last week's ACTUAL level) this was ~0.98.
+    assert synthetic_levels.iloc[-1] > 1.0
+
+
+def test_published_levels_never_exceed_the_actual_level_on_a_common_basis(synthetic_levels):
+    # Published lags actual. Compare both on the copied module's basis (1.0 = the actual
+    # level of the last week): published_levels times the copied week-0 value.
+    weeks = price_weeks(WEEK_ZERO, FIRST, LAST)
+    actual = inflation.weekly_price_level(weeks)
+    old_week_zero = copied_levels(FIRST, LAST).loc[0]
+    assert (synthetic_levels.to_numpy() * old_week_zero <= actual + 1e-12).all()
 
 
 def test_published_levels_pinned_values(synthetic_levels):
-    assert synthetic_levels.loc[-32] == pytest.approx(0.589, abs=5e-4)
-    assert synthetic_levels.loc[0] == pytest.approx(0.720, abs=5e-4)
-    assert synthetic_levels.loc[64] == pytest.approx(0.982, abs=5e-4)
+    assert synthetic_levels.loc[-32] == pytest.approx(0.8176, abs=5e-4)
+    assert synthetic_levels.loc[-1] == pytest.approx(0.9849, abs=5e-4)
+    assert synthetic_levels.loc[0] == 1.0
+    assert synthetic_levels.loc[5] == pytest.approx(1.0137, abs=5e-4)
+    assert synthetic_levels.loc[64] == pytest.approx(1.3631, abs=5e-4)
+
+
+# --- no future number enters: the levels do not depend on where the range stops ----------
+
+@pytest.mark.parametrize("longer_last", [11, 30, 64])
+def test_published_levels_do_not_depend_on_last_week(longer_last):
+    short = published_levels(WEEK_ZERO, -5, 10)
+    long = published_levels(WEEK_ZERO, -5, longer_last).loc[-5:10]
+    np.testing.assert_allclose(short.to_numpy(), long.to_numpy(), rtol=1e-14, atol=0)
+    assert list(long.index) == list(short.index)
+
+
+@pytest.mark.parametrize("first", [-32, -20, -5, 0])
+@pytest.mark.parametrize("last", [0, 5, 10, 30, 64])
+def test_published_levels_agree_on_common_weeks_whatever_the_range(synthetic_levels, first,
+                                                                    last):
+    got = published_levels(WEEK_ZERO, first, last)
+    np.testing.assert_allclose(got.to_numpy(), synthetic_levels.loc[first:last].to_numpy(),
+                               rtol=1e-14, atol=0)
+
+
+def test_published_levels_up_to_week_zero_use_no_later_tufe():
+    # A range that stops at week 0 uses only months published by week 0 (up to May 2025),
+    # and still agrees with the full range.
+    levels = published_levels(WEEK_ZERO, -32, 0)
+    full = published_levels(WEEK_ZERO, -32, 64).loc[-32:0]
+    np.testing.assert_allclose(levels.to_numpy(), full.to_numpy(), rtol=1e-14, atol=0)
+
+
+def test_published_levels_ignore_a_changed_future_tufe_month(monkeypatch):
+    # Change July 2026 (published only in week 63 and 64): weeks -5..10 must not move.
+    before = published_levels(WEEK_ZERO, -5, 64).loc[-5:10]
+    monkeypatch.setitem(inflation.TUFE, (2026, 7), inflation.TUFE[(2026, 7)] * 1.5)
+    after = published_levels(WEEK_ZERO, -5, 64)
+    np.testing.assert_allclose(after.loc[-5:10].to_numpy(), before.to_numpy(),
+                               rtol=1e-14, atol=0)
+    assert after.loc[64] != pytest.approx(before.iloc[-1])  # the change did reach week 64
+
+
+# --- the week-0 guard --------------------------------------------------------------------
+
+@pytest.mark.parametrize("first,last", [(1, 10), (30, 40), (64, 64), (-32, -1), (-10, -5),
+                                        (-32, -32)])
+def test_published_levels_without_week_zero_raise_the_exact_message(first, last):
+    with pytest.raises(ValueError) as error:
+        published_levels(WEEK_ZERO, first, last)
+    assert str(error.value) == GUARD_MESSAGE.format(first=first, last=last)
+    assert not isinstance(error.value, inflation.InflationCoverageError)
+
+
+@pytest.mark.parametrize("first,last", [(-39, -1), (-45, -40), (65, 70), (100, 120)])
+def test_published_levels_guard_comes_before_the_coverage_check(first, last):
+    # These ranges also fail the coverage check; the week-0 guard must win.
+    with pytest.raises(ValueError) as error:
+        published_levels(WEEK_ZERO, first, last)
+    assert str(error.value) == GUARD_MESSAGE.format(first=first, last=last)
+    assert not isinstance(error.value, inflation.InflationCoverageError)
+
+
+def test_published_levels_guard_ranges_really_fail_coverage_on_their_own():
+    # Pins the premise of the test above.
+    for first, last in [(-39, -1), (65, 70)]:
+        with pytest.raises(inflation.InflationCoverageError):
+            check_price_coverage(price_weeks(WEEK_ZERO, first, last))
+
+
+@pytest.mark.parametrize("first,last", [(0, 0), (0, 10), (-10, 0), (-32, 0), (0, 64)])
+def test_published_levels_range_starting_or_ending_at_week_zero_works(first, last):
+    levels = published_levels(WEEK_ZERO, first, last)
+    assert list(levels.index) == list(range(first, last + 1))
+    assert levels.loc[0] == 1.0
+
+
+def test_published_levels_single_week_zero():
+    levels = published_levels(WEEK_ZERO, 0, 0)
+    assert levels.tolist() == [1.0]
+    assert levels.name == "price_level"
 
 
 def test_published_levels_raise_for_a_range_past_the_table():
@@ -283,8 +428,10 @@ def test_published_levels_raise_instead_of_silent_fallback_at_the_start():
 
 
 def test_published_levels_raise_for_last_before_first():
-    with pytest.raises(ValueError):
+    # With last < first no range can hold week 0, so the guard answers first.
+    with pytest.raises(ValueError) as error:
         published_levels(WEEK_ZERO, 2, 1)
+    assert str(error.value) == GUARD_MESSAGE.format(first=2, last=1)
 
 
 def test_published_levels_are_deterministic():
@@ -374,14 +521,28 @@ def test_deflate_does_not_modify_its_inputs(levels):
     pd.testing.assert_series_equal(levels, l0)
 
 
-def test_deflate_with_published_levels_reads_as_last_weeks_try(synthetic_levels):
+def test_deflate_with_published_levels_reads_as_week_zeros_try(synthetic_levels):
     weeks = pd.Series([FIRST, 0, LAST])
     amounts = pd.Series([1000.0, 1000.0, 1000.0])
     result = deflate(amounts, weeks, synthetic_levels)
     np.testing.assert_allclose(
         result.to_numpy(), 1000.0 / synthetic_levels.loc[[FIRST, 0, LAST]].to_numpy())
-    # An older TRY is worth more of the last week's TRY.
-    assert result.iloc[0] > result.iloc[1] > result.iloc[2] > 1000.0
+    # Week 0's TRY is the unit: an older TRY is worth more of it, a later TRY less.
+    assert result.iloc[1] == 1000.0
+    assert result.iloc[0] > 1000.0 > result.iloc[2]
+
+
+def test_deflate_with_published_levels_changes_by_one_constant_versus_the_old_basis(
+        synthetic_levels):
+    # Deflating by the old (1.0 = the last week's actual level) and the new (1.0 = week 0)
+    # levels gives amounts that differ by one constant factor, the old level at week 0.
+    old = copied_levels(FIRST, LAST).rename("price_level")
+    weeks = pd.Series(list(range(FIRST, LAST + 1, 3)) + [0, 0, LAST])
+    amounts = pd.Series(np.linspace(-500.0, 9000.0, len(weeks)))
+    new_result = deflate(amounts, weeks, synthetic_levels)
+    old_result = deflate(amounts, weeks, old)
+    np.testing.assert_allclose(new_result.to_numpy(), old_result.to_numpy() * old.loc[0],
+                               rtol=1e-13)
 
 
 def test_deflate_week_outside_published_range_raises(synthetic_levels):

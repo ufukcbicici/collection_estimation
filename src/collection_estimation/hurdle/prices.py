@@ -46,13 +46,23 @@ def check_price_coverage(weeks: pd.DataFrame,
 
 def published_levels(week_zero: date, first_week: int, last_week: int) -> pd.Series:
     """The price level PUBLISHED as of each week (a monthly step), indexed by week number and
-    normalised to 1.0 at the price level of `last_week`, so deflated amounts read as TRY of
-    the last week. Raises if the TÜFE table does not cover the weeks (see
-    `check_price_coverage`)."""
+    normalised to 1.0 at week 0, so deflated amounts read as TRY of week 0.
+
+    Week 0, not the last week: scaling to the last week would multiply every amount by a
+    number not known until then. It is one constant and carries no information, but week 0
+    is known from the start, so nothing from the future appears at all. Raises ValueError
+    unless the weeks include week 0, and (see `check_price_coverage`) if the TÜFE table does
+    not cover them.
+    """
+    if not first_week <= 0 <= last_week:
+        raise ValueError(f"weeks {first_week} to {last_week} do not include week 0, the week "
+                         f"the price levels are normalised to")
     weeks = price_weeks(week_zero, first_week, last_week)
     check_price_coverage(weeks)
-    levels = inflation.published_price_level(weeks)
-    return pd.Series(levels, index=weeks["week"].to_numpy(), name="price_level")
+    # The copied module normalises to the last week of the range; rescale to week 0.
+    levels = pd.Series(inflation.published_price_level(weeks), index=weeks["week"].to_numpy(),
+                       name="price_level")
+    return levels / levels.loc[0]
 
 
 def deflate(amounts: pd.Series, weeks: pd.Series, levels: pd.Series) -> pd.Series:

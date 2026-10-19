@@ -694,3 +694,41 @@ def test_slow_synthetic_unfilled_no_labelled_row_in_a_missing_week(synthetic_unf
     *_, labelled = synthetic_unfilled
     rows = labelled[labelled["label_status"] == LABELLED]
     assert not rows["target_week"].isin(UNFILLED_MISSING_WEEKS).any()
+
+
+# --- add_deflated_label on the synthetic panel (SLOW) ----------------------------------
+# The real TÜFE levels for weeks -32 to 64, as the pipeline builds them. The unfilled panel
+# has missing-week rows as well as future ones, so both kinds of NaN are exercised.
+
+@pytest.fixture(scope="module")
+def synthetic_levels():
+    from collection_estimation.hurdle.prices import published_levels
+    return published_levels(WEEK_ZERO, -32, 64)
+
+
+@pytest.mark.parametrize("which", ["synthetic_filled", "synthetic_unfilled"])
+def test_slow_synthetic_deflated_label(which, synthetic_levels, request):
+    from collection_estimation.hurdle.panel import add_deflated_label
+
+    *_, labelled = request.getfixturevalue(which)
+    before = labelled.copy()
+    result = add_deflated_label(labelled, synthetic_levels)
+    pd.testing.assert_frame_equal(labelled, before)
+    pd.testing.assert_frame_equal(result.drop(columns="amount_deflated"), labelled)
+    assert result["amount_deflated"].dtype == "float64"
+
+    is_labelled = result["label_status"] == LABELLED
+    assert int(result["amount_deflated"].isna().sum()) == int((~is_labelled).sum())
+    assert result.loc[is_labelled, "amount_deflated"].notna().all()
+    assert ((result["amount"] == 0.0) == (result["amount_deflated"] == 0.0)).all()
+
+    # amount / amount_deflated is the target week's level, row by row and per target week.
+    paying = result[is_labelled & (result["amount"] > 0)]
+    ratio = paying["amount"] / paying["amount_deflated"]
+    np.testing.assert_allclose(ratio.to_numpy(),
+                               paying["target_week"].map(synthetic_levels).to_numpy(),
+                               rtol=1e-12, atol=0.0)
+    per_week = paying.groupby("target_week")[["amount", "amount_deflated"]].sum()
+    np.testing.assert_allclose((per_week["amount"] / per_week["amount_deflated"]).to_numpy(),
+                               per_week.index.map(synthetic_levels).to_numpy(),
+                               rtol=1e-12, atol=0.0)

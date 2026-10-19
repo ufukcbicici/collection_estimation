@@ -61,7 +61,11 @@ from collection_estimation.hurdle.holidays import load_holidays, public_holidays
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
-from collection_estimation.hurdle.panel import add_labels, panel_rows  # noqa: E402
+from collection_estimation.hurdle.panel import (  # noqa: E402
+    add_deflated_label,
+    add_labels,
+    panel_rows,
+)
 from collection_estimation.hurdle.side_tables import (  # noqa: E402
     check_side_tables,
     is_unidentified,
@@ -225,11 +229,14 @@ def main():
           f"(panel + A + G = gross receipts; R = refunds)")
 
     # Step 10: TÜFE price levels by week, from the first ledger line (history goes back that
-    # far) to the last week. The copied inflation.py is called directly here so it can be
-    # followed line by line; prices.py wraps it with our week numbers and a coverage guard.
+    # far), or week 0 if the ledger starts later, to the last week: the levels are normalised
+    # to week 0, so it must be in the range. The copied inflation.py is called directly here
+    # so it can be followed line by line; prices.py wraps it with our week numbers and a
+    # coverage guard.
     last_week = int(weeks["week"].max())
-    first_price_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]),
-                                        week_zero).iloc[0])
+    first_ledger_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]),
+                                         week_zero).iloc[0])
+    first_price_week = min(first_ledger_week, 0)
     weeks_for_prices = price_weeks(week_zero, first_price_week, last_week)
     actual_level = inflation.weekly_price_level(weeks_for_prices)        # hindsight only
     published_level = inflation.published_price_level(weeks_for_prices)  # known at the time
@@ -240,7 +247,9 @@ def main():
     # Step 11: the features. Built unit by unit; for now, the ledger's payments before the
     # first daily file, used as payment history if [history] use_ledger_before_first_file.
     if settings.history.use_ledger_before_first_file:
-        history_start = first_history_week(ledger, week_zero)
+        # Week 0 at the latest: a ledger that starts after the first daily file gives no
+        # history before it, and the matrix must still hold the daily files from week 0.
+        history_start = min(first_history_week(ledger, week_zero), 0)
         early_receipts = ledger_receipts_before(ledger, min(daily_files), week_zero)
         early_receipts = early_receipts[early_receipts["week"] >= history_start]
     else:
@@ -268,6 +277,10 @@ def main():
     owed = receivables_features(panel, receivables, levels, settings.receivables.horizons,
                                 settings.receivables.overdue_age_days)
     show_owed(owed, int(before_first_ledger_week(panel, receivables).sum()))
+
+    # The label in TRY of week 0, like the features: divided by its target week's level.
+    panel = add_deflated_label(panel, levels)
+    show_deflated_label(panel, levels)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -442,7 +455,8 @@ def show_prices(weeks_for_prices, actual_level, published_level, projected_level
     first, last = weeks_for_prices["week"].iloc[0], weeks_for_prices["week"].iloc[-1]
     print(f"Step 10: price levels for weeks {first} to {last} "
           f"({weeks_for_prices['week_start'].iloc[0]:%Y-%m-%d} to "
-          f"{weeks_for_prices['week_end'].iloc[-1]:%Y-%m-%d}), 1.0 = the last week")
+          f"{weeks_for_prices['week_end'].iloc[-1]:%Y-%m-%d}); the copied module gives 1.0 = the "
+          f"last week, published_levels() rescales to 1.0 = week 0")
     table = pd.DataFrame({"week": weeks_for_prices["week"], "actual": actual_level,
                           "published": published_level}).set_index("week")
     print(table.iloc[::13].round(3).to_string())
@@ -450,9 +464,12 @@ def show_prices(weeks_for_prices, actual_level, published_level, projected_level
     n = len(actual_level)
     one_ahead = [projected_level[origin, origin + 1] / actual_level[origin + 1] - 1
                  for origin in range(n - 1)]
+    # published_levels() is the copied module's published level, rescaled to week 0.
+    at_week_zero = published_level[list(weeks_for_prices["week"]).index(0)]
     print(f"        projected vs actual level one week ahead: mean error "
           f"{sum(one_ahead) / len(one_ahead):+.2%}; published_levels() matches: "
-          f"{bool((abs(levels.to_numpy() - published_level) < 1e-12).all())}")
+          f"{bool((abs(levels.to_numpy() - published_level / at_week_zero) < 1e-12).all())}; "
+          f"week 0 = {levels.loc[0]:.3f}, last week = {levels.iloc[-1]:.3f}")
 
 
 def show_early_receipts(early_receipts, history_start):
@@ -477,7 +494,7 @@ def show_matrix(matrix):
     busiest = matrix.sum(axis=1).idxmax()
     paid_weeks = [week for week in matrix.columns if matrix.loc[busiest, week] > 0][:6]
     print(f"        the key with the most receipts, its first weeks with a payment "
-          f"(TRY of the last week):")
+          f"(TRY of week 0):")
     print(matrix.loc[[busiest], paid_weeks].round(0).to_string())
 
 
@@ -529,9 +546,23 @@ def show_owed(owed, not_yet_in_ledger):
     print(summary.round(3).to_string())
     due_by_h = owed.groupby("h")[["due_before_target_week", "due_in_target_week",
                                   "due_after_target_week"]].sum() / 1e9
-    print("        due before / in / after the target week, by h (billion TRY of the last "
-          "week, summed over rows):")
+    print("        due before / in / after the target week, by h (billion TRY of week 0, "
+          "summed over rows):")
     print(due_by_h.round(2).to_string())
+
+
+def show_deflated_label(panel, levels):
+    """A short printout of the deflated label."""
+    labelled = panel[panel["label_status"] == "labelled"]
+    print(f"        deflated label: {labelled['amount_deflated'].notna().sum():,} labelled rows, "
+          f"{panel['amount_deflated'].isna().sum():,} NaN (rows not labelled: "
+          f"{(panel['label_status'] != 'labelled').sum():,})")
+    one_horizon = labelled[labelled["h"] == 1]
+    per_week = one_horizon.groupby("target_week")[["amount", "amount_deflated"]].sum()
+    per_week["ratio"] = per_week["amount"] / per_week["amount_deflated"]
+    per_week["level"] = per_week.index.map(levels)
+    print("        at h=1, label per target week, million TRY (nominal / of week 0), every 16th:")
+    print((per_week.loc[per_week.index % 16 == 0] / [1e6, 1e6, 1, 1]).round(3).to_string())
 
 
 if __name__ == "__main__":

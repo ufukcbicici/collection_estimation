@@ -670,6 +670,35 @@ def test_inputs_are_not_modified():
     pd.testing.assert_series_equal(level_series, copies[2])
 
 
+def test_amounts_change_by_one_constant_factor_versus_the_old_price_normalisation():
+    # Old basis: the copied module's published level (1.0 = the last week's actual level);
+    # new basis: published_levels (1.0 = week 0). Amounts move by the old week-0 level;
+    # days and counts do not move.
+    from datetime import date
+    from collection_estimation.hurdle import inflation
+    from collection_estimation.hurdle.prices import price_weeks, published_levels
+    week_zero = date(2025, 6, 2)
+    weeks = price_weeks(week_zero, 0, 12)
+    old = pd.Series(inflation.published_price_level(weeks), index=weeks["week"].to_numpy(),
+                    dtype="float64", name="price_level")
+    new = published_levels(week_zero, 0, 12)
+    triples = [("K", 10, 1), ("K", 10, 2), ("K", 11, 5)]
+    receivables = receivables_table([example_row(), receivables_row("K", 11, due_later=70.0,
+                                                                    open_balance=70.0)])
+    result_new = receivables_features(panel(triples), receivables, new, HORIZONS, AGE_EDGES)
+    result_old = receivables_features(panel(triples), receivables, old, HORIZONS, AGE_EDGES)
+    np.testing.assert_allclose(result_new[AMOUNT_FEATURES].to_numpy(),
+                               result_old[AMOUNT_FEATURES].to_numpy() * old.loc[0], rtol=1e-13)
+    others = [column for column in result_new.columns if column not in AMOUNT_FEATURES]
+    pd.testing.assert_frame_equal(result_new[others], result_old[others])
+    assert old.loc[0] != pytest.approx(1.0)
+
+
+def test_receivables_features_docstring_says_try_of_week_zero():
+    assert "TRY of week 0" in receivables_features.__doc__
+    assert "TRY of the last week" not in receivables_features.__doc__
+
+
 def test_same_inputs_give_the_same_table_twice():
     triples = [("A", 1, 3), ("B", 2, 1), ("C", 2, 5)]
     pd.testing.assert_frame_equal(features(triples, three_keys()), features(triples, three_keys()))

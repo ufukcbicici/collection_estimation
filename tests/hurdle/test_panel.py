@@ -1,6 +1,7 @@
-"""Tests for `hurdle/panel.py`: the panel's rows (key x origin week x horizon, no labels).
+"""Tests for `hurdle/panel.py`: the panel's rows (key x origin week x horizon, no labels),
+and `add_deflated_label` (the label divided by its target week's price level).
 
-Hand-built `known` tables for the unit tests; one slow integration block against the
+Hand-built `known` tables (and labelled panels) for the unit tests; one slow integration block against the
 synthetic corpus and ledger in data/raw (skipped if they are absent; never uses data/interim).
 """
 import contextlib
@@ -9,10 +10,11 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from collection_estimation.hurdle.panel import PANEL_ROW_COLUMNS, panel_rows
+from collection_estimation.hurdle.panel import PANEL_ROW_COLUMNS, add_deflated_label, panel_rows
 
 KNOWN_COLUMNS = ["key", "company_code", "customer_id", "first_seen", "known_week",
                  "first_seen_in"]
@@ -345,6 +347,400 @@ def test_input_not_modified_when_repeated_key_raises():
     with pytest.raises(ValueError, match="more than once"):
         panel_rows(known, 4, 2)
     pd.testing.assert_frame_equal(known, before)
+
+
+# --- add_deflated_label: the label in TRY of week 0 -------------------------------------
+# Hand-built labelled panels shaped like `add_labels`' output: the panel columns, then
+# label_status (object), amount (float64, NaN unless labelled) and paid (nullable boolean).
+
+LABELLED_COLUMNS = PANEL_ROW_COLUMNS + ["label_status", "amount", "paid"]
+DEFLATED_COLUMNS = PANEL_ROW_COLUMNS + ["label_status", "amount", "amount_deflated", "paid"]
+
+
+def labelled_panel(rows):
+    """rows: (key, origin_week, h, label_status, amount). Shaped like `add_labels`' output;
+    amount is NaN and paid NA on the rows that are not labelled."""
+    records = []
+    for key, origin, h, status, amount in rows:
+        company, customer = key.split("-")
+        amount = float(amount) if status == "labelled" else float("nan")
+        records.append((key, company, customer, origin, h, origin + h, status, amount))
+    frame = pd.DataFrame(records, columns=LABELLED_COLUMNS[:-1])
+    frame = frame.astype({"key": object, "company_code": object, "customer_id": object,
+                          "origin_week": "int64", "h": "int64", "target_week": "int64",
+                          "label_status": object, "amount": "float64"})
+    frame["paid"] = (frame["amount"] > 0).astype("boolean")
+    frame.loc[frame["label_status"] != "labelled", "paid"] = pd.NA
+    return frame
+
+
+def level_series(mapping):
+    """Price levels by week number, shaped like `published_levels`' output."""
+    return pd.Series(mapping, dtype="float64", name="price_level")
+
+
+def deflated_of(table, key, origin, h):
+    hit = table[(table["key"] == key) & (table["origin_week"] == origin) & (table["h"] == h)]
+    assert len(hit) == 1, (key, origin, h, len(hit))
+    return hit["amount_deflated"].iloc[0]
+
+
+@pytest.fixture
+def mixed_panel():
+    # Target weeks 39, 40, 42 labelled; 41 a missing week; 43 and 44 future.
+    return labelled_panel([
+        ("TR02-A", 38, 1, "labelled", 1_100.0),   # target 39
+        ("TR02-A", 38, 2, "labelled", 1_000.0),   # target 40
+        ("TR02-A", 39, 1, "labelled", 1_000.0),   # target 40
+        ("TR04-B", 39, 2, "missing_week", 0),     # target 41
+        ("TR04-B", 40, 2, "labelled", 0.0),       # target 42: paid nothing
+        ("TR04-B", 42, 1, "future", 0),           # target 43
+        ("TR02-A", 42, 2, "future", 0),           # target 44
+    ])
+
+
+@pytest.fixture
+def mixed_levels():
+    # A level for every labelled target week (and origin 38); none for the missing week 41
+    # or the future weeks 43 and 44.
+    return level_series({38: 1.0, 39: 1.1, 40: 1.25, 42: 1.5})
+
+
+def test_deflated_worked_example_1000_try_at_level_1_25_is_800():
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 1_000.0)])
+    result = add_deflated_label(panel, level_series({40: 1.25}))
+    assert result["amount_deflated"].iloc[0] == 800.0
+
+
+def test_deflated_divides_by_the_target_week_not_the_origin_week(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    # Origins 38 and 39, both targeting week 40: same amount, same level, same value.
+    assert deflated_of(result, "TR02-A", 38, 2) == 800.0
+    assert deflated_of(result, "TR02-A", 39, 1) == 800.0
+
+
+def test_deflated_same_origin_different_h_uses_different_levels(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    assert deflated_of(result, "TR02-A", 38, 1) == 1_100.0 / 1.1
+    assert deflated_of(result, "TR02-A", 38, 2) == 800.0
+    # Not the origin week's level (1.0 at week 38).
+    assert deflated_of(result, "TR02-A", 38, 1) != 1_100.0
+
+
+def test_deflated_origin_level_is_never_looked_up():
+    # A level only for the target week: origin week 39 has none, and nothing raises.
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 500.0)])
+    result = add_deflated_label(panel, level_series({40: 2.0}))
+    assert result["amount_deflated"].iloc[0] == 250.0
+
+
+def test_deflated_zero_stays_zero(mixed_panel, mixed_levels):
+    value = deflated_of(add_deflated_label(mixed_panel, mixed_levels), "TR04-B", 40, 2)
+    assert value == 0.0
+    assert not np.isnan(value)
+    assert not np.signbit(value)
+
+
+def test_deflated_missing_week_and_future_rows_nan_without_levels(mixed_panel, mixed_levels):
+    # Weeks 41, 43 and 44 have no level: no error, and their rows stay NaN.
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    assert np.isnan(deflated_of(result, "TR04-B", 39, 2))
+    assert np.isnan(deflated_of(result, "TR04-B", 42, 1))
+    assert np.isnan(deflated_of(result, "TR02-A", 42, 2))
+
+
+def test_deflated_nan_exactly_on_the_rows_not_labelled(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    is_labelled = result["label_status"] == "labelled"
+    assert result.loc[is_labelled, "amount_deflated"].notna().all()
+    assert result.loc[~is_labelled, "amount_deflated"].isna().all()
+
+
+def test_deflated_future_rows_far_beyond_the_levels_do_not_raise():
+    panel = labelled_panel([("TR02-A", 64, 1, "labelled", 10.0),
+                            ("TR02-A", 64, 5, "future", 0),
+                            ("TR02-A", 9_000, 1, "future", 0)])
+    result = add_deflated_label(panel, level_series({week: 1.0 for week in range(66)}))
+    assert result["amount_deflated"].iloc[0] == 10.0
+    assert result["amount_deflated"].iloc[1:].isna().all()
+
+
+def test_deflated_rows_not_labelled_need_no_levels_at_all():
+    panel = labelled_panel([("TR02-A", 3, 1, "missing_week", 0),
+                            ("TR02-A", 3, 2, "future", 0)])
+    result = add_deflated_label(panel, level_series({}))
+    assert result["amount_deflated"].isna().all()
+    assert result["amount_deflated"].dtype == "float64"
+
+
+def test_deflated_missing_week_row_with_a_level_still_nan():
+    # Even when the missing week does have a level, its row is not divided.
+    panel = labelled_panel([("TR02-A", 3, 1, "missing_week", 0)])
+    result = add_deflated_label(panel, level_series({4: 1.0}))
+    assert np.isnan(result["amount_deflated"].iloc[0])
+
+
+def no_level_message(weeks):
+    return re.escape(f"no price level for weeks {weeks}")
+
+
+def test_deflated_labelled_row_without_a_level_raises():
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 1_000.0),
+                            ("TR02-A", 40, 1, "labelled", 1_000.0)])
+    with pytest.raises(ValueError, match=no_level_message([41])):
+        add_deflated_label(panel, level_series({40: 1.25}))
+
+
+def test_deflated_labelled_zero_without_a_level_still_raises():
+    # A zero needs no division, but its level must still exist: no silent pass.
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 0.0)])
+    with pytest.raises(ValueError, match=no_level_message([40])):
+        add_deflated_label(panel, level_series({39: 1.0}))
+
+
+def test_deflated_labelled_row_with_a_nan_level_raises():
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 1_000.0)])
+    with pytest.raises(ValueError, match=no_level_message([40])):
+        add_deflated_label(panel, level_series({40: float("nan")}))
+
+
+def test_deflated_missing_levels_listed_sorted_and_once():
+    panel = labelled_panel([("TR02-A", 9, 1, "labelled", 1.0),
+                            ("TR04-B", 4, 1, "labelled", 1.0),
+                            ("TR04-B", 9, 1, "labelled", 1.0),
+                            ("TR05-C", 6, 1, "labelled", 1.0)])
+    with pytest.raises(ValueError, match=no_level_message([5, 7, 10])):
+        add_deflated_label(panel, level_series({0: 1.0}))
+
+
+def test_deflated_missing_levels_list_at_most_ten_weeks():
+    panel = labelled_panel([("TR02-A", week, 1, "labelled", 1.0) for week in range(12)])
+    with pytest.raises(ValueError, match=no_level_message(list(range(1, 11))) + "$"):
+        add_deflated_label(panel, level_series({0: 1.0}))
+
+
+def test_deflated_raise_names_only_labelled_weeks(mixed_panel):
+    # Week 40 lacks a level and is labelled; 41, 43 and 44 lack one too but are not labelled.
+    with pytest.raises(ValueError, match=no_level_message([40]) + "$"):
+        add_deflated_label(mixed_panel, level_series({39: 1.1, 42: 1.5}))
+
+
+def test_deflated_input_not_modified_when_it_raises():
+    panel = labelled_panel([("TR02-A", 39, 1, "labelled", 1_000.0)])
+    before = panel.copy()
+    with pytest.raises(ValueError):
+        add_deflated_label(panel, level_series({}))
+    pd.testing.assert_frame_equal(panel, before)
+
+
+def run_add_labels_message(columns):
+    return re.escape(f"the panel has no columns {columns}; run add_labels first")
+
+
+def test_deflated_raises_without_amount(mixed_panel, mixed_levels):
+    with pytest.raises(ValueError, match=run_add_labels_message(["amount"])):
+        add_deflated_label(mixed_panel.drop(columns="amount"), mixed_levels)
+
+
+def test_deflated_raises_without_label_status(mixed_panel, mixed_levels):
+    with pytest.raises(ValueError, match=run_add_labels_message(["label_status"])):
+        add_deflated_label(mixed_panel.drop(columns="label_status"), mixed_levels)
+
+
+def test_deflated_raises_without_both_listed_amount_first(mixed_panel, mixed_levels):
+    with pytest.raises(ValueError, match=run_add_labels_message(["amount", "label_status"])):
+        add_deflated_label(mixed_panel.drop(columns=["label_status", "amount"]), mixed_levels)
+
+
+def test_deflated_raises_on_panel_rows_output(three_keys):
+    # The unlabelled panel from `panel_rows` has neither column.
+    with pytest.raises(ValueError, match=run_add_labels_message(["amount", "label_status"])):
+        add_deflated_label(panel_rows(three_keys, 4, 2), level_series({}))
+
+
+def test_deflated_missing_column_checked_before_levels(mixed_panel):
+    # No levels at all: the column check must still be the error raised.
+    with pytest.raises(ValueError, match="run add_labels first"):
+        add_deflated_label(mixed_panel.drop(columns="amount"), level_series({}))
+
+
+def test_deflated_empty_panel():
+    result = add_deflated_label(labelled_panel([]), level_series({0: 1.0}))
+    assert len(result) == 0
+    assert list(result.columns) == DEFLATED_COLUMNS
+    assert result["amount_deflated"].dtype == "float64"
+
+
+def test_deflated_empty_panel_with_empty_levels():
+    result = add_deflated_label(labelled_panel([]), level_series({}))
+    assert len(result) == 0
+    assert result["amount_deflated"].dtype == "float64"
+
+
+def test_deflated_non_default_index_kept_and_rows_matched(mixed_panel, mixed_levels):
+    expected = add_deflated_label(mixed_panel, mixed_levels)["amount_deflated"].to_numpy()
+    index = pd.Index([70, 3, 15, 900, -2, 41, 8])
+    result = add_deflated_label(mixed_panel.set_axis(index), mixed_levels)
+    assert result.index.equals(index)
+    np.testing.assert_array_equal(result["amount_deflated"].to_numpy(), expected)
+
+
+def test_deflated_string_index_kept_and_rows_matched(mixed_panel, mixed_levels):
+    expected = add_deflated_label(mixed_panel, mixed_levels)["amount_deflated"].to_numpy()
+    result = add_deflated_label(mixed_panel.set_axis(list("gfedcba")), mixed_levels)
+    assert list(result.index) == list("gfedcba")
+    np.testing.assert_array_equal(result["amount_deflated"].to_numpy(), expected)
+
+
+def test_deflated_index_with_gaps_after_filtering(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel.iloc[[1, 2, 4, 6]], mixed_levels)
+    assert list(result.index) == [1, 2, 4, 6]
+    assert result["amount_deflated"].tolist()[:3] == [800.0, 800.0, 0.0]
+    assert np.isnan(result["amount_deflated"].iloc[3])
+
+
+def test_deflated_repeated_index_labels_rows_matched_by_position(mixed_panel, mixed_levels):
+    # pandas assigns by index label: with repeated labels a mis-alignment would mix rows up
+    # or raise. Each row must still get its own value.
+    expected = add_deflated_label(mixed_panel, mixed_levels)["amount_deflated"].to_numpy()
+    result = add_deflated_label(mixed_panel.set_axis([0, 0, 1, 1, 1, 2, 2]), mixed_levels)
+    np.testing.assert_array_equal(result["amount_deflated"].to_numpy(), expected)
+
+
+def test_deflated_column_inserted_right_after_amount(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    assert list(result.columns) == DEFLATED_COLUMNS
+
+
+def test_deflated_column_follows_amount_wherever_it_is(mixed_panel, mixed_levels):
+    order = ["amount", "key", "label_status", "extra", "h", "origin_week", "target_week",
+             "paid", "company_code", "customer_id"]
+    result = add_deflated_label(mixed_panel.assign(extra=1)[order], mixed_levels)
+    assert list(result.columns) == ["amount", "amount_deflated"] + order[1:]
+
+
+def test_deflated_amount_last_appends_at_the_end(mixed_panel, mixed_levels):
+    order = [column for column in mixed_panel.columns if column != "amount"] + ["amount"]
+    result = add_deflated_label(mixed_panel[order], mixed_levels)
+    assert list(result.columns) == order + ["amount_deflated"]
+
+
+def test_deflated_other_columns_and_dtypes_unchanged(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    pd.testing.assert_frame_equal(result.drop(columns="amount_deflated"), mixed_panel)
+    assert result["amount_deflated"].dtype == "float64"
+    assert result["amount"].dtype == "float64"
+    assert result["paid"].dtype == "boolean"
+    assert result["label_status"].dtype == object
+    for column in ("origin_week", "h", "target_week"):
+        assert result[column].dtype == "int64", column
+
+
+def test_deflated_paid_keeps_its_na(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    is_labelled = result["label_status"] == "labelled"
+    assert result.loc[~is_labelled, "paid"].isna().all()
+    assert result.loc[is_labelled, "paid"].tolist() == [True, True, True, False]
+
+
+def test_deflated_float64_with_integer_levels():
+    panel = labelled_panel([("TR02-A", 0, 1, "labelled", 9.0)])
+    result = add_deflated_label(panel, pd.Series({1: 2}, dtype="int64"))
+    assert result["amount_deflated"].dtype == "float64"
+    assert result["amount_deflated"].iloc[0] == 4.5
+
+
+def test_deflated_inputs_not_modified(mixed_panel, mixed_levels):
+    panel_before, levels_before = mixed_panel.copy(), mixed_levels.copy()
+    add_deflated_label(mixed_panel, mixed_levels)
+    pd.testing.assert_frame_equal(mixed_panel, panel_before)
+    pd.testing.assert_series_equal(mixed_levels, levels_before)
+    assert "amount_deflated" not in mixed_panel.columns
+
+
+def test_deflated_returns_a_new_table(mixed_panel, mixed_levels):
+    result = add_deflated_label(mixed_panel, mixed_levels)
+    assert result is not mixed_panel
+    result.loc[result.index[0], "amount"] = -1.0
+    assert mixed_panel["amount"].iloc[0] == 1_100.0
+
+
+def test_deflated_deterministic(mixed_panel, mixed_levels):
+    pd.testing.assert_frame_equal(add_deflated_label(mixed_panel, mixed_levels),
+                                  add_deflated_label(mixed_panel, mixed_levels))
+
+
+def test_deflated_applied_twice_raises_not_a_second_column(mixed_panel, mixed_levels):
+    once = add_deflated_label(mixed_panel, mixed_levels)
+    with pytest.raises(ValueError):
+        add_deflated_label(once, mixed_levels)
+
+
+def test_deflated_nominal_equals_deflated_times_level_for_every_labelled_row():
+    rng = np.random.default_rng(7)
+    rows = []
+    for origin in range(20):
+        for h in range(1, 6):
+            target = origin + h
+            status = ("future" if target > 20 else "missing_week" if target == 11
+                      else "labelled")
+            amount = 0.0 if rng.random() < 0.3 else float(rng.uniform(1, 5e6))
+            rows.append(("TR02-A", origin, h, status, amount))
+    levels = level_series({week: 1.0 + 0.03 * week + 0.001 * week ** 2 for week in range(21)})
+    result = add_deflated_label(labelled_panel(rows), levels)
+    labelled = result[result["label_status"] == "labelled"]
+    assert len(labelled) > 50
+    rebuilt = labelled["amount_deflated"] * labelled["target_week"].map(levels)
+    np.testing.assert_allclose(rebuilt.to_numpy(), labelled["amount"].to_numpy(),
+                               rtol=1e-14, atol=0.0)
+
+
+def test_deflated_with_published_levels_week_zero_target_unchanged():
+    from collection_estimation.hurdle.prices import published_levels
+
+    levels = published_levels(WEEK_ZERO, -32, 64)
+    assert levels.loc[0] == 1.0
+    amount = 123_456.789
+    panel = labelled_panel([("TR02-A", -1, 1, "labelled", amount),
+                            ("TR02-A", 39, 1, "labelled", amount)])
+    result = add_deflated_label(panel, levels)
+    assert result["amount_deflated"].iloc[0] == amount
+    # Week 40 is later: prices rose, so the same nominal amount is worth less in week 0.
+    assert result["amount_deflated"].iloc[1] == amount / levels.loc[40]
+    assert result["amount_deflated"].iloc[1] < amount
+
+
+def test_deflated_with_published_levels_future_week_past_the_range_is_nan():
+    from collection_estimation.hurdle.prices import published_levels
+
+    levels = published_levels(WEEK_ZERO, 0, 64)
+    panel = labelled_panel([("TR02-A", 63, 1, "labelled", 50.0),
+                            ("TR02-A", 64, 5, "future", 0)])
+    result = add_deflated_label(panel, levels)
+    assert result["amount_deflated"].iloc[0] == 50.0 / levels.loc[64]
+    assert np.isnan(result["amount_deflated"].iloc[1])
+
+
+def test_deflated_on_add_labels_output():
+    # End to end on a real `add_labels` table: weeks 0-4, week 3 missing, targets 5-6 future.
+    from collection_estimation.hurdle.panel import add_labels
+    from tests.hurdle.test_panel_labels import weekly_table, weeks_table
+
+    known = known_table([("TR02", "A", -5), ("TR04", "B", 2)])
+    panel = add_labels(panel_rows(known, 4, 2),
+                       weekly_table([("TR02-A", 1, 100.0, 0.0), ("TR02-A", 3, 50.0, 0.0),
+                                     ("TR04-B", 4, 30.0, -5.0)]),
+                       weeks_table(4, missing={3}))
+    levels = level_series({1: 1.0, 2: 1.25, 4: 2.0})   # none for weeks 3, 5 and 6
+    result = add_deflated_label(panel, levels)
+    labelled = result["label_status"] == "labelled"
+    assert set(result.loc[~labelled, "target_week"]) == {3, 5, 6}
+    assert result.loc[~labelled, "amount_deflated"].isna().all()
+    expected = result.loc[labelled, "amount"] / result.loc[labelled, "target_week"].map(levels)
+    pd.testing.assert_series_equal(result.loc[labelled, "amount_deflated"], expected,
+                                   check_names=False)
+    assert deflated_of(result, "TR04-B", 2, 2) == 15.0
+    assert deflated_of(result, "TR02-A", 0, 1) == 100.0
 
 
 # --- integration with the synthetic corpus and ledger (SLOW) ---------------------------

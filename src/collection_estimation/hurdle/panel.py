@@ -6,6 +6,8 @@ stacks these snapshots for every origin week, so the model learns from many past
 """
 import pandas as pd
 
+from .prices import deflate
+
 # The columns of the table `panel_rows` returns, in order.
 PANEL_ROW_COLUMNS = ["key", "company_code", "customer_id", "origin_week", "h", "target_week"]
 
@@ -117,3 +119,25 @@ def check_labels_within_receipts(labelled: pd.DataFrame, weekly: pd.DataFrame) -
         raise ValueError(f"for {too_much.sum()} (origin, target) weeks the labelled amounts add up "
                          f"to more than the target week's receipts (first: "
                          f"{first[['origin_week', 'target_week']].values.tolist()})")
+
+
+def add_deflated_label(panel: pd.DataFrame, levels: pd.Series) -> pd.DataFrame:
+    """The panel with `amount_deflated` added after `amount`: the label divided by the price
+    level of its TARGET week (`levels` from `published_levels`), so it reads as TRY of week
+    0, like the features.
+
+    Only labelled rows are divided: missing-week and future rows keep NaN and need no level.
+    0.0 stays 0.0. `panel` (from `add_labels`) is not changed. Raises ValueError if it has no
+    `amount` or `label_status` column, or (from `deflate`) if a labelled row's target week
+    has no price level.
+    """
+    absent = [column for column in ("amount", "label_status") if column not in panel.columns]
+    if absent:
+        raise ValueError(f"the panel has no columns {absent}; run add_labels first")
+    with_label = panel.copy()
+    is_labelled = with_label["label_status"] == LABELLED
+    deflated = pd.Series(float("nan"), index=with_label.index, dtype="float64")
+    labelled_rows = with_label[is_labelled]
+    deflated[is_labelled] = deflate(labelled_rows["amount"], labelled_rows["target_week"], levels)
+    with_label.insert(with_label.columns.get_loc("amount") + 1, "amount_deflated", deflated)
+    return with_label

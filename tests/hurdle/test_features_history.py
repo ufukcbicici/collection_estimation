@@ -798,6 +798,41 @@ def test_nominal_totals_tie_to_the_sources():
     assert nominal.sum().sum() == pytest.approx(10.0 + 2.5 + 7.25 + 1.0 + 9.0)
 
 
+# --- weekly_matrix with the real price levels: TRY of week 0 -----------------------------
+
+def test_matrix_with_published_levels_reads_week_zero_amounts_unchanged():
+    from collection_estimation.hurdle.prices import published_levels
+    levels = published_levels(WEEK_ZERO, -2, 3)
+    result = matrix(weekly_rows=[("TR02-1", 0, 123.45)], levels=levels)
+    assert result.loc["TR02-1", 0] == 123.45
+
+
+def test_matrix_changes_by_one_constant_factor_versus_the_old_normalisation():
+    # Old basis: the copied module's published level (1.0 = the last week's actual level).
+    # New basis: that divided by its week-0 value. Every cell moves by the same factor.
+    from collection_estimation.hurdle import inflation
+    from collection_estimation.hurdle.prices import price_weeks, published_levels
+    first, last = -2, 9
+    weeks = price_weeks(WEEK_ZERO, first, last)
+    old = pd.Series(inflation.published_price_level(weeks), index=weeks["week"].to_numpy(),
+                    dtype="float64", name="price_level")
+    new = published_levels(WEEK_ZERO, first, last)
+    weekly_rows = [("TR02-1", 0, 10.0), ("TR02-2", 3, 2.5), ("TR02-1", 6, 7.25),
+                   ("TR02-2", 9, 40.0)]
+    early_rows = [("TR02-2", -2, 1.0), ("TR02-1", -1, 9.0)]
+    args = dict(weekly_rows=weekly_rows, early_rows=early_rows, keys=["TR02-1", "TR02-2"],
+                first_week=first, last_week=last)
+    result_new = matrix(levels=new, **args)
+    result_old = matrix(levels=old, **args)
+    pd.testing.assert_frame_equal(result_new, result_old * old.loc[0], rtol=1e-13)
+    assert old.loc[0] != pytest.approx(1.0)  # the factor is a real change of unit
+
+
+def test_weekly_matrix_docstring_says_try_of_week_zero():
+    assert "TRY of week 0" in weekly_matrix.__doc__
+    assert "TRY of the last week" not in weekly_matrix.__doc__
+
+
 # --- check_matrix_totals ---------------------------------------------------------------
 
 def nominal_frame(values, weeks=(0, 1, 2), keys=("TR02-1", "TR02-2")):

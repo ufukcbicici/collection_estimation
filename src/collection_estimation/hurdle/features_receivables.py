@@ -27,7 +27,7 @@ def receivables_features(panel_rows: pd.DataFrame, receivables: pd.DataFrame,
       overdue_days, open_invoices, cleared_invoices, unapplied_cash, open_balance,
       usual_delay_days        as in `receivables_at`, for week t
     Amounts are DEFLATED by the price level of week t (`levels` from `published_levels`),
-    so they read as TRY of the last week, like the history features.
+    so they read as TRY of week 0, like the history features.
 
     A key can be known (from a daily file) before the ledger shows it, e.g. a payment on a
     Friday posted on the Monday. Before its first week in `receivables` (see

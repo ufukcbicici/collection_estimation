@@ -68,7 +68,7 @@ def weekly_matrix(weekly: pd.DataFrame, early_receipts: pd.DataFrame, keys: pd.S
     the key paid nothing, and NaN for a week with no data, i.e. a week the calendar `weeks`
     marks missing. (Without early receipts, call it with `first_week` 0: the matrix then has
     no weeks before 0 at all.) Amounts are divided by their week's price level (`levels`
-    from `published_levels`), so they read as TRY of the last week.
+    from `published_levels`), so they read as TRY of week 0.
 
     Raises ValueError if an early receipt is dated week 0 or later (the two sources must not
     overlap), if a receipt falls outside `first_week` ... `last_week`, if the matrix does
