@@ -1137,3 +1137,301 @@ def test_step_12_printout_with_no_training_rows_does_not_crash():
     assert lines[0].startswith("Step 12: stage 1 at forecast week 0: 0 training rows ")
     assert "4 forecast rows (origin 0, 2 customers x h)" in lines[0]
     assert lines[-1] == "ok"
+
+
+# Step 12 (U10.2): fit stage 1 at the demo origin, predict its forecast rows, score them.
+# The wiring is checked on main()'s source; the printout runs in a separate process on a
+# hand-made frame with a hand-made p, so every number can be worked out by hand:
+# six forecast rows, of which four are labelled (h=1: paid, not paid; h=2: paid, not paid)
+# with p 0.8, 0.4, 0.6, 0.2; one "missing_week" row (p 0.99) and one "future" row (p 0.01),
+# both with paid = NA, must be left out. Training share paid: 1 of 4 = 0.25.
+#   stage 1:   log loss = -(ln .8 + ln .6)/2 = 0.3670, Brier = (.04+.16+.16+.04)/4 = 0.1,
+#              AUC = 1 (both payers above both non-payers)
+#   base rate: log loss = -(ln .25 + ln .75)/2 = 0.8370, Brier = (.5625+.0625)/2 = 0.3125,
+#              AUC = 0.5
+#   per h:     h=1 mean p 0.6, share paid 0.5; h=2 mean p 0.4, share paid 0.5
+SCORES_WIRING = """
+import inspect
+import time
+import sklearn.metrics
+import run_hurdle_pipeline as script
+
+assert script.time is time
+assert script.log_loss is sklearn.metrics.log_loss
+assert script.brier_score_loss is sklearn.metrics.brier_score_loss
+assert script.roc_auc_score is sklearn.metrics.roc_auc_score
+from collection_estimation.hurdle import stage1
+assert script.fit_stage1 is stage1.fit_stage1
+assert script.predict_paid is stage1.predict_paid
+inspect.signature(script.show_stage1_scores).bind("forecast_rows", "p", "train_rows", 1.0)
+
+source = " ".join(inspect.getsource(script.main).split())
+steps = [
+    "show_stage1_rows(origin, train_rows, forecast_rows, train_x)",
+    "started = time.perf_counter()",
+    'stage1 = fit_stage1(train_x, train_rows["paid"], settings.stage1)',
+    "fit_seconds = time.perf_counter() - started",
+    "p = predict_paid(stage1, forecast_x)",
+    "show_stage1_scores(forecast_rows, p, train_rows, fit_seconds)",
+]
+for step in steps:
+    assert step in source, step
+    assert source.count(step) == 1, step
+positions = [source.index(step) for step in steps]
+assert positions == sorted(positions), positions
+# The fit is timed alone: nothing else between the two clock reads.
+between = source[source.index("started = time.perf_counter()"):
+                 source.index("fit_seconds = time.perf_counter() - started")]
+assert between.count("(") == 2, between   # perf_counter() and fit_stage1(...)
+print("ok")
+"""
+
+SCORES = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+forecast_rows = pd.DataFrame({
+    "key": ["TR02-A", "TR04-B", "TR02-C", "TR02-A", "TR04-B", "TR02-C"],
+    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
+    "label_status": ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"],
+    "paid": pd.array([True, False, None, True, False, None], dtype="boolean"),
+}, index=pd.Index([10, 11, 12, 13, 14, 15]))
+p = pd.Series([0.8, 0.4, 0.99, 0.6, 0.2, 0.01], index=forecast_rows.index, name="p")
+train_rows = pd.DataFrame({"paid": pd.array([True, False, False, False], dtype="boolean")},
+                          index=pd.Index([1, 2, 3, 4]))
+copies = forecast_rows.copy(deep=True), p.copy(), train_rows.copy(deep=True)
+script.show_stage1_scores(forecast_rows, p, train_rows, FIT_SECONDS)
+pd.testing.assert_frame_equal(forecast_rows, copies[0])
+pd.testing.assert_series_equal(p, copies[1])
+pd.testing.assert_frame_equal(train_rows, copies[2])
+print("ok")
+"""
+
+
+def run_scores(fit_seconds=1.23):
+    return subprocess.run([sys.executable, "-c",
+                           SCORES.replace("FIT_SECONDS", repr(fit_seconds))],
+                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                          timeout=120)
+
+
+def score_table(lines):
+    """The header words of the score table and its two rows as {name: [log loss, Brier,
+    AUC]}."""
+    header = lines[1].split()
+    table = {}
+    for line in lines[2:4]:
+        parts = line.rsplit(maxsplit=3)
+        table[parts[0].strip()] = [float(n) for n in parts[1:]]
+    return header, table
+
+
+def test_step_12_fit_predict_and_scores_are_wired_in_after_the_rows():
+    result = subprocess.run([sys.executable, "-c", SCORES_WIRING], cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_12_scores_runs_and_does_not_change_its_inputs():
+    result = run_scores()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"
+
+
+def test_step_12_scores_first_line_counts_only_labelled_rows():
+    result = run_scores()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == ("        fitted in 1.2 s; scored on 4 forecast "
+                                             "rows (50.0% paid)")
+
+
+def test_step_12_scores_fit_time_has_one_decimal():
+    result = run_scores(fit_seconds=0.04)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0].startswith("        fitted in 0.0 s; ")
+
+
+def test_step_12_scores_table_by_hand():
+    result = run_scores()
+    assert result.returncode == 0, result.stderr
+    header, table = score_table(result.stdout.splitlines())
+    assert header == ["log", "loss", "Brier", "AUC"]
+    assert list(table) == ["stage 1", "base rate"]
+    assert table["stage 1"] == [0.367, 0.1, 1.0]
+    assert table["base rate"] == [0.837, 0.3125, 0.5]
+
+
+def test_step_12_scores_per_h_table_by_hand():
+    # If the missing_week (p 0.99) or future (p 0.01) row were scored, mean p would move.
+    result = run_scores()
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[4] == "        per h, mean p vs share that actually paid:"
+    assert lines[5].split() == ["mean", "p", "share", "paid"]
+    assert lines[6].split() == ["h"]
+    assert lines[7].split() == ["1", "0.6", "0.5"]
+    assert lines[8].split() == ["2", "0.4", "0.5"]
+    assert lines[9:] == ["ok"]
+
+
+# The real chain on the tiny STAGE1 table: fit_stage1 -> predict_paid -> show_stage1_scores.
+# At origin 2 the forecast targets are weeks 3 (labelled) and 4 (future, last week 3): two
+# labelled rows, TR02-A paid and TR04-B not, so the score table is defined.
+STAGE1_FIT = STAGE1.replace('print("ok")', """
+from collection_estimation.hurdle.settings import Stage1Settings
+settings = Stage1Settings(max_iter=5, learning_rate=0.1, max_leaf_nodes=3, min_samples_leaf=1,
+                          random_seed=1, feature_blocks=("history", "calendar", "receivables"),
+                          company_as_feature=COMPANY_AS_FEATURE, diagnose_class_weights=False)
+forecast_x = script.stage1_features(forecast_rows, columns, companies, COMPANY_AS_FEATURE)
+model = script.fit_stage1(train_x, train_rows["paid"], settings)
+p = script.predict_paid(model, forecast_x)
+assert list(p.index) == list(forecast_rows.index)
+script.show_stage1_scores(forecast_rows, p, train_rows, 0.5)
+print("ok")
+""")
+
+
+@pytest.mark.parametrize("company", [True, False])
+def test_step_12_real_fit_predict_and_scores_on_the_tiny_table(company):
+    script = STAGE1_FIT.replace("COMPANY_AS_FEATURE", str(company)).replace("ORIGIN", "2")
+    result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    scores = [line for line in lines if line.startswith("        fitted in")]
+    assert scores == ["        fitted in 0.5 s; scored on 2 forecast rows (50.0% paid)"]
+    # Only h=1 is labelled at origin 2 (h=2 targets week 4, after the last week 3).
+    start = lines.index("        per h, mean p vs share that actually paid:")
+    assert [line.split()[0] for line in lines[start + 3:-1]] == ["1"]
+    assert lines[-1] == "ok"
+
+
+ONE_CLASS = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+forecast_rows = pd.DataFrame({"key": list("abcd"), "h": np.array([1, 1, 2, 2]),
+                              "label_status": ["labelled"] * 3 + ["missing_week"],
+                              "paid": pd.array([True, True, True, None], dtype="boolean")},
+                             index=[5, 6, 7, 8])
+p = pd.Series([0.7, 0.3, 0.6, 0.2], index=forecast_rows.index, name="p")
+train_rows = pd.DataFrame({"paid": pd.array([True, False], dtype="boolean")})
+script.show_stage1_scores(forecast_rows, p, train_rows, 0.1)
+print("ok")
+"""
+
+
+def test_step_12_scores_with_one_class_among_labelled_rows_shows_nan_auc_and_runs():
+    # sklearn 1.9's roc_auc_score warns and returns NaN for a single class; the printout
+    # must still finish.
+    result = subprocess.run([sys.executable, "-c", ONE_CLASS], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "        fitted in 0.1 s; scored on 3 forecast rows (100.0% paid)"
+    assert lines[2].split()[-1] == "NaN" and lines[2].startswith("stage 1")
+    assert lines[3].split()[-1] == "0.5"
+    assert lines[-1] == "ok"
+
+
+# No labelled forecast row: show_stage1_scores prints one line and returns. Every target week
+# of the origin can be a missing week, after the last week (future), a mix of both, or there
+# may be no forecast row at all.
+NO_LABELLED = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+statuses = STATUSES
+forecast_rows = pd.DataFrame({
+    "key": [f"TR02-{i}" for i in range(len(statuses))],
+    "h": np.array([1 + i % 2 for i in range(len(statuses))], dtype="int64"),
+    "label_status": pd.array(statuses, dtype=object),
+    "paid": pd.array([None] * len(statuses), dtype="boolean"),
+}, index=pd.Index(range(20, 20 + len(statuses))))
+p = pd.Series(np.linspace(0.1, 0.9, len(statuses)), index=forecast_rows.index, name="p")
+train_rows = pd.DataFrame({"paid": pd.array([True, False, False], dtype="boolean")})
+copies = forecast_rows.copy(deep=True), p.copy(), train_rows.copy(deep=True)
+assert list(forecast_rows["label_status"]) == statuses  # the frame holds what we meant
+returned = script.show_stage1_scores(forecast_rows, p, train_rows, FIT_SECONDS)
+assert returned is None
+pd.testing.assert_frame_equal(forecast_rows, copies[0])
+pd.testing.assert_series_equal(p, copies[1])
+pd.testing.assert_frame_equal(train_rows, copies[2])
+print("ok")
+"""
+
+NO_LABELLED_CASES = {
+    "all_missing_week": ["missing_week"] * 4,
+    "all_future": ["future"] * 3,
+    "missing_week_and_future": ["missing_week", "future", "missing_week", "future", "future"],
+    "empty": [],
+}
+
+
+def run_no_labelled(case, fit_seconds=2.345):
+    script = (NO_LABELLED.replace("STATUSES", repr(NO_LABELLED_CASES[case]))
+              .replace("FIT_SECONDS", repr(fit_seconds)))
+    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
+                          text=True, encoding="utf-8", timeout=120)
+
+
+@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
+def test_step_12_scores_without_labelled_rows_does_not_raise(case):
+    result = run_no_labelled(case)
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
+def test_step_12_scores_without_labelled_rows_prints_only_the_one_line(case):
+    # The exact line, then nothing from the function: the next line is the caller's "ok".
+    result = run_no_labelled(case)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "        fitted in 2.3 s; no labelled forecast rows to score", "ok"]
+
+
+@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
+def test_step_12_scores_without_labelled_rows_prints_no_table(case):
+    result = run_no_labelled(case)
+    assert result.returncode == 0, result.stderr
+    for word in ("scored on", "log loss", "Brier", "AUC", "base rate", "per h", "mean p"):
+        assert word not in result.stdout, word
+
+
+def test_step_12_scores_without_labelled_rows_fit_time_has_one_decimal():
+    result = run_no_labelled("all_missing_week", fit_seconds=0.04)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == (
+        "        fitted in 0.0 s; no labelled forecast rows to score")
+
+
+def test_step_12_scores_with_labelled_rows_does_not_print_the_no_rows_line():
+    # The normal case (SCORES: four labelled rows) keeps its full printout, unchanged.
+    result = run_scores()
+    assert result.returncode == 0, result.stderr
+    assert "no labelled forecast rows to score" not in result.stdout
+    lines = result.stdout.splitlines()
+    assert lines[0] == "        fitted in 1.2 s; scored on 4 forecast rows (50.0% paid)"
+    assert lines[1].split() == ["log", "loss", "Brier", "AUC"]
+    assert lines[2].startswith("stage 1") and lines[3].startswith("base rate")
+    assert lines[4] == "        per h, mean p vs share that actually paid:"
+    assert len(lines) == 10 and lines[-1] == "ok"
+
+
+def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
+    # The guard is on "no labelled row", not on "any unlabelled row".
+    script = NO_LABELLED.replace(
+        "STATUSES", repr(["missing_week", "labelled", "future"])).replace("FIT_SECONDS", "1.0")
+    script = script.replace('"paid": pd.array([None] * len(statuses), dtype="boolean")',
+                            '"paid": pd.array([None, True, None], dtype="boolean")')
+    result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
+                            text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert "no labelled forecast rows to score" not in result.stdout
+    assert result.stdout.splitlines()[0] == (
+        "        fitted in 1.0 s; scored on 1 forecast rows (100.0% paid)")

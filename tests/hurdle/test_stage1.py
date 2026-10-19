@@ -1,5 +1,5 @@
-"""Tests for `hurdle/stage1.py` (U10.1): `NOT_FEATURES`, `feature_columns` and
-`stage1_features`.
+"""Tests for `hurdle/stage1.py`: U10.1 (`NOT_FEATURES`, `feature_columns`,
+`stage1_features`) and, at the end, U10.2 (`fit_stage1`, `predict_paid`).
 
 `feature_columns(block_columns, blocks)` gives ["h"] + the columns of each block in the order
 of `blocks`, and raises ValueError for an unknown block (checked first) or for a column in
@@ -526,3 +526,350 @@ def test_chain_a_subset_of_blocks_gives_only_those_columns(chain, blocks):
     columns = chain_columns(chain, blocks)
     x = stage1_features(rows_known_at(chain["table"], T), columns, COMPANIES, False)
     assert list(x.columns) == columns
+
+
+# --- U10.2: fit_stage1 and predict_paid -----------------------------------------------------
+# Small synthetic X / y and few trees, so every fit takes well under a second.
+
+from sklearn.metrics import roc_auc_score  # noqa: E402
+
+from collection_estimation.hurdle.settings import Stage1Settings  # noqa: E402
+from collection_estimation.hurdle.stage1 import fit_stage1, predict_paid  # noqa: E402
+
+
+def stage1_settings(max_iter=10, learning_rate=0.1, max_leaf_nodes=7, min_samples_leaf=5,
+                    random_seed=3):
+    return Stage1Settings(max_iter=max_iter, learning_rate=learning_rate,
+                          max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
+                          random_seed=random_seed, feature_blocks=FEATURE_BLOCKS,
+                          company_as_feature=True, diagnose_class_weights=False)
+
+
+def synthetic_xy(n=400, seed=0, signal=True, share=0.3, company=True, index_offset=1000):
+    """x: h, a signal column s, a noise column z (with NaN), and the company code; paid is
+    s above its (1 - share) quantile (signal) or an independent coin with probability
+    `share` (no signal). The index starts at `index_offset`, not 0."""
+    rng = np.random.default_rng(seed)
+    s = rng.normal(size=n)
+    x = pd.DataFrame({"h": rng.integers(1, 6, size=n).astype("float64"),
+                      "s": s,
+                      "z": np.where(rng.random(n) < 0.2, np.nan, rng.normal(size=n))})
+    if company:
+        x["company_code"] = pd.Categorical(rng.choice(["TR02", "TR04"], size=n),
+                                           categories=["TR02", "TR04", "TR05"])
+    if signal:
+        paid = s > np.quantile(s, 1 - share)
+    else:
+        paid = rng.random(n) < share
+    x.index = pd.RangeIndex(index_offset, index_offset + n)
+    return x, pd.Series(paid, index=x.index, name="paid")
+
+
+# fit_stage1: the estimator's parameters
+
+def test_fit_stage1_parameters_come_from_the_settings():
+    x, paid = synthetic_xy()
+    settings = stage1_settings(max_iter=12, learning_rate=0.2, max_leaf_nodes=5,
+                               min_samples_leaf=7, random_seed=11)
+    params = fit_stage1(x, paid, settings).get_params()
+    assert params["max_iter"] == 12
+    assert params["learning_rate"] == 0.2
+    assert params["max_leaf_nodes"] == 5
+    assert params["min_samples_leaf"] == 7
+    assert params["random_state"] == 11
+
+
+def test_fit_stage1_fixed_parameters():
+    x, paid = synthetic_xy()
+    params = fit_stage1(x, paid, stage1_settings()).get_params()
+    assert params["loss"] == "log_loss"
+    assert params["early_stopping"] is False
+    assert params["categorical_features"] == "from_dtype"
+
+
+def test_fit_stage1_class_weight_defaults_to_none():
+    x, paid = synthetic_xy()
+    assert fit_stage1(x, paid, stage1_settings()).get_params()["class_weight"] is None
+
+
+def test_fit_stage1_balanced_class_weight_passes_through():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings(), class_weight="balanced")
+    assert model.get_params()["class_weight"] == "balanced"
+
+
+def test_fit_stage1_returns_a_fitted_classifier():
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    assert isinstance(model, HistGradientBoostingClassifier)
+    assert list(model.feature_names_in_) == ["h", "s", "z", "company_code"]
+    assert list(model.classes_) == [False, True]
+
+
+def test_fit_stage1_no_early_stopping_with_more_than_10000_rows():
+    # sklearn's early_stopping="auto" switches on above 10,000 rows; off, every tree is built.
+    x, paid = synthetic_xy(n=12_000, signal=False, company=False)
+    model = fit_stage1(x, paid, stage1_settings(max_iter=15, learning_rate=0.01))
+    assert model.n_iter_ == 15
+    assert model.do_early_stopping_ is False
+
+
+def test_fit_stage1_same_seed_gives_identical_predictions():
+    x, paid = synthetic_xy()
+    one = predict_paid(fit_stage1(x, paid, stage1_settings(random_seed=5)), x)
+    two = predict_paid(fit_stage1(x, paid, stage1_settings(random_seed=5)), x)
+    pd.testing.assert_series_equal(one, two)
+
+
+def test_fit_stage1_company_code_is_treated_as_categorical():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    assert model.is_categorical_.tolist() == [False, False, False, True]
+
+
+def test_fit_stage1_without_company_nothing_is_categorical():
+    x, paid = synthetic_xy(company=False)
+    model = fit_stage1(x, paid, stage1_settings())
+    assert model.is_categorical_ is None or not model.is_categorical_.any()
+
+
+def test_fit_stage1_learns_a_signal_carried_only_by_the_company():
+    # TR02 pays 90% of the time, TR05 10%; the other columns are noise.
+    rng = np.random.default_rng(7)
+    n = 600
+    codes = rng.choice(["TR02", "TR05"], size=n)
+    x = pd.DataFrame({"h": rng.integers(1, 6, size=n).astype("float64"),
+                      "z": rng.normal(size=n),
+                      "company_code": pd.Categorical(codes,
+                                                     categories=["TR02", "TR04", "TR05"])})
+    paid = pd.Series(np.where(codes == "TR02", rng.random(n) < 0.9, rng.random(n) < 0.1))
+    model = fit_stage1(x, paid, stage1_settings(max_iter=30))
+    p = predict_paid(model, x)
+    assert p[codes == "TR02"].mean() > 0.75
+    assert p[codes == "TR05"].mean() < 0.25
+
+
+# fit_stage1: the inputs it accepts
+
+def test_fit_stage1_accepts_nan_features():
+    x, paid = synthetic_xy()
+    x.loc[x.index[:50], "s"] = np.nan
+    p = predict_paid(fit_stage1(x, paid, stage1_settings()), x)
+    assert p.notna().all()
+
+
+def test_fit_stage1_accepts_nullable_boolean_without_na():
+    x, paid = synthetic_xy()
+    plain = predict_paid(fit_stage1(x, paid, stage1_settings()), x)
+    nullable = predict_paid(fit_stage1(x, paid.astype("boolean"), stage1_settings()), x)
+    pd.testing.assert_series_equal(plain, nullable)
+
+
+def test_fit_stage1_accepts_int_zero_one():
+    x, paid = synthetic_xy()
+    plain = predict_paid(fit_stage1(x, paid, stage1_settings()), x)
+    model = fit_stage1(x, paid.astype("int64"), stage1_settings())
+    assert list(model.classes_) == [False, True]
+    pd.testing.assert_series_equal(predict_paid(model, x), plain)
+
+
+def test_fit_stage1_does_not_change_its_inputs():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    x_copy, paid_copy = x.copy(deep=True), paid.copy(deep=True)
+    fit_stage1(x, paid, stage1_settings())
+    pd.testing.assert_frame_equal(x, x_copy)
+    pd.testing.assert_series_equal(paid, paid_copy)
+
+
+# fit_stage1: the guards
+
+def test_fit_stage1_index_mismatch_exact_message():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid.reset_index(drop=True), stage1_settings())
+    assert str(error.value) == "paid and train_x must have the same rows (the same index)"
+
+
+def test_fit_stage1_same_labels_in_another_order_is_a_mismatch():
+    # Same rows, other order: fitting by position would pair features with the wrong label.
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError, match=r"the same rows \(the same index\)"):
+        fit_stage1(x, paid.iloc[::-1], stage1_settings())
+
+
+def test_fit_stage1_different_lengths_is_a_mismatch():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError, match=r"the same rows \(the same index\)"):
+        fit_stage1(x, paid.iloc[:-1], stage1_settings())
+
+
+def test_fit_stage1_na_in_paid_exact_message():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    paid.iloc[[3, 8]] = pd.NA
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid, stage1_settings())
+    assert str(error.value) == ("paid has 2 missing values: training rows must all be "
+                                "labelled")
+
+
+def test_fit_stage1_nan_in_float_paid_is_refused():
+    x, paid = synthetic_xy()
+    paid = paid.astype("float64")
+    paid.iloc[0] = np.nan
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid, stage1_settings())
+    assert str(error.value) == ("paid has 1 missing values: training rows must all be "
+                                "labelled")
+
+
+def test_fit_stage1_index_is_checked_before_na():
+    x, paid = synthetic_xy()
+    paid = paid.astype("boolean")
+    paid.iloc[0] = pd.NA
+    with pytest.raises(ValueError, match="the same index"):
+        fit_stage1(x, paid.reset_index(drop=True), stage1_settings())
+
+
+def test_fit_stage1_all_na_reports_the_missing_values_not_one_class():
+    x, _ = synthetic_xy(n=20)
+    paid = pd.Series(pd.NA, index=x.index, dtype="boolean")
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid, stage1_settings())
+    assert str(error.value) == ("paid has 20 missing values: training rows must all be "
+                                "labelled")
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_fit_stage1_one_class_exact_message(value):
+    x, _ = synthetic_xy(n=30)
+    paid = pd.Series(value, index=x.index)
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid, stage1_settings())
+    assert str(error.value) == (f"paid is {value} in every row; the classifier needs both "
+                                f"outcomes")
+
+
+def test_fit_stage1_one_class_given_as_ints_names_the_bool():
+    x, _ = synthetic_xy(n=30)
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, pd.Series(1, index=x.index), stage1_settings())
+    assert str(error.value) == "paid is True in every row; the classifier needs both outcomes"
+
+
+def test_fit_stage1_empty_exact_message():
+    x, paid = synthetic_xy(n=10)
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x.iloc[0:0], paid.iloc[0:0], stage1_settings())
+    assert str(error.value) == "paid is empty in every row; the classifier needs both outcomes"
+
+
+# predict_paid
+
+def test_predict_paid_is_a_series_named_p_on_the_index_of_x():
+    x, paid = synthetic_xy()
+    p = predict_paid(fit_stage1(x, paid, stage1_settings()), x)
+    assert p.name == "p"
+    pd.testing.assert_index_equal(p.index, x.index)
+    assert p.dtype == np.float64
+
+
+def test_predict_paid_values_are_probabilities():
+    x, paid = synthetic_xy()
+    p = predict_paid(fit_stage1(x, paid, stage1_settings()), x)
+    assert ((p >= 0.0) & (p <= 1.0)).all()
+
+
+def test_predict_paid_is_the_true_column_of_predict_proba():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    true_column = list(model.classes_).index(True)
+    np.testing.assert_array_equal(predict_paid(model, x).to_numpy(),
+                                  model.predict_proba(x)[:, true_column])
+
+
+def test_predict_paid_on_a_shuffled_subset_keeps_each_row():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    full = predict_paid(model, x)
+    part = x.sample(n=37, random_state=2)
+    p = predict_paid(model, part)
+    pd.testing.assert_index_equal(p.index, part.index)
+    pd.testing.assert_series_equal(p, full.loc[part.index])
+
+
+def test_predict_paid_on_new_rows():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    new_x, _ = synthetic_xy(n=50, seed=9, index_offset=0)
+    p = predict_paid(model, new_x)
+    assert len(p) == 50 and p.between(0, 1).all()
+
+
+def test_predict_paid_column_order_mismatch_exact_message():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    with pytest.raises(ValueError) as error:
+        predict_paid(model, x[["s", "h", "z", "company_code"]])
+    assert str(error.value) == ("x has columns ['s', 'h', 'z', 'company_code'], but the model "
+                                "was fitted on ['h', 's', 'z', 'company_code']")
+
+
+def test_predict_paid_missing_column_raises():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    with pytest.raises(ValueError) as error:
+        predict_paid(model, x.drop(columns="company_code"))
+    assert str(error.value) == ("x has columns ['h', 's', 'z'], but the model was fitted on "
+                                "['h', 's', 'z', 'company_code']")
+
+
+def test_predict_paid_extra_column_raises():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    with pytest.raises(ValueError, match="but the model was fitted on"):
+        predict_paid(model, x.assign(extra=1.0))
+
+
+def test_predict_paid_does_not_change_x():
+    x, paid = synthetic_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    copy = x.copy(deep=True)
+    predict_paid(model, x)
+    pd.testing.assert_frame_equal(x, copy)
+
+
+def test_predict_paid_obvious_signal_gives_a_high_auc_on_new_rows():
+    x, paid = synthetic_xy(n=800)
+    model = fit_stage1(x, paid, stage1_settings(max_iter=30))
+    new_x, new_paid = synthetic_xy(n=400, seed=1)
+    # Above 0.9, not 0.95: each sample's threshold is its own quantile, so the new rows'
+    # cut differs a little from the training rows'.
+    assert roc_auc_score(new_paid, predict_paid(model, new_x)) > 0.9
+
+
+def test_predict_paid_no_signal_mean_p_is_the_base_rate():
+    x, paid = synthetic_xy(n=3000, signal=False, share=0.2, company=False)
+    model = fit_stage1(x, paid, stage1_settings(max_iter=20, min_samples_leaf=50))
+    assert abs(predict_paid(model, x).mean() - paid.mean()) < 0.01
+    new_x, _ = synthetic_xy(n=3000, seed=4, signal=False, share=0.2, company=False)
+    assert abs(predict_paid(model, new_x).mean() - 0.2) < 0.03
+
+
+# no class weights vs "balanced"
+
+def test_no_class_weights_keep_mean_p_at_the_share_paid_balanced_pushes_it_up():
+    x, paid = synthetic_xy(n=3000, seed=12, signal=False, share=0.15, company=False)
+    settings = stage1_settings(max_iter=30, min_samples_leaf=40)
+    plain = predict_paid(fit_stage1(x, paid, settings), x)
+    balanced = predict_paid(fit_stage1(x, paid, settings, class_weight="balanced"), x)
+    assert abs(plain.mean() - paid.mean()) < 0.01
+    assert balanced.mean() > paid.mean() + 0.2
+
+
+def test_no_class_weights_keep_mean_p_at_the_share_paid_with_a_signal_too():
+    x, paid = synthetic_xy(n=2000, seed=13, share=0.1)
+    plain = predict_paid(fit_stage1(x, paid, stage1_settings(max_iter=30)), x)
+    assert abs(plain.mean() - paid.mean()) < 0.01

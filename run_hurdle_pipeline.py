@@ -26,6 +26,7 @@ variable HURDLE_SETTINGS to it; nothing in the code needs to change.
 """
 import os
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -39,6 +40,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd  # noqa: E402
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score  # noqa: E402
 
 from collection_estimation.hurdle.read_collections import (  # noqa: E402
     list_daily_files,
@@ -66,7 +68,12 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     add_labels,
     panel_rows,
 )
-from collection_estimation.hurdle.stage1 import feature_columns, stage1_features  # noqa: E402
+from collection_estimation.hurdle.stage1 import (  # noqa: E402
+    feature_columns,
+    fit_stage1,
+    predict_paid,
+    stage1_features,
+)
 from collection_estimation.hurdle.training_table import (  # noqa: E402
     block_feature_columns,
     join_features,
@@ -311,6 +318,14 @@ def main():
     forecast_x = stage1_features(forecast_rows, columns, companies,
                                  settings.stage1.company_as_feature)
     show_stage1_rows(origin, train_rows, forecast_rows, train_x)
+
+    # Fit at the demo origin, predict its forecast rows, and score them: their target weeks
+    # have data, so the answers are known here (only because this is a check of the past).
+    started = time.perf_counter()
+    stage1 = fit_stage1(train_x, train_rows["paid"], settings.stage1)
+    fit_seconds = time.perf_counter() - started
+    p = predict_paid(stage1, forecast_x)
+    show_stage1_scores(forecast_rows, p, train_rows, fit_seconds)
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -622,6 +637,33 @@ def show_stage1_rows(origin, train_rows, forecast_rows, train_x):
           f"{int(train_x.isna().any().sum())}")
     if "company_code" in train_x.columns:
         print(f"        company_code categories: {list(train_x['company_code'].cat.categories)}")
+
+
+def show_stage1_scores(forecast_rows, p, train_rows, fit_seconds):
+    """Stage 1's scores on the demo origin's forecast rows, against the base rate (every row
+    gets the training share of paid rows). Log loss and Brier score: lower is better. AUC:
+    0.5 is a coin toss, 1 a perfect ranking of payers above non-payers."""
+    labelled = forecast_rows["label_status"] == "labelled"
+    actual = forecast_rows.loc[labelled, "paid"].astype(bool)
+    predicted = p[labelled]
+    if actual.empty:
+        # Every target week of this origin is a missing week: nothing can be scored.
+        print(f"        fitted in {fit_seconds:.1f} s; no labelled forecast rows to score")
+        return
+    base_rate = pd.Series(train_rows["paid"].astype(bool).mean(), index=actual.index)
+    print(f"        fitted in {fit_seconds:.1f} s; scored on {len(actual):,} forecast rows "
+          f"({actual.mean():.1%} paid)")
+    scores = pd.DataFrame({
+        name: {"log loss": log_loss(actual, guess, labels=[False, True]),
+               "Brier": brier_score_loss(actual, guess),
+               "AUC": roc_auc_score(actual, guess) if name != "base rate" else 0.5}
+        for name, guess in (("stage 1", predicted), ("base rate", base_rate))
+    }).T
+    print(scores.round(4).to_string())
+    by_h = pd.DataFrame({"mean p": predicted.groupby(forecast_rows.loc[labelled, "h"]).mean(),
+                         "share paid": actual.groupby(forecast_rows.loc[labelled, "h"]).mean()})
+    print("        per h, mean p vs share that actually paid:")
+    print(by_h.round(4).to_string())
 
 
 if __name__ == "__main__":

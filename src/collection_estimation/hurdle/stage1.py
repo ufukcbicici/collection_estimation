@@ -5,6 +5,7 @@ and predicts p. Choosing the rows (which forecast week, which rows are known) ha
 `training_table`.
 """
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 
 # Columns that must never be features: identities, absolute time, and the labels.
 NOT_FEATURES = ["key", "company_code", "customer_id", "origin_week", "target_week",
@@ -49,3 +50,51 @@ def stage1_features(rows: pd.DataFrame, columns: list[str], companies: list[str]
         features["company_code"] = pd.Categorical(rows["company_code"],
                                                   categories=sorted(set(companies)))
     return features
+
+
+def fit_stage1(train_x: pd.DataFrame, paid: pd.Series, settings,
+               class_weight: str | None = None) -> HistGradientBoostingClassifier:
+    """Fit the "will it pay?" classifier on `train_x` (from `stage1_features`) and `paid`
+    (True/False per row), with the `[stage1]` settings.
+
+    Log loss with no class weights, so that the predictions are probabilities: they will be
+    multiplied by amounts. `class_weight` exists only for the diagnostic; the forecast never
+    sets it. Early stopping is off: sklearn would otherwise hold out a random tenth of the
+    rows, mixing weeks. The company code, if present, is used as a category.
+
+    Raises ValueError if `paid` has a missing value, does not line up with `train_x`, or
+    holds only one class.
+    """
+    if not paid.index.equals(train_x.index):
+        raise ValueError("paid and train_x must have the same rows (the same index)")
+    if paid.isna().any():
+        raise ValueError(f"paid has {int(paid.isna().sum())} missing values: training rows must "
+                         f"all be labelled")
+    paid = paid.astype(bool)
+    if paid.nunique() < 2:
+        raise ValueError(f"paid is {bool(paid.iloc[0]) if len(paid) else 'empty'} in every "
+                         f"row; the classifier needs both outcomes")
+    model = HistGradientBoostingClassifier(
+        loss="log_loss",
+        max_iter=settings.max_iter,
+        learning_rate=settings.learning_rate,
+        max_leaf_nodes=settings.max_leaf_nodes,
+        min_samples_leaf=settings.min_samples_leaf,
+        early_stopping=False,
+        categorical_features="from_dtype",
+        class_weight=class_weight,
+        random_state=settings.random_seed,
+    )
+    model.fit(train_x, paid)
+    return model
+
+
+def predict_paid(model: HistGradientBoostingClassifier, x: pd.DataFrame) -> pd.Series:
+    """p for each row of `x`: the probability that the customer pays anything in the target
+    week. Raises ValueError unless `x` has the columns the model was fitted on, in order."""
+    fitted = list(model.feature_names_in_)
+    if list(x.columns) != fitted:
+        raise ValueError(f"x has columns {list(x.columns)}, but the model was fitted on "
+                         f"{fitted}")
+    paid_column = list(model.classes_).index(True)
+    return pd.Series(model.predict_proba(x)[:, paid_column], index=x.index, name="p")
