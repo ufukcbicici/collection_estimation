@@ -1725,74 +1725,38 @@ def test_diagnostic_guard_comes_before_the_long_steps():
         assert guard < source.index(later), later
 
 
-# Step 13 (U10.4a): the diagnostic's splits, and best_threshold + classification_scores on
-# step 12's predictions. Wiring checked on main()'s syntax tree; the block itself is run in a
-# separate process (exec of main()'s own `if settings.diagnostic.run:` statement) on hand-made
-# frames.
-# The table: T = 2, H = 2. Target weeks 0, 1, 2 (paid T, F, T) -> train 3 rows, 66.7% paid;
-# 3 (T) and 4 (F) -> validation 2 rows, 50.0% (a missing_week row at week 3 is left out);
-# refit 5 rows, 60.0%; 5, 6 (T, T) -> test 2 rows, 100.0%; week 7 is after the test weeks.
-# The forecast rows and predictions are step 12's SCORES frame (four labelled rows, one
-# missing_week row and one future row whose p would move every score if used):
-#   model A labelled p .8 T, .4 F, .6 T, .2 F -> best threshold .6, F1 1; AUC 1, AP 1,
-#     log loss -(ln .8 + ln .6)/2 = 0.367.
-#   model B labelled p .3 T, .9 F, .6 T, .4 F -> thresholds .3: F1 2/3, .4: 0.4, .6: 0.5,
-#     .9: 0 -> best .3, precision .5, recall 1; AUC 1 of 4 pairs = .25; AP .5*.5 + .5*.5 = .5;
-#     log loss -(ln .3 + ln .1 + ln .6 + ln .6)/4 = 1.132.
-STEP_13 = """
-import ast
-import inspect
-import textwrap
-from types import SimpleNamespace
+# Step 13 (U10.4b/c): the stage 1 diagnostic. For HGB, then LR: grid_search on validation,
+# choose_and_test on the test rows, the chosen setting refitted on train for the permutation
+# importance on validation, then show_diagnostic_grid; after both, show_diagnostic_test and
+# write_tables. (The U10.4a demo on step 12's predictions, with its "too few outcomes" skip,
+# is gone; its tests went with it.)
+#
+# Wiring is checked on main()'s syntax tree. The block itself is run in a separate process
+# (exec of main()'s own `if settings.diagnostic.run:` statement) on a tiny hand-made table:
+# T = 4, H = 2, 30 rows per target week 0..9, every tenth row (i % 10 == 9) a missing_week
+# row -> 27 labelled rows per week: train weeks 0..4 = 135 rows, validation 5..6 = 54, refit
+# 189, test 7..8 = 54; week 9 is after the test weeks. Grids: HGB 2 x 1 x 1 x 2 = 4 settings
+# of at most 10 trees, LR 2 x 2 = 4 settings. CSV output goes to pytest's tmp_path only.
+
+STEP_13_SPLIT_TABLE = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle.diagnostic import diagnostic_splits
 
-tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
-blocks = [node for node in tree.body[0].body
-          if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
-assert len(blocks) == 1, len(blocks)
-code = compile(ast.fix_missing_locations(ast.Module(body=blocks, type_ignores=[])),
-               "step13", "exec")
-
+# T = 2, H = 2. Target weeks 0, 1, 2 (paid T, F, T) -> train 3 rows, 66.7% paid; 3 (T) and
+# 4 (F) -> validation 2 rows, 50.0% (a missing_week row at week 3 is left out); refit 5 rows,
+# 60.0%; 5, 6 (T, T) -> test 2 rows, 100.0%; week 7 is after the test weeks.
 weeks = [0, 1, 2, 3, 3, 4, 5, 6, 7]
 statuses = ["labelled"] * 4 + ["missing_week"] + ["labelled"] * 4
 table = pd.DataFrame({
-    "key": [f"TR02-{i}" for i in range(len(weeks))],
     "target_week": np.array(weeks, dtype="int64"),
     "label_status": np.array(statuses, dtype=object),
     "paid": pd.array([True, False, True, True, None, False, True, True, False],
                      dtype="boolean"),
-}, index=pd.Index(range(100, 100 + len(weeks))))
-forecast_rows = pd.DataFrame({
-    "key": ["TR02-A", "TR04-B", "TR02-C", "TR02-A", "TR04-B", "TR02-C"],
-    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
-    "label_status": ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"],
-    "paid": pd.array([True, False, None, True, False, None], dtype="boolean"),
-}, index=pd.Index([10, 11, 12, 13, 14, 15]))
-predictions = {name: pd.Series(values, index=forecast_rows.index, name="p")
-               for name, values in MODELS}
-settings = SimpleNamespace(diagnostic=SimpleNamespace(run=RUN, origin=2),
-                           receivables=SimpleNamespace(horizons=2))
-copies = (table.copy(deep=True), forecast_rows.copy(deep=True),
-          {n: p.copy() for n, p in predictions.items()})
-namespace = dict(vars(script))
-namespace.update(settings=settings, table=table, forecast_rows=forecast_rows,
-                 predictions=predictions)
-STUBS
-exec(code, namespace)
-pd.testing.assert_frame_equal(table, copies[0])
-pd.testing.assert_frame_equal(forecast_rows, copies[1])
-for name in predictions:
-    pd.testing.assert_series_equal(predictions[name], copies[2][name])
+})
+script.show_diagnostic_splits(diagnostic_splits(table, 2, 2), 2, 2)
 print("ok")
-"""
-
-NO_CALLS = """
-def refuse(*args, **kwargs):
-    raise AssertionError("called although [diagnostic] run is false")
-namespace.update(diagnostic_splits=refuse, show_diagnostic_splits=refuse,
-                 best_threshold=refuse, classification_scores=refuse)
 """
 
 STEP_13_SPLIT_LINES = [
@@ -1802,68 +1766,360 @@ STEP_13_SPLIT_LINES = [
     "        refit              5 rows,  60.0% paid (target <= 4)",
     "        test               2 rows, 100.0% paid (4 < target <= 6)",
 ]
-STEP_13_MODEL_A = ("        stage 1 (HGB) at step 12's origin, best F1 threshold 0.600: F1 1.000, "
-                   "precision 1.000, recall 1.000, AUC 1.000, avg precision 1.000, "
-                   "log loss 0.367")
-STEP_13_MODEL_B = ("        baseline (LR) at step 12's origin, best F1 threshold 0.300: F1 0.667, "
-                   "precision 0.500, recall 1.000, AUC 0.250, avg precision 0.500, "
-                   "log loss 1.132")
 
 
-def run_step_13(models=None, run=True, stubs=""):
-    models = TWO_MODELS if models is None else models
-    models_text = "[" + ", ".join(f"({name!r}, {values})" for name, values in models) + "]"
-    script = (STEP_13.replace("MODELS", models_text).replace("RUN", str(run))
-              .replace("STUBS", stubs))
-    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
-                          text=True, encoding="utf-8", timeout=120)
+def run_code(code):
+    return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True,
+                          text=True, encoding="utf-8", timeout=300)
 
 
-def test_step_13_prints_the_splits_then_one_line_per_model_by_hand():
-    result = run_step_13()
+def test_step_13_split_printout_by_hand():
+    result = run_code(STEP_13_SPLIT_TABLE)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A,
-                                                                STEP_13_MODEL_B, "ok"]
+    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + ["ok"]
 
 
-def test_step_13_one_model():
-    result = run_step_13(ONE_MODEL)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A, "ok"]
+STEP_13 = """
+import ast
+import inspect
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.settings import Stage1Settings
+
+tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
+blocks = [node for node in tree.body[0].body
+          if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
+assert len(blocks) == 1, len(blocks)
+code = compile(ast.fix_missing_locations(ast.Module(body=blocks, type_ignores=[])),
+               "step13", "exec")
+
+rng = np.random.default_rng(5)
+n = 300
+weeks = np.repeat(np.arange(10), 30).astype("int64")
+signal = rng.normal(size=n)
+codes = rng.choice(["TR02", "TR04"], size=n)
+paid = rng.random(n) < 1 / (1 + np.exp(-(2.0 * signal - 0.3)))
+labelled = np.arange(n) % 10 != 9
+table = pd.DataFrame({
+    "key": [f"{c}-{i}" for i, c in enumerate(codes)],
+    "company_code": codes,
+    "origin_week": weeks - 1,
+    "target_week": weeks,
+    "label_status": np.where(labelled, "labelled", "missing_week").astype(object),
+    "paid": pd.array([bool(p) if keep else None for p, keep in zip(paid, labelled)],
+                     dtype="boolean"),
+    "h": rng.integers(1, 3, size=n).astype("int64"),
+    "signal": signal,
+    "noise": rng.normal(size=n),
+}, index=pd.RangeIndex(1000, 1000 + n))
+columns = ["h", "signal", "noise"]
+companies = ["TR04", "TR02"]
+settings = SimpleNamespace(
+    diagnostic=SimpleNamespace(run=__RUN__, origin=4, hgb_max_iter=(3, 10),
+                               hgb_learning_rate=(0.3,), hgb_max_leaf_nodes=(3,),
+                               lr_c=(0.1, 10.0), class_weights=("none", "balanced"),
+                               importance_repeats=2, output_folder=Path(__OUTPUT__)),
+    receivables=SimpleNamespace(horizons=2),
+    stage1=Stage1Settings(max_iter=5, learning_rate=0.2, max_leaf_nodes=4, min_samples_leaf=5,
+                          random_seed=3, feature_blocks=("history",),
+                          company_as_feature=__COMPANY__, baseline_c=1.0),
+)
+copies = (table.copy(deep=True), settings.stage1)
+namespace = dict(vars(script))
+namespace.update(settings=settings, table=table, columns=columns, companies=companies)
+__STUBS__
+exec(code, namespace)
+pd.testing.assert_frame_equal(table, copies[0])
+assert settings.stage1 is copies[1]
+assert settings.stage1.max_iter == 5 and settings.stage1.baseline_c == 1.0
+__AFTER__
+print("ok")
+"""
+
+from types import SimpleNamespace  # noqa: E402
+
+TABLE_NAMES = ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "test"]
 
 
-def test_step_13_models_follow_the_order_of_the_predictions_dict():
-    result = run_step_13(list(reversed(TWO_MODELS)))
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[5:] == [STEP_13_MODEL_B, STEP_13_MODEL_A, "ok"]
+def run_step_13(output, run=True, company=False, stubs="", after=""):
+    code = (STEP_13.replace("__RUN__", str(run)).replace("__OUTPUT__", repr(str(output)))
+            .replace("__COMPANY__", str(company)).replace("__STUBS__", stubs)
+            .replace("__AFTER__", after))
+    return run_code(code)
 
 
-def test_step_13_scores_each_model_on_its_own_p():
-    result = run_step_13([("stage 1 (HGB)", MODEL_B), ("baseline (LR)", MODEL_A)])
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[5] == STEP_13_MODEL_B.replace("baseline (LR)", "stage 1 (HGB)")
-    assert lines[6] == STEP_13_MODEL_A.replace("stage 1 (HGB)", "baseline (LR)")
+@pytest.fixture(scope="module", params=[False, True], ids=["no company", "company"])
+def real_run(request, tmp_path_factory):
+    """The real block on the tiny table (with and without the company as a feature)."""
+    output = tmp_path_factory.mktemp("step13") / "nested" / "hurdle_diagnostic"
+    result = run_step_13(output, company=request.param)
+    return SimpleNamespace(result=result, output=output, company=request.param,
+                           lines=result.stdout.splitlines())
 
 
-def test_step_13_does_not_print_the_threshold_twice():
-    result = run_step_13()
-    assert result.returncode == 0, result.stderr
-    for line in result.stdout.splitlines()[5:7]:
-        assert line.count("threshold") == 1, line
+def test_step_13_real_run_succeeds(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    assert real_run.lines[-1] == "ok"
 
 
-def test_step_13_with_run_false_prints_and_calls_nothing():
-    result = run_step_13(run=False, stubs=NO_CALLS)
+def test_step_13_real_run_prints_the_splits_first(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    lines = real_run.lines
+    assert lines[0] == ("Step 13: stage 1 diagnostic at origin 4 (diagnostic only, never the "
+                        "forecast)")
+    for line, name, rows, weeks in zip(
+            lines[1:5], ("train", "validation", "refit", "test"), (135, 54, 189, 54),
+            ("(target <= 4)", "(4 < target <= 6)", "(target <= 6)", "(6 < target <= 8)")):
+        assert line.startswith(f"        {name:<10} {rows:>9,} rows, "), line
+        assert line.endswith(f"paid {weeks}"), line
+
+
+def test_step_13_real_run_progress_lines_hgb_then_lr(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    progress = [line for line in real_run.lines if line.startswith("  ... ")]
+    assert [line.split(":")[0] for line in progress] == (
+        [f"  ... HGB {i} of 4" for i in range(1, 5)] + [f"  ... LR {i} of 4" for i in range(1, 5)])
+    assert progress[0].startswith("  ... HGB 1 of 4: {'max_iter': 3, 'learning_rate': 0.3, "
+                                  "'max_leaf_nodes': 3, 'class_weight': 'none'}, ")
+    assert progress[3].startswith("  ... HGB 4 of 4: {'max_iter': 10, 'learning_rate': 0.3, "
+                                  "'max_leaf_nodes': 3, 'class_weight': 'balanced'}, ")
+    assert progress[4].startswith("  ... LR 1 of 4: {'C': 0.1, 'class_weight': 'none'}, ")
+    assert progress[7].startswith("  ... LR 4 of 4: {'C': 10.0, 'class_weight': 'balanced'}, ")
+
+
+def test_step_13_real_run_printout_order(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    lines = real_run.lines
+
+    def first(prefix):
+        matches = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+        assert len(matches) == 1, (prefix, matches)
+        return matches[0]
+
+    order = [first("  ... HGB 4 of 4"),
+             first("        HGB: the 5 best of 4 settings by validation average precision"),
+             first("        HGB: the 15 most important features"),
+             first("  ... LR 1 of 4"),
+             first("        LR: the 5 best of 4 settings by validation average precision"),
+             first("        LR: the 15 most important features"),
+             first("        TEST (target weeks after the validation weeks)"),
+             first("        tables written to ")]
+    assert order == sorted(order)
+    assert order[-1] == len(lines) - 2   # then "ok"
+
+
+def test_step_13_real_run_reports_the_files_written(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    expected = (f"        tables written to {real_run.output}: "
+                f"{[name + '.csv' for name in TABLE_NAMES]}")
+    assert real_run.lines[-2] == expected
+
+
+def test_step_13_real_run_writes_the_five_tables_into_a_new_folder(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    assert real_run.output.is_dir()
+    assert sorted(path.name for path in real_run.output.iterdir()) == sorted(
+        name + ".csv" for name in TABLE_NAMES)
+
+
+def test_step_13_real_run_grid_tables(real_run):
+    import pandas as pd
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    hgb = pd.read_csv(real_run.output / "hgb_grid.csv")
+    lr = pd.read_csv(real_run.output / "lr_grid.csv")
+    scores = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss"]
+    assert list(hgb.columns) == (["candidate", "max_iter", "learning_rate", "max_leaf_nodes",
+                                  "class_weight"] + scores + ["fit seconds"])
+    assert list(lr.columns) == ["candidate", "C", "class_weight"] + scores + ["fit seconds"]
+    for grid in (hgb, lr):
+        assert sorted(grid["candidate"]) == [0, 1, 2, 3]
+        assert grid["avg precision"].is_monotonic_decreasing
+
+
+def test_step_13_real_run_importance_tables(real_run):
+    import pandas as pd
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    features = ["h", "signal", "noise"] + (["company_code"] if real_run.company else [])
+    for name in ("hgb_importance", "lr_importance"):
+        table = pd.read_csv(real_run.output / f"{name}.csv")
+        assert list(table.columns) == ["feature", "log loss rise", "std"]
+        assert sorted(table["feature"]) == sorted(features)
+        assert table["log loss rise"].is_monotonic_decreasing
+        # paid follows `signal` only: it is the most important feature for both models.
+        assert table.loc[0, "feature"] == "signal", (name, table)
+
+
+def test_step_13_real_run_test_table_uses_each_models_validation_threshold(real_run):
+    import pandas as pd
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    test = pd.read_csv(real_run.output / "test.csv")
+    assert test["model"].tolist() == ["HGB", "LR"]
+    assert list(test.columns[:1]) == ["model"]
+    for model, name in (("HGB", "hgb_grid"), ("LR", "lr_grid")):
+        top = pd.read_csv(real_run.output / f"{name}.csv").iloc[0]
+        row = test[test["model"] == model].iloc[0]
+        assert row["threshold"] == pytest.approx(top["threshold"], rel=1e-12)
+        assert row["class_weight"] == top["class_weight"]
+    hgb = pd.read_csv(real_run.output / "hgb_grid.csv").iloc[0]
+    assert test.loc[0, "max_iter"] == hgb["max_iter"]
+    lr = pd.read_csv(real_run.output / "lr_grid.csv").iloc[0]
+    assert test.loc[1, "C"] == pytest.approx(lr["C"])
+
+
+def test_step_13_with_run_false_calls_nothing_and_writes_nothing(tmp_path):
+    output = tmp_path / "never"
+    refuse = ("def refuse(*args, **kwargs):\n"
+              "    raise AssertionError('called although [diagnostic] run is false')\n"
+              "for name in ('diagnostic_splits', 'show_diagnostic_splits', 'stage1_features', "
+              "'hgb_candidates', 'lr_candidates', 'grid_search', 'choose_and_test', "
+              "'permutation_importances', 'show_diagnostic_grid', 'show_diagnostic_test', "
+              "'write_tables', 'fit_stage1', 'fit_stage1_baseline'):\n"
+              "    namespace[name] = refuse\n")
+    result = run_step_13(output, run=False, stubs=refuse)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["ok"]
+    assert not output.exists()
 
 
-def test_step_13_with_run_true_calls_go_through_the_stubs_check():
-    # The NO_CALLS stubs do bite when run is true (so the run-false test is meaningful).
-    result = run_step_13(run=True, stubs=NO_CALLS)
+def test_step_13_the_run_false_stubs_bite_when_run_is_true(tmp_path):
+    refuse = ("def refuse(*args, **kwargs):\n"
+              "    raise AssertionError('called although [diagnostic] run is false')\n"
+              "namespace['grid_search'] = refuse\n")
+    result = run_step_13(tmp_path / "out", run=True, stubs=refuse)
     assert result.returncode != 0
     assert "called although [diagnostic] run is false" in result.stderr
+
+
+# The spy run: every diagnostic function and both fits are replaced by recorders, so the
+# block's data flow is checked call by call. The stubbed grid_search puts candidate 1 on top
+# for HGB (max_iter 3, balanced) and candidate 3 for LR (C 10, balanced).
+SPY_STUBS = """
+from collection_estimation.hurdle import diagnostic
+from collection_estimation.hurdle.stage1 import stage1_features
+calls = []
+real = {"fit_stage1": script.fit_stage1, "fit_stage1_baseline": script.fit_stage1_baseline}
+TOPS = {"HGB": [1, 0, 2, 3], "LR": [3, 2, 1, 0]}
+
+def make_fit(label):
+    def fit(train_x, paid, settings_, class_weight="NOT GIVEN"):
+        calls.append(("fit", label, train_x, paid, settings_, class_weight))
+        return ("model", label, len(calls))
+    fit.label = label
+    return fit
+
+def spy_grid_search(name, fit, candidates, train_x, train_paid, validation_x, validation_paid):
+    calls.append(("grid_search", name, fit.label, candidates, train_x, train_paid,
+                  validation_x, validation_paid))
+    return pd.DataFrame({"candidate": TOPS[name], "threshold": [0.11, 0.22, 0.33, 0.44],
+                         "avg precision": [0.9, 0.8, 0.7, 0.6]})
+
+def spy_choose_and_test(name, fit, candidates, grid, refit_x, refit_paid, test_x, test_paid):
+    calls.append(("choose_and_test", name, fit.label, candidates, grid, refit_x, refit_paid,
+                  test_x, test_paid))
+    return {"model": name, "F1": 0.5 if name == "HGB" else 0.25}
+
+def spy_importances(model, x, paid, repeats, seed):
+    calls.append(("permutation_importances", model, x, paid, repeats, seed))
+    return pd.DataFrame({"feature": list(x.columns), "log loss rise": 0.0, "std": 0.0})
+
+def spy_show_grid(name, grid, importance):
+    calls.append(("show_diagnostic_grid", name, grid, importance))
+
+def spy_show_test(test):
+    calls.append(("show_diagnostic_test", test))
+
+def spy_write_tables(folder, tables):
+    calls.append(("write_tables", folder, tables))
+    return [Path(folder) / f"{name}.csv" for name in tables]
+
+namespace.update(fit_stage1=make_fit("HGB fit"), fit_stage1_baseline=make_fit("LR fit"),
+                 grid_search=spy_grid_search, choose_and_test=spy_choose_and_test,
+                 permutation_importances=spy_importances, show_diagnostic_grid=spy_show_grid,
+                 show_diagnostic_test=spy_show_test, write_tables=spy_write_tables)
+"""
+
+SPY_CHECKS = """
+splits = diagnostic.diagnostic_splits(table, 4, 2)
+def expected(part):
+    rows = getattr(splits, part)
+    return (stage1_features(rows, columns, companies, settings.stage1.company_as_feature),
+            rows["paid"].astype(bool))
+def same(pair, part):
+    x, paid = pair
+    want_x, want_paid = expected(part)
+    pd.testing.assert_frame_equal(x, want_x)
+    pd.testing.assert_series_equal(paid, want_paid)
+    assert paid.dtype == bool
+
+kinds = [call[0] for call in calls]
+assert kinds == ["grid_search", "choose_and_test", "fit", "permutation_importances",
+                 "show_diagnostic_grid"] * 2 + ["show_diagnostic_test", "write_tables"], kinds
+
+hgb_candidates = diagnostic.hgb_candidates(settings.stage1, settings.diagnostic)
+lr_candidates = diagnostic.lr_candidates(settings.stage1, settings.diagnostic)
+for offset, name, label, candidates, top in ((0, "HGB", "HGB fit", hgb_candidates, 1),
+                                             (5, "LR", "LR fit", lr_candidates, 3)):
+    grid_call, test_call, fit_call, importance_call, show_call = calls[offset:offset + 5]
+    # grid_search: this model's fit and candidates, the train and validation inputs.
+    assert grid_call[1] == name and grid_call[2] == label
+    assert [c.params for c in grid_call[3]] == [c.params for c in candidates]
+    assert [c.settings for c in grid_call[3]] == [c.settings for c in candidates]
+    same(grid_call[4:6], "train")
+    same(grid_call[6:8], "validation")
+    # choose_and_test: the same candidates and the grid just returned, refit and test inputs.
+    assert test_call[1] == name and test_call[2] == label
+    assert test_call[3] is grid_call[3]
+    assert test_call[4]["candidate"].tolist() == TOPS[name]
+    same(test_call[5:7], "refit")
+    same(test_call[7:9], "test")
+    # The importance model: the grid's top candidate, refitted on the TRAIN rows.
+    assert fit_call[1] == label
+    same(fit_call[2:4], "train")
+    assert fit_call[4] == candidates[top].settings
+    assert fit_call[5] == "balanced"
+    # Its permutation importance on the VALIDATION rows, with the settings' repeats and seed.
+    assert importance_call[1] == ("model", label, offset + 3)
+    same(importance_call[2:4], "validation")
+    assert importance_call[4] == 2 and importance_call[5] == 3
+    # The printout gets this model's grid and importance.
+    assert show_call[1] == name
+    assert show_call[2] is test_call[4]
+    assert show_call[3]["feature"].tolist() == list(expected("validation")[0].columns)
+
+test_table = calls[10][1]
+pd.testing.assert_frame_equal(test_table, pd.DataFrame([{"model": "HGB", "F1": 0.5},
+                                                        {"model": "LR", "F1": 0.25}]))
+folder, tables = calls[11][1], calls[11][2]
+assert folder == settings.diagnostic.output_folder
+assert list(tables) == ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "test"]
+assert tables["hgb_grid"] is calls[0 + 4][2] and tables["lr_grid"] is calls[5 + 4][2]
+assert tables["hgb_importance"] is calls[0 + 4][3]
+assert tables["lr_importance"] is calls[5 + 4][3]
+assert tables["test"] is test_table
+"""
+
+
+@pytest.mark.parametrize("company", [False, True], ids=["no company", "company"])
+def test_step_13_data_flow_call_by_call(company, tmp_path):
+    result = run_step_13(tmp_path / "spy", company=company, stubs=SPY_STUBS, after=SPY_CHECKS)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"
+    # Only the splits come from the real functions; the stubs print nothing.
+    assert result.stdout.splitlines()[0].startswith("Step 13: stage 1 diagnostic at origin 4")
+    assert not (tmp_path / "spy").exists()   # write_tables was stubbed
+
+
+def test_step_13_spy_stubs_bite():
+    # The spy checks fail when the recorded calls are wrong (so the data-flow test means
+    # something): here the recorded calls are emptied before the checks run.
+    result = run_step_13(REPO_ROOT / "never_written", stubs=SPY_STUBS,
+                         after="calls.clear()\n" + SPY_CHECKS)
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
 
 
 STEP_13_WIRING = """
@@ -1873,10 +2129,15 @@ import textwrap
 import run_hurdle_pipeline as script
 from collection_estimation.hurdle import diagnostic
 
-assert script.diagnostic_splits is diagnostic.diagnostic_splits
-assert script.best_threshold is diagnostic.best_threshold
-assert script.classification_scores is diagnostic.classification_scores
+for name in ("diagnostic_splits", "grid_search", "choose_and_test", "class_weight_argument",
+             "hgb_candidates", "lr_candidates", "permutation_importances", "write_tables"):
+    assert getattr(script, name) is getattr(diagnostic, name), name
+# The U10.4a demo's functions are no longer imported.
+assert not hasattr(script, "best_threshold")
+assert not hasattr(script, "classification_scores")
 inspect.signature(script.show_diagnostic_splits).bind("splits", 40, 5)
+inspect.signature(script.show_diagnostic_grid).bind("name", "grid", "importance")
+inspect.signature(script.show_diagnostic_test).bind("test")
 
 body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
 statements = [ast.unparse(node) for node in body]
@@ -1889,160 +2150,151 @@ scores = statements.index(
 assert scores < blocks[0], (scores, blocks)
 assert block.orelse == []
 inner = [ast.unparse(node) for node in block.body]
-assert inner[:4] == [
+assert inner[:2] == [
     "splits = diagnostic_splits(table, settings.diagnostic.origin, "
     "settings.receivables.horizons)",
     "show_diagnostic_splits(splits, settings.diagnostic.origin, settings.receivables.horizons)",
-    "labelled = forecast_rows['label_status'] == 'labelled'",
-    "actual = forecast_rows.loc[labelled, 'paid'].astype(bool)",
-], inner[:4]
-assert len(block.body) == 5 and isinstance(block.body[4], ast.For)
-loop = block.body[4]
-assert ast.unparse(loop.target) == "(name, p)"
-assert ast.unparse(loop.iter) == "predictions.items()"
-loop_body = [ast.unparse(node) for node in loop.body]
-# First, the skip: fewer than two outcomes among the labelled rows -> print, next model.
-skip = loop.body[0]
-assert isinstance(skip, ast.If), loop_body
-assert ast.unparse(skip.test) == "actual.nunique() < 2", ast.unparse(skip.test)
-assert skip.orelse == []
-assert len(skip.body) == 2, [ast.unparse(node) for node in skip.body]
-assert isinstance(skip.body[0], ast.Expr) and isinstance(skip.body[0].value, ast.Call)
-assert ast.unparse(skip.body[0].value.func) == "print"
-assert isinstance(skip.body[1], ast.Continue)
-assert "best_threshold" not in ast.unparse(skip)
-assert "classification_scores" not in ast.unparse(skip)
-assert loop_body[1] == "threshold, f1 = best_threshold(actual, p[labelled])", loop_body
-assert loop_body[2] == ("scores = classification_scores(actual, p[labelled], threshold)"), \\
-    loop_body
-# The diagnostic uses its own origin, never step 12's demo origin.
-assert "demo_origin" not in ast.unparse(block)
+], inner[:2]
+text = ast.unparse(block)
+# The diagnostic uses its own origin and rows, never step 12's demo origin or predictions.
+for name in ("demo_origin", "predictions", "forecast_rows", "train_rows", "forecast_x",
+             "best_threshold", "classification_scores"):
+    assert name not in text, name
+# The test rows are used once, by choose_and_test; the importance is measured on validation.
+assert text.count("inputs['test']") == 1, text
+assert "permutation_importances(model, *inputs['validation']" in text
+assert "settings.diagnostic.importance_repeats, settings.stage1.random_seed)" in text
+assert "write_tables(settings.diagnostic.output_folder, tables)" in text
+# The two models, in this order, with their fits and candidate lists.
+loops = [node for node in ast.walk(block) if isinstance(node, ast.For)
+         and ast.unparse(node.target) == "(name, fit, candidates)"]
+assert len(loops) == 1, len(loops)
+items = [[ast.unparse(e) for e in item.elts] for item in loops[0].iter.elts]
+assert items == [
+    ["'HGB'", "fit_stage1", "hgb_candidates(settings.stage1, settings.diagnostic)"],
+    ["'LR'", "fit_stage1_baseline", "lr_candidates(settings.stage1, settings.diagnostic)"],
+], items
 print("ok")
 """
 
 
 def test_step_13_is_wired_in_after_step_12s_scores():
-    result = subprocess.run([sys.executable, "-c", STEP_13_WIRING], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    result = run_code(STEP_13_WIRING)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
 
 
-def test_step_13_block_is_the_only_use_of_the_diagnostic_functions():
+def test_step_13_each_diagnostic_function_is_called_once_in_main():
     tree = main_tree()
-    for name in ("diagnostic_splits", "show_diagnostic_splits", "best_threshold",
-                 "classification_scores"):
+    for name in ("diagnostic_splits", "show_diagnostic_splits", "hgb_candidates",
+                 "lr_candidates", "grid_search", "choose_and_test", "permutation_importances",
+                 "show_diagnostic_grid", "show_diagnostic_test", "write_tables"):
         assert len(calls_to(tree, name)) == 1, name
+    for gone in ("best_threshold", "classification_scores"):
+        assert calls_to(tree, gone) == [], gone
 
 
-# Step 13's skip: when step 12's labelled forecast rows hold one outcome only (all paid, all
-# unpaid) or none at all (no labelled rows, so actual is empty), best_threshold cannot choose a
-# threshold. The loop prints one skip line per model, in model order, and goes on; it calls
-# neither best_threshold nor classification_scores (stubbed here to raise). The splits are
-# still printed (they come from the table, which is unchanged). The forecast rows are changed
-# in place before the block runs, and the no-mutation check's copy is taken again after that.
-ONE_OUTCOME_ROWS = {
-    "all paid": (
-        '["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]',
-        "[True, True, None, True, True, None]"),
-    "all unpaid": (
-        '["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]',
-        "[False, False, None, False, False, None]"),
-    "no labelled rows": (
-        '["missing_week", "future", "missing_week", "future", "missing_week", "future"]',
-        "[True, False, None, True, False, None]"),
-}
+def test_step_13_old_too_few_outcomes_skip_is_gone():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "too few outcomes" not in source
+    assert "at step 12's origin, best F1 threshold" not in source
 
-REFUSE_SCORING = """
-def refuse_scoring(*args, **kwargs):
-    raise AssertionError("scoring called although there are too few outcomes")
-namespace.update(best_threshold=refuse_scoring, classification_scores=refuse_scoring)
+
+# show_diagnostic_grid / show_diagnostic_test on tiny hand-made frames.
+SHOW = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+grid = pd.DataFrame({
+    "candidate": [3, 0, 6, 1, 5, 2, 4][:N_GRID],
+    "C": [10.0, 0.01, 1.0, 0.1, 100.0, 0.5, 2.0][:N_GRID],
+    "class_weight": ["balanced", "none", "none", "balanced", "none", "balanced", "none"][:N_GRID],
+    "avg precision": [0.987654321, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05][:N_GRID],
+    "fit seconds": [1.23456, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0][:N_GRID],
+})
+importance = pd.DataFrame({"feature": [f"f{i}" for i in range(N_IMPORTANCE)],
+                           "log loss rise": np.linspace(0.0123456789, -0.001, N_IMPORTANCE),
+                           "std": np.full(N_IMPORTANCE, 0.000123456)})
+copies = (grid.copy(deep=True), importance.copy(deep=True))
+WHAT
+pd.testing.assert_frame_equal(grid, copies[0])
+pd.testing.assert_frame_equal(importance, copies[1])
+print("ok")
 """
 
 
-def one_outcome_stubs(case, refuse=True):
-    statuses, paid = ONE_OUTCOME_ROWS[case]
-    stubs = (f"forecast_rows['label_status'] = {statuses}\n"
-             f"forecast_rows['paid'] = pd.array({paid}, dtype='boolean')\n"
-             "copies = (copies[0], forecast_rows.copy(deep=True), copies[2])\n")
-    return stubs + (REFUSE_SCORING if refuse else "")
+def run_show(what, n_grid=7, n_importance=20):
+    return run_code(SHOW.replace("N_GRID", str(n_grid))
+                    .replace("N_IMPORTANCE", str(n_importance)).replace("WHAT", what))
 
 
-def skip_line(name):
-    return f"        {name} at step 12's origin: too few outcomes to choose a threshold"
+def expected_grid_printout(name, n_grid, n_importance):
+    import numpy as np
+    import pandas as pd
+    grid = pd.DataFrame({
+        "C": [10.0, 0.01, 1.0, 0.1, 100.0, 0.5, 2.0][:n_grid],
+        "class_weight": ["balanced", "none", "none", "balanced", "none", "balanced",
+                         "none"][:n_grid],
+        "avg precision": [0.987654321, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05][:n_grid],
+        "fit seconds": [1.23456, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0][:n_grid],
+    })
+    importance = pd.DataFrame({"feature": [f"f{i}" for i in range(n_importance)],
+                               "log loss rise": np.linspace(0.0123456789, -0.001, n_importance),
+                               "std": np.full(n_importance, 0.000123456)})
+    return ([f"        {name}: the 5 best of {n_grid} settings by validation average precision"]
+            + grid.head(5).round(4).to_string(index=False).splitlines()
+            + [f"        {name}: the 15 most important features (rise in validation log loss "
+               f"when shuffled)"]
+            + importance.head(15).round(5).to_string(index=False).splitlines())
 
 
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_does_not_raise(case):
-    result = run_step_13(stubs=one_outcome_stubs(case))
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_prints_the_splits_then_one_skip_line_per_model(case):
-    result = run_step_13(stubs=one_outcome_stubs(case))
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [
-        skip_line("stage 1 (HGB)"), skip_line("baseline (LR)"), "ok"]
-
-
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_skip_lines_follow_the_model_order(case):
-    result = run_step_13(list(reversed(TWO_MODELS)), stubs=one_outcome_stubs(case))
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[5:] == [
-        skip_line("baseline (LR)"), skip_line("stage 1 (HGB)"), "ok"]
-
-
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_one_model_prints_one_skip_line(case):
-    result = run_step_13(ONE_MODEL, stubs=one_outcome_stubs(case))
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[5:] == [skip_line("stage 1 (HGB)"), "ok"]
-
-
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_prints_no_threshold_or_score(case):
-    result = run_step_13(stubs=one_outcome_stubs(case))
-    assert result.returncode == 0, result.stderr
-    for line in result.stdout.splitlines()[5:]:
-        assert "best F1 threshold" not in line, line
-        assert "log loss" not in line, line
-    assert result.stdout.count("too few outcomes") == 2
-
-
-@pytest.mark.parametrize("case", list(ONE_OUTCOME_ROWS))
-def test_step_13_too_few_outcomes_without_stubs_gives_the_same_output(case):
-    # The real best_threshold / classification_scores are not reached either.
-    stubbed = run_step_13(stubs=one_outcome_stubs(case))
-    real = run_step_13(stubs=one_outcome_stubs(case, refuse=False))
-    assert real.returncode == 0, real.stderr
-    assert real.stdout == stubbed.stdout
-
-
-def test_step_13_refuse_scoring_stubs_bite_with_two_outcomes():
-    # The stubs do raise once the loop reaches best_threshold (so the skip tests mean something).
-    result = run_step_13(stubs=REFUSE_SCORING)
-    assert result.returncode != 0
-    assert "scoring called although there are too few outcomes" in result.stderr
-
-
-def test_step_13_two_outcomes_prints_no_skip_line():
-    result = run_step_13()
-    assert result.returncode == 0, result.stderr
-    assert "too few outcomes" not in result.stdout
-    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + [STEP_13_MODEL_A,
-                                                                STEP_13_MODEL_B, "ok"]
-
-
-def test_step_13_one_paid_and_one_unpaid_labelled_row_is_scored_not_skipped():
-    # Two outcomes is enough: labelled rows 10 (paid, p .8) and 11 (unpaid, p .4) only.
-    stubs = ("forecast_rows['label_status'] = "
-             "['labelled', 'labelled', 'missing_week', 'future', 'future', 'future']\n"
-             "copies = (copies[0], forecast_rows.copy(deep=True), copies[2])\n")
-    result = run_step_13(ONE_MODEL, stubs=stubs)
+def test_show_diagnostic_grid_printout():
+    result = run_show("script.show_diagnostic_grid('LR', grid, importance)")
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
-    assert "too few outcomes" not in result.stdout
-    assert lines[5].startswith("        stage 1 (HGB) at step 12's origin, best F1 threshold "
-                               "0.800: F1 1.000"), lines[5]
+    assert lines == expected_grid_printout("LR", 7, 20) + ["ok"]
+
+
+def test_show_diagnostic_grid_drops_the_candidate_column_and_rounds():
+    result = run_show("script.show_diagnostic_grid('HGB', grid, importance)")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    header = lines[1]
+    assert "candidate" not in header
+    assert header.split() == ["C", "class_weight", "avg", "precision", "fit", "seconds"]
+    assert len(lines) == 1 + 1 + 5 + 1 + 1 + 15 + 1
+    assert "0.9877" in lines[2] and "1.2346" in lines[2]
+    assert "0.987654" not in result.stdout
+    assert "0.01235" in lines[9]          # importance rounded to 5 places
+    assert "f14" in lines[-2] and "f15" not in result.stdout
+
+
+def test_show_diagnostic_grid_with_fewer_rows_than_shown_prints_them_all():
+    result = run_show("script.show_diagnostic_grid('LR', grid, importance)", n_grid=2,
+                      n_importance=3)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines == expected_grid_printout("LR", 2, 3) + ["ok"]
+    # The header still says "the 5 best" (pinned: it states the cap, not the count shown).
+    assert lines[0] == "        LR: the 5 best of 2 settings by validation average precision"
+
+
+def test_show_diagnostic_test_printout():
+    code = ("test = pd.DataFrame([{'model': 'HGB', 'max_iter': 300, 'F1': 0.123456, "
+            "'threshold': 0.55555}, {'model': 'LR', 'max_iter': np.nan, 'F1': 0.5, "
+            "'threshold': 0.25}])\n"
+            "before = test.copy(deep=True)\n"
+            "script.show_diagnostic_test(test)\n"
+            "pd.testing.assert_frame_equal(test, before)\n"
+            "print('EXPECTED')\n"
+            "print(test.round(4).to_string(index=False))\n")
+    result = run_show(code)
+    assert result.returncode == 0, result.stderr
+    out, expected = result.stdout.split("EXPECTED\n")
+    lines = out.splitlines()
+    assert lines[0] == ("        TEST (target weeks after the validation weeks), each model's "
+                        "chosen setting at its validation threshold:")
+    assert lines[1:] == expected.splitlines()[:-1]   # minus the final "ok"
+    assert "0.1235" in lines[2] and "0.5556" in lines[2]
+    assert lines[2].split()[0] == "HGB" and lines[3].split()[0] == "LR"

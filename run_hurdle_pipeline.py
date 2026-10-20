@@ -69,9 +69,14 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     panel_rows,
 )
 from collection_estimation.hurdle.diagnostic import (  # noqa: E402
-    best_threshold,
-    classification_scores,
+    choose_and_test,
+    class_weight_argument,
     diagnostic_splits,
+    grid_search,
+    hgb_candidates,
+    lr_candidates,
+    permutation_importances,
+    write_tables,
 )
 from collection_estimation.hurdle.stage1 import (  # noqa: E402
     feature_columns,
@@ -342,26 +347,44 @@ def main():
         predictions[name] = predict_paid(model, forecast_x)
     show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
 
-    # Step 13: the stage 1 diagnostic (diagnostic only, never the forecast). Built unit by
-    # unit; for now, its splits, and the F1 threshold and scores on step 12's predictions.
+    # Step 13: the stage 1 diagnostic (diagnostic only, never the forecast): stage 1 tuned as
+    # a classifier. For each model: a grid on validation (each setting at its own best-F1
+    # threshold), the best by average precision, refitted on train + validation and tested
+    # once with its validation threshold; then the permutation importance on validation.
     if settings.diagnostic.run:
         splits = diagnostic_splits(table, settings.diagnostic.origin,
                                    settings.receivables.horizons)
         show_diagnostic_splits(splits, settings.diagnostic.origin,
                                settings.receivables.horizons)
-        labelled = forecast_rows["label_status"] == "labelled"
-        actual = forecast_rows.loc[labelled, "paid"].astype(bool)
-        for name, p in predictions.items():
-            if actual.nunique() < 2:
-                # best_threshold needs payers and non-payers among the rows.
-                print(f"        {name} at step 12's origin: too few outcomes to choose a "
-                      f"threshold")
-                continue
-            threshold, f1 = best_threshold(actual, p[labelled])
-            scores = classification_scores(actual, p[labelled], threshold)
-            print(f"        {name} at step 12's origin, best F1 threshold {threshold:.3f}: "
-                  + ", ".join(f"{key} {value:.3f}" for key, value in scores.items()
-                              if key != "threshold"))
+        inputs = {part: (stage1_features(rows, columns, companies,
+                                         settings.stage1.company_as_feature),
+                         rows["paid"].astype(bool))
+                  for part, rows in (("train", splits.train), ("validation", splits.validation),
+                                     ("refit", splits.refit), ("test", splits.test))}
+        tables, tests = {}, []
+        for name, fit, candidates in (
+                ("HGB", fit_stage1, hgb_candidates(settings.stage1, settings.diagnostic)),
+                ("LR", fit_stage1_baseline, lr_candidates(settings.stage1,
+                                                          settings.diagnostic))):
+            grid = grid_search(name, fit, candidates, *inputs["train"], *inputs["validation"])
+            tests.append(choose_and_test(name, fit, candidates, grid, *inputs["refit"],
+                                         *inputs["test"]))
+            # The importance of the chosen setting, fitted on the training rows, measured on
+            # the validation rows (the test rows stay untouched).
+            chosen = candidates[int(grid.iloc[0]["candidate"])]
+            model = fit(*inputs["train"], chosen.settings,
+                        class_weight=class_weight_argument(chosen.class_weight))
+            importance = permutation_importances(model, *inputs["validation"],
+                                                 settings.diagnostic.importance_repeats,
+                                                 settings.stage1.random_seed)
+            tables[f"{name.lower()}_grid"] = grid
+            tables[f"{name.lower()}_importance"] = importance
+            show_diagnostic_grid(name, grid, importance)
+        tables["test"] = pd.DataFrame(tests)
+        show_diagnostic_test(tables["test"])
+        paths = write_tables(settings.diagnostic.output_folder, tables)
+        print(f"        tables written to {settings.diagnostic.output_folder}: "
+              f"{[path.name for path in paths]}")
 
     # Step 11 continues, and later steps follow, as each unit is built.
 
@@ -717,6 +740,23 @@ def show_diagnostic_splits(splits, origin, horizons):
     }.items():
         print(f"        {name:<10} {len(rows):>9,} rows, {rows['paid'].astype(bool).mean():6.1%} "
               f"paid ({weeks})")
+
+
+def show_diagnostic_grid(name, grid, importance):
+    """A short printout of one model's diagnostic grid and permutation importance."""
+    columns = [column for column in grid.columns if column not in ("candidate",)]
+    print(f"        {name}: the 5 best of {len(grid)} settings by validation average precision")
+    print(grid[columns].head(5).round(4).to_string(index=False))
+    print(f"        {name}: the 15 most important features (rise in validation log loss when "
+          f"shuffled)")
+    print(importance.head(15).round(5).to_string(index=False))
+
+
+def show_diagnostic_test(test):
+    """The test table: each model's chosen setting, scored once on the test rows."""
+    print("        TEST (target weeks after the validation weeks), each model's chosen setting "
+          "at its validation threshold:")
+    print(test.round(4).to_string(index=False))
 
 
 if __name__ == "__main__":

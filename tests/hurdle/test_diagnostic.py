@@ -1,5 +1,7 @@
-"""Tests for `hurdle/diagnostic.py`: `DiagnosticSplits`, `diagnostic_splits`, `best_threshold`
-and `classification_scores`.
+"""Tests for `hurdle/diagnostic.py`: `DiagnosticSplits`, `diagnostic_splits`, `best_threshold`,
+`classification_scores` (U10.4a), and `Candidate`, `class_weight_argument`, `hgb_candidates`,
+`lr_candidates`, `grid_search`, `choose_and_test`, `permutation_importances` and
+`write_tables` (U10.4b/c).
 
 Every table is hand-made; nothing is read from data/ (no corpus, no ledger, no cache).
 Hypothesis is not installed in this env, so the brute-force checks use seeded random trials.
@@ -699,3 +701,898 @@ def test_no_threshold_beats_the_best_one_in_classification_scores():
     _, f1 = best_threshold(actual, p)
     for t in sorted(set(p.tolist())) + [0.0, 1.0, 0.555]:
         assert classification_scores(actual, p, t)["F1"] <= f1 + 1e-12, t
+
+
+# =============================================================================================
+# U10.4b / U10.4c: Candidate, class_weight_argument, hgb_candidates, lr_candidates,
+# grid_search, choose_and_test, permutation_importances, write_tables.
+#
+# Every table is tiny (a few hundred rows) and every real grid has a few small fits, so these
+# run in seconds. Spy fits record their arguments; fake models return p chosen by hand.
+# =============================================================================================
+
+import io  # noqa: E402
+import itertools  # noqa: E402
+from contextlib import redirect_stdout  # noqa: E402
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from sklearn.base import BaseEstimator, ClassifierMixin  # noqa: E402
+from sklearn.metrics import average_precision_score  # noqa: E402
+
+from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    Candidate,
+    choose_and_test,
+    class_weight_argument,
+    grid_search,
+    hgb_candidates,
+    lr_candidates,
+    permutation_importances,
+    write_tables,
+)
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    DiagnosticSettings,
+    Stage1Settings,
+)
+from collection_estimation.hurdle.stage1 import (  # noqa: E402
+    fit_stage1,
+    fit_stage1_baseline,
+    predict_paid,
+)
+
+
+def stage1_settings(**changes):
+    base = Stage1Settings(max_iter=7, learning_rate=0.3, max_leaf_nodes=5, min_samples_leaf=4,
+                          random_seed=11, feature_blocks=("history", "calendar"),
+                          company_as_feature=True, baseline_c=0.5)
+    return dataclasses.replace(base, **changes)
+
+
+def diagnostic_settings(**changes):
+    base = DiagnosticSettings(run=True, origin=40, hgb_max_iter=(10, 30),
+                              hgb_learning_rate=(0.05, 0.1, 0.2), hgb_max_leaf_nodes=(3, 7),
+                              lr_c=(0.01, 1.0, 100.0), class_weights=("none", "balanced"),
+                              importance_repeats=2, output_folder=Path("unused"))
+    return dataclasses.replace(base, **changes)
+
+
+# --- Candidate -------------------------------------------------------------------------------
+
+def test_candidate_fields_in_order():
+    assert [field.name for field in dataclasses.fields(Candidate)] == [
+        "params", "settings", "class_weight"]
+
+
+def test_candidate_is_frozen():
+    candidate = Candidate(params={"C": 1.0}, settings=stage1_settings(), class_weight="none")
+    for name in ("params", "settings", "class_weight"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(candidate, name, None)
+
+
+# --- class_weight_argument -------------------------------------------------------------------
+
+def test_class_weight_none_is_none():
+    assert class_weight_argument("none") is None
+
+
+def test_class_weight_balanced_is_balanced():
+    assert class_weight_argument("balanced") == "balanced"
+
+
+@pytest.mark.parametrize("value", ["None", "Balanced", "BALANCED", "", " none", "balanced ",
+                                   "auto", None, 0])
+def test_class_weight_anything_else_raises_the_exact_message(value):
+    with pytest.raises(ValueError) as error:
+        class_weight_argument(value)
+    assert str(error.value) == f"class weight {value!r} is not 'none' or 'balanced'"
+
+
+# --- hgb_candidates --------------------------------------------------------------------------
+
+HGB_KEYS = ["max_iter", "learning_rate", "max_leaf_nodes", "class_weight"]
+
+
+def test_hgb_candidates_count_is_the_product_of_the_grid():
+    candidates = hgb_candidates(stage1_settings(), diagnostic_settings())
+    assert len(candidates) == 2 * 3 * 2 * 2
+
+
+def test_hgb_candidates_follow_itertools_product_order():
+    diagnostic = diagnostic_settings()
+    candidates = hgb_candidates(stage1_settings(), diagnostic)
+    expected = list(itertools.product(diagnostic.hgb_max_iter, diagnostic.hgb_learning_rate,
+                                      diagnostic.hgb_max_leaf_nodes, diagnostic.class_weights))
+    assert [tuple(c.params[k] for k in HGB_KEYS) for c in candidates] == expected
+    # The last axis (class weight) varies fastest.
+    assert [c.class_weight for c in candidates[:4]] == ["none", "balanced", "none", "balanced"]
+
+
+def test_hgb_candidates_params_keys_in_order():
+    for candidate in hgb_candidates(stage1_settings(), diagnostic_settings()):
+        assert list(candidate.params) == HGB_KEYS
+
+
+def test_hgb_candidates_class_weight_matches_the_params():
+    for candidate in hgb_candidates(stage1_settings(), diagnostic_settings()):
+        assert candidate.class_weight == candidate.params["class_weight"]
+
+
+def test_hgb_candidates_settings_have_the_grid_values_in_place():
+    for candidate in hgb_candidates(stage1_settings(), diagnostic_settings()):
+        assert isinstance(candidate.settings, Stage1Settings)
+        assert candidate.settings.max_iter == candidate.params["max_iter"]
+        assert candidate.settings.learning_rate == candidate.params["learning_rate"]
+        assert candidate.settings.max_leaf_nodes == candidate.params["max_leaf_nodes"]
+
+
+def test_hgb_candidates_every_other_setting_is_unchanged():
+    stage1 = stage1_settings()
+    for candidate in hgb_candidates(stage1, diagnostic_settings()):
+        assert candidate.settings == dataclasses.replace(
+            stage1, max_iter=candidate.params["max_iter"],
+            learning_rate=candidate.params["learning_rate"],
+            max_leaf_nodes=candidate.params["max_leaf_nodes"])
+        for name in ("min_samples_leaf", "random_seed", "feature_blocks",
+                     "company_as_feature", "baseline_c"):
+            assert getattr(candidate.settings, name) == getattr(stage1, name), name
+
+
+def test_hgb_candidates_do_not_change_the_forecast_settings():
+    stage1, diagnostic = stage1_settings(), diagnostic_settings()
+    before = (dataclasses.replace(stage1), dataclasses.replace(diagnostic))
+    candidates = hgb_candidates(stage1, diagnostic)
+    assert stage1 == before[0] and diagnostic == before[1]
+    assert all(candidate.settings is not stage1 for candidate in candidates)
+    assert stage1.max_iter == 7 and stage1.learning_rate == 0.3 and stage1.max_leaf_nodes == 5
+
+
+def test_hgb_candidates_one_value_per_axis_gives_one_candidate():
+    diagnostic = diagnostic_settings(hgb_max_iter=(5,), hgb_learning_rate=(0.1,),
+                                     hgb_max_leaf_nodes=(4,), class_weights=("balanced",))
+    candidates = hgb_candidates(stage1_settings(), diagnostic)
+    assert len(candidates) == 1
+    assert candidates[0].params == {"max_iter": 5, "learning_rate": 0.1, "max_leaf_nodes": 4,
+                                    "class_weight": "balanced"}
+    assert candidates[0].class_weight == "balanced"
+
+
+@pytest.mark.parametrize("axis", ["hgb_max_iter", "hgb_learning_rate", "hgb_max_leaf_nodes",
+                                  "class_weights"])
+def test_hgb_candidates_an_empty_axis_gives_no_candidates(axis):
+    assert hgb_candidates(stage1_settings(), diagnostic_settings(**{axis: ()})) == []
+
+
+def test_hgb_candidates_ignore_the_lr_grid():
+    one = hgb_candidates(stage1_settings(), diagnostic_settings(lr_c=(0.1,)))
+    two = hgb_candidates(stage1_settings(), diagnostic_settings(lr_c=(1.0, 2.0, 3.0)))
+    assert [c.params for c in one] == [c.params for c in two]
+    assert [c.settings for c in one] == [c.settings for c in two]
+
+
+# --- lr_candidates ---------------------------------------------------------------------------
+
+def test_lr_candidates_count_and_order():
+    diagnostic = diagnostic_settings()
+    candidates = lr_candidates(stage1_settings(), diagnostic)
+    assert len(candidates) == 3 * 2
+    assert [(c.params["C"], c.params["class_weight"]) for c in candidates] == list(
+        itertools.product(diagnostic.lr_c, diagnostic.class_weights))
+
+
+def test_lr_candidates_params_keys_in_order():
+    for candidate in lr_candidates(stage1_settings(), diagnostic_settings()):
+        assert list(candidate.params) == ["C", "class_weight"]
+        assert candidate.class_weight == candidate.params["class_weight"]
+
+
+def test_lr_candidates_replace_only_baseline_c():
+    stage1 = stage1_settings()
+    for candidate in lr_candidates(stage1, diagnostic_settings()):
+        assert isinstance(candidate.settings, Stage1Settings)
+        assert candidate.settings.baseline_c == candidate.params["C"]
+        assert candidate.settings == dataclasses.replace(stage1,
+                                                         baseline_c=candidate.params["C"])
+        for name in ("max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
+                     "random_seed", "feature_blocks", "company_as_feature"):
+            assert getattr(candidate.settings, name) == getattr(stage1, name), name
+
+
+def test_lr_candidates_do_not_change_the_forecast_settings():
+    stage1, diagnostic = stage1_settings(), diagnostic_settings()
+    before = (dataclasses.replace(stage1), dataclasses.replace(diagnostic))
+    lr_candidates(stage1, diagnostic)
+    assert stage1 == before[0] and diagnostic == before[1]
+    assert stage1.baseline_c == 0.5
+
+
+def test_lr_candidates_ignore_the_hgb_grid():
+    one = lr_candidates(stage1_settings(), diagnostic_settings(hgb_max_iter=(1,)))
+    two = lr_candidates(stage1_settings(), diagnostic_settings(hgb_max_iter=(1, 2, 3, 4)))
+    assert [c.params for c in one] == [c.params for c in two]
+
+
+@pytest.mark.parametrize("axis", ["lr_c", "class_weights"])
+def test_lr_candidates_an_empty_axis_gives_no_candidates(axis):
+    assert lr_candidates(stage1_settings(), diagnostic_settings(**{axis: ()})) == []
+
+
+# --- tiny data for the real fits -------------------------------------------------------------
+
+def tiny_data(n=300, seed=0, company=False, index_start=0):
+    """x with an informative column `signal`, a pure-noise column `noise` and h; paid depends
+    on signal only (and, with `company`, on the company: TR04 pays more often)."""
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    x = pd.DataFrame({"h": rng.integers(1, 6, size=n).astype("float64"),
+                      "signal": signal, "noise": noise},
+                     index=pd.RangeIndex(index_start, index_start + n))
+    logit = 2.5 * signal - 0.8
+    if company:
+        codes = rng.choice(["TR02", "TR04", "TR91"], size=n)
+        x["company_code"] = pd.Categorical(codes, categories=["TR02", "TR04", "TR91"])
+        logit = logit + np.where(codes == "TR04", 2.0, 0.0)
+    paid = pd.Series(rng.random(n) < 1 / (1 + np.exp(-logit)), index=x.index, name="paid")
+    return x, paid
+
+
+@pytest.fixture(scope="module")
+def data():
+    train_x, train_paid = tiny_data(300, seed=1)
+    validation_x, validation_paid = tiny_data(200, seed=2, index_start=1000)
+    test_x, test_paid = tiny_data(200, seed=3, index_start=5000)
+    return SimpleNamespace(train_x=train_x, train_paid=train_paid, validation_x=validation_x,
+                           validation_paid=validation_paid, test_x=test_x, test_paid=test_paid)
+
+
+def run_quietly(function, *args, **kwargs):
+    with redirect_stdout(io.StringIO()) as out:
+        result = function(*args, **kwargs)
+    return result, out.getvalue()
+
+
+SMALL_HGB = diagnostic_settings(hgb_max_iter=(3, 15), hgb_learning_rate=(0.3,),
+                                hgb_max_leaf_nodes=(3,), class_weights=("none", "balanced"))
+SMALL_LR = diagnostic_settings(lr_c=(0.001, 1.0, 100.0), class_weights=("none", "balanced"))
+
+
+# --- fakes -----------------------------------------------------------------------------------
+
+class FakeModel:
+    """A model predict_paid accepts: p is given by hand, as a function of x."""
+
+    def __init__(self, columns, p_of_x):
+        self.feature_names_in_ = np.array(list(columns), dtype=object)
+        self.classes_ = np.array([False, True])
+        self.p_of_x = p_of_x
+        self.predicted_on = []
+
+    def predict_proba(self, x):
+        self.predicted_on.append(x)
+        p = np.asarray(self.p_of_x(x), dtype=float)
+        return np.column_stack([1 - p, p])
+
+
+class SpyFit:
+    """A fit that records each call and returns a FakeModel whose p comes from `p_for`
+    (a function of the settings and class_weight passed in, and of the x predicted)."""
+
+    def __init__(self, p_for):
+        self.p_for = p_for
+        self.calls = []
+        self.models = []
+
+    def __call__(self, train_x, paid, settings, class_weight="NOT GIVEN"):
+        self.calls.append(SimpleNamespace(train_x=train_x, paid=paid, settings=settings,
+                                          class_weight=class_weight))
+        model = FakeModel(train_x.columns,
+                          lambda x, s=settings, w=class_weight: self.p_for(s, w, x))
+        self.models.append(model)
+        return model
+
+
+def fake_candidates(n, weights=None):
+    weights = weights or ["none"] * n
+    return [Candidate(params={"k": i, "class_weight": weights[i]},
+                      settings=SimpleNamespace(tag=i), class_weight=weights[i])
+            for i in range(n)]
+
+
+# Hand-made validation rows: 8 rows, 4 payers.
+VAL_X = pd.DataFrame({"a": np.arange(8, dtype="float64")}, index=pd.Index(range(20, 28)))
+VAL_PAID = pd.Series([True, True, False, True, False, False, True, False], index=VAL_X.index)
+TRAIN_X = pd.DataFrame({"a": np.arange(6, dtype="float64")}, index=pd.Index(range(6)))
+TRAIN_PAID = pd.Series([True, False, True, False, True, False], index=TRAIN_X.index)
+# Three p vectors with different average precision on VAL_PAID: GOOD > MID > BAD.
+P_GOOD = np.array([0.9, 0.8, 0.2, 0.7, 0.1, 0.3, 0.6, 0.15])   # perfect ranking
+P_MID = np.array([0.9, 0.3, 0.8, 0.7, 0.1, 0.2, 0.25, 0.6])
+P_BAD = np.array([0.1, 0.2, 0.9, 0.3, 0.8, 0.7, 0.4, 0.6])
+
+
+def test_the_hand_made_p_vectors_rank_good_mid_bad():
+    ap = [average_precision_score(VAL_PAID, p) for p in (P_GOOD, P_MID, P_BAD)]
+    assert ap[0] > ap[1] > ap[2]
+
+
+SCORE_KEYS = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss"]
+
+
+# --- grid_search: shape ----------------------------------------------------------------------
+
+def fake_grid(assignment, weights=None, name="M"):
+    """grid_search over len(assignment) fake candidates; candidate i predicts assignment[i]."""
+    candidates = fake_candidates(len(assignment), weights)
+    fit = SpyFit(lambda s, w, x: assignment[s.tag])
+    grid, out = run_quietly(grid_search, name, fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X,
+                            VAL_PAID)
+    return grid, out, fit, candidates
+
+
+def test_grid_search_one_row_per_candidate():
+    grid, _, _, _ = fake_grid([P_GOOD, P_MID, P_BAD, P_MID])
+    assert len(grid) == 4
+    assert sorted(grid["candidate"]) == [0, 1, 2, 3]
+
+
+def test_grid_search_columns_in_order():
+    grid, _, _, _ = fake_grid([P_GOOD, P_MID])
+    assert list(grid.columns) == ["candidate", "k", "class_weight"] + SCORE_KEYS + [
+        "fit seconds"]
+
+
+def test_grid_search_hgb_params_columns_in_order():
+    candidates = hgb_candidates(stage1_settings(), SMALL_HGB)
+    fit = SpyFit(lambda s, w, x: P_MID)
+    grid, _ = run_quietly(grid_search, "HGB", fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X,
+                          VAL_PAID)
+    assert list(grid.columns) == ["candidate"] + HGB_KEYS + SCORE_KEYS + ["fit seconds"]
+
+
+def test_grid_search_has_a_fresh_index():
+    grid, _, _, _ = fake_grid([P_BAD, P_MID, P_GOOD])
+    assert isinstance(grid.index, pd.RangeIndex)
+    assert list(grid.index) == [0, 1, 2]
+
+
+def test_grid_search_fit_seconds_are_non_negative_floats():
+    grid, _, _, _ = fake_grid([P_BAD, P_MID, P_GOOD])
+    assert (grid["fit seconds"] >= 0).all()
+    assert grid["fit seconds"].dtype == np.float64
+
+
+def test_grid_search_candidate_column_holds_ints():
+    grid, _, _, _ = fake_grid([P_BAD, P_MID, P_GOOD])
+    assert pd.api.types.is_integer_dtype(grid["candidate"])
+
+
+# --- grid_search: sort -----------------------------------------------------------------------
+
+def test_grid_search_sorted_by_avg_precision_best_first():
+    grid, _, _, _ = fake_grid([P_BAD, P_MID, P_GOOD])
+    assert list(grid["candidate"]) == [2, 1, 0]
+    assert grid["avg precision"].is_monotonic_decreasing
+
+
+def test_grid_search_ties_keep_grid_order():
+    # Candidates 1 and 3 tie at the top, 0 and 2 at the bottom, 4 in the middle.
+    grid, _, _, _ = fake_grid([P_BAD, P_GOOD, P_BAD, P_GOOD, P_MID])
+    assert list(grid["candidate"]) == [1, 3, 4, 0, 2]
+
+
+def test_grid_search_all_tied_keeps_grid_order_exactly():
+    grid, _, _, _ = fake_grid([P_MID] * 7)
+    assert list(grid["candidate"]) == list(range(7))
+
+
+def test_grid_search_ties_keep_grid_order_with_many_interleaved_ties():
+    # Many ties interleaved: a non-stable sort (quicksort) could swap them.
+    assignment = [P_GOOD if i % 3 == 0 else (P_MID if i % 3 == 1 else P_BAD)
+                  for i in range(30)]
+    grid, _, _, _ = fake_grid(assignment)
+    expected = ([i for i in range(30) if i % 3 == 0] + [i for i in range(30) if i % 3 == 1]
+                + [i for i in range(30) if i % 3 == 2])
+    assert list(grid["candidate"]) == expected
+
+
+def test_grid_search_candidate_maps_back_to_its_candidate():
+    assignment = [P_BAD, P_GOOD, P_MID, P_GOOD]
+    grid, _, _, candidates = fake_grid(assignment, weights=["none", "balanced", "none",
+                                                            "balanced"])
+    for _, row in grid.iterrows():
+        candidate = candidates[int(row["candidate"])]
+        assert row["k"] == candidate.params["k"]
+        assert row["class_weight"] == candidate.params["class_weight"]
+        expected = average_precision_score(VAL_PAID, assignment[int(row["candidate"])])
+        assert row["avg precision"] == pytest.approx(expected)
+
+
+# --- grid_search: scores and thresholds per candidate ----------------------------------------
+
+def test_grid_search_each_row_has_its_own_best_threshold_and_scores():
+    assignment = [P_BAD, P_GOOD, P_MID]
+    grid, _, _, _ = fake_grid(assignment)
+    for _, row in grid.iterrows():
+        p = pd.Series(assignment[int(row["candidate"])], index=VAL_X.index)
+        threshold, _ = best_threshold(VAL_PAID, p)
+        assert row["threshold"] == threshold
+        expected = classification_scores(VAL_PAID, p, threshold)
+        for key in SCORE_KEYS:
+            assert row[key] == pytest.approx(expected[key], rel=1e-12, abs=1e-15), key
+    # The hand-made p give different thresholds: they are chosen per candidate.
+    assert grid["threshold"].nunique() == 3
+
+
+def test_grid_search_passes_the_class_weight_argument_to_fit():
+    weights = ["none", "balanced", "balanced", "none"]
+    _, _, fit, candidates = fake_grid([P_MID] * 4, weights=weights)
+    assert [call.class_weight for call in fit.calls] == [None, "balanced", "balanced", None]
+    for call, candidate in zip(fit.calls, candidates):
+        assert call.settings is candidate.settings
+
+
+def test_grid_search_rejects_a_bad_class_weight_with_the_exact_message():
+    candidates = [Candidate(params={"k": 0}, settings=SimpleNamespace(tag=0),
+                            class_weight="Balanced")]
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with pytest.raises(ValueError) as error:
+        run_quietly(grid_search, "M", fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID)
+    assert str(error.value) == "class weight 'Balanced' is not 'none' or 'balanced'"
+    assert fit.calls == []
+
+
+def test_grid_search_fits_on_train_rows_only():
+    _, _, fit, _ = fake_grid([P_MID, P_GOOD, P_BAD])
+    assert len(fit.calls) == 3
+    for call in fit.calls:
+        assert call.train_x is TRAIN_X
+        assert call.paid is TRAIN_PAID
+
+
+def test_grid_search_predicts_and_scores_validation_rows_only():
+    _, _, fit, _ = fake_grid([P_MID, P_GOOD, P_BAD])
+    for model in fit.models:
+        assert len(model.predicted_on) == 1
+        assert model.predicted_on[0] is VAL_X
+
+
+def test_grid_search_scores_against_validation_paid():
+    # P_GOOD ranks VAL_PAID perfectly: AUC 1 and average precision 1.
+    grid, _, _, _ = fake_grid([P_GOOD])
+    assert grid.loc[0, "AUC"] == 1.0
+    assert grid.loc[0, "avg precision"] == 1.0
+
+
+def test_grid_search_fits_once_per_candidate_in_grid_order():
+    _, _, fit, _ = fake_grid([P_BAD, P_GOOD, P_MID, P_MID, P_GOOD])
+    assert [call.settings.tag for call in fit.calls] == [0, 1, 2, 3, 4]
+
+
+def test_grid_search_does_not_change_its_inputs():
+    train_x, train_paid, val_x, val_paid = (TRAIN_X.copy(), TRAIN_PAID.copy(), VAL_X.copy(),
+                                            VAL_PAID.copy())
+    candidates = fake_candidates(3)
+    params_before = [dict(c.params) for c in candidates]
+    fit = SpyFit(lambda s, w, x: [P_BAD, P_GOOD, P_MID][s.tag])
+    run_quietly(grid_search, "M", fit, candidates, train_x, train_paid, val_x, val_paid)
+    pd.testing.assert_frame_equal(train_x, TRAIN_X)
+    pd.testing.assert_series_equal(train_paid, TRAIN_PAID)
+    pd.testing.assert_frame_equal(val_x, VAL_X)
+    pd.testing.assert_series_equal(val_paid, VAL_PAID)
+    assert [c.params for c in candidates] == params_before
+
+
+# --- grid_search: printout and errors --------------------------------------------------------
+
+def test_grid_search_prints_one_progress_line_per_candidate_in_grid_order():
+    assignment = [P_BAD, P_GOOD, P_MID]
+    _, out, _, candidates = fake_grid(assignment, name="HGB")
+    lines = out.splitlines()
+    assert len(lines) == 3
+    for number, (line, candidate, p) in enumerate(zip(lines, candidates, assignment), start=1):
+        ap = average_precision_score(VAL_PAID, p)
+        prefix = f"  ... HGB {number} of 3: {candidate.params}, avg precision {ap:.4f} ("
+        assert line.startswith(prefix), line
+        assert line.endswith(" s)"), line
+
+
+def test_grid_search_empty_candidate_list_raises_the_exact_message():
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with pytest.raises(ValueError) as error:
+        grid_search("LR", fit, [], TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID)
+    assert str(error.value) == "LR: the grid has no settings to try"
+    assert fit.calls == []
+
+
+def test_grid_search_one_class_validation_raises_from_best_threshold():
+    one_class = pd.Series([True] * 8, index=VAL_X.index)
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with pytest.raises(ValueError) as error:
+        run_quietly(grid_search, "M", fit, fake_candidates(1), TRAIN_X, TRAIN_PAID, VAL_X,
+                    one_class)
+    assert str(error.value) == ONE_CLASS
+
+
+# --- grid_search: real fits ------------------------------------------------------------------
+
+@pytest.mark.parametrize("model", ["HGB", "LR"])
+def test_grid_search_real_thresholds_equal_an_independent_best_threshold(model, data):
+    if model == "HGB":
+        fit, candidates = fit_stage1, hgb_candidates(stage1_settings(), SMALL_HGB)
+    else:
+        fit, candidates = fit_stage1_baseline, lr_candidates(stage1_settings(), SMALL_LR)
+    grid, _ = run_quietly(grid_search, model, fit, candidates, data.train_x, data.train_paid,
+                          data.validation_x, data.validation_paid)
+    assert len(grid) == len(candidates)
+    thresholds = {}
+    for _, row in grid.iterrows():
+        candidate = candidates[int(row["candidate"])]
+        for key, value in candidate.params.items():
+            assert row[key] == value, key
+        fitted = fit(data.train_x, data.train_paid, candidate.settings,
+                     class_weight=class_weight_argument(candidate.class_weight))
+        p = predict_paid(fitted, data.validation_x)
+        threshold, _ = best_threshold(data.validation_paid, p)
+        assert row["threshold"] == threshold
+        expected = classification_scores(data.validation_paid, p, threshold)
+        for key in SCORE_KEYS:
+            assert row[key] == pytest.approx(expected[key], rel=1e-9), key
+        thresholds[int(row["candidate"])] = threshold
+    # Balanced class weights move p, so the per-candidate thresholds differ.
+    assert len(set(thresholds.values())) > 1
+    assert grid["avg precision"].is_monotonic_decreasing
+
+
+# --- choose_and_test -------------------------------------------------------------------------
+
+TEST_X = pd.DataFrame({"a": np.arange(6, dtype="float64")}, index=pd.Index(range(50, 56)))
+TEST_PAID = pd.Series([True, False, True, False, True, False], index=TEST_X.index)
+REFIT_X = pd.DataFrame({"a": np.arange(10, dtype="float64")}, index=pd.Index(range(100, 110)))
+REFIT_PAID = pd.Series([True, False] * 5, index=REFIT_X.index)
+# On the test rows, the best F1 threshold is 0.35 (F1 1); at 0.65 only one payer is caught.
+P_TEST = np.array([0.7, 0.3, 0.4, 0.1, 0.35, 0.2])
+
+
+def hand_grid(rows):
+    """A grid as grid_search returns it: candidate, k, class_weight, the scores."""
+    return pd.DataFrame([{"candidate": c, "k": c, "class_weight": w, "F1": 0.5,
+                          "precision": 0.5, "recall": 0.5, "threshold": t, "AUC": 0.5,
+                          "avg precision": ap, "log loss": 0.7, "fit seconds": 0.0}
+                         for c, w, t, ap in rows])
+
+
+def test_choose_and_test_refits_the_top_rows_candidate_on_the_refit_rows():
+    candidates = fake_candidates(3, ["none", "balanced", "none"])
+    grid = hand_grid([(1, "balanced", 0.65, 0.9), (0, "none", 0.2, 0.8), (2, "none", 0.5, 0.1)])
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X, TEST_PAID)
+    assert len(fit.calls) == 1
+    call = fit.calls[0]
+    assert call.settings is candidates[1].settings
+    assert call.class_weight == "balanced"
+    assert call.train_x is REFIT_X
+    assert call.paid is REFIT_PAID
+    assert len(fit.models[0].predicted_on) == 1
+    assert fit.models[0].predicted_on[0] is TEST_X
+
+
+def test_choose_and_test_takes_the_first_row_not_the_highest_avg_precision():
+    # Pins "grid.iloc[0]": the grid is trusted to be sorted already.
+    candidates = fake_candidates(3)
+    grid = hand_grid([(2, "none", 0.5, 0.1), (0, "none", 0.2, 0.9), (1, "none", 0.3, 0.8)])
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    result = choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X,
+                             TEST_PAID)
+    assert fit.calls[0].settings is candidates[2].settings
+    assert result["k"] == 2
+
+
+def test_choose_and_test_uses_the_validation_threshold_unchanged():
+    candidates = fake_candidates(2)
+    grid = hand_grid([(0, "none", 0.65, 0.9), (1, "none", 0.35, 0.5)])
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    result = choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X,
+                             TEST_PAID)
+    p = pd.Series(P_TEST, index=TEST_X.index)
+    test_best, test_best_f1 = best_threshold(TEST_PAID, p)
+    assert test_best == 0.35 and test_best_f1 == 1.0
+    assert result["threshold"] == 0.65
+    expected = classification_scores(TEST_PAID, p, 0.65)
+    for key in SCORE_KEYS:
+        assert result[key] == pytest.approx(expected[key]), key
+    assert result["F1"] < test_best_f1   # not re-tuned on the test rows
+    assert result["recall"] == pytest.approx(1 / 3)
+
+
+def test_choose_and_test_returns_model_then_params_then_scores():
+    candidates = fake_candidates(1, ["balanced"])
+    grid = hand_grid([(0, "balanced", 0.35, 0.9)])
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    result = choose_and_test("LR", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X,
+                             TEST_PAID)
+    assert list(result) == ["model", "k", "class_weight"] + SCORE_KEYS
+    p = pd.Series(P_TEST, index=TEST_X.index)
+    assert result == {"model": "LR", "k": 0, "class_weight": "balanced",
+                      **classification_scores(TEST_PAID, p, 0.35)}
+
+
+def test_choose_and_test_threshold_is_a_float():
+    candidates = fake_candidates(1)
+    grid = hand_grid([(0, "none", 0.35, 0.9)])
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    result = choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X,
+                             TEST_PAID)
+    assert type(result["threshold"]) is float
+
+
+def test_choose_and_test_accepts_a_float_candidate_column():
+    # e.g. a grid read back from CSV, or a row of mixed dtypes.
+    candidates = fake_candidates(3)
+    grid = hand_grid([(2, "none", 0.35, 0.9)]).astype({"candidate": "float64"})
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X, TEST_PAID)
+    assert fit.calls[0].settings is candidates[2].settings
+
+
+def test_choose_and_test_does_not_change_the_grid():
+    candidates = fake_candidates(2)
+    grid = hand_grid([(1, "none", 0.65, 0.9), (0, "none", 0.35, 0.5)])
+    before = grid.copy(deep=True)
+    choose_and_test("M", SpyFit(lambda s, w, x: P_TEST), candidates, grid, REFIT_X,
+                    REFIT_PAID, TEST_X, TEST_PAID)
+    pd.testing.assert_frame_equal(grid, before)
+
+
+def test_choose_and_test_after_a_real_grid_search(data):
+    candidates = lr_candidates(stage1_settings(), SMALL_LR)
+    grid, _ = run_quietly(grid_search, "LR", fit_stage1_baseline, candidates, data.train_x,
+                          data.train_paid, data.validation_x, data.validation_paid)
+    refit_x = pd.concat([data.train_x, data.validation_x])
+    refit_paid = pd.concat([data.train_paid, data.validation_paid])
+    result = choose_and_test("LR", fit_stage1_baseline, candidates, grid, refit_x, refit_paid,
+                             data.test_x, data.test_paid)
+    best = candidates[int(grid.iloc[0]["candidate"])]
+    model = fit_stage1_baseline(refit_x, refit_paid, best.settings,
+                                class_weight=class_weight_argument(best.class_weight))
+    p = predict_paid(model, data.test_x)
+    expected = classification_scores(data.test_paid, p, float(grid.iloc[0]["threshold"]))
+    assert result["model"] == "LR"
+    assert result["C"] == best.params["C"]
+    assert result["class_weight"] == best.params["class_weight"]
+    assert result["threshold"] == grid.iloc[0]["threshold"]
+    for key in SCORE_KEYS:
+        assert result[key] == pytest.approx(expected[key], rel=1e-9), key
+
+
+# --- permutation_importances -----------------------------------------------------------------
+
+def importance_of(table, feature):
+    return float(table.loc[table["feature"] == feature, "log loss rise"].iloc[0])
+
+
+@pytest.fixture(scope="module")
+def lr_model(data):
+    return fit_stage1_baseline(data.train_x, data.train_paid, stage1_settings(baseline_c=1.0))
+
+
+@pytest.fixture(scope="module")
+def company_data():
+    train_x, train_paid = tiny_data(400, seed=21, company=True)
+    validation_x, validation_paid = tiny_data(300, seed=22, company=True, index_start=900)
+    return SimpleNamespace(train_x=train_x, train_paid=train_paid, validation_x=validation_x,
+                           validation_paid=validation_paid)
+
+
+@pytest.fixture(scope="module")
+def hgb_company_model(company_data):
+    return fit_stage1(company_data.train_x, company_data.train_paid,
+                      stage1_settings(max_iter=30, learning_rate=0.1, max_leaf_nodes=4,
+                                      min_samples_leaf=10))
+
+
+def test_permutation_importances_columns_and_one_row_per_feature(lr_model, data):
+    table = permutation_importances(lr_model, data.validation_x, data.validation_paid, 3, 0)
+    assert list(table.columns) == ["feature", "log loss rise", "std"]
+    assert sorted(table["feature"]) == sorted(data.validation_x.columns)
+    assert len(table) == data.validation_x.shape[1]
+
+
+def test_permutation_importances_sorted_descending_with_a_fresh_index(lr_model, data):
+    table = permutation_importances(lr_model, data.validation_x, data.validation_paid, 3, 0)
+    assert table["log loss rise"].is_monotonic_decreasing
+    assert isinstance(table.index, pd.RangeIndex)
+    assert list(table.index) == list(range(len(table)))
+
+
+def test_permutation_importances_informative_column_rises_noise_does_not(lr_model, data):
+    table = permutation_importances(lr_model, data.validation_x, data.validation_paid, 5, 0)
+    assert table.iloc[0]["feature"] == "signal"
+    assert importance_of(table, "signal") > 0.2
+    assert abs(importance_of(table, "noise")) < 0.03
+    assert abs(importance_of(table, "h")) < 0.03
+
+
+def test_permutation_importances_std_is_non_negative(lr_model, data):
+    table = permutation_importances(lr_model, data.validation_x, data.validation_paid, 4, 0)
+    assert (table["std"] >= 0).all()
+
+
+def test_permutation_importances_match_sklearn_on_neg_log_loss(lr_model, data):
+    # The rise is sklearn's importances_mean for scoring="neg_log_loss": the mean fall of
+    # minus the log loss, i.e. the mean rise of the log loss after shuffling.
+    from sklearn.inspection import permutation_importance
+    table = permutation_importances(lr_model, data.validation_x, data.validation_paid, 3, 7)
+    result = permutation_importance(lr_model, data.validation_x, data.validation_paid,
+                                    scoring="neg_log_loss", n_repeats=3, random_state=7)
+    for column, mean, std in zip(data.validation_x.columns, result.importances_mean,
+                                 result.importances_std):
+        row = table[table["feature"] == column].iloc[0]
+        assert row["log loss rise"] == pytest.approx(mean)
+        assert row["std"] == pytest.approx(std)
+
+
+def test_permutation_importances_a_column_the_model_ignores_rises_exactly_zero(data):
+    # A fixed model that reads only `signal`: shuffling any other column changes nothing,
+    # so its rise is exactly 0; shuffling `signal` raises the log loss.
+
+    class ByHand(ClassifierMixin, BaseEstimator):
+        """A fixed model: p = sigmoid(2.5 * signal - 0.8), the true model of tiny_data."""
+        classes_ = np.array([False, True])
+
+        def fit(self, x, y):
+            return self
+
+        def predict_proba(self, x):
+            p = 1 / (1 + np.exp(-(2.5 * np.asarray(x["signal"]) - 0.8)))
+            return np.column_stack([1 - p, p])
+
+    x, paid = data.validation_x, data.validation_paid
+    table = permutation_importances(ByHand(), x, paid, 1, 0)
+    assert importance_of(table, "signal") > 0.3
+    assert importance_of(table, "noise") == 0.0
+    assert importance_of(table, "h") == 0.0
+
+
+def test_permutation_importances_reproducible_with_the_same_seed(lr_model, data):
+    one = permutation_importances(lr_model, data.validation_x, data.validation_paid, 3, 42)
+    two = permutation_importances(lr_model, data.validation_x, data.validation_paid, 3, 42)
+    pd.testing.assert_frame_equal(one, two)
+
+
+def test_permutation_importances_do_not_change_their_inputs(lr_model, data):
+    x, paid = data.validation_x.copy(), data.validation_paid.copy()
+    permutation_importances(lr_model, x, paid, 2, 0)
+    pd.testing.assert_frame_equal(x, data.validation_x)
+    pd.testing.assert_series_equal(paid, data.validation_paid)
+
+
+def test_permutation_importances_accept_nullable_boolean_paid(lr_model, data):
+    plain = permutation_importances(lr_model, data.validation_x, data.validation_paid, 2, 0)
+    nullable = permutation_importances(lr_model, data.validation_x,
+                                       data.validation_paid.astype("boolean"), 2, 0)
+    pd.testing.assert_frame_equal(plain, nullable)
+
+
+def test_permutation_importances_hgb_with_a_categorical_company(hgb_company_model,
+                                                                 company_data):
+    x = company_data.validation_x
+    table = permutation_importances(hgb_company_model, x, company_data.validation_paid, 3, 0)
+    assert sorted(table["feature"]) == sorted(["h", "signal", "noise", "company_code"])
+    assert table.iloc[0]["feature"] == "signal"
+    assert importance_of(table, "signal") > 0.1
+    assert importance_of(table, "company_code") > 0.01
+    assert abs(importance_of(table, "noise")) < 0.05
+    assert x["company_code"].dtype == "category"
+
+
+def test_permutation_importances_lr_pipeline_with_a_categorical_company(company_data):
+    model = fit_stage1_baseline(company_data.train_x, company_data.train_paid,
+                                stage1_settings(baseline_c=1.0))
+    table = permutation_importances(model, company_data.validation_x,
+                                    company_data.validation_paid, 3, 0)
+    assert sorted(table["feature"]) == sorted(["h", "signal", "noise", "company_code"])
+    assert importance_of(table, "signal") > importance_of(table, "company_code") > 0.01
+
+
+def test_permutation_importances_hgb_reproducible(hgb_company_model, company_data):
+    one = permutation_importances(hgb_company_model, company_data.validation_x,
+                                  company_data.validation_paid, 2, 5)
+    two = permutation_importances(hgb_company_model, company_data.validation_x,
+                                  company_data.validation_paid, 2, 5)
+    pd.testing.assert_frame_equal(one, two)
+
+
+def test_permutation_importances_ties_keep_column_order():
+    # A model that ignores every column: every rise is 0, so the order is x's column order.
+    x = pd.DataFrame({"z": np.arange(40.0), "a": np.arange(40.0)[::-1], "m": np.ones(40)})
+    paid = pd.Series([True, False] * 20)
+
+    class Constant(ClassifierMixin, BaseEstimator):
+        classes_ = np.array([False, True])
+
+        def fit(self, x, y):
+            return self
+
+        def predict_proba(self, x):
+            return np.tile([0.4, 0.6], (len(x), 1))
+
+    table = permutation_importances(Constant(), x, paid, 2, 0)
+    assert list(table["feature"]) == ["z", "a", "m"]
+    assert (table["log loss rise"] == 0).all()
+
+
+# --- write_tables ----------------------------------------------------------------------------
+
+def tables_to_write():
+    return {
+        "hgb_grid": pd.DataFrame({"candidate": [1, 0], "max_iter": [30, 10],
+                                  "class_weight": ["balanced", "none"],
+                                  "avg precision": [0.75, 0.5]}),
+        "test": pd.DataFrame({"model": ["HGB", "LR"], "F1": [0.25, 0.125]},
+                             index=pd.Index([7, 9], name="row")),
+    }
+
+
+def test_write_tables_writes_one_csv_per_table(tmp_path):
+    paths = write_tables(tmp_path, tables_to_write())
+    assert paths == [tmp_path / "hgb_grid.csv", tmp_path / "test.csv"]
+    assert all(path.is_file() for path in paths)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["hgb_grid.csv", "test.csv"]
+
+
+def test_write_tables_returns_path_objects(tmp_path):
+    for path in write_tables(tmp_path, tables_to_write()):
+        assert isinstance(path, Path)
+
+
+def test_write_tables_read_back_equal_without_the_index(tmp_path):
+    tables = tables_to_write()
+    write_tables(tmp_path, tables)
+    for name, table in tables.items():
+        back = pd.read_csv(tmp_path / f"{name}.csv")
+        pd.testing.assert_frame_equal(back, table.reset_index(drop=True))
+
+
+def test_write_tables_writes_no_index_column(tmp_path):
+    write_tables(tmp_path, tables_to_write())
+    header = (tmp_path / "test.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert header == "model,F1"
+
+
+def test_write_tables_creates_missing_parent_folders(tmp_path):
+    folder = tmp_path / "a" / "b" / "hurdle_diagnostic"
+    paths = write_tables(folder, tables_to_write())
+    assert folder.is_dir()
+    assert all(path.parent == folder for path in paths)
+
+
+def test_write_tables_takes_a_string_folder(tmp_path):
+    paths = write_tables(str(tmp_path / "out"), tables_to_write())
+    assert paths[0] == tmp_path / "out" / "hgb_grid.csv"
+    assert paths[0].is_file()
+
+
+def test_write_tables_into_an_existing_folder_overwrites_the_files(tmp_path):
+    (tmp_path / "test.csv").write_text("old", encoding="utf-8")
+    write_tables(tmp_path, tables_to_write())
+    assert pd.read_csv(tmp_path / "test.csv")["model"].tolist() == ["HGB", "LR"]
+
+
+def test_write_tables_with_no_tables_creates_the_folder_and_returns_nothing(tmp_path):
+    folder = tmp_path / "empty"
+    assert write_tables(folder, {}) == []
+    assert folder.is_dir()
+    assert list(folder.iterdir()) == []
+
+
+def test_write_tables_paths_follow_the_dict_order(tmp_path):
+    tables = {name: pd.DataFrame({"x": [1]}) for name in ("z", "a", "m")}
+    assert [p.name for p in write_tables(tmp_path, tables)] == ["z.csv", "a.csv", "m.csv"]
+
+
+def test_write_tables_does_not_change_the_tables(tmp_path):
+    tables = tables_to_write()
+    before = {name: table.copy(deep=True) for name, table in tables.items()}
+    write_tables(tmp_path, tables)
+    for name in tables:
+        pd.testing.assert_frame_equal(tables[name], before[name])

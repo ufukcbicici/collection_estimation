@@ -12,12 +12,19 @@ threshold is chosen on validation too. The chosen setting is then refitted and t
 with the validation threshold. (The forecast's own setting, both stages together, is chosen
 elsewhere by the pooled WAPE of the total cash forecast.)
 """
+import dataclasses
+import itertools
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import (average_precision_score, f1_score, log_loss, precision_recall_curve,
                              precision_score, recall_score, roc_auc_score)
+
+from .stage1 import predict_paid
 
 
 @dataclass(frozen=True)
@@ -90,3 +97,115 @@ def classification_scores(actual: pd.Series, p: pd.Series, threshold: float) -> 
         "avg precision": average_precision_score(actual, p),
         "log loss": log_loss(actual, p, labels=[False, True]),
     }
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One setting of a diagnostic grid: what is tried, and how to fit it."""
+    params: dict            # the values that vary, shown in the tables, e.g. {"C": 0.1, ...}
+    settings: object        # a copy of the [stage1] settings with those values in place
+    class_weight: str       # "none" or "balanced"
+
+
+def class_weight_argument(class_weight: str) -> str | None:
+    """The class_weight sklearn takes: None for "none", "balanced" for "balanced"."""
+    if class_weight not in ("none", "balanced"):
+        raise ValueError(f"class weight {class_weight!r} is not 'none' or 'balanced'")
+    return None if class_weight == "none" else "balanced"
+
+
+def hgb_candidates(stage1, diagnostic) -> list[Candidate]:
+    """Every combination of the [diagnostic] HGB grid and class weights, each a copy of the
+    [stage1] settings with those values replaced (the forecast's settings are not changed)."""
+    return [
+        Candidate(params={"max_iter": trees, "learning_rate": rate, "max_leaf_nodes": leaves,
+                          "class_weight": weight},
+                  settings=dataclasses.replace(stage1, max_iter=trees, learning_rate=rate,
+                                               max_leaf_nodes=leaves),
+                  class_weight=weight)
+        for trees, rate, leaves, weight in itertools.product(
+            diagnostic.hgb_max_iter, diagnostic.hgb_learning_rate,
+            diagnostic.hgb_max_leaf_nodes, diagnostic.class_weights)
+    ]
+
+
+def lr_candidates(stage1, diagnostic) -> list[Candidate]:
+    """Every combination of the [diagnostic] logistic-regression C values and class weights."""
+    return [
+        Candidate(params={"C": c, "class_weight": weight},
+                  settings=dataclasses.replace(stage1, baseline_c=c), class_weight=weight)
+        for c, weight in itertools.product(diagnostic.lr_c, diagnostic.class_weights)
+    ]
+
+
+def grid_search(name: str, fit, candidates: list[Candidate], train_x: pd.DataFrame,
+                train_paid: pd.Series, validation_x: pd.DataFrame,
+                validation_paid: pd.Series) -> pd.DataFrame:
+    """Fit each candidate on the training rows, predict the validation rows, find its own
+    best-F1 threshold there and score it. One row per candidate (its params, the validation
+    scores at its threshold, the fit time and its position `candidate` in `candidates`),
+    sorted by average precision, best first. `fit` is `fit_stage1` or `fit_stage1_baseline`.
+    """
+    if not candidates:
+        raise ValueError(f"{name}: the grid has no settings to try")
+    rows = []
+    for number, candidate in enumerate(candidates, start=1):
+        started = time.perf_counter()
+        model = fit(train_x, train_paid, candidate.settings,
+                    class_weight=class_weight_argument(candidate.class_weight))
+        seconds = time.perf_counter() - started
+        p = predict_paid(model, validation_x)
+        threshold, _ = best_threshold(validation_paid, p)
+        scores = classification_scores(validation_paid, p, threshold)
+        rows.append({"candidate": number - 1, **candidate.params, **scores,
+                     "fit seconds": seconds})
+        print(f"  ... {name} {number} of {len(candidates)}: {candidate.params}, "
+              f"avg precision {scores['avg precision']:.4f} ({seconds:.0f} s)")
+    grid = pd.DataFrame(rows)
+    # mergesort is stable: settings with the same average precision keep their grid order.
+    return grid.sort_values("avg precision", ascending=False, kind="mergesort",
+                            ignore_index=True)
+
+
+def choose_and_test(name: str, fit, candidates: list[Candidate], grid: pd.DataFrame,
+                    refit_x: pd.DataFrame, refit_paid: pd.Series, test_x: pd.DataFrame,
+                    test_paid: pd.Series) -> dict:
+    """The test row of the best setting of `grid` (from `grid_search`): refit it on the refit
+    rows (train and validation), predict the test rows and score them with the threshold it
+    got on validation, unchanged. Returns {"model": name, the setting's params, the test
+    scores}."""
+    best = grid.iloc[0]
+    candidate = candidates[int(best["candidate"])]
+    model = fit(refit_x, refit_paid, candidate.settings,
+                class_weight=class_weight_argument(candidate.class_weight))
+    p = predict_paid(model, test_x)
+    scores = classification_scores(test_paid, p, float(best["threshold"]))
+    return {"model": name, **candidate.params, **scores}
+
+
+def permutation_importances(model, x: pd.DataFrame, paid: pd.Series, repeats: int,
+                            seed: int) -> pd.DataFrame:
+    """How much each feature matters to `model` on the rows `x`: shuffle the feature's
+    column `repeats` times and measure how much the log loss rises (0 or less: the model does
+    not use it). One row per feature, most important first, with the mean rise and its
+    standard deviation over the shuffles."""
+    result = permutation_importance(model, x, paid.astype(bool), scoring="neg_log_loss",
+                                    n_repeats=repeats, random_state=seed)
+    # The score is minus the log loss, so a fall in the score is a rise in the log loss.
+    table = pd.DataFrame({"feature": list(x.columns),
+                          "log loss rise": result.importances_mean,
+                          "std": result.importances_std})
+    return table.sort_values("log loss rise", ascending=False, kind="mergesort",
+                             ignore_index=True)
+
+
+def write_tables(folder: Path, tables: dict[str, pd.DataFrame]) -> list[Path]:
+    """Write each table as `<name>.csv` in `folder` (created if missing); returns the paths."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, table in tables.items():
+        path = folder / f"{name}.csv"
+        table.to_csv(path, index=False)
+        paths.append(path)
+    return paths
