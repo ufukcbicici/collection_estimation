@@ -753,8 +753,9 @@ def diagnostic_settings(**changes):
     base = DiagnosticSettings(run=True, origin=40, hgb_max_iter=(10, 30),
                               hgb_learning_rate=(0.05, 0.1, 0.2), hgb_max_leaf_nodes=(3, 7),
                               lr_c=(0.01, 1.0, 100.0), class_weights=("none", "balanced"),
-                              selection_metric="log loss", importance_repeats=2,
-                              output_folder=Path("unused"))
+                              selection_metric="log loss", calibration_groups=4,
+                              reference_window=13, reference_prior_weeks=1.0,
+                              importance_repeats=2, output_folder=Path("unused"))
     return dataclasses.replace(base, **changes)
 
 
@@ -1945,3 +1946,917 @@ def test_grid_search_real_hgb_brier_column_matches_an_independent_fit(data):
         p = predict_paid(model, data.validation_x)
         assert row["brier"] == pytest.approx(brier_score_loss(data.validation_paid, p),
                                              rel=1e-9)
+
+
+# =============================================================================================
+# U10.4d: calibration of stage 1. check_outcomes, reliability_table, calibration_slope_intercept,
+# clipped_logit, calibration_summary (U10.4d.1); fit_platt, apply_platt (U10.4d.2);
+# reference_probabilities (U10.4d.3); best_unweighted, calibration_comparison (U10.4d.4).
+#
+# The hand-worked example HAND (6 rows, 3 groups of 2):
+#   row     0    1    2    3    4    5
+#   p      .1   .4   .2   .3   .8   .6
+#   paid    F    T    F    T    T    F
+# Sorted by p: rows 0, 2 | 3, 1 | 5, 4 -> groups 1, 2, 3 with
+#   mean p .15, .35, .70; share paid 0, 1, .5; weights 1/3 each; overall share .5.
+#   ECE = (.15 + .65 + .20) / 3 = 1/3
+#   calibration error = (.0225 + .4225 + .04) / 3 = .485 / 3 = 97/600
+#   resolution = (.25 + .25 + 0) / 3 = 1/6 = 100/600; uncertainty = .25 = 150/600
+#   brier = (.01 + .36 + .04 + .49 + .04 + .36) / 6 = 1.3 / 6 = 130/600
+#   decomposition gap = 130/600 - (97 - 100 + 150)/600 = -17/600
+#   AUC: payers .4, .3, .8 against non-payers .1, .2, .6: 2 + 2 + 3 = 7 of 9 pairs
+#   against a constant .5 reference: brier skill = 1 - (130/600)/.25 = 2/15
+# =============================================================================================
+
+from sklearn.metrics import roc_auc_score  # noqa: E402
+
+from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    LOGIT_CLIP,
+    apply_platt,
+    best_unweighted,
+    calibration_comparison,
+    calibration_slope_intercept,
+    calibration_summary,
+    check_outcomes,
+    clipped_logit,
+    fit_platt,
+    reference_probabilities,
+    reliability_table,
+)
+
+HAND_P = pd.Series([0.1, 0.4, 0.2, 0.3, 0.8, 0.6])
+HAND_PAID = pd.Series([False, True, False, True, True, False])
+HALF = pd.Series(0.5, index=HAND_P.index)
+
+SUMMARY_KEYS = ["mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
+                "calibration error", "resolution", "uncertainty", "decomposition gap",
+                "log loss skill", "brier skill", "AUC"]
+RELIABILITY_COLUMNS = ["group", "p_low", "p_high", "mean_p", "share_paid", "rows"]
+
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+
+def simulated(n, seed, scale=1.5):
+    """True logits z, the true p = sigmoid(z) and outcomes drawn from it."""
+    rng = np.random.default_rng(seed)
+    z = rng.normal(scale=scale, size=n)
+    paid = pd.Series(rng.random(n) < sigmoid(z))
+    return z, paid
+
+
+# --- LOGIT_CLIP and clipped_logit -------------------------------------------------------------
+
+def test_logit_clip_constant():
+    assert LOGIT_CLIP == 1e-6
+
+
+def test_clipped_logit_values_by_hand():
+    p = pd.Series([0.5, 0.75, 0.25, 0.9], index=list("abcd"))
+    logit = clipped_logit(p)
+    assert list(logit.index) == list("abcd")
+    assert logit.tolist() == pytest.approx([0.0, math.log(3), -math.log(3), math.log(9)],
+                                           abs=1e-12)
+
+
+def test_clipped_logit_clips_the_edges_and_beyond():
+    p = pd.Series([0.0, 1.0, -0.5, 1.5, 1e-9, 1 - 1e-9])
+    edge = math.log(LOGIT_CLIP / (1 - LOGIT_CLIP))
+    logit = clipped_logit(p)
+    assert np.isfinite(logit).all()
+    assert logit.tolist() == pytest.approx([edge, -edge, edge, -edge, edge, -edge], rel=1e-9)
+
+
+def test_clipped_logit_is_antisymmetric_and_leaves_p_unchanged():
+    p = pd.Series([0.01, 0.3, 0.7, 0.99])
+    before = p.copy()
+    logit = clipped_logit(p)
+    assert logit.iloc[0] == pytest.approx(-logit.iloc[3]) and logit.iloc[1] == pytest.approx(
+        -logit.iloc[2])
+    pd.testing.assert_series_equal(p, before)
+
+
+# --- check_outcomes --------------------------------------------------------------------------
+
+def test_check_outcomes_returns_actual_as_bool():
+    actual = pd.Series([1, 0, 1], index=[5, 6, 7])
+    result = check_outcomes(actual, pd.Series([0.2, 0.3, 0.4], index=[5, 6, 7]))
+    assert result.dtype == bool
+    assert result.tolist() == [True, False, True]
+    assert list(result.index) == [5, 6, 7]
+
+
+def test_check_outcomes_accepts_the_nullable_boolean_dtype():
+    actual = pd.Series(pd.array([True, False], dtype="boolean"))
+    assert check_outcomes(actual, pd.Series([0.1, 0.2])).dtype == bool
+
+
+@pytest.mark.parametrize("p_index", [[0, 1, 2, 4], [1, 0, 2, 3], [0, 1, 2], ["0", "1", "2", "3"]],
+                         ids=["other label", "reordered", "shorter", "strings"])
+def test_check_outcomes_refuses_a_different_index(p_index):
+    actual = pd.Series([True, False, True, False])
+    with pytest.raises(ValueError) as error:
+        check_outcomes(actual, pd.Series(0.5, index=p_index))
+    assert str(error.value) == "actual and p must have the same rows (the same index)"
+
+
+def test_check_outcomes_refuses_no_rows():
+    with pytest.raises(ValueError) as error:
+        check_outcomes(pd.Series([], dtype=bool), pd.Series([], dtype=float))
+    assert str(error.value) == "there are no rows to measure"
+
+
+@pytest.mark.parametrize("values", [[True, True, True], [False, False], [True]])
+def test_check_outcomes_refuses_one_outcome(values):
+    with pytest.raises(ValueError) as error:
+        check_outcomes(pd.Series(values), pd.Series(0.5, index=range(len(values))))
+    assert str(error.value) == "actual must hold both outcomes (payers and non-payers)"
+
+
+def test_check_outcomes_does_not_change_actual():
+    actual = pd.Series([1, 0])
+    check_outcomes(actual, pd.Series([0.5, 0.5]))
+    assert actual.dtype == np.int64 and actual.tolist() == [1, 0]
+
+
+# --- reliability_table -----------------------------------------------------------------------
+
+def test_reliability_table_by_hand():
+    table = reliability_table(HAND_PAID, HAND_P, 3)
+    assert list(table.columns) == RELIABILITY_COLUMNS
+    assert table["group"].tolist() == [1, 2, 3]
+    assert table["p_low"].tolist() == pytest.approx([0.1, 0.3, 0.6])
+    assert table["p_high"].tolist() == pytest.approx([0.2, 0.4, 0.8])
+    assert table["mean_p"].tolist() == pytest.approx([0.15, 0.35, 0.7])
+    assert table["share_paid"].tolist() == pytest.approx([0.0, 1.0, 0.5])
+    assert table["rows"].tolist() == [2, 2, 2]
+
+
+def test_reliability_table_does_not_depend_on_row_order():
+    shuffled = [4, 0, 5, 2, 1, 3]
+    a = reliability_table(HAND_PAID, HAND_P, 3)
+    b = reliability_table(HAND_PAID[shuffled], HAND_P[shuffled], 3)
+    pd.testing.assert_frame_equal(a, b)
+
+
+@pytest.mark.parametrize("n, groups, sizes", [(7, 3, [3, 2, 2]), (10, 4, [3, 2, 3, 2]),
+                                              (6, 6, [1] * 6), (5, 2, [3, 2]), (8, 2, [4, 4])])
+def test_reliability_table_group_sizes_follow_position_times_groups_over_n(n, groups, sizes):
+    # group = position * groups // n + 1, worked out by hand for each case.
+    p = pd.Series(np.linspace(0.05, 0.95, n))
+    actual = pd.Series([i % 2 == 0 for i in range(n)])
+    table = reliability_table(actual, p, groups)
+    assert table["rows"].tolist() == sizes
+    assert table["group"].tolist() == list(range(1, groups + 1))
+    assert int(table["rows"].sum()) == n
+
+
+def test_reliability_table_ties_keep_row_order():
+    # Every p ties: the stable sort keeps rows 0, 1 in group 1 and rows 2, 3 in group 2.
+    table = reliability_table(pd.Series([True, True, False, False]), pd.Series([0.5] * 4), 2)
+    assert table["share_paid"].tolist() == [1.0, 0.0]
+    assert table["mean_p"].tolist() == [0.5, 0.5]
+
+
+def test_reliability_table_ties_keep_row_order_with_a_shuffled_index():
+    # Row order, not index order: index 9 comes first.
+    actual = pd.Series([False, True, True, False], index=[9, 3, 7, 1])
+    table = reliability_table(actual, pd.Series(0.3, index=actual.index), 2)
+    assert table["share_paid"].tolist() == [0.5, 0.5]
+    actual = pd.Series([False, False, True, True], index=[9, 3, 7, 1])
+    table = reliability_table(actual, pd.Series(0.3, index=actual.index), 2)
+    assert table["share_paid"].tolist() == [0.0, 1.0]
+
+
+def test_reliability_table_groups_ordered_by_p():
+    rng = np.random.default_rng(4)
+    p = pd.Series(rng.random(200))
+    actual = pd.Series(rng.random(200) < p)
+    table = reliability_table(actual, p, 10)
+    assert table["mean_p"].is_monotonic_increasing
+    assert (table["p_high"].iloc[:-1].to_numpy() <= table["p_low"].iloc[1:].to_numpy()).all()
+    assert (table["p_low"] <= table["mean_p"]).all() and (table["mean_p"] <= table["p_high"]).all()
+    assert table["rows"].tolist() == [20] * 10
+
+
+def test_reliability_table_does_not_change_its_inputs():
+    p, actual = HAND_P.copy(), HAND_PAID.copy()
+    reliability_table(actual, p, 3)
+    pd.testing.assert_series_equal(p, HAND_P)
+    pd.testing.assert_series_equal(actual, HAND_PAID)
+
+
+@pytest.mark.parametrize("groups", [1, 0, -2])
+def test_reliability_table_refuses_fewer_than_two_groups(groups):
+    with pytest.raises(ValueError) as error:
+        reliability_table(HAND_PAID, HAND_P, groups)
+    assert str(error.value) == f"groups is {groups}; at least 2 are needed"
+
+
+@pytest.mark.parametrize("groups", [7, 100])
+def test_reliability_table_refuses_more_groups_than_rows(groups):
+    with pytest.raises(ValueError) as error:
+        reliability_table(HAND_PAID, HAND_P, groups)
+    assert str(error.value) == f"6 rows cannot be cut into {groups} groups"
+
+
+def test_reliability_table_checks_the_outcomes_first():
+    with pytest.raises(ValueError, match="both outcomes"):
+        reliability_table(pd.Series([True] * 6), HAND_P, 1)
+    with pytest.raises(ValueError, match="same rows"):
+        reliability_table(HAND_PAID, HAND_P.reset_index(drop=True).set_axis(range(1, 7)), 3)
+
+
+# --- calibration_slope_intercept -------------------------------------------------------------
+
+def test_slope_intercept_are_python_floats():
+    slope, intercept = calibration_slope_intercept(HAND_PAID, HAND_P)
+    assert type(slope) is float and type(intercept) is float
+
+
+def test_slope_intercept_solve_the_unpenalised_score_equations():
+    # The unpenalised maximum-likelihood fit has zero gradient: sum(y - s) = 0 and
+    # sum(x (y - s)) = 0, with x = logit(p) and s = sigmoid(a x + b). A penalty would break this.
+    slope, intercept = calibration_slope_intercept(HAND_PAID, HAND_P)
+    x = np.log(HAND_P / (1 - HAND_P)).to_numpy()
+    residual = HAND_PAID.to_numpy().astype(float) - sigmoid(slope * x + intercept)
+    # Up to the solver's tolerance; a penalty of C = 1 would leave a gradient of about slope.
+    assert abs(residual.sum()) < 1e-3
+    assert abs((x * residual).sum()) < 1e-3
+
+
+def test_slope_intercept_is_unpenalised_on_a_larger_sample():
+    z, paid = simulated(3000, seed=21)
+    p = pd.Series(sigmoid(0.6 * z + 0.3))
+    slope, intercept = calibration_slope_intercept(paid, p)
+    x = np.log(p / (1 - p)).to_numpy()
+    residual = paid.to_numpy().astype(float) - sigmoid(slope * x + intercept)
+    assert abs(residual.mean()) < 1e-4 and abs((x * residual).mean()) < 1e-4
+
+
+def test_slope_intercept_of_calibrated_p_is_about_one_and_zero():
+    z, paid = simulated(40000, seed=1)
+    slope, intercept = calibration_slope_intercept(paid, pd.Series(sigmoid(z)))
+    assert slope == pytest.approx(1.0, abs=0.05)
+    assert intercept == pytest.approx(0.0, abs=0.05)
+
+
+def test_slope_of_over_confident_p_is_below_one():
+    # p = sigmoid(2 z): too extreme, the slope is about 1/2.
+    z, paid = simulated(40000, seed=2)
+    slope, intercept = calibration_slope_intercept(paid, pd.Series(sigmoid(2 * z)))
+    assert slope == pytest.approx(0.5, abs=0.04)
+    assert intercept == pytest.approx(0.0, abs=0.05)
+
+
+def test_slope_of_under_confident_p_is_above_one():
+    # p = sigmoid(z / 2): too timid, the slope is about 2.
+    z, paid = simulated(40000, seed=3)
+    slope, intercept = calibration_slope_intercept(paid, pd.Series(sigmoid(0.5 * z)))
+    assert slope == pytest.approx(2.0, abs=0.12)
+    assert intercept == pytest.approx(0.0, abs=0.05)
+
+
+@pytest.mark.parametrize("shift", [-1.0, 0.7])
+def test_intercept_of_shifted_p_undoes_the_shift(shift):
+    # p = sigmoid(z + shift): every p moved the same way; slope 1, intercept -shift.
+    z, paid = simulated(40000, seed=4)
+    slope, intercept = calibration_slope_intercept(paid, pd.Series(sigmoid(z + shift)))
+    assert slope == pytest.approx(1.0, abs=0.05)
+    assert intercept == pytest.approx(-shift, abs=0.06)
+
+
+def test_slope_intercept_clip_p_of_zero_and_one():
+    # p of exactly 0 and 1 would give an infinite logit; the clip keeps the fit finite.
+    actual = pd.Series([False, True, False, True, True, False])
+    p = pd.Series([0.0, 1.0, 0.3, 0.6, 0.5, 0.4])
+    slope, intercept = calibration_slope_intercept(actual, p)
+    assert math.isfinite(slope) and math.isfinite(intercept)
+
+
+@pytest.mark.parametrize("actual, p, match", [
+    (pd.Series([True, True]), pd.Series([0.5, 0.6]), "both outcomes"),
+    (pd.Series([True, False]), pd.Series([0.5, 0.6], index=[1, 2]), "same rows"),
+    (pd.Series([], dtype=bool), pd.Series([], dtype=float), "no rows"),
+])
+def test_slope_intercept_refusals(actual, p, match):
+    with pytest.raises(ValueError, match=match):
+        calibration_slope_intercept(actual, p)
+
+
+# --- calibration_summary ---------------------------------------------------------------------
+
+def test_calibration_summary_keys_in_order():
+    assert list(calibration_summary(HAND_PAID, HAND_P, HALF, 3)) == SUMMARY_KEYS
+
+
+def test_calibration_summary_by_hand():
+    summary = calibration_summary(HAND_PAID, HAND_P, HALF, 3)
+    log_loss_by_hand = -(math.log(0.9) + math.log(0.4) + math.log(0.8) + math.log(0.3)
+                         + math.log(0.8) + math.log(0.4)) / 6
+    expected = {
+        "mean p": 0.4, "share paid": 0.5, "ECE": 1 / 3, "log loss": log_loss_by_hand,
+        "brier": 130 / 600, "calibration error": 97 / 600, "resolution": 100 / 600,
+        "uncertainty": 0.25, "decomposition gap": -17 / 600,
+        "log loss skill": 1 - log_loss_by_hand / math.log(2), "brier skill": 2 / 15,
+        "AUC": 7 / 9,
+    }
+    for key, value in expected.items():
+        assert summary[key] == pytest.approx(value, abs=1e-12), key
+
+
+def test_calibration_summary_slope_and_intercept_are_the_regressions():
+    summary = calibration_summary(HAND_PAID, HAND_P, HALF, 3)
+    slope, intercept = calibration_slope_intercept(HAND_PAID, HAND_P)
+    assert summary["slope"] == slope and summary["intercept"] == intercept
+
+
+def test_calibration_summary_values_are_python_floats():
+    summary = calibration_summary(HAND_PAID, HAND_P, HALF, 3)
+    for key, value in summary.items():
+        assert isinstance(value, float), (key, type(value))
+
+
+def test_calibration_summary_a_second_hand_example_with_other_groups():
+    # p .1 .2 .3 .4 (paid F F T F): 2 groups. Group 1 mean .15 share 0; group 2 mean .35
+    # share .5; overall .25. ECE = (.15 + .15)/2 = .15; calibration error = (.0225 +
+    # .0225)/2 = .0225; resolution = (.0625 + .0625)/2 = .0625; uncertainty = .1875;
+    # brier = (.01 + .04 + .49 + .16)/4 = .175; gap = .175 - (.0225 - .0625 + .1875) = .0275.
+    actual = pd.Series([False, False, True, False])
+    p = pd.Series([0.1, 0.2, 0.3, 0.4])
+    summary = calibration_summary(actual, p, pd.Series(0.25, index=p.index), 2)
+    for key, value in {"ECE": 0.15, "calibration error": 0.0225, "resolution": 0.0625,
+                       "uncertainty": 0.1875, "brier": 0.175, "decomposition gap": 0.0275,
+                       "mean p": 0.25, "share paid": 0.25,
+                       "brier skill": 1 - 0.175 / 0.1875, "AUC": 2 / 3}.items():
+        assert summary[key] == pytest.approx(value, abs=1e-12), key
+
+
+def test_decomposition_gap_is_zero_when_p_is_constant_in_each_group():
+    # Grouping loses nothing when every group holds one p: brier = CE - RES + UNC exactly.
+    actual = pd.Series([False, True, True, False, True, True])
+    p = pd.Series([0.2, 0.2, 0.5, 0.5, 0.9, 0.9])
+    summary = calibration_summary(actual, p, pd.Series(0.5, index=p.index), 3)
+    assert summary["decomposition gap"] == pytest.approx(0.0, abs=1e-12)
+    assert summary["brier"] == pytest.approx(
+        summary["calibration error"] - summary["resolution"] + summary["uncertainty"],
+        abs=1e-12)
+
+
+def test_calibration_summary_of_a_perfectly_grouped_p():
+    # Each group's mean p equals its share paid: ECE and calibration error 0, no resolution.
+    actual = pd.Series([True, False, True, False])
+    p = pd.Series([0.5] * 4)
+    summary = calibration_summary(actual, p, p, 2)
+    assert summary["ECE"] == 0 and summary["calibration error"] == 0
+    assert summary["resolution"] == 0 and summary["uncertainty"] == 0.25
+    assert summary["brier"] == 0.25 and summary["decomposition gap"] == pytest.approx(0)
+    assert summary["AUC"] == 0.5
+
+
+def test_calibration_summary_skill_against_itself_is_zero():
+    summary = calibration_summary(HAND_PAID, HAND_P, HAND_P, 3)
+    assert summary["log loss skill"] == pytest.approx(0.0, abs=1e-12)
+    assert summary["brier skill"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_calibration_summary_skill_against_a_better_reference_is_negative():
+    better = pd.Series([0.05, 0.9, 0.1, 0.8, 0.9, 0.2])
+    summary = calibration_summary(HAND_PAID, HAND_P, better, 3)
+    assert summary["log loss skill"] < 0 and summary["brier skill"] < 0
+
+
+def test_calibration_summary_matches_sklearn_scores_on_random_rows():
+    rng = np.random.default_rng(8)
+    p = pd.Series(rng.uniform(0.02, 0.98, 500), index=pd.RangeIndex(100, 600))
+    actual = pd.Series(rng.random(500) < p)
+    reference = pd.Series(actual.mean(), index=p.index)
+    summary = calibration_summary(actual, p, reference, 10)
+    table = reliability_table(actual, p, 10)
+    weights = table["rows"] / 500
+    assert summary["log loss"] == pytest.approx(log_loss(actual, p))
+    assert summary["brier"] == pytest.approx(brier_score_loss(actual, p))
+    assert summary["AUC"] == pytest.approx(roc_auc_score(actual, p))
+    assert summary["ECE"] == pytest.approx(
+        float((weights * (table["mean_p"] - table["share_paid"]).abs()).sum()))
+    assert summary["log loss skill"] == pytest.approx(
+        1 - log_loss(actual, p) / log_loss(actual, reference))
+    assert summary["brier skill"] == pytest.approx(
+        1 - brier_score_loss(actual, p) / brier_score_loss(actual, reference))
+    assert 0 <= summary["ECE"] <= 1 and summary["calibration error"] >= 0
+    assert summary["resolution"] >= 0
+
+
+def test_calibration_summary_uses_the_groups_argument():
+    rng = np.random.default_rng(9)
+    p = pd.Series(rng.random(120))
+    actual = pd.Series(rng.random(120) < p)
+    few = calibration_summary(actual, p, pd.Series(0.5, index=p.index), 2)
+    many = calibration_summary(actual, p, pd.Series(0.5, index=p.index), 12)
+    assert few["ECE"] != many["ECE"]
+    assert few["brier"] == many["brier"] and few["log loss"] == many["log loss"]
+
+
+def test_calibration_summary_refuses_a_misaligned_reference():
+    with pytest.raises(ValueError) as error:
+        calibration_summary(HAND_PAID, HAND_P, HALF.set_axis(range(1, 7)), 3)
+    assert str(error.value) == "reference_p and p must have the same rows (the same index)"
+
+
+def test_calibration_summary_refuses_a_reordered_reference():
+    with pytest.raises(ValueError, match="reference_p and p must have the same rows"):
+        calibration_summary(HAND_PAID, HAND_P, HALF[[1, 0, 2, 3, 4, 5]], 3)
+
+
+@pytest.mark.parametrize("actual, p, groups, match", [
+    (pd.Series([True] * 6), HAND_P, 3, "both outcomes"),
+    (HAND_PAID, HAND_P, 1, "at least 2"),
+    (HAND_PAID, HAND_P, 7, "cannot be cut"),
+])
+def test_calibration_summary_passes_on_the_refusals(actual, p, groups, match):
+    with pytest.raises(ValueError, match=match):
+        calibration_summary(actual, p, pd.Series(0.5, index=p.index), groups)
+
+
+# --- fit_platt and apply_platt ---------------------------------------------------------------
+
+def test_fit_platt_is_calibration_slope_intercept():
+    z, paid = simulated(2000, seed=11)
+    p = pd.Series(sigmoid(1.7 * z - 0.4))
+    assert fit_platt(paid, p) == calibration_slope_intercept(paid, p)
+    assert fit_platt(HAND_PAID, HAND_P) == calibration_slope_intercept(HAND_PAID, HAND_P)
+
+
+def test_fit_platt_has_the_same_refusals():
+    with pytest.raises(ValueError, match="both outcomes"):
+        fit_platt(pd.Series([False, False]), pd.Series([0.1, 0.2]))
+    with pytest.raises(ValueError, match="same rows"):
+        fit_platt(HAND_PAID, HAND_P.set_axis(range(10, 16)))
+
+
+def test_apply_platt_by_hand():
+    # a = 2, b = 1: logit(.5) = 0 -> sigmoid(1); logit(.75) = log 3 -> sigmoid(2 log 3 + 1).
+    p = pd.Series([0.5, 0.75, 0.25], index=["x", "y", "z"])
+    corrected = apply_platt(p, 2.0, 1.0)
+    expected = [sigmoid(1.0), sigmoid(2 * math.log(3) + 1), sigmoid(-2 * math.log(3) + 1)]
+    assert corrected.tolist() == pytest.approx(expected, abs=1e-12)
+    assert list(corrected.index) == ["x", "y", "z"]
+
+
+def test_apply_platt_identity_leaves_p_unchanged():
+    p = pd.Series(np.linspace(0.001, 0.999, 50), index=pd.RangeIndex(7, 57))
+    pd.testing.assert_series_equal(apply_platt(p, 1.0, 0.0), p, check_exact=False, rtol=1e-9)
+
+
+def test_apply_platt_accepts_ints_and_numpy_floats():
+    p = pd.Series([0.2, 0.6])
+    expected = apply_platt(p, 1.0, 0.0)
+    pd.testing.assert_series_equal(apply_platt(p, 1, 0), expected)
+    pd.testing.assert_series_equal(apply_platt(p, np.float64(1.0), np.float64(0.0)), expected)
+
+
+def test_apply_platt_does_not_change_p():
+    p = pd.Series([0.2, 0.6])
+    apply_platt(p, 3.0, -1.0)
+    assert p.tolist() == [0.2, 0.6]
+
+
+def test_apply_platt_p_of_zero_and_one_stays_strictly_inside():
+    p = pd.Series([0.0, 1.0, -0.1, 1.1, 0.5])
+    corrected = apply_platt(p, 1.0, 0.0)
+    assert ((corrected > 0) & (corrected < 1)).all()
+    assert corrected.tolist()[:4] == pytest.approx(
+        [LOGIT_CLIP, 1 - LOGIT_CLIP, LOGIT_CLIP, 1 - LOGIT_CLIP], rel=1e-6)
+
+
+@pytest.mark.parametrize("a, b", [(5.0, 0.0), (1.0, 40.0), (1.0, -800.0), (3.0, 0.0)],
+                         ids=["steep", "shifted up", "shifted far down", "a=3"])
+def test_apply_platt_stays_strictly_inside_for_large_corrections(a, b):
+    # The contract: every value strictly between 0 and 1, whatever finite a and b.
+    p = pd.Series([0.0, 1e-6, 0.5, 1 - 1e-6, 1.0])
+    corrected = apply_platt(p, a, b)
+    assert ((corrected > 0) & (corrected < 1)).all(), corrected.tolist()
+
+
+@pytest.mark.parametrize("bad", [True, False, "1", None, [1.0], float("nan"), float("inf"),
+                                 float("-inf"), np.nan, complex(1, 0)])
+@pytest.mark.parametrize("which", ["a", "b"])
+def test_apply_platt_refuses_a_non_finite_or_non_number(bad, which):
+    args = {"a": 1.0, "b": 0.0}
+    args[which] = bad
+    with pytest.raises(ValueError) as error:
+        apply_platt(pd.Series([0.2, 0.6]), args["a"], args["b"])
+    assert str(error.value) == f"Platt's {which} is {bad!r}, not a finite number"
+
+
+def test_platt_recovers_a_known_distortion_out_of_sample():
+    # The model's p = sigmoid(2 z + .5) (too extreme, shifted); the truth is sigmoid(z). So
+    # logit(p) = 2 z + .5 and z = .5 logit(p) - .25: Platt should find a ~ .5, b ~ -.25 on
+    # one sample and correct a second, independent one back to the truth.
+    z_fit, paid_fit = simulated(40000, seed=31)
+    a, b = fit_platt(paid_fit, pd.Series(sigmoid(2 * z_fit + 0.5)))
+    assert a == pytest.approx(0.5, abs=0.03)
+    assert b == pytest.approx(-0.25, abs=0.04)
+
+    z_new, paid_new = simulated(20000, seed=32)
+    distorted = pd.Series(sigmoid(2 * z_new + 0.5))
+    corrected = apply_platt(distorted, a, b)
+    truth = sigmoid(z_new)
+    assert np.abs(corrected.to_numpy() - truth).max() < 0.03
+    assert log_loss(paid_new, corrected) < log_loss(paid_new, distorted)
+    slope, intercept = calibration_slope_intercept(paid_new, corrected)
+    assert slope == pytest.approx(1.0, abs=0.06) and intercept == pytest.approx(0.0, abs=0.06)
+
+
+def test_platt_corrected_p_is_exactly_calibrated_in_sample():
+    # Refitting on the corrected p of the same rows gives slope 1 and intercept 0 (the
+    # correction is itself a logistic regression on logit(p)).
+    z, paid = simulated(5000, seed=33)
+    p = pd.Series(sigmoid(1.6 * z - 0.7))
+    a, b = fit_platt(paid, p)
+    slope, intercept = calibration_slope_intercept(paid, apply_platt(p, a, b))
+    assert slope == pytest.approx(1.0, abs=1e-3) and intercept == pytest.approx(0.0, abs=1e-3)
+
+
+# --- reference_probabilities -----------------------------------------------------------------
+# Train: h 1 paid T F F F (1/4), h 2 paid T T T F F F (1/2) -> 4 of 10, base rate .4.
+# Rows a..d: h 2, 1, 2, 1; window 13 history (paying, observed) (0, 0), (3, 4), (13, 13),
+# (2, 10). Own rate with prior 1: .4/1 = .4, 3.4/5 = .68, 13.4/14, 2.4/11.
+# With prior 2: .8/2 = .4, 3.8/6, 13.8/15 = .92, 2.8/12.
+
+def ref_train(paid=None, h=None):
+    paid = [True, False, False, False, True, True, True, False, False, False] if paid is None \
+        else paid
+    h = [1, 1, 1, 1, 2, 2, 2, 2, 2, 2] if h is None else h
+    return pd.DataFrame({"h": np.array(h, dtype="int64"), "paid": paid,
+                         "paying_weeks_13": 99, "observed_weeks_13": 99},
+                        index=pd.RangeIndex(500, 500 + len(h)))
+
+
+def ref_rows(**changes):
+    columns = {"h": np.array([2, 1, 2, 1], dtype="int64"),
+               "paying_weeks_4": [0, 1, 4, 0], "observed_weeks_4": [0, 4, 4, 3],
+               "paying_weeks_13": [0, 3, 13, 2], "observed_weeks_13": [0, 4, 13, 10],
+               "other": ["w", "x", "y", "z"]}
+    columns.update(changes)
+    return pd.DataFrame(columns, index=list("abcd"))
+
+
+def test_reference_probabilities_columns_index_and_dtypes():
+    refs = reference_probabilities(ref_train(), ref_rows(), 13, 1.0)
+    assert list(refs.columns) == ["base rate", "base rate per h", "own rate"]
+    assert list(refs.index) == list("abcd")
+    assert all(dtype == np.float64 for dtype in refs.dtypes)
+
+
+def test_reference_probabilities_by_hand_prior_one():
+    refs = reference_probabilities(ref_train(), ref_rows(), 13, 1.0)
+    assert refs["base rate"].tolist() == pytest.approx([0.4] * 4, abs=1e-15)
+    assert refs["base rate per h"].tolist() == pytest.approx([0.5, 0.25, 0.5, 0.25], abs=1e-15)
+    assert refs["own rate"].tolist() == pytest.approx([0.4, 0.68, 13.4 / 14, 2.4 / 11],
+                                                      abs=1e-15)
+
+
+def test_reference_probabilities_by_hand_prior_two():
+    refs = reference_probabilities(ref_train(), ref_rows(), 13, 2.0)
+    assert refs["own rate"].tolist() == pytest.approx([0.4, 3.8 / 6, 0.92, 2.8 / 12], abs=1e-15)
+    # The prior does not touch the other two references.
+    assert refs["base rate per h"].tolist() == pytest.approx([0.5, 0.25, 0.5, 0.25])
+
+
+def test_reference_probabilities_reads_the_window_given():
+    # Window 4: (0, 0), (1, 4), (4, 4), (0, 3) -> .4, 1.4/5, 4.4/5, .4/4.
+    refs = reference_probabilities(ref_train(), ref_rows(), 4, 1.0)
+    assert refs["own rate"].tolist() == pytest.approx([0.4, 0.28, 0.88, 0.1], abs=1e-15)
+
+
+def test_reference_probabilities_ignore_the_training_rows_history():
+    # The train rows' own history columns (99, 99) play no part; only their paid and h.
+    refs = reference_probabilities(ref_train(), ref_rows(), 13, 1.0)
+    assert refs["own rate"].iloc[1] == pytest.approx(0.68)
+
+
+@pytest.mark.parametrize("prior", [0.5, 1.0, 2.0, 3.0, 7.0, 1e-9, 1e6])
+@pytest.mark.parametrize("paid_count", [2, 3, 7, 13])
+def test_no_observed_week_gives_exactly_the_base_rate(prior, paid_count):
+    # The contract: a row with no observed week gets EXACTLY the base rate, whatever prior.
+    # 20 train rows, h alternating 1, 2; rows 0-3 give each h both outcomes; then
+    # paid_count - 2 more payers -> base rate paid_count / 20 (.1, .15, .35, .65).
+    paid = [True, True, False, False] + [True] * (paid_count - 2) + [False] * (18 - paid_count)
+    train = ref_train(paid=paid, h=[1, 2] * 10)
+    base = paid_count / 20
+    assert train["paid"].mean() == base
+    rows = ref_rows(paying_weeks_13=[0, 0, 0, 0], observed_weeks_13=[0, 0, 0, 0])
+    refs = reference_probabilities(train, rows, 13, prior)
+    assert refs["own rate"].tolist() == [base] * 4, (refs["own rate"].tolist(), base)
+    assert (refs["own rate"] == refs["base rate"]).all()
+
+
+def test_own_rate_never_reaches_zero_or_one():
+    rows = ref_rows(paying_weeks_13=[0, 52, 0, 13], observed_weeks_13=[52, 52, 13, 13])
+    refs = reference_probabilities(ref_train(), rows, 13, 1.0)
+    assert ((refs["own rate"] > 0) & (refs["own rate"] < 1)).all()
+    assert refs["own rate"].tolist() == pytest.approx([0.4 / 53, 52.4 / 53, 0.4 / 14, 13.4 / 14])
+
+
+def test_own_rate_shrinks_towards_the_base_rate_as_the_prior_grows():
+    rows = ref_rows()
+    small = reference_probabilities(ref_train(), rows, 13, 0.01)["own rate"]
+    large = reference_probabilities(ref_train(), rows, 13, 1e6)["own rate"]
+    raw = pd.Series([np.nan, 0.75, 1.0, 0.2], index=rows.index)
+    assert small.iloc[1:].tolist() == pytest.approx(raw.iloc[1:].tolist(), abs=0.01)
+    assert large.tolist() == pytest.approx([0.4] * 4, abs=1e-4)
+
+
+def test_reference_probabilities_accept_fractional_counts_and_nullable_paid():
+    train = ref_train()
+    train["paid"] = pd.array(train["paid"], dtype="boolean")
+    rows = ref_rows(paying_weeks_13=[0.0, 1.5, 2.0, 0.0], observed_weeks_13=[0.0, 3.0, 2.0, 1.0])
+    refs = reference_probabilities(train, rows, 13, 1.0)
+    assert refs["own rate"].tolist() == pytest.approx([0.4, 1.9 / 4, 2.4 / 3, 0.4 / 2])
+
+
+def test_reference_probabilities_do_not_change_their_inputs():
+    train, rows = ref_train(), ref_rows()
+    before = (train.copy(deep=True), rows.copy(deep=True))
+    reference_probabilities(train, rows, 13, 1.0)
+    pd.testing.assert_frame_equal(train, before[0])
+    pd.testing.assert_frame_equal(rows, before[1])
+
+
+def test_reference_probabilities_on_no_rows_is_empty():
+    rows = ref_rows().iloc[:0]
+    refs = reference_probabilities(ref_train(), rows, 13, 1.0)
+    assert refs.empty and list(refs.columns) == ["base rate", "base rate per h", "own rate"]
+
+
+@pytest.mark.parametrize("prior", [0, 0.0, -1.0, float("nan")])
+def test_reference_probabilities_refuse_a_prior_not_above_zero(prior):
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(), ref_rows(), 13, prior)
+    assert str(error.value) == f"prior_weeks is {prior!r}; it must be above 0"
+
+
+@pytest.mark.parametrize("drop, missing", [
+    (["paying_weeks_13"], "['paying_weeks_13']"),
+    (["observed_weeks_13"], "['observed_weeks_13']"),
+    (["paying_weeks_13", "observed_weeks_13"], "['paying_weeks_13', 'observed_weeks_13']"),
+])
+def test_reference_probabilities_refuse_missing_history_columns(drop, missing):
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(), ref_rows().drop(columns=drop), 13, 1.0)
+    assert str(error.value) == f"the rows have no history columns {missing} for window 13"
+
+
+def test_reference_probabilities_refuse_a_window_without_columns():
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(), ref_rows(), 52, 1.0)
+    assert str(error.value) == ("the rows have no history columns ['paying_weeks_52', "
+                                "'observed_weeks_52'] for window 52")
+
+
+@pytest.mark.parametrize("paying, observed, count", [
+    ([-1, 3, 13, 2], [0, 4, 13, 10], 1),
+    ([0, 5, 13, 2], [0, 4, 13, 10], 1),
+    ([np.nan, 3, 13, 2], [0, 4, 13, 10], 1),
+    ([0, 3, 13, 2], [0, np.nan, 13, 10], 1),
+    ([0, 3, 14, 11], [-1, 4, 13, 10], 3),
+], ids=["negative paying", "paying above observed", "NaN paying", "NaN observed", "three"])
+def test_reference_probabilities_refuse_impossible_counts(paying, observed, count):
+    rows = ref_rows(paying_weeks_13=paying, observed_weeks_13=observed)
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(), rows, 13, 1.0)
+    assert str(error.value) == (f"{count} rows have impossible history counts for window 13 "
+                                f"(negative, NaN, or more paying than observed weeks)")
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_reference_probabilities_refuse_train_with_one_outcome(value):
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(paid=[value] * 10), ref_rows(), 13, 1.0)
+    assert str(error.value) == "the training rows must hold both outcomes for a base rate"
+
+
+def test_reference_probabilities_refuse_an_h_train_lacks():
+    rows = ref_rows(h=np.array([2, 3, 5, 1], dtype="int64"))
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(), rows, 13, 1.0)
+    assert str(error.value) == "the training rows have no rows with h [3, 5]"
+
+
+@pytest.mark.parametrize("paid, bad", [
+    ([True, True, True, True, True, True, True, False, False, False], "[1]"),
+    ([True, False, False, False, False, False, False, False, False, False], "[2]"),
+], ids=["h 1 all paid", "h 2 none paid"])
+def test_reference_probabilities_refuse_an_h_with_one_outcome(paid, bad):
+    with pytest.raises(ValueError) as error:
+        reference_probabilities(ref_train(paid=paid), ref_rows(), 13, 1.0)
+    assert str(error.value) == f"the training rows hold one outcome only for h {bad}"
+
+
+def test_reference_probabilities_one_outcome_h_absent_from_rows_still_refused():
+    # Train's h 3 holds one outcome; rows have no h 3. Pinned: the check covers every train h.
+    train = ref_train(paid=[True, False, False, False, True, True, True, False, False, False,
+                            True], h=[1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3])
+    with pytest.raises(ValueError, match=r"one outcome only for h \[3\]"):
+        reference_probabilities(train, ref_rows(), 13, 1.0)
+
+
+def test_reference_probabilities_prior_is_checked_before_the_columns():
+    with pytest.raises(ValueError, match="prior_weeks"):
+        reference_probabilities(ref_train(), ref_rows().drop(columns="paying_weeks_13"), 13, 0)
+
+
+# --- best_unweighted -------------------------------------------------------------------------
+
+def weighted_candidates(weights):
+    return [Candidate(params={"k": i}, settings=SimpleNamespace(tag=i), class_weight=w)
+            for i, w in enumerate(weights)]
+
+
+def test_best_unweighted_is_the_first_unweighted_row_in_grid_order():
+    candidates = weighted_candidates(["none", "balanced", "none", "balanced"])
+    grid = pd.DataFrame({"candidate": [3, 1, 2, 0], "log loss": [0.1, 0.2, 0.3, 0.4]})
+    assert best_unweighted(grid, candidates) is candidates[2]
+
+
+def test_best_unweighted_follows_the_grid_order_not_the_score_or_candidate_number():
+    candidates = weighted_candidates(["none", "none", "balanced"])
+    grid = pd.DataFrame({"candidate": [2, 1, 0], "log loss": [0.9, 0.5, 0.1]})
+    assert best_unweighted(grid, candidates) is candidates[1]
+
+
+def test_best_unweighted_top_row_unweighted_is_the_chosen_object():
+    candidates = weighted_candidates(["balanced", "none"])
+    grid = pd.DataFrame({"candidate": [1, 0]})
+    chosen = candidates[int(grid.iloc[0]["candidate"])]
+    assert best_unweighted(grid, candidates) is chosen
+
+
+def test_best_unweighted_reads_float_candidate_numbers():
+    candidates = weighted_candidates(["balanced", "none"])
+    assert best_unweighted(pd.DataFrame({"candidate": [0.0, 1.0]}), candidates) is candidates[1]
+
+
+def test_best_unweighted_none_when_every_setting_is_weighted():
+    candidates = weighted_candidates(["balanced"] * 3)
+    assert best_unweighted(pd.DataFrame({"candidate": [2, 0, 1]}), candidates) is None
+
+
+def test_best_unweighted_none_for_an_empty_grid():
+    grid = pd.DataFrame({"candidate": pd.Series([], dtype="int64")})
+    assert best_unweighted(grid, weighted_candidates(["none"])) is None
+
+
+def test_best_unweighted_only_looks_at_the_grids_candidates():
+    # Candidate 1 is unweighted but not in the grid.
+    candidates = weighted_candidates(["balanced", "none", "balanced"])
+    assert best_unweighted(pd.DataFrame({"candidate": [2, 0]}), candidates) is None
+
+
+def test_best_unweighted_on_real_candidate_lists():
+    candidates = lr_candidates(stage1_settings(), diagnostic_settings())   # C x (none, balanced)
+    grid = pd.DataFrame({"candidate": [5, 3, 2, 0, 1, 4]})
+    assert candidates[5].class_weight == "balanced" and candidates[3].class_weight == "balanced"
+    assert best_unweighted(grid, candidates) is candidates[2]
+
+
+# --- calibration_comparison ------------------------------------------------------------------
+
+def comparison_data(n=90, seed=12):
+    """Rows with h 3, 1, 2 (first appearance unsorted), two models and a reference."""
+    rng = np.random.default_rng(seed)
+    index = pd.Index([f"r{i}" for i in range(n)])
+    h = pd.Series(np.array([3, 1, 2] * (n // 3), dtype="int64"), index=index)
+    p = pd.Series(rng.uniform(0.05, 0.95, n), index=index)
+    actual = pd.Series(rng.random(n) < p, index=index)
+    other = pd.Series(rng.uniform(0.05, 0.95, n), index=index)
+    reference = pd.Series(actual.mean(), index=index)
+    for horizon in (1, 2, 3):
+        assert actual[h == horizon].nunique() == 2
+    return actual, h, {"Model": p, "Another": other}, reference
+
+
+def test_calibration_comparison_summary_shape_and_order():
+    actual, h, predictions, reference = comparison_data()
+    summary, _ = calibration_comparison(actual, h, predictions, reference, 3)
+    assert list(summary.columns) == ["model", "h"] + SUMMARY_KEYS
+    assert list(zip(summary["model"], summary["h"])) == [
+        ("Model", 1), ("Model", 2), ("Model", 3), ("Model", "all"),
+        ("Another", 1), ("Another", 2), ("Another", 3), ("Another", "all")]
+    assert list(summary.index) == list(range(8))
+
+
+def test_calibration_comparison_all_rows_equal_a_direct_summary():
+    actual, h, predictions, reference = comparison_data()
+    summary, _ = calibration_comparison(actual, h, predictions, reference, 4)
+    for label, p in predictions.items():
+        row = summary[(summary["model"] == label) & (summary["h"] == "all")].iloc[0]
+        direct = calibration_summary(actual, p, reference, 4)
+        for key in SUMMARY_KEYS:
+            assert row[key] == direct[key], (label, key)
+
+
+def test_calibration_comparison_per_h_rows_equal_a_direct_summary_on_those_rows():
+    actual, h, predictions, reference = comparison_data()
+    summary, _ = calibration_comparison(actual, h, predictions, reference, 3)
+    for label, p in predictions.items():
+        for horizon in (1, 2, 3):
+            mask = h == horizon
+            row = summary[(summary["model"] == label) & (summary["h"] == horizon)].iloc[0]
+            direct = calibration_summary(actual[mask], p[mask], reference[mask], 3)
+            for key in SUMMARY_KEYS:
+                assert row[key] == direct[key], (label, horizon, key)
+
+
+def test_calibration_comparison_reliability_shape_and_content():
+    actual, h, predictions, reference = comparison_data()
+    _, reliability = calibration_comparison(actual, h, predictions, reference, 5)
+    assert list(reliability.columns) == ["model", "h"] + RELIABILITY_COLUMNS
+    assert len(reliability) == 2 * 4 * 5
+    assert list(reliability.index) == list(range(40))
+    labels = [(m, x) for m in ("Model", "Another") for x in (1, 2, 3, "all")]
+    assert list(dict.fromkeys(zip(reliability["model"], reliability["h"]))) == labels
+    part = reliability[(reliability["model"] == "Another") & (reliability["h"] == 2)]
+    mask = h == 2
+    direct = reliability_table(actual[mask], predictions["Another"][mask], 5)
+    pd.testing.assert_frame_equal(part.drop(columns=["model", "h"]).reset_index(drop=True),
+                                  direct)
+    for (_, _), block in reliability.groupby(["model", reliability["h"].astype(str)]):
+        assert block["group"].tolist() == [1, 2, 3, 4, 5]
+    all_rows = reliability[reliability["h"] == "all"]
+    assert all_rows.groupby("model")["rows"].sum().tolist() == [90, 90]
+
+
+def test_calibration_comparison_one_horizon_still_has_an_all_row():
+    actual, _, predictions, reference = comparison_data()
+    h = pd.Series(1, index=actual.index)
+    summary, _ = calibration_comparison(actual, h, {"Model": predictions["Model"]}, reference, 3)
+    assert summary["h"].tolist() == [1, "all"]
+    one, everything = summary.iloc[0], summary.iloc[1]
+    for key in SUMMARY_KEYS:
+        assert one[key] == everything[key], key
+
+
+def test_calibration_comparison_does_not_change_its_inputs():
+    actual, h, predictions, reference = comparison_data()
+    before = [s.copy() for s in (actual, h, reference, *predictions.values())]
+    calibration_comparison(actual, h, predictions, reference, 3)
+    for old, new in zip(before, (actual, h, reference, *predictions.values())):
+        pd.testing.assert_series_equal(old, new)
+
+
+@pytest.mark.parametrize("what", ["h", "reference_p", "Model", "Another"])
+@pytest.mark.parametrize("how", ["relabelled", "reordered", "shorter"])
+def test_calibration_comparison_refuses_misaligned_series(what, how):
+    actual, h, predictions, reference = comparison_data()
+    series = {"h": h, "reference_p": reference, **predictions}[what]
+    if how == "relabelled":
+        bad = series.set_axis([f"s{i}" for i in range(len(series))])
+    elif how == "reordered":
+        bad = series.iloc[::-1]
+    else:
+        bad = series.iloc[:-1]
+    if what == "h":
+        h = bad
+    elif what == "reference_p":
+        reference = bad
+    else:
+        predictions = {**predictions, what: bad}
+    with pytest.raises(ValueError) as error:
+        calibration_comparison(actual, h, predictions, reference, 3)
+    assert str(error.value) == f"{what} must have the rows of actual (the same index)"
+
+
+def test_calibration_comparison_checks_alignment_before_measuring():
+    # A misaligned second model is refused even though the first could be measured.
+    actual, h, predictions, reference = comparison_data()
+    predictions["Another"] = predictions["Another"].iloc[1:]
+    with pytest.raises(ValueError, match="Another must have the rows"):
+        calibration_comparison(actual, h, predictions, reference, 3)
+
+
+def test_calibration_comparison_refuses_a_horizon_with_one_outcome():
+    actual, h, predictions, reference = comparison_data()
+    actual = actual.copy()
+    actual[h == 2] = True
+    with pytest.raises(ValueError, match="both outcomes"):
+        calibration_comparison(actual, h, predictions, reference, 3)
+
+
+def test_calibration_comparison_refuses_too_many_groups_for_a_horizon():
+    actual, h, predictions, reference = comparison_data()   # 30 rows per h
+    with pytest.raises(ValueError, match="30 rows cannot be cut into 31 groups"):
+        calibration_comparison(actual, h, predictions, reference, 31)
+
+
+def test_calibration_comparison_with_references_as_predictions():
+    # As the pipeline does: the references are scored like models, beside them.
+    actual, h, predictions, reference = comparison_data()
+    labels = {"Model": predictions["Model"], "base rate": reference}
+    summary, _ = calibration_comparison(actual, h, labels, reference, 3)
+    base_all = summary[(summary["model"] == "base rate") & (summary["h"] == "all")].iloc[0]
+    assert base_all["log loss skill"] == pytest.approx(0.0, abs=1e-12)
+    assert base_all["brier skill"] == pytest.approx(0.0, abs=1e-12)
+    assert base_all["AUC"] == 0.5

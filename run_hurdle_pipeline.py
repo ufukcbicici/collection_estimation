@@ -69,13 +69,18 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     panel_rows,
 )
 from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    apply_platt,
+    best_unweighted,
+    calibration_comparison,
     choose_and_test,
     class_weight_argument,
     diagnostic_splits,
+    fit_platt,
     grid_search,
     hgb_candidates,
     lr_candidates,
     permutation_importances,
+    reference_probabilities,
     write_tables,
 )
 from collection_estimation.hurdle.stage1 import (  # noqa: E402
@@ -362,6 +367,7 @@ def main():
                   for part, rows in (("train", splits.train), ("validation", splits.validation),
                                      ("refit", splits.refit), ("test", splits.test))}
         tables, tests = {}, []
+        calibration_p = {"validation": {}, "test": {}}   # label -> p, for the calibration
         for name, fit, candidates in (
                 ("HGB", fit_stage1, hgb_candidates(settings.stage1, settings.diagnostic)),
                 ("LR", fit_stage1_baseline, lr_candidates(settings.stage1,
@@ -381,6 +387,40 @@ def main():
             tables[f"{name.lower()}_grid"] = grid
             tables[f"{name.lower()}_importance"] = importance
             show_diagnostic_grid(name, grid, importance, settings.diagnostic.selection_metric)
+            # Calibration: the best UNWEIGHTED setting, fitted on the training rows, and the
+            # same model after a Platt correction fitted on its validation p; scored on the
+            # validation rows (in-sample for the correction) and the test rows.
+            unweighted = best_unweighted(grid, candidates)
+            if unweighted is None:
+                print(f"        {name}: the grid has no unweighted setting; calibration skipped")
+                continue
+            if unweighted is not chosen:
+                model = fit(*inputs["train"], unweighted.settings)
+            a, b = fit_platt(inputs["validation"][1],
+                             predict_paid(model, inputs["validation"][0]))
+            print(f"        {name}: Platt correction fitted on validation: a {a:.4f}, b {b:.4f}")
+            for part in ("validation", "test"):
+                p = predict_paid(model, inputs[part][0])
+                calibration_p[part][name] = p
+                calibration_p[part][f"{name} + Platt"] = apply_platt(p, a, b)
+        # The models' calibration beside the three references, per horizon and pooled; skill
+        # against the training rows' share paid.
+        summaries, reliabilities = [], []
+        for part in ("validation", "test"):
+            rows, paid = getattr(splits, part), inputs[part][1]
+            references = reference_probabilities(splits.train, rows,
+                                                 settings.diagnostic.reference_window,
+                                                 settings.diagnostic.reference_prior_weeks)
+            summary, reliability = calibration_comparison(
+                paid, rows["h"], {**calibration_p[part], **references},
+                references["base rate"], settings.diagnostic.calibration_groups)
+            summary.insert(0, "part", part)
+            reliability.insert(0, "part", part)
+            summaries.append(summary)
+            reliabilities.append(reliability)
+        tables["calibration"] = pd.concat(summaries, ignore_index=True)
+        tables["reliability"] = pd.concat(reliabilities, ignore_index=True)
+        show_calibration(tables["calibration"])
         tables["test"] = pd.DataFrame(tests)
         show_diagnostic_test(tables["test"])
         paths = write_tables(settings.diagnostic.output_folder, tables)
@@ -752,6 +792,21 @@ def show_diagnostic_grid(name, grid, importance, metric):
     print(f"        {name}: the 15 most important features (rise in validation log loss when "
           f"shuffled)")
     print(importance.head(15).round(5).to_string(index=False))
+
+
+def show_calibration(calibration):
+    """A short printout of the calibration table: the test rows pooled over the horizons, one
+    line per model or reference, and the log-loss skill per horizon on test (the full table,
+    validation included, is in the CSV)."""
+    test = calibration[calibration["part"] == "test"]
+    columns = ["model", "mean p", "share paid", "ECE", "slope", "intercept", "log loss",
+               "brier", "log loss skill", "brier skill", "AUC"]
+    print("        CALIBRATION on test, all horizons (train-only models; skill against the "
+          "base rate):")
+    print(test[test["h"] == "all"][columns].round(4).to_string(index=False))
+    print("        log-loss skill per horizon, on test:")
+    by_h = test.pivot(index="model", columns="h", values="log loss skill")
+    print(by_h.loc[test["model"].unique()].round(4).to_string())
 
 
 def show_diagnostic_test(test):

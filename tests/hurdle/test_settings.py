@@ -153,7 +153,8 @@ VALID = {
     "diagnostic": {"run": "true", "origin": "40", "hgb_max_iter": "[100, 300, 600]",
                    "hgb_learning_rate": "[0.05, 0.1]", "hgb_max_leaf_nodes": "[15, 31, 63]",
                    "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
-                   "selection_metric": '"log loss"',
+                   "selection_metric": '"log loss"', "calibration_groups": "4",
+                   "reference_window": "13", "reference_prior_weeks": "1.0",
                    "importance_repeats": "3", "output_folder": '"results/diagnostic"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
@@ -309,7 +310,8 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
-    ("diagnostic", "selection_metric"),
+    ("diagnostic", "selection_metric"), ("diagnostic", "calibration_groups"),
+    ("diagnostic", "reference_window"), ("diagnostic", "reference_prior_weeks"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
@@ -436,7 +438,8 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
-    ("diagnostic", "selection_metric"),
+    ("diagnostic", "selection_metric"), ("diagnostic", "calibration_groups"),
+    ("diagnostic", "reference_window"), ("diagnostic", "reference_prior_weeks"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
@@ -2010,7 +2013,9 @@ def test_a_missing_history_section_names_it(tmp_path, repo):
     ("[1]", (1,)), ("[8]", (8,)), ("[104, 1]", (1, 104)),
 ], ids=["sorted", "unsorted", "reversed", "one", "single", "two-unsorted"])
 def test_windows_are_returned_sorted(tmp_path, repo, good, expected):
-    settings = load(tmp_path, repo, changes={("history", "windows"): good})
+    # reference_window must be one of the windows (U10.4d), so it follows the list here.
+    settings = load(tmp_path, repo, changes={("history", "windows"): good,
+                                             ("diagnostic", "reference_window"): str(expected[0])})
     assert settings.history.windows == expected
     assert type(settings.history.windows) is tuple
 
@@ -2610,8 +2615,9 @@ def test_the_synthetic_stage1_and_demo_origin_settings():
 # the file and the section, exactly); grid_setting and class_weight_setting also by direct calls.
 
 DIAG = f"{FILE_NAME} [diagnostic]"
-DIAGNOSTIC_KEYS = ['class_weights', 'hgb_learning_rate', 'hgb_max_iter', 'hgb_max_leaf_nodes',
-                   'importance_repeats', 'lr_c', 'origin', 'output_folder', 'run',
+DIAGNOSTIC_KEYS = ['calibration_groups', 'class_weights', 'hgb_learning_rate', 'hgb_max_iter',
+                   'hgb_max_leaf_nodes', 'importance_repeats', 'lr_c', 'origin',
+                   'output_folder', 'reference_prior_weeks', 'reference_window', 'run',
                    'selection_metric']
 
 
@@ -2621,7 +2627,8 @@ def test_the_diagnostic_section_is_read(tmp_path, repo):
     assert diagnostic == DiagnosticSettings(
         run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
         hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
-        class_weights=("none", "balanced"), selection_metric="log loss", importance_repeats=3,
+        class_weights=("none", "balanced"), selection_metric="log loss", calibration_groups=4,
+        reference_window=13, reference_prior_weeks=1.0, importance_repeats=3,
         output_folder=(repo / "results" / "diagnostic").resolve())
 
 
@@ -2644,7 +2651,8 @@ def test_the_diagnostic_values_have_the_right_python_types(tmp_path, repo):
 def test_diagnostic_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(DiagnosticSettings)] == [
         "run", "origin", "hgb_max_iter", "hgb_learning_rate", "hgb_max_leaf_nodes", "lr_c",
-        "class_weights", "selection_metric", "importance_repeats", "output_folder"]
+        "class_weights", "selection_metric", "calibration_groups", "reference_window",
+        "reference_prior_weeks", "importance_repeats", "output_folder"]
 
 
 def test_settings_has_a_diagnostic_field_between_stage1_and_debug():
@@ -2944,7 +2952,8 @@ def test_the_synthetic_diagnostic_settings():
         run=True, origin=40, hgb_max_iter=(100, 300, 600, 900),
         hgb_learning_rate=(0.01, 0.05, 0.1), hgb_max_leaf_nodes=(15, 31, 63),
         lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none", "balanced"),
-        selection_metric="log loss", importance_repeats=3,
+        selection_metric="log loss", calibration_groups=10, reference_window=13,
+        reference_prior_weeks=1.0, importance_repeats=3,
         output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_diagnostic").resolve())
 
 
@@ -3047,10 +3056,11 @@ def test_the_selection_metric_is_checked_when_run_is_false(tmp_path, repo):
     assert message == f"{DIAG}: selection_metric is 'AUC', not one of {METRIC_CHOICES}"
 
 
-def test_diagnostic_settings_selection_metric_sits_between_class_weights_and_repeats():
+def test_diagnostic_settings_selection_metric_sits_between_class_weights_and_calibration():
+    # U10.4d put the three calibration settings between selection_metric and the repeats.
     names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
     assert (names.index("class_weights") + 1 == names.index("selection_metric")
-            == names.index("importance_repeats") - 1)
+            == names.index("calibration_groups") - 1 == names.index("importance_repeats") - 4)
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -3058,3 +3068,226 @@ def test_the_synthetic_file_chooses_by_log_loss():
     raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
     assert raw["diagnostic"]["selection_metric"] == "log loss"
     assert load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).diagnostic.selection_metric == "log loss"
+
+
+# --- [diagnostic] calibration settings (U10.4d) ------------------------------------------------
+# calibration_groups (group_count_setting: a whole number, 2 or more), reference_window
+# (reference_window_setting: a count that is one of the [history] windows) and
+# reference_prior_weeks (positive_number_setting). All three are required and strict.
+
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    group_count_setting,
+    reference_window_setting,
+)
+
+
+# group_count_setting, by direct calls
+
+@pytest.mark.parametrize("good", [2, 3, 10, 1000, 2**40])
+def test_group_count_setting_accepts_whole_numbers_of_2_or_more(good):
+    value = group_count_setting({"g": good}, "g", "here")
+    assert value == good and type(value) is int
+
+
+@pytest.mark.parametrize("bad", [1, 0, -1, -10, True, False, 2.0, 10.0, 2.5, "10", None,
+                                 [10], (10,), {"g": 10}, float("nan"), float("inf")])
+def test_group_count_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        group_count_setting({"g": bad}, "g", "here")
+    assert str(error.value) == f"here: g is {bad!r}, not a whole number of 2 or more"
+
+
+def test_group_count_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        group_count_setting({}, "g", "here")
+
+
+def test_group_count_setting_does_not_change_the_table():
+    table = {"g": 5, "other": "x"}
+    group_count_setting(table, "g", "here")
+    assert table == {"g": 5, "other": "x"}
+
+
+# reference_window_setting, by direct calls
+
+@pytest.mark.parametrize("good", [4, 13, 52])
+def test_reference_window_setting_accepts_each_history_window(good):
+    value = reference_window_setting({"w": good}, "w", "here", (4, 13, 52))
+    assert value == good and type(value) is int
+
+
+@pytest.mark.parametrize("bad", [1, 5, 12, 14, 51, 53, 100])
+def test_reference_window_setting_rejects_a_count_not_among_the_windows(bad):
+    with pytest.raises(ValueError) as error:
+        reference_window_setting({"w": bad}, "w", "here", (4, 13, 52))
+    assert str(error.value) == f"here: w is {bad}, not one of the [history] windows [4, 13, 52]"
+
+
+@pytest.mark.parametrize("bad", [0, -4, True, 13.0, "13", None, [13]])
+def test_reference_window_setting_rejects_a_non_count_as_count_setting_does(bad):
+    # Not a count at all: count_setting's message, before the windows are looked at.
+    with pytest.raises(ValueError) as error:
+        reference_window_setting({"w": bad}, "w", "here", (1, 4, 13))
+    assert str(error.value) == f"here: w is {bad!r}, not a whole number of 1 or more"
+
+
+def test_reference_window_setting_true_is_not_window_1():
+    # True == 1 in Python; it must still be refused even when 1 is a window.
+    with pytest.raises(ValueError):
+        reference_window_setting({"w": True}, "w", "here", (1, 4))
+
+
+def test_reference_window_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        reference_window_setting({}, "w", "here", (4, 13))
+
+
+# Through the file
+
+def test_the_calibration_settings_are_read(tmp_path, repo):
+    diagnostic = load(tmp_path, repo).diagnostic
+    assert diagnostic.calibration_groups == 4 and type(diagnostic.calibration_groups) is int
+    assert diagnostic.reference_window == 13 and type(diagnostic.reference_window) is int
+    assert (diagnostic.reference_prior_weeks == 1.0
+            and type(diagnostic.reference_prior_weeks) is float)
+
+
+def test_the_calibration_settings_change_nothing_else(tmp_path, repo):
+    base = load(tmp_path, repo).diagnostic
+    other = load(tmp_path, repo, changes={("diagnostic", "calibration_groups"): "7",
+                                          ("diagnostic", "reference_window"): "52",
+                                          ("diagnostic", "reference_prior_weeks"): "2.5"})
+    assert other.diagnostic == dataclasses.replace(base, calibration_groups=7,
+                                                   reference_window=52,
+                                                   reference_prior_weeks=2.5)
+
+
+@pytest.mark.parametrize("good, expected", [("2", 2), ("3", 3), ("20", 20), ("1_000", 1000)])
+def test_calibration_groups_accepts_whole_numbers_of_2_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("diagnostic", "calibration_groups"): good}).diagnostic
+    assert value.calibration_groups == expected and type(value.calibration_groups) is int
+
+
+@pytest.mark.parametrize("bad, shown", [("1", "1"), ("0", "0"), ("-3", "-3"), ("10.0", "10.0"),
+                                        ('"10"', "'10'"), ("true", "True"), ("[10]", "[10]"),
+                                        ("nan", "nan"), ("inf", "inf")])
+def test_calibration_groups_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "calibration_groups"): bad})
+    assert message == f"{DIAG}: calibration_groups is {shown}, not a whole number of 2 or more"
+
+
+@pytest.mark.parametrize("good", ["4", "13", "52"])
+def test_reference_window_accepts_each_history_window(tmp_path, repo, good):
+    value = load(tmp_path, repo,
+                 changes={("diagnostic", "reference_window"): good}).diagnostic.reference_window
+    assert value == int(good) and type(value) is int
+
+
+def test_reference_window_follows_the_history_windows(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("history", "windows"): "[26, 8]",
+                                             ("diagnostic", "reference_window"): "8"})
+    assert settings.history.windows == (8, 26)
+    assert settings.diagnostic.reference_window == 8
+
+
+@pytest.mark.parametrize("bad", ["5", "12", "26", "104"])
+def test_reference_window_not_a_history_window_has_the_exact_message(tmp_path, repo, bad):
+    message = exact_message(tmp_path, repo, {("diagnostic", "reference_window"): bad})
+    assert message == (f"{DIAG}: reference_window is {bad}, not one of the [history] windows "
+                       f"[4, 13, 52]")
+
+
+def test_reference_window_message_lists_the_windows_sorted(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("history", "windows"): "[52, 4]",
+                                             ("diagnostic", "reference_window"): "13"})
+    assert message == (f"{DIAG}: reference_window is 13, not one of the [history] windows "
+                       f"[4, 52]")
+
+
+@pytest.mark.parametrize("bad, shown", [("0", "0"), ("-13", "-13"), ("13.0", "13.0"),
+                                        ('"13"', "'13'"), ("true", "True"), ("[13]", "[13]")])
+def test_reference_window_that_is_not_a_count_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "reference_window"): bad})
+    assert message == f"{DIAG}: reference_window is {shown}, not a whole number of 1 or more"
+
+
+def test_a_bad_history_window_is_reported_before_the_reference_window(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("history", "windows"): "[]",
+                                             ("diagnostic", "reference_window"): "99"})
+    assert message == (f"{FILE_NAME} [history]: windows is [], not a non-empty list of "
+                       f"window lengths")
+
+
+@pytest.mark.parametrize("good, expected", [("1", 1.0), ("1.0", 1.0), ("0.5", 0.5),
+                                            ("3", 3.0), ("1e-9", 1e-9), ("100", 100.0)])
+def test_reference_prior_weeks_accepts_numbers_above_0(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("diagnostic", "reference_prior_weeks"): good})
+    assert value.diagnostic.reference_prior_weeks == expected
+    assert type(value.diagnostic.reference_prior_weeks) is float
+
+
+@pytest.mark.parametrize("bad, shown", [("0", "0"), ("0.0", "0.0"), ("-1", "-1"),
+                                        ("nan", "nan"), ("inf", "inf"), ('"1"', "'1'"),
+                                        ("true", "True"), ("[1]", "[1]")])
+def test_reference_prior_weeks_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "reference_prior_weeks"): bad})
+    assert message == f"{DIAG}: reference_prior_weeks is {shown}, not a number above 0"
+
+
+@pytest.mark.parametrize("key", ["calibration_groups", "reference_window",
+                                 "reference_prior_weeks"])
+def test_a_missing_calibration_setting_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("diagnostic", key): REMOVE})
+    assert message == f"{DIAG}: missing [{key!r}]; expected exactly {DIAGNOSTIC_KEYS}"
+
+
+@pytest.mark.parametrize("key, value", [("calibration_groups", "4"), ("reference_window", "13"),
+                                        ("reference_prior_weeks", "1.0")])
+def test_a_calibration_setting_in_the_stage1_section_is_unknown(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("stage1", key): value})
+    assert message.startswith(f"{FILE_NAME} [stage1]: unknown [{key!r}]; ")
+
+
+@pytest.mark.parametrize("key, bad", [("calibration_groups", "1"),
+                                      ("reference_window", "5"),
+                                      ("reference_prior_weeks", "0")])
+def test_the_calibration_settings_are_checked_when_run_is_false(tmp_path, repo, key, bad):
+    message = exact_message(tmp_path, repo, {("diagnostic", "run"): "false",
+                                             ("diagnostic", key): bad})
+    assert message.startswith(f"{DIAG}: {key} is ")
+
+
+def test_the_calibration_settings_are_checked_in_field_order(tmp_path, repo):
+    # All three broken: calibration_groups is reported, then (with it fixed) reference_window.
+    changes = {("diagnostic", "calibration_groups"): "1",
+               ("diagnostic", "reference_window"): "5",
+               ("diagnostic", "reference_prior_weeks"): "0"}
+    assert exact_message(tmp_path, repo, changes).startswith(f"{DIAG}: calibration_groups is ")
+    changes[("diagnostic", "calibration_groups")] = "4"
+    assert exact_message(tmp_path, repo, changes).startswith(f"{DIAG}: reference_window is ")
+    changes[("diagnostic", "reference_window")] = "13"
+    assert exact_message(tmp_path, repo, changes).startswith(
+        f"{DIAG}: reference_prior_weeks is ")
+
+
+def test_diagnostic_settings_calibration_fields_sit_between_selection_metric_and_repeats():
+    names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
+    start = names.index("selection_metric")
+    assert names[start:start + 5] == ["selection_metric", "calibration_groups",
+                                      "reference_window", "reference_prior_weeks",
+                                      "importance_repeats"]
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_file_calibration_settings():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert raw["diagnostic"]["calibration_groups"] == 10
+    assert raw["diagnostic"]["reference_window"] == 13
+    assert raw["diagnostic"]["reference_prior_weeks"] == 1
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.diagnostic.calibration_groups == 10
+    assert settings.diagnostic.reference_window == 13
+    assert settings.diagnostic.reference_window in settings.history.windows
+    assert settings.diagnostic.reference_prior_weeks == 1.0
+    assert type(settings.diagnostic.reference_prior_weeks) is float

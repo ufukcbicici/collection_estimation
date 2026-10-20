@@ -15,13 +15,16 @@ pooled WAPE of the total cash forecast.)
 """
 import dataclasses
 import itertools
+import numbers
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit
 from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (average_precision_score, brier_score_loss, f1_score, log_loss,
                              precision_recall_curve, precision_score, recall_score,
                              roc_auc_score)
@@ -222,3 +225,234 @@ def write_tables(folder: Path, tables: dict[str, pd.DataFrame]) -> list[Path]:
         table.to_csv(path, index=False)
         paths.append(path)
     return paths
+
+
+# p is kept this far from 0 and 1 before taking logit(p), which is infinite at the edges.
+LOGIT_CLIP = 1e-6
+
+
+def check_outcomes(actual: pd.Series, p: pd.Series) -> pd.Series:
+    """`actual` as True/False, after checking that it lines up with `p`, is not empty and holds
+    both outcomes (the measures below compare payers with non-payers)."""
+    if not actual.index.equals(p.index):
+        raise ValueError("actual and p must have the same rows (the same index)")
+    if actual.empty:
+        raise ValueError("there are no rows to measure")
+    actual = actual.astype(bool)
+    if actual.nunique() < 2:
+        raise ValueError("actual must hold both outcomes (payers and non-payers)")
+    return actual
+
+
+def reliability_table(actual: pd.Series, p: pd.Series, groups: int) -> pd.DataFrame:
+    """How well p matches what happened: the rows sorted by p and cut into `groups` groups of
+    (nearly) equal size, one row per group with its lowest and highest p, its mean p, the
+    share of its rows that actually paid, and its row count. A calibrated model has mean p
+    close to the share paid in every group.
+
+    Equal-size groups, not equal-width ones: most p are small, so equal widths would leave
+    the top groups nearly empty. Raises ValueError if `groups` < 2 or there are fewer rows
+    than groups (and see `check_outcomes`).
+    """
+    actual = check_outcomes(actual, p)
+    if groups < 2:
+        raise ValueError(f"groups is {groups}; at least 2 are needed")
+    if len(p) < groups:
+        raise ValueError(f"{len(p)} rows cannot be cut into {groups} groups")
+    # Position of each row in p's order (stable, so tied p keep their row order), then its
+    # group: the first len/groups positions are group 1, and so on.
+    order = np.argsort(p.to_numpy(), kind="mergesort")
+    group = np.empty(len(p), dtype=int)
+    group[order] = np.arange(len(p)) * groups // len(p) + 1
+    rows = pd.DataFrame({"group": group, "p": p.to_numpy(), "paid": actual.to_numpy()})
+    table = rows.groupby("group").agg(p_low=("p", "min"), p_high=("p", "max"),
+                                      mean_p=("p", "mean"), share_paid=("paid", "mean"),
+                                      rows=("p", "size"))
+    return table.reset_index()
+
+
+def calibration_slope_intercept(actual: pd.Series, p: pd.Series) -> tuple[float, float]:
+    """The slope a and intercept b of an unpenalised logistic regression of the outcome on
+    logit(p). Calibrated: a = 1, b = 0. a below 1: p is too extreme (too confident); b
+    shifts every p up (b > 0) or down (b < 0). p is first clipped to [LOGIT_CLIP,
+    1 - LOGIT_CLIP]."""
+    actual = check_outcomes(actual, p)
+    logit = clipped_logit(p).to_numpy().reshape(-1, 1)
+    # C = infinity: no penalty (scikit-learn 1.8 deprecates penalty=None for this).
+    fit = LogisticRegression(C=np.inf).fit(logit, actual.to_numpy())
+    return float(fit.coef_[0, 0]), float(fit.intercept_[0])
+
+
+def clipped_logit(p: pd.Series) -> pd.Series:
+    """logit(p) = log(p / (1 - p)), with p first clipped to [LOGIT_CLIP, 1 - LOGIT_CLIP]."""
+    clipped = p.clip(LOGIT_CLIP, 1 - LOGIT_CLIP)
+    return np.log(clipped / (1 - clipped))
+
+
+def fit_platt(actual: pd.Series, p: pd.Series) -> tuple[float, float]:
+    """The Platt correction learned from p and what happened: (a, b) such that
+    sigmoid(a x logit(p) + b) matches the outcomes best (see `apply_platt`). It is the same fit
+    as `calibration_slope_intercept`; this name is for learning a correction, that one for
+    measuring calibration."""
+    return calibration_slope_intercept(actual, p)
+
+
+def apply_platt(p: pd.Series, a: float, b: float) -> pd.Series:
+    """p corrected by Platt's (a, b) from `fit_platt`: sigmoid(a x logit(p) + b), with the same
+    index as p, every value within [LOGIT_CLIP, 1 - LOGIT_CLIP], so strictly between 0 and 1
+    even for a large correction. Raises ValueError unless a and b are finite numbers (numpy
+    numbers included)."""
+    for name, value in (("a", a), ("b", b)):
+        if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+                or not np.isfinite(value)):
+            raise ValueError(f"Platt's {name} is {value!r}, not a finite number")
+    # expit is the sigmoid without overflow; the clip keeps 0 and 1 out, which floating point
+    # reaches for |a x logit(p) + b| above about 37.
+    return expit(a * clipped_logit(p) + b).clip(LOGIT_CLIP, 1 - LOGIT_CLIP)
+
+
+def calibration_summary(actual: pd.Series, p: pd.Series, reference_p: pd.Series,
+                        groups: int) -> dict:
+    """One row of calibration measures for p against `actual` (True/False):
+
+      mean p, share paid    calibration in the large
+      ECE                   expected calibration error: the size-weighted mean of
+                            |mean p - share paid| over the `groups` groups of
+                            `reliability_table`; 0 = calibrated
+      slope, intercept      see `calibration_slope_intercept`
+      log loss, brier       the two proper scores (lower is better)
+      calibration error, resolution, uncertainty
+                            the Brier decomposition over the same groups: how far p is from
+                            the share paid (lower is better), how much the groups' shares
+                            differ from the overall share (higher is better: payers are
+                            separated), and the data's own difficulty
+      decomposition gap     brier - (calibration error - resolution + uncertainty): not 0,
+                            because grouping p loses its spread within each group
+      log loss skill, brier skill
+                            1 - score / `reference_p`'s score: 0 = no better than the
+                            reference, 1 = perfect, below 0 = worse
+      AUC                   separation of payers from non-payers, beside calibration
+    """
+    actual = check_outcomes(actual, p)
+    if not reference_p.index.equals(p.index):
+        raise ValueError("reference_p and p must have the same rows (the same index)")
+    table = reliability_table(actual, p, groups)
+    weights = table["rows"] / table["rows"].sum()
+    overall = actual.mean()
+    slope, intercept = calibration_slope_intercept(actual, p)
+    scores = {"log loss": log_loss(actual, p, labels=[False, True]),
+              "brier": brier_score_loss(actual, p)}
+    reference = {"log loss": log_loss(actual, reference_p, labels=[False, True]),
+                 "brier": brier_score_loss(actual, reference_p)}
+    calibration_error = float((weights * (table["mean_p"] - table["share_paid"]) ** 2).sum())
+    resolution = float((weights * (table["share_paid"] - overall) ** 2).sum())
+    uncertainty = float(overall * (1 - overall))
+    return {
+        "mean p": float(p.mean()),
+        "share paid": float(overall),
+        "ECE": float((weights * (table["mean_p"] - table["share_paid"]).abs()).sum()),
+        "slope": slope,
+        "intercept": intercept,
+        "log loss": scores["log loss"],
+        "brier": scores["brier"],
+        "calibration error": calibration_error,
+        "resolution": resolution,
+        "uncertainty": uncertainty,
+        "decomposition gap": scores["brier"] - (calibration_error - resolution + uncertainty),
+        "log loss skill": 1 - scores["log loss"] / reference["log loss"],
+        "brier skill": 1 - scores["brier"] / reference["brier"],
+        "AUC": roc_auc_score(actual, p),
+    }
+
+
+def reference_probabilities(train_rows: pd.DataFrame, rows: pd.DataFrame, window: int,
+                            prior_weeks: float) -> pd.DataFrame:
+    """Three simple references for p, one column each, with the same index as `rows`; all
+    learned from `train_rows` (known at fit time), scored like a model:
+
+      base rate         the share paid in `train_rows`, for every row
+      base rate per h   the share paid in `train_rows` with the row's horizon h
+      own rate          the customer's own recent pay rate: (paying weeks + prior_weeks x base
+                        rate) / (observed weeks + prior_weeks), from the row's history columns
+                        paying_weeks_<window> and observed_weeks_<window> (weeks up to the
+                        origin t, so known at t). The prior weeks keep a rate of exactly 0 or 1
+                        away from the edges (log loss is infinite there); a customer with no
+                        observed week gets exactly the base rate.
+
+    Raises ValueError if `rows` has an h that `train_rows` lacks, the history columns of
+    `window` are missing or impossible (negative, NaN, or more paying than observed weeks),
+    `prior_weeks` is not above 0, or `train_rows` holds one outcome only, overall or for an h
+    (a rate of 0 or 1).
+    """
+    if not prior_weeks > 0:
+        raise ValueError(f"prior_weeks is {prior_weeks!r}; it must be above 0")
+    paying, observed = f"paying_weeks_{window}", f"observed_weeks_{window}"
+    missing = [column for column in (paying, observed) if column not in rows.columns]
+    if missing:
+        raise ValueError(f"the rows have no history columns {missing} for window {window}")
+    impossible = ~((rows[paying] >= 0) & (rows[paying] <= rows[observed]))
+    if impossible.any():
+        raise ValueError(f"{int(impossible.sum())} rows have impossible history counts for "
+                         f"window {window} (negative, NaN, or more paying than observed weeks)")
+    train_paid = train_rows["paid"].astype(bool)
+    if train_paid.nunique() < 2:
+        raise ValueError("the training rows must hold both outcomes for a base rate")
+    base_rate = float(train_paid.mean())
+    rate_per_h = train_paid.groupby(train_rows["h"]).mean()
+    unknown = sorted(set(rows["h"]) - set(rate_per_h.index))
+    if unknown:
+        raise ValueError(f"the training rows have no rows with h {unknown}")
+    one_outcome = sorted(h for h, rate in rate_per_h.items() if rate in (0.0, 1.0))
+    if one_outcome:
+        raise ValueError(f"the training rows hold one outcome only for h {one_outcome}")
+    own_rate = ((rows[paying] + prior_weeks * base_rate)
+                / (rows[observed] + prior_weeks))
+    # With no observed week the formula is the base rate, but floating point can miss it by
+    # one last digit; set it exactly.
+    own_rate = own_rate.where(rows[observed] > 0, base_rate)
+    return pd.DataFrame({
+        "base rate": base_rate,
+        "base rate per h": rows["h"].map(rate_per_h).astype("float64"),
+        "own rate": own_rate.astype("float64"),
+    }, index=rows.index)
+
+
+def best_unweighted(grid: pd.DataFrame, candidates: list[Candidate]) -> Candidate | None:
+    """The highest-ranked setting of `grid` (from `grid_search`) without class weights, or None
+    if the grid has none. Calibration is measured on it: a class-weighted model's p is not a
+    probability."""
+    for number in grid["candidate"]:
+        candidate = candidates[int(number)]
+        if candidate.class_weight == "none":
+            return candidate
+    return None
+
+
+def calibration_comparison(actual: pd.Series, h: pd.Series, predictions: dict[str, pd.Series],
+                           reference_p: pd.Series,
+                           groups: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The calibration of several sets of p (`predictions`: label -> p, e.g. models, models
+    after Platt, references) on the same rows, for each horizon in `h` and for all rows
+    together (h = "all"). Returns two long tables:
+
+      summary       one row per (model, h): `calibration_summary` against `reference_p`
+      reliability   one row per (model, h, group): `reliability_table`
+
+    Raises ValueError if `h`, `reference_p` or a prediction does not have the rows of `actual`
+    (and as `calibration_summary` does, e.g. for a horizon whose rows hold one outcome).
+    """
+    for name, series in (("h", h), ("reference_p", reference_p), *predictions.items()):
+        if not series.index.equals(actual.index):
+            raise ValueError(f"{name} must have the rows of actual (the same index)")
+    summary, reliability = [], []
+    for label, p in predictions.items():
+        for horizon in [*sorted(h.unique()), "all"]:
+            rows = h.index if horizon == "all" else h.index[h == horizon]
+            summary.append({"model": label, "h": horizon,
+                            **calibration_summary(actual[rows], p[rows], reference_p[rows],
+                                                  groups)})
+            table = reliability_table(actual[rows], p[rows], groups)
+            table.insert(0, "h", horizon)
+            table.insert(0, "model", label)
+            reliability.append(table)
+    return pd.DataFrame(summary), pd.concat(reliability, ignore_index=True)

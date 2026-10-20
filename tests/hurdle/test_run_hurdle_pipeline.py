@@ -1816,13 +1816,20 @@ table = pd.DataFrame({
     "signal": signal,
     "noise": rng.normal(size=n),
 }, index=pd.RangeIndex(1000, 1000 + n))
+# U10.4d: the window-13 history the "own rate" reference reads (drawn after everything else,
+# so the rows above are unchanged); not a feature.
+observed = rng.integers(0, 14, size=n)
+table["observed_weeks_13"] = observed.astype("int64")
+table["paying_weeks_13"] = rng.integers(0, observed + 1).astype("int64")
 columns = ["h", "signal", "noise"]
 companies = ["TR04", "TR02"]
 settings = SimpleNamespace(
     diagnostic=SimpleNamespace(run=__RUN__, origin=4, hgb_max_iter=(3, 10),
                                hgb_learning_rate=(0.3,), hgb_max_leaf_nodes=(3,),
-                               lr_c=(0.1, 10.0), class_weights=("none", "balanced"),
-                               selection_metric=__METRIC__, importance_repeats=2,
+                               lr_c=(0.1, 10.0), class_weights=__WEIGHTS__,
+                               selection_metric=__METRIC__, calibration_groups=4,
+                               reference_window=13, reference_prior_weeks=1.0,
+                               importance_repeats=2,
                                output_folder=Path(__OUTPUT__)),
     receivables=SimpleNamespace(horizons=2),
     stage1=Stage1Settings(max_iter=5, learning_rate=0.2, max_leaf_nodes=4, min_samples_leaf=5,
@@ -1843,12 +1850,14 @@ print("ok")
 
 from types import SimpleNamespace  # noqa: E402
 
-TABLE_NAMES = ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "test"]
+TABLE_NAMES = ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "calibration",
+               "reliability", "test"]
 
 
-def run_step_13(output, run=True, company=False, stubs="", after="", metric="avg precision"):
+def run_step_13(output, run=True, company=False, stubs="", after="", metric="avg precision",
+                weights=("none", "balanced")):
     code = (STEP_13.replace("__RUN__", str(run)).replace("__OUTPUT__", repr(str(output)))
-            .replace("__METRIC__", repr(metric))
+            .replace("__METRIC__", repr(metric)).replace("__WEIGHTS__", repr(tuple(weights)))
             .replace("__COMPANY__", str(company)).replace("__STUBS__", stubs)
             .replace("__AFTER__", after))
     return run_code(code)
@@ -1905,9 +1914,13 @@ def test_step_13_real_run_printout_order(real_run):
     order = [first("  ... HGB 4 of 4"),
              first("        HGB: the 5 best of 4 settings by validation avg precision"),
              first("        HGB: the 15 most important features"),
+             first("        HGB: Platt correction fitted on validation: "),
              first("  ... LR 1 of 4"),
              first("        LR: the 5 best of 4 settings by validation avg precision"),
              first("        LR: the 15 most important features"),
+             first("        LR: Platt correction fitted on validation: "),
+             first("        CALIBRATION on test, all horizons"),
+             first("        log-loss skill per horizon, on test:"),
              first("        TEST (target weeks after the validation weeks)"),
              first("        tables written to ")]
     assert order == sorted(order)
@@ -1921,7 +1934,7 @@ def test_step_13_real_run_reports_the_files_written(real_run):
     assert real_run.lines[-2] == expected
 
 
-def test_step_13_real_run_writes_the_five_tables_into_a_new_folder(real_run):
+def test_step_13_real_run_writes_the_seven_tables_into_a_new_folder(real_run):
     assert real_run.result.returncode == 0, real_run.result.stderr
     assert real_run.output.is_dir()
     assert sorted(path.name for path in real_run.output.iterdir()) == sorted(
@@ -1980,7 +1993,9 @@ def test_step_13_with_run_false_calls_nothing_and_writes_nothing(tmp_path):
               "for name in ('diagnostic_splits', 'show_diagnostic_splits', 'stage1_features', "
               "'hgb_candidates', 'lr_candidates', 'grid_search', 'choose_and_test', "
               "'permutation_importances', 'show_diagnostic_grid', 'show_diagnostic_test', "
-              "'write_tables', 'fit_stage1', 'fit_stage1_baseline'):\n"
+              "'write_tables', 'fit_stage1', 'fit_stage1_baseline', 'best_unweighted', "
+              "'fit_platt', 'apply_platt', 'predict_paid', 'reference_probabilities', "
+              "'calibration_comparison', 'show_calibration'):\n"
               "    namespace[name] = refuse\n")
     result = run_step_13(output, run=False, stubs=refuse)
     assert result.returncode == 0, result.stderr
@@ -1999,13 +2014,20 @@ def test_step_13_the_run_false_stubs_bite_when_run_is_true(tmp_path):
 
 # The spy run: every diagnostic function and both fits are replaced by recorders, so the
 # block's data flow is checked call by call. The stubbed grid_search puts candidate 1 on top
-# for HGB (max_iter 3, balanced) and candidate 3 for LR (C 10, balanced).
+# for HGB (max_iter 3, balanced) and candidate 3 for LR (C 10, balanced) by default; TOPS can
+# be changed per test (spy_stubs). U10.4d: best_unweighted is the real one behind a recorder
+# (SKIP_FIRST makes its first call return None), predict_paid, fit_platt, apply_platt,
+# reference_probabilities, calibration_comparison and show_calibration are recorders.
+# HGB candidates: 0 (3, none), 1 (3, balanced), 2 (10, none), 3 (10, balanced); LR candidates:
+# 0 (C .1, none), 1 (.1, balanced), 2 (10, none), 3 (10, balanced).
 SPY_STUBS = """
 from collection_estimation.hurdle import diagnostic
 from collection_estimation.hurdle.stage1 import stage1_features
 calls = []
 real = {"fit_stage1": script.fit_stage1, "fit_stage1_baseline": script.fit_stage1_baseline}
-TOPS = {"HGB": [1, 0, 2, 3], "LR": [3, 2, 1, 0]}
+TOPS = __TOPS__
+SKIP_FIRST = __SKIP_FIRST__
+PLATT = [(1.5, -0.25), (0.75, 0.125)]   # (a, b) of the first and second fit_platt call
 
 def make_fit(label):
     def fit(train_x, paid, settings_, class_weight="NOT GIVEN"):
@@ -2040,11 +2062,62 @@ def spy_write_tables(folder, tables):
     calls.append(("write_tables", folder, tables))
     return [Path(folder) / f"{name}.csv" for name in tables]
 
+def spy_best_unweighted(grid, candidates):
+    result = diagnostic.best_unweighted(grid, candidates)
+    if SKIP_FIRST and not any(call[0] == "best_unweighted" for call in calls):
+        result = None
+    calls.append(("best_unweighted", grid, candidates, result))
+    return result
+
+def spy_predict_paid(model, x):
+    p = pd.Series(np.linspace(0.1, 0.9, len(x)), index=x.index)
+    calls.append(("predict_paid", model, x, p))
+    return p
+
+def spy_fit_platt(actual, p):
+    calls.append(("fit_platt", actual, p))
+    return PLATT[sum(1 for call in calls if call[0] == "fit_platt") - 1]
+
+def spy_apply_platt(p, a, b):
+    corrected = p * 0 + 0.5
+    calls.append(("apply_platt", p, a, b, corrected))
+    return corrected
+
+def spy_references(train_rows, rows, window, prior_weeks):
+    references = pd.DataFrame({"base rate": 0.4, "base rate per h": 0.45, "own rate": 0.5},
+                              index=rows.index)
+    calls.append(("reference_probabilities", train_rows, rows, window, prior_weeks, references))
+    return references
+
+def spy_comparison(actual, h, predictions, reference_p, groups):
+    summary = pd.DataFrame({"model": list(predictions), "h": "all",
+                            "log loss skill": np.arange(len(predictions), dtype=float)})
+    reliability = pd.DataFrame({"model": list(predictions), "h": "all", "group": 1})
+    calls.append(("calibration_comparison", actual, h, dict(predictions), reference_p, groups,
+                  summary, reliability))
+    return summary, reliability
+
+def spy_show_calibration(calibration):
+    calls.append(("show_calibration", calibration))
+
 namespace.update(fit_stage1=make_fit("HGB fit"), fit_stage1_baseline=make_fit("LR fit"),
                  grid_search=spy_grid_search, choose_and_test=spy_choose_and_test,
                  permutation_importances=spy_importances, show_diagnostic_grid=spy_show_grid,
-                 show_diagnostic_test=spy_show_test, write_tables=spy_write_tables)
+                 show_diagnostic_test=spy_show_test, write_tables=spy_write_tables,
+                 best_unweighted=spy_best_unweighted, predict_paid=spy_predict_paid,
+                 fit_platt=spy_fit_platt, apply_platt=spy_apply_platt,
+                 reference_probabilities=spy_references,
+                 calibration_comparison=spy_comparison,
+                 show_calibration=spy_show_calibration)
 """
+
+DEFAULT_TOPS = {"HGB": [1, 0, 2, 3], "LR": [3, 2, 1, 0]}
+
+
+def spy_stubs(tops=None, skip_first=False):
+    return (SPY_STUBS.replace("__TOPS__", repr(tops or DEFAULT_TOPS))
+            .replace("__SKIP_FIRST__", str(skip_first)))
+
 
 SPY_CHECKS = """
 splits = diagnostic.diagnostic_splits(table, 4, 2)
@@ -2058,16 +2131,24 @@ def same(pair, part):
     pd.testing.assert_frame_equal(x, want_x)
     pd.testing.assert_series_equal(paid, want_paid)
     assert paid.dtype == bool
+def position(call):
+    return next(i for i, other in enumerate(calls) if other is call)
 
-kinds = [call[0] for call in calls]
-assert kinds == ["grid_search", "choose_and_test", "fit", "permutation_importances",
-                 "show_diagnostic_grid"] * 2 + ["show_diagnostic_test", "write_tables"], kinds
+queue = list(calls)
+def take(kind):
+    assert queue, f"no call left where {kind} was expected"
+    call = queue.pop(0)
+    assert call[0] == kind, (kind, call[0], [c[0] for c in calls])
+    return call
 
 hgb_candidates = diagnostic.hgb_candidates(settings.stage1, settings.diagnostic)
 lr_candidates = diagnostic.lr_candidates(settings.stage1, settings.diagnostic)
-for offset, name, label, candidates, top in ((0, "HGB", "HGB fit", hgb_candidates, 1),
-                                             (5, "LR", "LR fit", lr_candidates, 3)):
-    grid_call, test_call, fit_call, importance_call, show_call = calls[offset:offset + 5]
+grids, importances, tests_shown, stored, calibrated, refitted = {}, {}, {}, {}, [], []
+stored = {"validation": {}, "test": {}}
+for name, label, candidates in (("HGB", "HGB fit", hgb_candidates),
+                                ("LR", "LR fit", lr_candidates)):
+    top = TOPS[name][0]
+    grid_call = take("grid_search")
     # grid_search: this model's fit and candidates, the train and validation inputs.
     assert grid_call[1] == name and grid_call[2] == label
     assert [c.params for c in grid_call[3]] == [c.params for c in candidates]
@@ -2077,42 +2158,129 @@ for offset, name, label, candidates, top in ((0, "HGB", "HGB fit", hgb_candidate
     # ... ranked by the settings' selection metric, passed by keyword.
     assert grid_call[8] == settings.diagnostic.selection_metric, grid_call[8]
     # choose_and_test: the same candidates and the grid just returned, refit and test inputs.
+    test_call = take("choose_and_test")
     assert test_call[1] == name and test_call[2] == label
     assert test_call[3] is grid_call[3]
     assert test_call[4]["candidate"].tolist() == TOPS[name]
     same(test_call[5:7], "refit")
     same(test_call[7:9], "test")
     # The importance model: the grid's top candidate, refitted on the TRAIN rows.
+    fit_call = take("fit")
     assert fit_call[1] == label
     same(fit_call[2:4], "train")
     assert fit_call[4] == candidates[top].settings
-    assert fit_call[5] == "balanced"
+    assert fit_call[5] == diagnostic.class_weight_argument(candidates[top].class_weight)
+    model = ("model", label, position(fit_call) + 1)
     # Its permutation importance on the VALIDATION rows, with the settings' repeats and seed.
-    assert importance_call[1] == ("model", label, offset + 3)
+    importance_call = take("permutation_importances")
+    assert importance_call[1] == model
     same(importance_call[2:4], "validation")
     assert importance_call[4] == 2 and importance_call[5] == 3
     # The printout gets this model's grid and importance.
+    show_call = take("show_diagnostic_grid")
     assert show_call[1] == name
     assert show_call[2] is test_call[4]
     assert show_call[3]["feature"].tolist() == list(expected("validation")[0].columns)
     assert show_call[4] == settings.diagnostic.selection_metric, show_call[4]
+    grids[name], importances[name] = show_call[2], show_call[3]
+    # U10.4d: the best unweighted setting of this grid.
+    best_call = take("best_unweighted")
+    assert best_call[1] is test_call[4] and best_call[2] is grid_call[3]
+    unweighted = best_call[3]
+    if unweighted is None:
+        continue
+    assert unweighted.class_weight == "none"
+    chosen = grid_call[3][top]
+    if unweighted is not chosen:
+        # Refitted on the TRAIN rows with the unweighted settings and no class_weight.
+        refit = take("fit")
+        assert refit[1] == label
+        same(refit[2:4], "train")
+        assert refit[4] is unweighted.settings
+        assert refit[5] == "NOT GIVEN", refit[5]
+        model = ("model", label, position(refit) + 1)
+        refitted.append(name)
+    # Platt: fitted on this model's validation p against the validation outcomes.
+    platt_predict = take("predict_paid")
+    assert platt_predict[1] == model, (platt_predict[1], model)
+    pd.testing.assert_frame_equal(platt_predict[2], expected("validation")[0])
+    platt_call = take("fit_platt")
+    pd.testing.assert_series_equal(platt_call[1], expected("validation")[1])
+    assert platt_call[2] is platt_predict[3]
+    a, b = PLATT[len(calibrated)]
+    for part in ("validation", "test"):
+        predict_call = take("predict_paid")
+        assert predict_call[1] == model
+        pd.testing.assert_frame_equal(predict_call[2], expected(part)[0])
+        apply_call = take("apply_platt")
+        assert apply_call[1] is predict_call[3]
+        assert (apply_call[2], apply_call[3]) == (a, b)
+        stored[part][name] = predict_call[3]
+        stored[part][name + " + Platt"] = apply_call[4]
+    calibrated.append(name)
 
-test_table = calls[10][1]
+REFERENCES = ["base rate", "base rate per h", "own rate"]
+comparisons = {}
+for part in ("validation", "test"):
+    reference_call = take("reference_probabilities")
+    pd.testing.assert_frame_equal(reference_call[1], splits.train)
+    pd.testing.assert_frame_equal(reference_call[2], getattr(splits, part))
+    assert reference_call[3] == settings.diagnostic.reference_window
+    assert reference_call[4] == settings.diagnostic.reference_prior_weeks
+    references = reference_call[5]
+    comparison_call = take("calibration_comparison")
+    pd.testing.assert_series_equal(comparison_call[1], expected(part)[1])
+    pd.testing.assert_series_equal(comparison_call[2], getattr(splits, part)["h"])
+    predictions = comparison_call[3]
+    assert list(predictions) == list(stored[part]) + REFERENCES, list(predictions)
+    for label, p in stored[part].items():
+        assert predictions[label] is p, label
+    for column in REFERENCES:
+        pd.testing.assert_series_equal(predictions[column], references[column])
+    pd.testing.assert_series_equal(comparison_call[4], references["base rate"])
+    assert comparison_call[5] == settings.diagnostic.calibration_groups
+    comparisons[part] = comparison_call
+
+show_calibration_call = take("show_calibration")
+show_test_call = take("show_diagnostic_test")
+write_call = take("write_tables")
+assert queue == [], [call[0] for call in queue]
+
+test_table = show_test_call[1]
 pd.testing.assert_frame_equal(test_table, pd.DataFrame([{"model": "HGB", "F1": 0.5},
                                                         {"model": "LR", "F1": 0.25}]))
-folder, tables = calls[11][1], calls[11][2]
+folder, tables = write_call[1], write_call[2]
 assert folder == settings.diagnostic.output_folder
-assert list(tables) == ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "test"]
-assert tables["hgb_grid"] is calls[0 + 4][2] and tables["lr_grid"] is calls[5 + 4][2]
-assert tables["hgb_importance"] is calls[0 + 4][3]
-assert tables["lr_importance"] is calls[5 + 4][3]
+assert list(tables) == ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance",
+                        "calibration", "reliability", "test"], list(tables)
+assert tables["hgb_grid"] is grids["HGB"] and tables["lr_grid"] is grids["LR"]
+assert tables["hgb_importance"] is importances["HGB"]
+assert tables["lr_importance"] is importances["LR"]
 assert tables["test"] is test_table
+# The calibration tables: validation then test, each with "part" put first.
+calibration, reliability = tables["calibration"], tables["reliability"]
+assert show_calibration_call[1] is calibration
+labels = list(stored["validation"]) + REFERENCES
+assert calibration["part"].tolist() == ["validation"] * len(labels) + ["test"] * len(labels)
+assert calibration["model"].tolist() == labels * 2
+assert list(calibration.columns) == ["part", "model", "h", "log loss skill"]
+assert list(reliability.columns) == ["part", "model", "h", "group"]
+assert reliability["part"].tolist() == ["validation"] * len(labels) + ["test"] * len(labels)
+assert list(calibration.index) == list(range(2 * len(labels)))
+pd.testing.assert_frame_equal(
+    calibration, pd.concat([comparisons["validation"][6], comparisons["test"][6]],
+                           ignore_index=True))
+pd.testing.assert_frame_equal(
+    reliability, pd.concat([comparisons["validation"][7], comparisons["test"][7]],
+                           ignore_index=True))
 """
 
 
 @pytest.mark.parametrize("company", [False, True], ids=["no company", "company"])
 def test_step_13_data_flow_call_by_call(company, tmp_path):
-    result = run_step_13(tmp_path / "spy", company=company, stubs=SPY_STUBS, after=SPY_CHECKS)
+    after = SPY_CHECKS + ("assert calibrated == ['HGB', 'LR'], calibrated\n"
+                          "assert refitted == ['HGB', 'LR'], refitted\n")
+    result = run_step_13(tmp_path / "spy", company=company, stubs=spy_stubs(), after=after)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "ok"
     # Only the splits come from the real functions; the stubs print nothing.
@@ -2123,10 +2291,99 @@ def test_step_13_data_flow_call_by_call(company, tmp_path):
 def test_step_13_spy_stubs_bite():
     # The spy checks fail when the recorded calls are wrong (so the data-flow test means
     # something): here the recorded calls are emptied before the checks run.
-    result = run_step_13(REPO_ROOT / "never_written", stubs=SPY_STUBS,
+    result = run_step_13(REPO_ROOT / "never_written", stubs=spy_stubs(),
                          after="calls.clear()\n" + SPY_CHECKS)
     assert result.returncode != 0
     assert "AssertionError" in result.stderr
+
+
+# --- U10.4d: step 13's calibration, by the spy run ---------------------------------------------
+
+def test_step_13_refits_the_unweighted_setting_when_the_chosen_one_is_weighted(tmp_path):
+    # Default tops: HGB's chosen 1 and LR's chosen 3 are balanced, so the best unweighted
+    # (HGB 0, LR 2) is refitted on train without a class_weight (checked in SPY_CHECKS).
+    after = SPY_CHECKS + ("assert refitted == ['HGB', 'LR']\n"
+                          "assert [c[4] for c in calls if c[0] == 'fit'] == [\n"
+                          "    hgb_candidates[1].settings, hgb_candidates[0].settings,\n"
+                          "    lr_candidates[3].settings, lr_candidates[2].settings]\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after)
+    assert result.returncode == 0, result.stderr
+
+
+def test_step_13_reuses_the_importance_model_when_the_chosen_setting_is_unweighted(tmp_path):
+    # HGB's top 0 and LR's top 2 are unweighted: no second fit, Platt and the p come from the
+    # importance model itself.
+    tops = {"HGB": [0, 1, 2, 3], "LR": [2, 3, 1, 0]}
+    after = SPY_CHECKS + ("assert refitted == [], refitted\n"
+                          "assert calibrated == ['HGB', 'LR']\n"
+                          "fits = [c for c in calls if c[0] == 'fit']\n"
+                          "assert len(fits) == 2, len(fits)\n"
+                          "models = {c[1] for c in calls if c[0] == 'predict_paid'}\n"
+                          "assert models == {('model', 'HGB fit', position(fits[0]) + 1),\n"
+                          "                  ('model', 'LR fit', position(fits[1]) + 1)}\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(tops), after=after)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"
+
+
+def test_step_13_mixed_reuse_and_refit(tmp_path):
+    # HGB's chosen setting is unweighted (reuse), LR's is weighted (refit).
+    tops = {"HGB": [2, 3, 1, 0], "LR": [1, 0, 2, 3]}
+    after = SPY_CHECKS + "assert refitted == ['LR'], refitted\n"
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(tops), after=after)
+    assert result.returncode == 0, result.stderr
+
+
+def test_step_13_platt_labels_and_printout(tmp_path):
+    after = SPY_CHECKS + (
+        "assert list(stored['validation']) == ['HGB', 'HGB + Platt', 'LR', 'LR + Platt']\n"
+        "assert list(stored['test']) == list(stored['validation'])\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    platt = [line for line in lines if "Platt correction" in line]
+    assert platt == ["        HGB: Platt correction fitted on validation: a 1.5000, b -0.2500",
+                     "        LR: Platt correction fitted on validation: a 0.7500, b 0.1250"]
+    assert not any("calibration skipped" in line for line in lines)
+
+
+def test_step_13_skips_the_calibration_of_a_model_without_an_unweighted_setting(tmp_path):
+    # best_unweighted returns None for HGB only: HGB gets no Platt, no p, no extra fit; LR
+    # still runs (the loop continues), and the references are still added for both parts.
+    after = SPY_CHECKS + (
+        "assert calibrated == ['LR'], calibrated\n"
+        "assert list(stored['validation']) == ['LR', 'LR + Platt']\n"
+        "assert [c[1] for c in calls if c[0] == 'grid_search'] == ['HGB', 'LR']\n"
+        "assert [c[1] for c in calls if c[0] == 'fit'].count('HGB fit') == 1\n"
+        "for part in ('validation', 'test'):\n"
+        "    assert list(comparisons[part][3]) == ['LR', 'LR + Platt', 'base rate',\n"
+        "                                          'base rate per h', 'own rate']\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(skip_first=True), after=after)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert "        HGB: the grid has no unweighted setting; calibration skipped" in lines
+    assert not any(line.startswith("        LR: the grid has no unweighted") for line in lines)
+    assert [line for line in lines if "Platt correction" in line] == [
+        "        LR: Platt correction fitted on validation: a 1.5000, b -0.2500"]
+
+
+def test_step_13_references_are_added_for_both_parts(tmp_path):
+    after = SPY_CHECKS + (
+        "refs = [c for c in calls if c[0] == 'reference_probabilities']\n"
+        "assert len(refs) == 2\n"
+        "assert [len(c[2]) for c in refs] == [len(splits.validation), len(splits.test)]\n"
+        "for part in ('validation', 'test'):\n"
+        "    assert list(comparisons[part][3])[-3:] == REFERENCES\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after)
+    assert result.returncode == 0, result.stderr
+
+
+def test_step_13_the_calibration_and_reliability_tables_are_written(tmp_path):
+    after = SPY_CHECKS + ("assert 'calibration' in tables and 'reliability' in tables\n"
+                          "assert tables['calibration'] is show_calibration_call[1]\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after)
+    assert result.returncode == 0, result.stderr
+
 
 
 STEP_13_WIRING = """
@@ -2137,8 +2394,11 @@ import run_hurdle_pipeline as script
 from collection_estimation.hurdle import diagnostic
 
 for name in ("diagnostic_splits", "grid_search", "choose_and_test", "class_weight_argument",
-             "hgb_candidates", "lr_candidates", "permutation_importances", "write_tables"):
+             "hgb_candidates", "lr_candidates", "permutation_importances", "write_tables",
+             "best_unweighted", "fit_platt", "apply_platt", "reference_probabilities",
+             "calibration_comparison"):
     assert getattr(script, name) is getattr(diagnostic, name), name
+inspect.signature(script.show_calibration).bind("calibration")
 # The U10.4a demo's functions are no longer imported.
 assert not hasattr(script, "best_threshold")
 assert not hasattr(script, "classification_scores")
@@ -2199,7 +2459,9 @@ def test_step_13_each_diagnostic_function_is_called_once_in_main():
     tree = main_tree()
     for name in ("diagnostic_splits", "show_diagnostic_splits", "hgb_candidates",
                  "lr_candidates", "grid_search", "choose_and_test", "permutation_importances",
-                 "show_diagnostic_grid", "show_diagnostic_test", "write_tables"):
+                 "show_diagnostic_grid", "show_diagnostic_test", "write_tables",
+                 "best_unweighted", "fit_platt", "apply_platt", "reference_probabilities",
+                 "calibration_comparison", "show_calibration"):
         assert len(calls_to(tree, name)) == 1, name
     for gone in ("best_threshold", "classification_scores"):
         assert calls_to(tree, gone) == [], gone
@@ -2343,9 +2605,11 @@ def test_step_13_spy_passes_the_settings_metric_through(metric, tmp_path):
     # SPY_CHECKS assert grid_search got metric=settings.diagnostic.selection_metric by keyword
     # and show_diagnostic_grid got it as its 4th argument; here for each metric.
     after = SPY_CHECKS + (f"assert settings.diagnostic.selection_metric == {metric!r}\n"
-                          f"assert calls[0][8] == calls[5][8] == {metric!r}\n"
-                          f"assert calls[4][4] == calls[9][4] == {metric!r}\n")
-    result = run_step_13(tmp_path / "spy", stubs=SPY_STUBS, after=after, metric=metric)
+                          f"assert [c[8] for c in calls if c[0] == 'grid_search'] == "
+                          f"[{metric!r}] * 2\n"
+                          f"assert [c[4] for c in calls if c[0] == 'show_diagnostic_grid'] == "
+                          f"[{metric!r}] * 2\n")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after, metric=metric)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "ok"
 
@@ -2353,7 +2617,7 @@ def test_step_13_spy_passes_the_settings_metric_through(metric, tmp_path):
 def test_step_13_spy_metric_check_bites(tmp_path):
     # The pass-through check fails when the settings say something else than was passed.
     after = SPY_CHECKS + "assert calls[0][8] == 'log loss', calls[0][8]\n"
-    result = run_step_13(tmp_path / "spy", stubs=SPY_STUBS, after=after, metric="brier")
+    result = run_step_13(tmp_path / "spy", stubs=spy_stubs(), after=after, metric="brier")
     assert result.returncode != 0
     assert "AssertionError" in result.stderr
 
@@ -2430,3 +2694,246 @@ def test_the_synthetic_settings_choose_the_diagnostic_by_log_loss():
     from collection_estimation.hurdle.settings import load_settings
     settings = load_settings(REPO_ROOT / "settings" / "synthetic.toml", REPO_ROOT)
     assert settings.diagnostic.selection_metric == "log loss"
+
+
+# --- U10.4d: step 13's calibration, by the real run ---------------------------------------------
+# The real block on the tiny table (real_run above): for each model the best unweighted setting
+# fitted on train, its Platt correction from the validation p, then calibration_comparison of
+# the models, the corrected models and the three references, on validation and on test.
+
+import re  # noqa: E402
+
+CALIBRATION_KEYS = ["mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
+                    "calibration error", "resolution", "uncertainty", "decomposition gap",
+                    "log loss skill", "brier skill", "AUC"]
+CALIBRATION_LABELS = ["HGB", "HGB + Platt", "LR", "LR + Platt", "base rate", "base rate per h",
+                      "own rate"]
+PLATT_LINE = re.compile(r"^        (HGB|LR): Platt correction fitted on validation: "
+                        r"a -?\d+\.\d{4}, b -?\d+\.\d{4}$")
+
+
+def read_calibration(folder):
+    import pandas as pd
+    return pd.read_csv(folder / "calibration.csv", dtype={"h": str})
+
+
+def test_step_13_real_run_prints_one_platt_line_per_model(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    platt = [line for line in real_run.lines if PLATT_LINE.match(line)]
+    assert [PLATT_LINE.match(line).group(1) for line in platt] == ["HGB", "LR"], platt
+    assert not any("calibration skipped" in line for line in real_run.lines)
+
+
+def test_step_13_real_run_calibration_table_shape_and_order(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    calibration = read_calibration(real_run.output)
+    assert list(calibration.columns) == ["part", "model", "h"] + CALIBRATION_KEYS
+    expected = [(part, label, h) for part in ("validation", "test")
+                for label in CALIBRATION_LABELS for h in ("1", "2", "all")]
+    assert list(zip(calibration["part"], calibration["model"], calibration["h"])) == expected
+
+
+def test_step_13_real_run_reliability_table(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    import pandas as pd
+    reliability = pd.read_csv(real_run.output / "reliability.csv", dtype={"h": str})
+    assert list(reliability.columns) == ["part", "model", "h", "group", "p_low", "p_high",
+                                         "mean_p", "share_paid", "rows"]
+    assert len(reliability) == 2 * 7 * 3 * 4
+    for (part, label, h), block in reliability.groupby(["part", "model", "h"], sort=False):
+        assert block["group"].tolist() == [1, 2, 3, 4], (part, label, h)
+    all_rows = reliability[reliability["h"] == "all"]
+    assert set(all_rows.groupby(["part", "model"])["rows"].sum()) == {54}
+
+
+def test_step_13_real_run_platt_is_calibrated_in_sample_on_validation(real_run):
+    # The correction was fitted on exactly these rows: its slope and intercept there are
+    # 1 and 0, and its mean p is the share paid (up to the solver's tolerance).
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    calibration = read_calibration(real_run.output)
+    pooled = calibration[(calibration["part"] == "validation") & (calibration["h"] == "all")]
+    for label in ("HGB + Platt", "LR + Platt"):
+        row = pooled[pooled["model"] == label].iloc[0]
+        assert row["slope"] == pytest.approx(1.0, abs=0.02), (label, row["slope"])
+        assert row["intercept"] == pytest.approx(0.0, abs=0.02), (label, row["intercept"])
+        assert row["mean p"] == pytest.approx(row["share paid"], abs=1e-3), label
+
+
+def test_step_13_real_run_platt_does_not_change_the_ranking(real_run):
+    # Platt is monotone (for a > 0), so each model's AUC is unchanged by it.
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    calibration = read_calibration(real_run.output).set_index(["part", "model", "h"])
+    for part in ("validation", "test"):
+        for h in ("1", "2", "all"):
+            for name in ("HGB", "LR"):
+                assert calibration.loc[(part, f"{name} + Platt", h), "AUC"] == pytest.approx(
+                    calibration.loc[(part, name, h), "AUC"], abs=1e-12), (part, name, h)
+
+
+def test_step_13_real_run_the_base_rate_has_no_skill_against_itself(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    calibration = read_calibration(real_run.output)
+    base = calibration[calibration["model"] == "base rate"]
+    assert len(base) == 6
+    assert base["log loss skill"].abs().max() < 1e-12
+    assert base["brier skill"].abs().max() < 1e-12
+
+
+def test_step_13_real_run_share_paid_is_the_same_for_every_label(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    calibration = read_calibration(real_run.output)
+    for (part, h), block in calibration.groupby(["part", "h"]):
+        assert block["share paid"].nunique() == 1, (part, h)
+
+
+def test_step_13_real_run_printout_shows_the_test_calibration(real_run):
+    assert real_run.result.returncode == 0, real_run.result.stderr
+    lines = real_run.lines
+    start = lines.index("        CALIBRATION on test, all horizons (train-only models; skill "
+                        "against the base rate):")
+    header = lines[start + 1].split()
+    assert header[:3] == ["model", "mean", "p"] and header[-1] == "AUC"
+    shown = lines[start + 2:start + 2 + 7]
+    for line, label in zip(shown, CALIBRATION_LABELS):
+        assert line.strip().startswith(label), (line, label)
+    middle = lines.index("        log-loss skill per horizon, on test:")
+    assert middle == start + 2 + 7
+
+
+REFERENCE_CHECK = """
+from collection_estimation.hurdle.diagnostic import (calibration_comparison,
+                                                     diagnostic_splits, reference_probabilities)
+calibration = pd.read_csv(settings.diagnostic.output_folder / "calibration.csv",
+                          dtype={"h": str})
+splits = diagnostic_splits(table, 4, 2)
+for part in ("validation", "test"):
+    rows = getattr(splits, part)
+    refs = reference_probabilities(splits.train, rows, 13, 1.0)
+    direct, _ = calibration_comparison(rows["paid"].astype(bool), rows["h"], dict(refs),
+                                       refs["base rate"], 4)
+    written = calibration[(calibration["part"] == part)
+                          & calibration["model"].isin(list(refs.columns))]
+    assert len(written) == len(direct) == 9
+    for (_, want), (_, got) in zip(direct.iterrows(), written.iterrows()):
+        assert want["model"] == got["model"] and str(want["h"]) == got["h"]
+        for key in direct.columns[2:]:
+            assert np.isclose(want[key], got[key], rtol=1e-9, atol=1e-12), (part, key)
+base = splits.train["paid"].astype(bool).mean()
+assert np.allclose(calibration.loc[calibration["model"] == "base rate", "mean p"], base)
+"""
+
+
+def test_step_13_real_run_reference_rows_equal_a_direct_comparison(tmp_path):
+    result = run_step_13(tmp_path / "out", after=REFERENCE_CHECK)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"
+
+
+def test_step_13_real_run_with_only_weighted_settings_skips_both_calibrations(tmp_path):
+    output = tmp_path / "weighted"
+    result = run_step_13(output, weights=("balanced",))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    for name in ("HGB", "LR"):
+        assert lines.count(f"        {name}: the grid has no unweighted setting; calibration "
+                           f"skipped") == 1
+    assert not any("Platt" in line for line in lines)
+    assert sorted(path.name for path in output.iterdir()) == sorted(
+        name + ".csv" for name in TABLE_NAMES)
+    calibration = read_calibration(output)
+    assert calibration["model"].unique().tolist() == ["base rate", "base rate per h",
+                                                      "own rate"]
+    assert calibration["part"].unique().tolist() == ["validation", "test"]
+    # The skip line comes right before the next model's progress lines.
+    skip = lines.index("        HGB: the grid has no unweighted setting; calibration skipped")
+    assert lines[skip + 1].startswith("  ... LR 1 of 2"), lines[skip + 1]
+
+
+# --- show_calibration ----------------------------------------------------------------------------
+
+SHOW_CALIBRATION = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+keys = ["mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
+        "calibration error", "resolution", "uncertainty", "decomposition gap",
+        "log loss skill", "brier skill", "AUC"]
+rows = []
+for part, offset in (("validation", 0.5), ("test", 0.0)):
+    for m, label in enumerate(["Zeta", "Alpha + Platt", "base rate"]):
+        for k, h in enumerate([1, 2, "all"]):
+            values = {key: offset + 0.0123456789 * (i + 1) + 0.1 * m + 0.01 * k
+                      for i, key in enumerate(keys)}
+            rows.append({"part": part, "model": label, "h": h, **values})
+calibration = pd.DataFrame(rows)
+before = calibration.copy(deep=True)
+script.show_calibration(calibration)
+pd.testing.assert_frame_equal(calibration, before)
+print("EXPECTED")
+test = before[before["part"] == "test"]
+columns = ["model", "mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
+           "log loss skill", "brier skill", "AUC"]
+print(test[test["h"] == "all"][columns].round(4).to_string(index=False))
+print("PIVOT")
+for label in ["Zeta", "Alpha + Platt", "base rate"]:
+    print(label + " [" + ", ".join(
+        str(round(v, 4)) for v in test[test["model"] == label]["log loss skill"]) + "]")
+"""
+
+
+def test_show_calibration_printout():
+    result = run_code(SHOW_CALIBRATION)
+    assert result.returncode == 0, result.stderr
+    out, rest = result.stdout.split("EXPECTED\n")
+    table, pivot_rows = rest.split("PIVOT\n")
+    lines = out.splitlines()
+    assert lines[0] == ("        CALIBRATION on test, all horizons (train-only models; skill "
+                        "against the base rate):")
+    shown = table.splitlines()
+    assert len(shown) == 1 + 3
+    assert lines[1:1 + len(shown)] == shown
+    assert lines[1 + len(shown)] == "        log-loss skill per horizon, on test:"
+    pivot = lines[2 + len(shown):]
+    # Two header lines (h, then model), then one line per model in first-seen order (Zeta
+    # before Alpha: not sorted), its log-loss skill for h 1, 2 and all.
+    assert len(pivot) == 2 + 3, pivot
+    assert pivot[0].split() == ["h", "1", "2", "all"]
+    assert pivot[1].split() == ["model"]
+    expected = {}
+    for line in pivot_rows.splitlines():
+        label, values = line.split(" [")
+        expected[label] = [float(v) for v in values.rstrip("]").split(", ")]
+    for line, label in zip(pivot[2:], ["Zeta", "Alpha + Platt", "base rate"]):
+        assert line.startswith(label), (line, label)
+        assert [float(v) for v in line[len(label):].split()] == expected[label]
+
+
+def test_show_calibration_shows_only_test_rows_pooled_and_rounds():
+    result = run_code(SHOW_CALIBRATION)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout.split("EXPECTED\n")[0]
+    lines = out.splitlines()
+    table = lines[2:5]
+    assert [line.split()[0] for line in table] == ["Zeta", "Alpha", "base"]
+    # Validation values are 0.5 higher: Zeta's pooled mean p there is 0.5 + .0123 + .02 =
+    # 0.5323; on test 0.0323 (rounded to 4 places).
+    assert "0.5323" not in out
+    assert table[0].split()[1] == "0.0323"
+    assert "0.032345" not in out
+    header = lines[1]
+    for gone in ("calibration error", "resolution", "uncertainty", "decomposition gap"):
+        assert gone not in header
+    assert header.split()[0] == "model" and "part" not in header
+
+
+def test_show_calibration_without_test_rows_does_not_fail():
+    code = ("import pandas as pd\nimport run_hurdle_pipeline as script\n"
+            "script.show_calibration(pd.DataFrame({'part': ['validation'], 'model': ['M'], "
+            "'h': ['all'], 'mean p': [0.1], 'share paid': [0.1], 'ECE': [0.0], 'slope': [1.0], "
+            "'intercept': [0.0], 'log loss': [0.3], 'brier': [0.1], 'log loss skill': [0.0], "
+            "'brier skill': [0.0], 'AUC': [0.5]}))\nprint('ok')\n")
+    result = run_code(code)
+    # Pinned behaviour: with no test rows the printout's tables are empty, nothing fails.
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"

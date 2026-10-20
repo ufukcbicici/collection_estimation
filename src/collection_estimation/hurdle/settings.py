@@ -71,6 +71,9 @@ class DiagnosticSettings:
     lr_c: tuple[float, ...]                   # the grid of the logistic regression
     class_weights: tuple[str, ...]            # "none" and/or "balanced", for both models
     selection_metric: str                     # validation score choosing each model's setting
+    calibration_groups: int                   # groups of the reliability table (by p, equal size)
+    reference_window: int                     # history window of the "own rate" reference
+    reference_prior_weeks: float              # imaginary weeks at the base rate in "own rate"
     importance_repeats: int                   # shuffles per feature for permutation importance
     output_folder: Path                       # where the result tables are written as CSV
 
@@ -148,7 +151,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     diagnostic = raw["diagnostic"]
     check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
                             "hgb_max_leaf_nodes", "lr_c", "class_weights", "selection_metric",
-                            "importance_repeats", "output_folder"}, f"{name} [diagnostic]")
+                            "calibration_groups", "reference_window",
+                            "reference_prior_weeks", "importance_repeats", "output_folder"},
+               f"{name} [diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -158,6 +163,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     ledger_layout = raw["ledger_layout"]
     check_keys(ledger_layout, {"header_row", "first_data_row", "headers", "document_types"},
                f"{name} [ledger_layout]")
+
+    windows = window_list_setting(history, "windows", f"{name} [history]")
 
     return Settings(
         settings_file=settings_file.resolve(),
@@ -188,7 +195,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                                f"{name} [receivables]"),
         ),
         history=HistorySettings(
-            windows=window_list_setting(history, "windows", f"{name} [history]"),
+            windows=windows,
             use_ledger_before_first_file=bool_setting(history, "use_ledger_before_first_file",
                                                       f"{name} [history]"),
         ),
@@ -217,6 +224,12 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                        class_weight_setting),
             selection_metric=selection_metric_setting(diagnostic, "selection_metric",
                                                       f"{name} [diagnostic]"),
+            calibration_groups=group_count_setting(diagnostic, "calibration_groups",
+                                                   f"{name} [diagnostic]"),
+            reference_window=reference_window_setting(diagnostic, "reference_window",
+                                                      f"{name} [diagnostic]", windows),
+            reference_prior_weeks=positive_number_setting(diagnostic, "reference_prior_weeks",
+                                                          f"{name} [diagnostic]"),
             importance_repeats=count_setting(diagnostic, "importance_repeats",
                                              f"{name} [diagnostic]"),
             output_folder=path_setting(diagnostic, "output_folder", repo_root,
@@ -427,6 +440,26 @@ def count_setting(table: dict, key: str, where: str) -> int:
     # bool is a subclass of int in Python, so it is excluded explicitly.
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{where}: {key} is {value!r}, not a whole number of 1 or more")
+    return value
+
+
+def reference_window_setting(table: dict, key: str, where: str,
+                             windows: tuple[int, ...]) -> int:
+    """A history window for a reference: one of the [history] `windows` (only those have
+    history columns)."""
+    value = count_setting(table, key, where)
+    if value not in windows:
+        raise ValueError(f"{where}: {key} is {value}, not one of the [history] windows "
+                         f"{list(windows)}")
+    return value
+
+
+def group_count_setting(table: dict, key: str, where: str) -> int:
+    """A number of groups: a whole number, 2 or more."""
+    value = table[key]
+    # bool is a subclass of int in Python, so it is excluded explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError(f"{where}: {key} is {value!r}, not a whole number of 2 or more")
     return value
 
 
