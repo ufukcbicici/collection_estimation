@@ -153,6 +153,7 @@ VALID = {
     "diagnostic": {"run": "true", "origin": "40", "hgb_max_iter": "[100, 300, 600]",
                    "hgb_learning_rate": "[0.05, 0.1]", "hgb_max_leaf_nodes": "[15, 31, 63]",
                    "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
+                   "selection_metric": '"log loss"',
                    "importance_repeats": "3", "output_folder": '"results/diagnostic"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
@@ -308,6 +309,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
+    ("diagnostic", "selection_metric"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
@@ -434,6 +436,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
+    ("diagnostic", "selection_metric"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
 ])
@@ -2608,7 +2611,8 @@ def test_the_synthetic_stage1_and_demo_origin_settings():
 
 DIAG = f"{FILE_NAME} [diagnostic]"
 DIAGNOSTIC_KEYS = ['class_weights', 'hgb_learning_rate', 'hgb_max_iter', 'hgb_max_leaf_nodes',
-                   'importance_repeats', 'lr_c', 'origin', 'output_folder', 'run']
+                   'importance_repeats', 'lr_c', 'origin', 'output_folder', 'run',
+                   'selection_metric']
 
 
 def test_the_diagnostic_section_is_read(tmp_path, repo):
@@ -2617,7 +2621,7 @@ def test_the_diagnostic_section_is_read(tmp_path, repo):
     assert diagnostic == DiagnosticSettings(
         run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
         hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
-        class_weights=("none", "balanced"), importance_repeats=3,
+        class_weights=("none", "balanced"), selection_metric="log loss", importance_repeats=3,
         output_folder=(repo / "results" / "diagnostic").resolve())
 
 
@@ -2626,6 +2630,7 @@ def test_the_diagnostic_values_have_the_right_python_types(tmp_path, repo):
     assert diagnostic.run is True
     assert type(diagnostic.origin) is int
     assert type(diagnostic.importance_repeats) is int
+    assert type(diagnostic.selection_metric) is str
     for name, item_type in (("hgb_max_iter", int), ("hgb_learning_rate", float),
                             ("hgb_max_leaf_nodes", int), ("lr_c", float),
                             ("class_weights", str)):
@@ -2639,7 +2644,7 @@ def test_the_diagnostic_values_have_the_right_python_types(tmp_path, repo):
 def test_diagnostic_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(DiagnosticSettings)] == [
         "run", "origin", "hgb_max_iter", "hgb_learning_rate", "hgb_max_leaf_nodes", "lr_c",
-        "class_weights", "importance_repeats", "output_folder"]
+        "class_weights", "selection_metric", "importance_repeats", "output_folder"]
 
 
 def test_settings_has_a_diagnostic_field_between_stage1_and_debug():
@@ -2936,9 +2941,10 @@ def test_grid_setting_with_the_key_absent_raises_key_error():
 def test_the_synthetic_diagnostic_settings():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.diagnostic == DiagnosticSettings(
-        run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
-        hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
-        class_weights=("none", "balanced"), importance_repeats=3,
+        run=True, origin=40, hgb_max_iter=(100, 300, 600, 900),
+        hgb_learning_rate=(0.01, 0.05, 0.1), hgb_max_leaf_nodes=(15, 31, 63),
+        lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none", "balanced"),
+        selection_metric="log loss", importance_repeats=3,
         output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_diagnostic").resolve())
 
 
@@ -2947,3 +2953,108 @@ def test_the_synthetic_file_has_no_diagnose_class_weights():
     raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
     assert "diagnose_class_weights" not in raw["stage1"]
     assert "diagnostic" in raw
+
+
+# --- [diagnostic] selection_metric (U10.4b') ---------------------------------------------------
+# The validation score that chooses each model's setting in the stage 1 diagnostic: exactly one
+# of "log loss", "brier", "avg precision" (case and spacing matter).
+
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    SELECTION_METRICS,
+    selection_metric_setting,
+)
+
+METRIC_CHOICES = "['log loss', 'brier', 'avg precision']"
+
+
+def test_selection_metrics_constant():
+    assert SELECTION_METRICS == ("log loss", "brier", "avg precision")
+    assert type(SELECTION_METRICS) is tuple
+
+
+@pytest.mark.parametrize("good", ["log loss", "brier", "avg precision"])
+def test_selection_metric_setting_accepts_each_metric(good):
+    value = selection_metric_setting({"m": good}, "m", "here")
+    assert value == good and type(value) is str
+
+
+@pytest.mark.parametrize("bad", ["Log loss", "LOG LOSS", "log_loss", "logloss", "log-loss",
+                                 " log loss", "log loss ", "Brier", "brier score",
+                                 "average precision", "avg_precision", "AUC", "F1", "", None,
+                                 True, 1, 0.5, ["log loss"], ("log loss",), {"log loss": 1}])
+def test_selection_metric_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        selection_metric_setting({"m": bad}, "m", "here")
+    assert str(error.value) == f"here: m is {bad!r}, not one of {METRIC_CHOICES}"
+
+
+def test_selection_metric_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        selection_metric_setting({}, "m", "here")
+
+
+def test_selection_metric_setting_does_not_change_the_table():
+    table = {"m": "brier", "other": 1}
+    selection_metric_setting(table, "m", "here")
+    assert table == {"m": "brier", "other": 1}
+
+
+@pytest.mark.parametrize("good", ["log loss", "brier", "avg precision"])
+def test_the_selection_metric_is_read_from_the_file(tmp_path, repo, good):
+    settings = load(tmp_path, repo, changes={("diagnostic", "selection_metric"): f'"{good}"'})
+    assert settings.diagnostic.selection_metric == good
+    assert type(settings.diagnostic.selection_metric) is str
+
+
+def test_the_selection_metric_changes_nothing_else(tmp_path, repo):
+    base = load(tmp_path, repo).diagnostic
+    other = load(tmp_path, repo,
+                 changes={("diagnostic", "selection_metric"): '"avg precision"'}).diagnostic
+    assert other == dataclasses.replace(base, selection_metric="avg precision")
+
+
+@pytest.mark.parametrize("bad, shown", [('"Log loss"', "'Log loss'"), ('"AUC"', "'AUC'"),
+                                        ('"average precision"', "'average precision'"),
+                                        ('""', "''"), ("1", "1"), ("true", "True"),
+                                        ('["log loss"]', "['log loss']"),
+                                        ('{ a = "brier" }', "{'a': 'brier'}")])
+def test_a_bad_selection_metric_in_the_file_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "selection_metric"): bad})
+    assert message == f"{DIAG}: selection_metric is {shown}, not one of {METRIC_CHOICES}"
+
+
+def test_a_missing_selection_metric_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "selection_metric"): REMOVE})
+    assert message == (f"{DIAG}: missing ['selection_metric']; expected exactly "
+                       f"{DIAGNOSTIC_KEYS}")
+
+
+def test_a_selection_metric_typo_is_both_missing_and_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "selection_metric"): REMOVE,
+                                             ("diagnostic", "selection_metrics"): '"brier"'})
+    assert message == (f"{DIAG}: missing ['selection_metric']; unknown "
+                       f"['selection_metrics']; expected exactly {DIAGNOSTIC_KEYS}")
+
+
+def test_selection_metric_in_the_stage1_section_is_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "selection_metric"): '"brier"'})
+    assert message.startswith(f"{FILE_NAME} [stage1]: unknown ['selection_metric']; ")
+
+
+def test_the_selection_metric_is_checked_when_run_is_false(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "run"): "false",
+                                             ("diagnostic", "selection_metric"): '"AUC"'})
+    assert message == f"{DIAG}: selection_metric is 'AUC', not one of {METRIC_CHOICES}"
+
+
+def test_diagnostic_settings_selection_metric_sits_between_class_weights_and_repeats():
+    names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
+    assert (names.index("class_weights") + 1 == names.index("selection_metric")
+            == names.index("importance_repeats") - 1)
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_file_chooses_by_log_loss():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert raw["diagnostic"]["selection_metric"] == "log loss"
+    assert load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).diagnostic.selection_metric == "log loss"

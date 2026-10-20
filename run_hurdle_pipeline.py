@@ -347,9 +347,9 @@ def main():
         predictions[name] = predict_paid(model, forecast_x)
     show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
 
-    # Step 13: the stage 1 diagnostic (diagnostic only, never the forecast): stage 1 tuned as
-    # a classifier. For each model: a grid on validation (each setting at its own best-F1
-    # threshold), the best by average precision, refitted on train + validation and tested
+    # Step 13: the stage 1 diagnostic (diagnostic only, never the forecast): stage 1 tuned on
+    # its own. For each model: a grid on validation (each setting at its own best-F1
+    # threshold), the best by the selection metric, refitted on train + validation and tested
     # once with its validation threshold; then the permutation importance on validation.
     if settings.diagnostic.run:
         splits = diagnostic_splits(table, settings.diagnostic.origin,
@@ -366,7 +366,8 @@ def main():
                 ("HGB", fit_stage1, hgb_candidates(settings.stage1, settings.diagnostic)),
                 ("LR", fit_stage1_baseline, lr_candidates(settings.stage1,
                                                           settings.diagnostic))):
-            grid = grid_search(name, fit, candidates, *inputs["train"], *inputs["validation"])
+            grid = grid_search(name, fit, candidates, *inputs["train"], *inputs["validation"],
+                               metric=settings.diagnostic.selection_metric)
             tests.append(choose_and_test(name, fit, candidates, grid, *inputs["refit"],
                                          *inputs["test"]))
             # The importance of the chosen setting, fitted on the training rows, measured on
@@ -379,7 +380,7 @@ def main():
                                                  settings.stage1.random_seed)
             tables[f"{name.lower()}_grid"] = grid
             tables[f"{name.lower()}_importance"] = importance
-            show_diagnostic_grid(name, grid, importance)
+            show_diagnostic_grid(name, grid, importance, settings.diagnostic.selection_metric)
         tables["test"] = pd.DataFrame(tests)
         show_diagnostic_test(tables["test"])
         paths = write_tables(settings.diagnostic.output_folder, tables)
@@ -742,10 +743,11 @@ def show_diagnostic_splits(splits, origin, horizons):
               f"paid ({weeks})")
 
 
-def show_diagnostic_grid(name, grid, importance):
-    """A short printout of one model's diagnostic grid and permutation importance."""
+def show_diagnostic_grid(name, grid, importance, metric):
+    """A short printout of one model's diagnostic grid (ranked by `metric`) and permutation
+    importance."""
     columns = [column for column in grid.columns if column not in ("candidate",)]
-    print(f"        {name}: the 5 best of {len(grid)} settings by validation average precision")
+    print(f"        {name}: the 5 best of {len(grid)} settings by validation {metric}")
     print(grid[columns].head(5).round(4).to_string(index=False))
     print(f"        {name}: the 15 most important features (rise in validation log loss when "
           f"shuffled)")

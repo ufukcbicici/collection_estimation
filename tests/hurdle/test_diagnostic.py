@@ -551,7 +551,8 @@ def test_best_threshold_index_is_checked_before_the_classes():
 
 # --- classification_scores -------------------------------------------------------------------
 
-KEYS = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss"]
+KEYS = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss",
+        "brier"]
 
 # The worked example: actual T, T, F, F, T; p .9, .4, .6, .1, .7; threshold .5.
 # Predicted T, F, T, F, T: TP 2, FP 1, FN 1 -> precision 2/3, recall 2/3, F1 2/3.
@@ -602,7 +603,7 @@ def test_a_p_equal_to_the_threshold_is_predicted_to_pay():
 
 def test_threshold_free_scores_do_not_depend_on_the_threshold():
     a, b = example_scores(0.05), example_scores(0.95)
-    for key in ("AUC", "avg precision", "log loss"):
+    for key in ("AUC", "avg precision", "log loss", "brier"):
         assert a[key] == b[key], key
 
 
@@ -752,7 +753,8 @@ def diagnostic_settings(**changes):
     base = DiagnosticSettings(run=True, origin=40, hgb_max_iter=(10, 30),
                               hgb_learning_rate=(0.05, 0.1, 0.2), hgb_max_leaf_nodes=(3, 7),
                               lr_c=(0.01, 1.0, 100.0), class_weights=("none", "balanced"),
-                              importance_repeats=2, output_folder=Path("unused"))
+                              selection_metric="log loss", importance_repeats=2,
+                              output_folder=Path("unused"))
     return dataclasses.replace(base, **changes)
 
 
@@ -1015,17 +1017,20 @@ def test_the_hand_made_p_vectors_rank_good_mid_bad():
     assert ap[0] > ap[1] > ap[2]
 
 
-SCORE_KEYS = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss"]
+SCORE_KEYS = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss",
+              "brier"]
 
 
 # --- grid_search: shape ----------------------------------------------------------------------
 
-def fake_grid(assignment, weights=None, name="M"):
-    """grid_search over len(assignment) fake candidates; candidate i predicts assignment[i]."""
+def fake_grid(assignment, weights=None, name="M", metric="avg precision"):
+    """grid_search over len(assignment) fake candidates; candidate i predicts assignment[i].
+    Ranked by average precision unless `metric` says otherwise (the hand-made P_GOOD > P_MID
+    > P_BAD order is an average-precision order)."""
     candidates = fake_candidates(len(assignment), weights)
     fit = SpyFit(lambda s, w, x: assignment[s.tag])
     grid, out = run_quietly(grid_search, name, fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X,
-                            VAL_PAID)
+                            VAL_PAID, metric=metric)
     return grid, out, fit, candidates
 
 
@@ -1045,7 +1050,7 @@ def test_grid_search_hgb_params_columns_in_order():
     candidates = hgb_candidates(stage1_settings(), SMALL_HGB)
     fit = SpyFit(lambda s, w, x: P_MID)
     grid, _ = run_quietly(grid_search, "HGB", fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X,
-                          VAL_PAID)
+                          VAL_PAID, metric="log loss")
     assert list(grid.columns) == ["candidate"] + HGB_KEYS + SCORE_KEYS + ["fit seconds"]
 
 
@@ -1136,7 +1141,8 @@ def test_grid_search_rejects_a_bad_class_weight_with_the_exact_message():
                             class_weight="Balanced")]
     fit = SpyFit(lambda s, w, x: P_MID)
     with pytest.raises(ValueError) as error:
-        run_quietly(grid_search, "M", fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID)
+        run_quietly(grid_search, "M", fit, candidates, TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID,
+                    metric="log loss")
     assert str(error.value) == "class weight 'Balanced' is not 'none' or 'balanced'"
     assert fit.calls == []
 
@@ -1174,7 +1180,8 @@ def test_grid_search_does_not_change_its_inputs():
     candidates = fake_candidates(3)
     params_before = [dict(c.params) for c in candidates]
     fit = SpyFit(lambda s, w, x: [P_BAD, P_GOOD, P_MID][s.tag])
-    run_quietly(grid_search, "M", fit, candidates, train_x, train_paid, val_x, val_paid)
+    run_quietly(grid_search, "M", fit, candidates, train_x, train_paid, val_x, val_paid,
+                metric="brier")
     pd.testing.assert_frame_equal(train_x, TRAIN_X)
     pd.testing.assert_series_equal(train_paid, TRAIN_PAID)
     pd.testing.assert_frame_equal(val_x, VAL_X)
@@ -1199,7 +1206,7 @@ def test_grid_search_prints_one_progress_line_per_candidate_in_grid_order():
 def test_grid_search_empty_candidate_list_raises_the_exact_message():
     fit = SpyFit(lambda s, w, x: P_MID)
     with pytest.raises(ValueError) as error:
-        grid_search("LR", fit, [], TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID)
+        grid_search("LR", fit, [], TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID, metric="log loss")
     assert str(error.value) == "LR: the grid has no settings to try"
     assert fit.calls == []
 
@@ -1209,7 +1216,7 @@ def test_grid_search_one_class_validation_raises_from_best_threshold():
     fit = SpyFit(lambda s, w, x: P_MID)
     with pytest.raises(ValueError) as error:
         run_quietly(grid_search, "M", fit, fake_candidates(1), TRAIN_X, TRAIN_PAID, VAL_X,
-                    one_class)
+                    one_class, metric="log loss")
     assert str(error.value) == ONE_CLASS
 
 
@@ -1222,7 +1229,7 @@ def test_grid_search_real_thresholds_equal_an_independent_best_threshold(model, 
     else:
         fit, candidates = fit_stage1_baseline, lr_candidates(stage1_settings(), SMALL_LR)
     grid, _ = run_quietly(grid_search, model, fit, candidates, data.train_x, data.train_paid,
-                          data.validation_x, data.validation_paid)
+                          data.validation_x, data.validation_paid, metric="avg precision")
     assert len(grid) == len(candidates)
     thresholds = {}
     for _, row in grid.iterrows():
@@ -1257,7 +1264,8 @@ def hand_grid(rows):
     """A grid as grid_search returns it: candidate, k, class_weight, the scores."""
     return pd.DataFrame([{"candidate": c, "k": c, "class_weight": w, "F1": 0.5,
                           "precision": 0.5, "recall": 0.5, "threshold": t, "AUC": 0.5,
-                          "avg precision": ap, "log loss": 0.7, "fit seconds": 0.0}
+                          "avg precision": ap, "log loss": 0.7, "brier": 0.25,
+                          "fit seconds": 0.0}
                          for c, w, t, ap in rows])
 
 
@@ -1346,7 +1354,8 @@ def test_choose_and_test_does_not_change_the_grid():
 def test_choose_and_test_after_a_real_grid_search(data):
     candidates = lr_candidates(stage1_settings(), SMALL_LR)
     grid, _ = run_quietly(grid_search, "LR", fit_stage1_baseline, candidates, data.train_x,
-                          data.train_paid, data.validation_x, data.validation_paid)
+                          data.train_paid, data.validation_x, data.validation_paid,
+                          metric="avg precision")
     refit_x = pd.concat([data.train_x, data.validation_x])
     refit_paid = pd.concat([data.train_paid, data.validation_paid])
     result = choose_and_test("LR", fit_stage1_baseline, candidates, grid, refit_x, refit_paid,
@@ -1596,3 +1605,343 @@ def test_write_tables_does_not_change_the_tables(tmp_path):
     write_tables(tmp_path, tables)
     for name in tables:
         pd.testing.assert_frame_equal(tables[name], before[name])
+
+
+# =============================================================================================
+# U10.4b': the Brier score in classification_scores, LOWER_IS_BETTER, and grid_search ranked
+# by a chosen selection metric (log loss, brier or avg precision).
+# =============================================================================================
+
+from sklearn.metrics import brier_score_loss, log_loss  # noqa: E402
+
+from collection_estimation.hurdle.diagnostic import LOWER_IS_BETTER  # noqa: E402
+from collection_estimation.hurdle.settings import SELECTION_METRICS  # noqa: E402
+
+METRICS = ["log loss", "brier", "avg precision"]
+ALLOWED = "['log loss', 'brier', 'avg precision']"
+
+
+# --- classification_scores: brier ------------------------------------------------------------
+
+def test_scores_brier_by_hand():
+    # (p - outcome)^2: .1^2, .6^2, .6^2, .1^2, .3^2 = .01 + .36 + .36 + .01 + .09 = .83; / 5.
+    assert example_scores()["brier"] == pytest.approx(0.166)
+
+
+def test_scores_brier_comes_right_after_log_loss_and_last():
+    keys = list(example_scores())
+    assert keys[-2:] == ["log loss", "brier"]
+
+
+def test_scores_brier_is_zero_for_certain_right_answers():
+    scores = classification_scores(series([True, False, True]), series([1.0, 0.0, 1.0]), 0.5)
+    assert scores["brier"] == 0.0
+
+
+def test_scores_brier_is_one_for_certain_wrong_answers_unlike_log_loss():
+    # Brier is bounded by 1; log loss blows up (clipped) on the same rows.
+    scores = classification_scores(series([True, False]), series([0.0, 1.0]), 0.5)
+    assert scores["brier"] == 1.0
+    assert scores["log loss"] > 10
+
+
+def test_scores_brier_of_a_constant_half_is_a_quarter():
+    scores = classification_scores(series([True, False, False, True, False]),
+                                   series([0.5] * 5), 0.5)
+    assert scores["brier"] == pytest.approx(0.25)
+
+
+def test_scores_brier_does_not_depend_on_the_threshold():
+    assert example_scores(0.05)["brier"] == example_scores(0.95)["brier"]
+
+
+def test_scores_brier_is_a_float():
+    assert isinstance(example_scores()["brier"], float)
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_scores_brier_equals_the_mean_squared_error_of_p(seed):
+    rng = np.random.default_rng(7000 + seed)
+    n = int(rng.integers(2, 50))
+    actual = np.array([True, False] + list(rng.random(n - 2) < 0.4))
+    p = rng.random(n)
+    scores = classification_scores(series(actual), series(p), 0.5)
+    assert scores["brier"] == pytest.approx(float(np.mean((p - actual) ** 2)), abs=1e-12)
+    assert scores["brier"] == pytest.approx(brier_score_loss(actual, p), abs=1e-15)
+
+
+def test_scores_brier_with_nullable_boolean_and_int_actual_is_the_same():
+    plain = example_scores()["brier"]
+    for actual in (series(EX_ACTUAL, dtype="boolean"), series([int(a) for a in EX_ACTUAL])):
+        assert classification_scores(actual, series(EX_P), 0.5)["brier"] == plain
+
+
+# --- LOWER_IS_BETTER -------------------------------------------------------------------------
+
+def test_lower_is_better_constant():
+    assert LOWER_IS_BETTER == {"log loss": True, "brier": True, "avg precision": False}
+    assert list(LOWER_IS_BETTER) == METRICS
+
+
+def test_lower_is_better_keys_are_scores_of_classification_scores():
+    assert set(LOWER_IS_BETTER) <= set(example_scores())
+
+
+def test_lower_is_better_matches_the_settings_selection_metrics():
+    # The settings accept exactly the metrics grid_search can rank by, in the same order.
+    assert tuple(LOWER_IS_BETTER) == SELECTION_METRICS
+
+
+# --- grid_search: ranked by the selection metric ----------------------------------------------
+# Four hand-made p vectors on VAL_PAID (payers at rows 0, 1, 3, 6) on which the metrics disagree:
+#   SHY       perfect ranking, every p near .5        log loss .645  brier .226  avg prec 1
+#   SURE      confident, one payer below a non-payer  log loss .212  brier .071  avg prec .95
+#   RECKLESS  near-certain, one payer at p = .001     log loss .864  brier .125  avg prec .875
+#   HALF      every p .5                              log loss .693  brier .250  avg prec .5
+# In the grid order [HALF, RECKLESS, SURE, SHY] (candidates 0..3):
+#   log loss, ascending:       SURE, SHY, HALF, RECKLESS   -> [2, 3, 0, 1]
+#   brier, ascending:          SURE, RECKLESS, SHY, HALF   -> [2, 1, 3, 0]
+#   avg precision, descending: SHY, SURE, RECKLESS, HALF   -> [3, 2, 1, 0]
+P_SHY = np.array([0.54, 0.53, 0.48, 0.52, 0.47, 0.46, 0.51, 0.49])
+P_SURE = np.array([0.97, 0.97, 0.03, 0.97, 0.03, 0.45, 0.40, 0.03])
+P_RECKLESS = np.array([0.999, 0.999, 0.001, 0.999, 0.001, 0.001, 0.001, 0.001])
+P_HALF = np.full(8, 0.5)
+DISAGREE = [P_HALF, P_RECKLESS, P_SURE, P_SHY]
+EXPECTED_ORDER = {"log loss": [2, 3, 0, 1], "brier": [2, 1, 3, 0],
+                  "avg precision": [3, 2, 1, 0]}
+
+
+def test_the_disagreeing_p_vectors_have_the_stated_scores():
+    def scores(p):
+        return (log_loss(VAL_PAID, p, labels=[False, True]), brier_score_loss(VAL_PAID, p),
+                average_precision_score(VAL_PAID, p))
+    assert scores(P_SHY) == pytest.approx((0.6446, 0.22575, 1.0), abs=1e-4)
+    assert scores(P_SURE) == pytest.approx((0.2121, 0.0709875, 0.95), abs=1e-4)
+    assert scores(P_RECKLESS) == pytest.approx((0.8643, 0.124751, 0.875), abs=1e-4)
+    assert scores(P_HALF) == pytest.approx((0.6931, 0.25, 0.5), abs=1e-4)
+
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_grid_search_ranks_by_the_chosen_metric(metric):
+    grid, _, _, _ = fake_grid(DISAGREE, metric=metric)
+    assert list(grid["candidate"]) == EXPECTED_ORDER[metric]
+
+
+def test_grid_search_by_log_loss_is_ascending():
+    grid, _, _, _ = fake_grid(DISAGREE, metric="log loss")
+    assert grid["log loss"].is_monotonic_increasing
+    assert grid.loc[0, "log loss"] == grid["log loss"].min()
+
+
+def test_grid_search_by_brier_is_ascending():
+    grid, _, _, _ = fake_grid(DISAGREE, metric="brier")
+    assert grid["brier"].is_monotonic_increasing
+    assert grid.loc[0, "brier"] == grid["brier"].min()
+
+
+def test_grid_search_by_avg_precision_is_descending():
+    grid, _, _, _ = fake_grid(DISAGREE, metric="avg precision")
+    assert grid["avg precision"].is_monotonic_decreasing
+    assert grid.loc[0, "avg precision"] == grid["avg precision"].max()
+
+
+def test_grid_search_log_loss_and_avg_precision_pick_different_winners():
+    # The confident but slightly mis-ranked SURE wins on log loss; the perfectly ranked but
+    # timid SHY wins on average precision.
+    by_log_loss, _, _, _ = fake_grid(DISAGREE, metric="log loss")
+    by_ap, _, _, _ = fake_grid(DISAGREE, metric="avg precision")
+    assert by_log_loss.loc[0, "candidate"] == 2
+    assert by_ap.loc[0, "candidate"] == 3
+
+
+def test_grid_search_log_loss_and_brier_pick_different_winners():
+    # One confident mistake: log loss punishes RECKLESS without bound, Brier by at most 1/8.
+    by_log_loss, _, _, _ = fake_grid([P_HALF, P_RECKLESS], metric="log loss")
+    by_brier, _, _, _ = fake_grid([P_HALF, P_RECKLESS], metric="brier")
+    assert list(by_log_loss["candidate"]) == [0, 1]
+    assert list(by_brier["candidate"]) == [1, 0]
+
+
+def test_grid_search_rows_are_the_same_whatever_the_metric():
+    # The metric changes only the order of the rows, never their content.
+    grids = [fake_grid(DISAGREE, metric=metric)[0] for metric in METRICS]
+    tidy = [g.drop(columns="fit seconds").sort_values("candidate", ignore_index=True)
+            for g in grids]
+    for other in tidy[1:]:
+        pd.testing.assert_frame_equal(other, tidy[0])
+
+
+def test_grid_search_fits_each_candidate_once_whatever_the_metric():
+    for metric in METRICS:
+        _, _, fit, _ = fake_grid(DISAGREE, metric=metric)
+        assert [call.settings.tag for call in fit.calls] == [0, 1, 2, 3], metric
+
+
+@pytest.mark.parametrize("metric", ["log loss", "brier"])
+def test_grid_search_ties_keep_grid_order_when_lower_is_better(metric):
+    # SURE beats SHY on both: candidates 1 and 3 tie on top, 0 and 2 below, in grid order.
+    grid, _, _, _ = fake_grid([P_SHY, P_SURE, P_SHY, P_SURE], metric=metric)
+    assert list(grid["candidate"]) == [1, 3, 0, 2]
+
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_grid_search_all_tied_keeps_grid_order_for_every_metric(metric):
+    grid, _, _, _ = fake_grid([P_MID] * 6, metric=metric)
+    assert list(grid["candidate"]) == list(range(6))
+
+
+@pytest.mark.parametrize("metric", ["log loss", "brier"])
+def test_grid_search_many_interleaved_ties_stay_stable_when_lower_is_better(metric):
+    # Ascending order with many ties: a non-stable sort could swap equal rows.
+    vectors = [P_SURE, P_SHY, P_HALF]   # better to worse on both log loss and brier
+    assignment = [vectors[i % 3] for i in range(30)]
+    grid, _, _, _ = fake_grid(assignment, metric=metric)
+    expected = [i for k in range(3) for i in range(30) if i % 3 == k]
+    assert list(grid["candidate"]) == expected
+
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_grid_search_progress_line_names_the_metric_and_its_score(metric):
+    _, out, _, candidates = fake_grid(DISAGREE, name="LR", metric=metric)
+    lines = out.splitlines()
+    assert len(lines) == 4
+    for number, (line, candidate, p) in enumerate(zip(lines, candidates, DISAGREE), start=1):
+        score = classification_scores(VAL_PAID, pd.Series(p, index=VAL_X.index), 0.5)[metric]
+        prefix = f"  ... LR {number} of 4: {candidate.params}, {metric} {score:.4f} ("
+        assert line.startswith(prefix), line
+        assert line.endswith(" s)"), line
+
+
+@pytest.mark.parametrize("metric", ["log loss", "brier"])
+def test_grid_search_progress_line_does_not_show_avg_precision_for_other_metrics(metric):
+    _, out, _, _ = fake_grid(DISAGREE, metric=metric)
+    assert "avg precision" not in out
+
+
+# --- grid_search: the metric argument --------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["AUC", "F1", "threshold", "Log loss", "log_loss", "logloss",
+                                 " log loss", "Brier", "average precision", "", None, 0])
+def test_grid_search_unknown_metric_raises_the_exact_message(bad):
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with pytest.raises(ValueError) as error:
+        run_quietly(grid_search, "HGB", fit, fake_candidates(2), TRAIN_X, TRAIN_PAID, VAL_X,
+                    VAL_PAID, metric=bad)
+    assert str(error.value) == f"HGB: cannot rank by {bad!r}; choose one of {ALLOWED}"
+    assert fit.calls == []
+
+
+def test_grid_search_unknown_metric_message_starts_with_the_model_name():
+    with pytest.raises(ValueError) as error:
+        run_quietly(grid_search, "LR", SpyFit(lambda s, w, x: P_MID), fake_candidates(1),
+                    TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID, metric="AUC")
+    assert str(error.value).startswith("LR: ")
+
+
+def test_grid_search_unknown_metric_prints_nothing():
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with redirect_stdout(io.StringIO()) as out:
+        with pytest.raises(ValueError):
+            grid_search("M", fit, fake_candidates(3), TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID,
+                        metric="AUC")
+    assert out.getvalue() == ""
+
+
+def test_grid_search_unknown_metric_is_reported_before_an_empty_grid():
+    fit = SpyFit(lambda s, w, x: P_MID)
+    with pytest.raises(ValueError) as error:
+        grid_search("LR", fit, [], TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID, metric="AUC")
+    assert str(error.value) == f"LR: cannot rank by 'AUC'; choose one of {ALLOWED}"
+
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_grid_search_empty_grid_with_a_good_metric_has_the_empty_message(metric):
+    with pytest.raises(ValueError) as error:
+        grid_search("LR", SpyFit(lambda s, w, x: P_MID), [], TRAIN_X, TRAIN_PAID, VAL_X,
+                    VAL_PAID, metric=metric)
+    assert str(error.value) == "LR: the grid has no settings to try"
+
+
+def test_grid_search_metric_is_required():
+    with pytest.raises(TypeError):
+        run_quietly(grid_search, "M", SpyFit(lambda s, w, x: P_MID), fake_candidates(1),
+                    TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID)
+
+
+def test_grid_search_metric_is_keyword_only():
+    with pytest.raises(TypeError):
+        run_quietly(grid_search, "M", SpyFit(lambda s, w, x: P_MID), fake_candidates(1),
+                    TRAIN_X, TRAIN_PAID, VAL_X, VAL_PAID, "log loss")
+
+
+# --- choose_and_test follows the metric that sorted the grid ---------------------------------
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_choose_and_test_refits_the_winner_of_the_metric(metric):
+    grid, _, _, candidates = fake_grid(DISAGREE, metric=metric)
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    result = choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X, TEST_PAID)
+    winner = EXPECTED_ORDER[metric][0]
+    assert len(fit.calls) == 1
+    assert fit.calls[0].settings is candidates[winner].settings
+    assert fit.calls[0].train_x is REFIT_X
+    assert result["k"] == winner
+    assert result["threshold"] == grid.loc[0, "threshold"]
+
+
+def test_choose_and_test_after_a_log_loss_grid_is_not_the_avg_precision_winner():
+    grid, _, _, candidates = fake_grid(DISAGREE, metric="log loss")
+    fit = SpyFit(lambda s, w, x: P_TEST)
+    choose_and_test("M", fit, candidates, grid, REFIT_X, REFIT_PAID, TEST_X, TEST_PAID)
+    assert fit.calls[0].settings is candidates[2].settings          # SURE, the log-loss best
+    assert fit.calls[0].settings is not candidates[3].settings      # SHY, the AP best
+
+
+def test_choose_and_test_uses_the_log_loss_winners_own_validation_threshold():
+    grid, _, _, candidates = fake_grid(DISAGREE, metric="log loss")
+    sure_threshold, _ = best_threshold(VAL_PAID, pd.Series(P_SURE, index=VAL_X.index))
+    result = choose_and_test("M", SpyFit(lambda s, w, x: P_TEST), candidates, grid, REFIT_X,
+                             REFIT_PAID, TEST_X, TEST_PAID)
+    assert result["threshold"] == sure_threshold
+    expected = classification_scores(TEST_PAID, pd.Series(P_TEST, index=TEST_X.index),
+                                     sure_threshold)
+    for key in SCORE_KEYS:
+        assert result[key] == pytest.approx(expected[key]), key
+
+
+def test_choose_and_test_result_carries_the_brier_score():
+    grid, _, _, candidates = fake_grid([P_SURE], metric="brier")
+    result = choose_and_test("M", SpyFit(lambda s, w, x: P_TEST), candidates, grid, REFIT_X,
+                             REFIT_PAID, TEST_X, TEST_PAID)
+    assert list(result)[-2:] == ["log loss", "brier"]
+
+
+# --- grid_search: real fits by each metric ---------------------------------------------------
+
+@pytest.mark.parametrize("metric", METRICS)
+def test_grid_search_real_lr_grid_is_sorted_by_the_metric(metric, data):
+    candidates = lr_candidates(stage1_settings(), SMALL_LR)
+    grid, out = run_quietly(grid_search, "LR", fit_stage1_baseline, candidates, data.train_x,
+                            data.train_paid, data.validation_x, data.validation_paid,
+                            metric=metric)
+    if LOWER_IS_BETTER[metric]:
+        assert grid[metric].is_monotonic_increasing
+    else:
+        assert grid[metric].is_monotonic_decreasing
+    assert sorted(grid["candidate"]) == list(range(len(candidates)))
+    assert all(f", {metric} " in line for line in out.splitlines())
+
+
+def test_grid_search_real_hgb_brier_column_matches_an_independent_fit(data):
+    candidates = hgb_candidates(stage1_settings(), SMALL_HGB)
+    grid, _ = run_quietly(grid_search, "HGB", fit_stage1, candidates, data.train_x,
+                          data.train_paid, data.validation_x, data.validation_paid,
+                          metric="brier")
+    assert grid["brier"].is_monotonic_increasing
+    for _, row in grid.iterrows():
+        candidate = candidates[int(row["candidate"])]
+        model = fit_stage1(data.train_x, data.train_paid, candidate.settings,
+                           class_weight=class_weight_argument(candidate.class_weight))
+        p = predict_paid(model, data.validation_x)
+        assert row["brier"] == pytest.approx(brier_score_loss(data.validation_paid, p),
+                                             rel=1e-9)

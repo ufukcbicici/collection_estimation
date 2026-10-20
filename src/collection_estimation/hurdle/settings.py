@@ -61,15 +61,16 @@ class Stage1Settings:
 
 @dataclass(frozen=True)
 class DiagnosticSettings:
-    """The stage 1 diagnostic: a train / validation / test of stage 1 as a classifier, with a
+    """The stage 1 diagnostic: a train / validation / test of stage 1 tuned on its own, with a
     grid per model. Diagnostic only: nothing from it reaches the forecast."""
-    run: bool                                 # run it at all (it takes about 15 minutes)
+    run: bool                                 # run it at all (long; grows with the grid size)
     origin: int                               # T: train <= T < validation <= T+H < test <= T+2H
     hgb_max_iter: tuple[int, ...]             # the grid of the HGB classifier
     hgb_learning_rate: tuple[float, ...]
     hgb_max_leaf_nodes: tuple[int, ...]
     lr_c: tuple[float, ...]                   # the grid of the logistic regression
     class_weights: tuple[str, ...]            # "none" and/or "balanced", for both models
+    selection_metric: str                     # validation score choosing each model's setting
     importance_repeats: int                   # shuffles per feature for permutation importance
     output_folder: Path                       # where the result tables are written as CSV
 
@@ -146,8 +147,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                         "baseline_c"}, f"{name} [stage1]")
     diagnostic = raw["diagnostic"]
     check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
-                            "hgb_max_leaf_nodes", "lr_c", "class_weights", "importance_repeats",
-                            "output_folder"}, f"{name} [diagnostic]")
+                            "hgb_max_leaf_nodes", "lr_c", "class_weights", "selection_metric",
+                            "importance_repeats", "output_folder"}, f"{name} [diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -214,6 +215,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                               positive_number_setting),
             class_weights=grid_setting(diagnostic, "class_weights", f"{name} [diagnostic]",
                                        class_weight_setting),
+            selection_metric=selection_metric_setting(diagnostic, "selection_metric",
+                                                      f"{name} [diagnostic]"),
             importance_repeats=count_setting(diagnostic, "importance_repeats",
                                              f"{name} [diagnostic]"),
             output_folder=path_setting(diagnostic, "output_folder", repo_root,
@@ -548,6 +551,18 @@ def class_weight_setting(table: dict, key: str, where: str) -> str:
     value = table[key]
     if value not in CLASS_WEIGHTS:
         raise ValueError(f"{where}: {key} is {value!r}, not one of {list(CLASS_WEIGHTS)}")
+    return value
+
+
+# The validation scores the diagnostic can choose a setting by.
+SELECTION_METRICS = ("log loss", "brier", "avg precision")
+
+
+def selection_metric_setting(table: dict, key: str, where: str) -> str:
+    """The score that chooses the diagnostic's settings: one of SELECTION_METRICS."""
+    value = table[key]
+    if value not in SELECTION_METRICS:
+        raise ValueError(f"{where}: {key} is {value!r}, not one of {list(SELECTION_METRICS)}")
     return value
 
 

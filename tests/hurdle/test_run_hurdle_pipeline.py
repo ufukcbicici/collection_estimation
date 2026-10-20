@@ -1822,7 +1822,8 @@ settings = SimpleNamespace(
     diagnostic=SimpleNamespace(run=__RUN__, origin=4, hgb_max_iter=(3, 10),
                                hgb_learning_rate=(0.3,), hgb_max_leaf_nodes=(3,),
                                lr_c=(0.1, 10.0), class_weights=("none", "balanced"),
-                               importance_repeats=2, output_folder=Path(__OUTPUT__)),
+                               selection_metric=__METRIC__, importance_repeats=2,
+                               output_folder=Path(__OUTPUT__)),
     receivables=SimpleNamespace(horizons=2),
     stage1=Stage1Settings(max_iter=5, learning_rate=0.2, max_leaf_nodes=4, min_samples_leaf=5,
                           random_seed=3, feature_blocks=("history",),
@@ -1845,8 +1846,9 @@ from types import SimpleNamespace  # noqa: E402
 TABLE_NAMES = ["hgb_grid", "hgb_importance", "lr_grid", "lr_importance", "test"]
 
 
-def run_step_13(output, run=True, company=False, stubs="", after=""):
+def run_step_13(output, run=True, company=False, stubs="", after="", metric="avg precision"):
     code = (STEP_13.replace("__RUN__", str(run)).replace("__OUTPUT__", repr(str(output)))
+            .replace("__METRIC__", repr(metric))
             .replace("__COMPANY__", str(company)).replace("__STUBS__", stubs)
             .replace("__AFTER__", after))
     return run_code(code)
@@ -1901,10 +1903,10 @@ def test_step_13_real_run_printout_order(real_run):
         return matches[0]
 
     order = [first("  ... HGB 4 of 4"),
-             first("        HGB: the 5 best of 4 settings by validation average precision"),
+             first("        HGB: the 5 best of 4 settings by validation avg precision"),
              first("        HGB: the 15 most important features"),
              first("  ... LR 1 of 4"),
-             first("        LR: the 5 best of 4 settings by validation average precision"),
+             first("        LR: the 5 best of 4 settings by validation avg precision"),
              first("        LR: the 15 most important features"),
              first("        TEST (target weeks after the validation weeks)"),
              first("        tables written to ")]
@@ -1931,7 +1933,8 @@ def test_step_13_real_run_grid_tables(real_run):
     assert real_run.result.returncode == 0, real_run.result.stderr
     hgb = pd.read_csv(real_run.output / "hgb_grid.csv")
     lr = pd.read_csv(real_run.output / "lr_grid.csv")
-    scores = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss"]
+    scores = ["F1", "precision", "recall", "threshold", "AUC", "avg precision", "log loss",
+              "brier"]
     assert list(hgb.columns) == (["candidate", "max_iter", "learning_rate", "max_leaf_nodes",
                                   "class_weight"] + scores + ["fit seconds"])
     assert list(lr.columns) == ["candidate", "C", "class_weight"] + scores + ["fit seconds"]
@@ -2011,9 +2014,10 @@ def make_fit(label):
     fit.label = label
     return fit
 
-def spy_grid_search(name, fit, candidates, train_x, train_paid, validation_x, validation_paid):
+def spy_grid_search(name, fit, candidates, train_x, train_paid, validation_x, validation_paid,
+                    *, metric):
     calls.append(("grid_search", name, fit.label, candidates, train_x, train_paid,
-                  validation_x, validation_paid))
+                  validation_x, validation_paid, metric))
     return pd.DataFrame({"candidate": TOPS[name], "threshold": [0.11, 0.22, 0.33, 0.44],
                          "avg precision": [0.9, 0.8, 0.7, 0.6]})
 
@@ -2026,8 +2030,8 @@ def spy_importances(model, x, paid, repeats, seed):
     calls.append(("permutation_importances", model, x, paid, repeats, seed))
     return pd.DataFrame({"feature": list(x.columns), "log loss rise": 0.0, "std": 0.0})
 
-def spy_show_grid(name, grid, importance):
-    calls.append(("show_diagnostic_grid", name, grid, importance))
+def spy_show_grid(name, grid, importance, metric):
+    calls.append(("show_diagnostic_grid", name, grid, importance, metric))
 
 def spy_show_test(test):
     calls.append(("show_diagnostic_test", test))
@@ -2070,6 +2074,8 @@ for offset, name, label, candidates, top in ((0, "HGB", "HGB fit", hgb_candidate
     assert [c.settings for c in grid_call[3]] == [c.settings for c in candidates]
     same(grid_call[4:6], "train")
     same(grid_call[6:8], "validation")
+    # ... ranked by the settings' selection metric, passed by keyword.
+    assert grid_call[8] == settings.diagnostic.selection_metric, grid_call[8]
     # choose_and_test: the same candidates and the grid just returned, refit and test inputs.
     assert test_call[1] == name and test_call[2] == label
     assert test_call[3] is grid_call[3]
@@ -2089,6 +2095,7 @@ for offset, name, label, candidates, top in ((0, "HGB", "HGB fit", hgb_candidate
     assert show_call[1] == name
     assert show_call[2] is test_call[4]
     assert show_call[3]["feature"].tolist() == list(expected("validation")[0].columns)
+    assert show_call[4] == settings.diagnostic.selection_metric, show_call[4]
 
 test_table = calls[10][1]
 pd.testing.assert_frame_equal(test_table, pd.DataFrame([{"model": "HGB", "F1": 0.5},
@@ -2136,7 +2143,7 @@ for name in ("diagnostic_splits", "grid_search", "choose_and_test", "class_weigh
 assert not hasattr(script, "best_threshold")
 assert not hasattr(script, "classification_scores")
 inspect.signature(script.show_diagnostic_splits).bind("splits", 40, 5)
-inspect.signature(script.show_diagnostic_grid).bind("name", "grid", "importance")
+inspect.signature(script.show_diagnostic_grid).bind("name", "grid", "importance", "metric")
 inspect.signature(script.show_diagnostic_test).bind("test")
 
 body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
@@ -2165,6 +2172,10 @@ assert text.count("inputs['test']") == 1, text
 assert "permutation_importances(model, *inputs['validation']" in text
 assert "settings.diagnostic.importance_repeats, settings.stage1.random_seed)" in text
 assert "write_tables(settings.diagnostic.output_folder, tables)" in text
+# The grid is ranked, and the printout labelled, by the settings' selection metric.
+assert "*inputs['validation'], metric=settings.diagnostic.selection_metric)" in text, text
+assert ("show_diagnostic_grid(name, grid, importance, settings.diagnostic.selection_metric)"
+        in text), text
 # The two models, in this order, with their fits and candidate lists.
 loops = [node for node in ast.walk(block) if isinstance(node, ast.For)
          and ast.unparse(node.target) == "(name, fit, candidates)"]
@@ -2229,7 +2240,7 @@ def run_show(what, n_grid=7, n_importance=20):
                     .replace("N_IMPORTANCE", str(n_importance)).replace("WHAT", what))
 
 
-def expected_grid_printout(name, n_grid, n_importance):
+def expected_grid_printout(name, n_grid, n_importance, metric="avg precision"):
     import numpy as np
     import pandas as pd
     grid = pd.DataFrame({
@@ -2242,7 +2253,7 @@ def expected_grid_printout(name, n_grid, n_importance):
     importance = pd.DataFrame({"feature": [f"f{i}" for i in range(n_importance)],
                                "log loss rise": np.linspace(0.0123456789, -0.001, n_importance),
                                "std": np.full(n_importance, 0.000123456)})
-    return ([f"        {name}: the 5 best of {n_grid} settings by validation average precision"]
+    return ([f"        {name}: the 5 best of {n_grid} settings by validation {metric}"]
             + grid.head(5).round(4).to_string(index=False).splitlines()
             + [f"        {name}: the 15 most important features (rise in validation log loss "
                f"when shuffled)"]
@@ -2250,14 +2261,14 @@ def expected_grid_printout(name, n_grid, n_importance):
 
 
 def test_show_diagnostic_grid_printout():
-    result = run_show("script.show_diagnostic_grid('LR', grid, importance)")
+    result = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')")
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     assert lines == expected_grid_printout("LR", 7, 20) + ["ok"]
 
 
 def test_show_diagnostic_grid_drops_the_candidate_column_and_rounds():
-    result = run_show("script.show_diagnostic_grid('HGB', grid, importance)")
+    result = run_show("script.show_diagnostic_grid('HGB', grid, importance, 'avg precision')")
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     header = lines[1]
@@ -2271,13 +2282,13 @@ def test_show_diagnostic_grid_drops_the_candidate_column_and_rounds():
 
 
 def test_show_diagnostic_grid_with_fewer_rows_than_shown_prints_them_all():
-    result = run_show("script.show_diagnostic_grid('LR', grid, importance)", n_grid=2,
-                      n_importance=3)
+    result = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')",
+                      n_grid=2, n_importance=3)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     assert lines == expected_grid_printout("LR", 2, 3) + ["ok"]
     # The header still says "the 5 best" (pinned: it states the cap, not the count shown).
-    assert lines[0] == "        LR: the 5 best of 2 settings by validation average precision"
+    assert lines[0] == "        LR: the 5 best of 2 settings by validation avg precision"
 
 
 def test_show_diagnostic_test_printout():
@@ -2298,3 +2309,124 @@ def test_show_diagnostic_test_printout():
     assert lines[1:] == expected.splitlines()[:-1]   # minus the final "ok"
     assert "0.1235" in lines[2] and "0.5556" in lines[2]
     assert lines[2].split()[0] == "HGB" and lines[3].split()[0] == "LR"
+
+
+# --- U10.4b': step 13 ranks each grid by [diagnostic] selection_metric -----------------------
+
+@pytest.mark.parametrize("metric", ["log loss", "brier"])
+def test_show_diagnostic_grid_header_names_the_metric(metric):
+    result = run_show(f"script.show_diagnostic_grid('HGB', grid, importance, {metric!r})")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == f"        HGB: the 5 best of 7 settings by validation {metric}"
+    assert lines == expected_grid_printout("HGB", 7, 20, metric) + ["ok"]
+    assert "average precision" not in lines[0]
+
+
+def test_show_diagnostic_grid_metric_does_not_reorder_the_grid():
+    # The printout shows the grid as given (grid_search already sorted it); the metric is only
+    # named in the header. The hand-made grid has no log loss column at all.
+    by_ap = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')")
+    by_ll = run_show("script.show_diagnostic_grid('LR', grid, importance, 'log loss')")
+    assert by_ap.returncode == 0 and by_ll.returncode == 0, (by_ap.stderr, by_ll.stderr)
+    assert by_ap.stdout.splitlines()[1:] == by_ll.stdout.splitlines()[1:]
+
+
+def test_show_diagnostic_grid_needs_the_metric():
+    result = run_show("script.show_diagnostic_grid('LR', grid, importance)")
+    assert result.returncode != 0
+    assert "TypeError" in result.stderr
+
+
+@pytest.mark.parametrize("metric", ["log loss", "brier", "avg precision"])
+def test_step_13_spy_passes_the_settings_metric_through(metric, tmp_path):
+    # SPY_CHECKS assert grid_search got metric=settings.diagnostic.selection_metric by keyword
+    # and show_diagnostic_grid got it as its 4th argument; here for each metric.
+    after = SPY_CHECKS + (f"assert settings.diagnostic.selection_metric == {metric!r}\n"
+                          f"assert calls[0][8] == calls[5][8] == {metric!r}\n"
+                          f"assert calls[4][4] == calls[9][4] == {metric!r}\n")
+    result = run_step_13(tmp_path / "spy", stubs=SPY_STUBS, after=after, metric=metric)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "ok"
+
+
+def test_step_13_spy_metric_check_bites(tmp_path):
+    # The pass-through check fails when the settings say something else than was passed.
+    after = SPY_CHECKS + "assert calls[0][8] == 'log loss', calls[0][8]\n"
+    result = run_step_13(tmp_path / "spy", stubs=SPY_STUBS, after=after, metric="brier")
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
+
+
+def test_step_13_an_unknown_metric_stops_the_real_block(tmp_path):
+    # Settings normally refuse it first; if one slipped through, grid_search refuses it before
+    # any fit, and nothing is written.
+    output = tmp_path / "never"
+    result = run_step_13(output, metric="AUC")
+    assert result.returncode != 0
+    assert ("HGB: cannot rank by 'AUC'; choose one of ['log loss', 'brier', 'avg precision']"
+            in result.stderr)
+    assert not output.exists()
+
+
+@pytest.fixture(scope="module", params=["log loss", "brier"])
+def metric_run(request, tmp_path_factory):
+    """The real block on the tiny table, ranked by log loss or Brier."""
+    output = tmp_path_factory.mktemp("step13_metric") / "hurdle_diagnostic"
+    result = run_step_13(output, metric=request.param)
+    return SimpleNamespace(result=result, output=output, metric=request.param,
+                           lines=result.stdout.splitlines())
+
+
+def test_step_13_real_run_by_metric_succeeds(metric_run):
+    assert metric_run.result.returncode == 0, metric_run.result.stderr
+    assert metric_run.lines[-1] == "ok"
+
+
+def test_step_13_real_run_by_metric_header_names_it(metric_run):
+    assert metric_run.result.returncode == 0, metric_run.result.stderr
+    for name in ("HGB", "LR"):
+        header = f"        {name}: the 5 best of 4 settings by validation {metric_run.metric}"
+        assert metric_run.lines.count(header) == 1, (header, metric_run.lines)
+    assert not any("by validation avg precision" in line for line in metric_run.lines)
+
+
+def test_step_13_real_run_by_metric_progress_lines_show_it(metric_run):
+    assert metric_run.result.returncode == 0, metric_run.result.stderr
+    progress = [line for line in metric_run.lines if line.startswith("  ... ")]
+    assert len(progress) == 8
+    assert all(f"}}, {metric_run.metric} " in line for line in progress), progress
+    assert not any("avg precision" in line for line in progress)
+
+
+def test_step_13_real_run_by_metric_grids_are_ascending(metric_run):
+    import pandas as pd
+    assert metric_run.result.returncode == 0, metric_run.result.stderr
+    for name in ("hgb_grid", "lr_grid"):
+        grid = pd.read_csv(metric_run.output / f"{name}.csv")
+        assert grid[metric_run.metric].is_monotonic_increasing, (name, grid)
+        assert "brier" in grid.columns
+
+
+def test_step_13_real_run_by_metric_tests_the_grid_winner(metric_run):
+    import pandas as pd
+    assert metric_run.result.returncode == 0, metric_run.result.stderr
+    test = pd.read_csv(metric_run.output / "test.csv")
+    assert test["model"].tolist() == ["HGB", "LR"]
+    hgb = pd.read_csv(metric_run.output / "hgb_grid.csv").iloc[0]
+    lr = pd.read_csv(metric_run.output / "lr_grid.csv").iloc[0]
+    assert test.loc[0, "max_iter"] == hgb["max_iter"]
+    assert test.loc[0, "class_weight"] == hgb["class_weight"]
+    assert test.loc[0, "threshold"] == pytest.approx(hgb["threshold"], rel=1e-12)
+    assert test.loc[1, "C"] == pytest.approx(lr["C"])
+    assert test.loc[1, "class_weight"] == lr["class_weight"]
+    assert test.loc[1, "threshold"] == pytest.approx(lr["threshold"], rel=1e-12)
+    assert "brier" in test.columns
+
+
+@pytest.mark.skipif(not (REPO_ROOT / "settings" / "synthetic.toml").exists(),
+                    reason="settings/synthetic.toml not present")
+def test_the_synthetic_settings_choose_the_diagnostic_by_log_loss():
+    from collection_estimation.hurdle.settings import load_settings
+    settings = load_settings(REPO_ROOT / "settings" / "synthetic.toml", REPO_ROOT)
+    assert settings.diagnostic.selection_metric == "log loss"

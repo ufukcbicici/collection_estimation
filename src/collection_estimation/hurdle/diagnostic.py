@@ -1,16 +1,17 @@
-"""The stage 1 diagnostic: how well does stage 1 classify payers when tuned for it?
+"""The stage 1 diagnostic: how good can stage 1 be, tuned on its own?
 
-DIAGNOSTIC ONLY. The forecast needs honest probabilities (log loss, no class weights, the
-[stage1] setting); this module instead tunes each model for F1, class weights allowed, to
-see how good a classifier it can be. Nothing from it reaches the forecast.
+DIAGNOSTIC ONLY. Nothing from it reaches the forecast, whose setting is [stage1].
 
 Labelled rows are split by target week, with H the number of horizons and T the origin:
 training (target <= T), validation (T < target <= T+H), refit (target <= T+H) and test
-(T+H < target <= T+2H). Each model's setting is chosen on validation by AVERAGE PRECISION
-(threshold-free, and focused on the rare payers), with its log loss shown beside it; the F1
-threshold is chosen on validation too. The chosen setting is then refitted and tested once,
-with the validation threshold. (The forecast's own setting, both stages together, is chosen
-elsewhere by the pooled WAPE of the total cash forecast.)
+(T+H < target <= T+2H). Each model's setting is chosen on validation by the SELECTION METRIC
+of the settings: log loss or Brier score (which reward honest probabilities: calibration and
+separation together), or average precision (threshold-free, focused on the rare payers;
+class-weighted settings, whose p is not a probability, usually win only under it). Every
+setting also gets its own best-F1 threshold
+on validation. The chosen setting is then refitted and tested once, with the validation
+threshold. (The forecast's own setting, both stages together, is chosen elsewhere by the
+pooled WAPE of the total cash forecast.)
 """
 import dataclasses
 import itertools
@@ -21,8 +22,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import (average_precision_score, f1_score, log_loss, precision_recall_curve,
-                             precision_score, recall_score, roc_auc_score)
+from sklearn.metrics import (average_precision_score, brier_score_loss, f1_score, log_loss,
+                             precision_recall_curve, precision_score, recall_score,
+                             roc_auc_score)
 
 from .stage1 import predict_paid
 
@@ -83,7 +85,8 @@ def best_threshold(actual: pd.Series, p: pd.Series) -> tuple[float, float]:
 def classification_scores(actual: pd.Series, p: pd.Series, threshold: float) -> dict:
     """The diagnostic's scores of p against `actual` (True/False): F1, precision and recall
     when rows with p >= `threshold` are predicted to pay, plus the threshold-free AUC, average
-    precision (the area under the precision-recall curve) and log loss."""
+    precision (the area under the precision-recall curve), log loss and Brier score (the mean
+    of (p - outcome)^2)."""
     if not actual.index.equals(p.index):
         raise ValueError("actual and p must have the same rows (the same index)")
     actual = actual.astype(bool)
@@ -96,7 +99,13 @@ def classification_scores(actual: pd.Series, p: pd.Series, threshold: float) -> 
         "AUC": roc_auc_score(actual, p),
         "avg precision": average_precision_score(actual, p),
         "log loss": log_loss(actual, p, labels=[False, True]),
+        "brier": brier_score_loss(actual, p),
     }
+
+
+# The scores a grid can be ranked by (keys of `classification_scores`), and whether lower is
+# better for each.
+LOWER_IS_BETTER = {"log loss": True, "brier": True, "avg precision": False}
 
 
 @dataclass(frozen=True)
@@ -140,12 +149,16 @@ def lr_candidates(stage1, diagnostic) -> list[Candidate]:
 
 def grid_search(name: str, fit, candidates: list[Candidate], train_x: pd.DataFrame,
                 train_paid: pd.Series, validation_x: pd.DataFrame,
-                validation_paid: pd.Series) -> pd.DataFrame:
+                validation_paid: pd.Series, *, metric: str) -> pd.DataFrame:
     """Fit each candidate on the training rows, predict the validation rows, find its own
     best-F1 threshold there and score it. One row per candidate (its params, the validation
     scores at its threshold, the fit time and its position `candidate` in `candidates`),
-    sorted by average precision, best first. `fit` is `fit_stage1` or `fit_stage1_baseline`.
+    sorted by `metric` (a key of LOWER_IS_BETTER), best first. `fit` is `fit_stage1` or
+    `fit_stage1_baseline`.
     """
+    if metric not in LOWER_IS_BETTER:
+        raise ValueError(f"{name}: cannot rank by {metric!r}; choose one of "
+                         f"{list(LOWER_IS_BETTER)}")
     if not candidates:
         raise ValueError(f"{name}: the grid has no settings to try")
     rows = []
@@ -160,10 +173,10 @@ def grid_search(name: str, fit, candidates: list[Candidate], train_x: pd.DataFra
         rows.append({"candidate": number - 1, **candidate.params, **scores,
                      "fit seconds": seconds})
         print(f"  ... {name} {number} of {len(candidates)}: {candidate.params}, "
-              f"avg precision {scores['avg precision']:.4f} ({seconds:.0f} s)")
+              f"{metric} {scores[metric]:.4f} ({seconds:.0f} s)")
     grid = pd.DataFrame(rows)
-    # mergesort is stable: settings with the same average precision keep their grid order.
-    return grid.sort_values("avg precision", ascending=False, kind="mergesort",
+    # mergesort is stable: settings with the same score keep their grid order.
+    return grid.sort_values(metric, ascending=LOWER_IS_BETTER[metric], kind="mergesort",
                             ignore_index=True)
 
 
