@@ -105,10 +105,10 @@ baseline_c = 1.0                # the logistic-regression baseline's C (inverse 
 run = true                      # long: the time grows with the grid size (72 HGB fits here)
 origin = 40
 hgb_max_iter = [100, 300, 600, 900]
-hgb_learning_rate = [0.01, 0.05, 0.1]
+hgb_learning_rate = [0.01, 0.05, 0.1, 0.15, 0.2, 0.5]
 hgb_max_leaf_nodes = [15, 31, 63]
 lr_c = [0.01, 0.1, 1.0, 10.0]
-class_weights = ["none", "balanced"]   # tried for both models
+class_weights = ["none"]   # tried for both models
 selection_metric = "log loss"   # chooses each model's setting on validation: "log loss" or
                                 # "brier" (honest probabilities: calibration and separation),
                                 # or "avg precision" (ranking of the rare payers)
