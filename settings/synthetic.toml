@@ -111,6 +111,14 @@ max_leaf_nodes = 31             # leaves per tree
 min_samples_leaf = 20           # rows per leaf, at least
 random_seed = 1
 feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
+scale = "open balance"          # m = s x E. "none": E = 1, s is the amount. "open balance":
+                                # E = the open balance (lifted to the floor), s is the share
+                                # of the balance paid
+balance_floor = "own mean"      # E's floor: "median" or "mean" of the paid training amounts,
+                                # or "own mean", the customer's own mean payment
+own_mean_window = 52            # "own mean": the customer's payments over this many weeks
+                                # (one of the [history] windows) ...
+own_mean_prior_weeks = 1        # ... plus this many imaginary weeks at the training mean
 
 [diagnostic]
 # A train / validation / test of stage 1 tuned on its own, with a grid per model, each chosen

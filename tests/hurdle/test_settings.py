@@ -157,7 +157,11 @@ VALID = {
     # trees, ...), so a test can tell which section a value was read from.
     "stage2": {"loss": '"gamma"', "max_iter": "200", "learning_rate": "0.1",
                "max_leaf_nodes": "15", "min_samples_leaf": "10", "random_seed": "7",
-               "feature_blocks": '["calendar", "history"]'},
+               "feature_blocks": '["calendar", "history"]',
+               # U11.3b: m = s x E. Values differ from synthetic.toml's on purpose ("mean",
+               # 13, 2.0 against "own mean", 52, 1).
+               "scale": '"open balance"', "balance_floor": '"mean"', "own_mean_window": "13",
+               "own_mean_prior_weeks": "2.0"},
     "diagnostic": {"run": "true", "origin": "40", "hgb_max_iter": "[100, 300, 600]",
                    "hgb_learning_rate": "[0.05, 0.1]", "hgb_max_leaf_nodes": "[15, 31, 63]",
                    "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
@@ -2034,7 +2038,8 @@ def test_windows_are_returned_sorted(tmp_path, repo, good, expected):
     settings = load(tmp_path, repo, changes={("history", "windows"): good,
                                              ("diagnostic", "reference_window"): str(expected[0]),
                                              ("diagnostic", "amount_reference_window"):
-                                                 str(expected[0])})
+                                                 str(expected[0]),
+                                             ("stage2", "own_mean_window"): str(expected[0])})
     assert settings.history.windows == expected
     assert type(settings.history.windows) is tuple
 
@@ -3208,7 +3213,8 @@ def test_reference_window_accepts_each_history_window(tmp_path, repo, good):
 def test_reference_window_follows_the_history_windows(tmp_path, repo):
     settings = load(tmp_path, repo, changes={("history", "windows"): "[26, 8]",
                                              ("diagnostic", "reference_window"): "8",
-                                             ("diagnostic", "amount_reference_window"): "26"})
+                                             ("diagnostic", "amount_reference_window"): "26",
+                                             ("stage2", "own_mean_window"): "26"})
     assert settings.history.windows == (8, 26)
     assert settings.diagnostic.reference_window == 8
 
@@ -3221,7 +3227,9 @@ def test_reference_window_not_a_history_window_has_the_exact_message(tmp_path, r
 
 
 def test_reference_window_message_lists_the_windows_sorted(tmp_path, repo):
+    # [stage2] own_mean_window (U11.3b, read before [diagnostic]) follows the windows here.
     message = exact_message(tmp_path, repo, {("history", "windows"): "[52, 4]",
+                                             ("stage2", "own_mean_window"): "4",
                                              ("diagnostic", "reference_window"): "13"})
     assert message == (f"{DIAG}: reference_window is 13, not one of the [history] windows "
                        f"[4, 52]")
@@ -3322,8 +3330,9 @@ def test_the_synthetic_file_calibration_settings():
 # which section a value was read from.
 
 STAGE2 = f"{FILE_NAME} [stage2]"
-STAGE2_KEYS = ['feature_blocks', 'learning_rate', 'loss', 'max_iter', 'max_leaf_nodes',
-               'min_samples_leaf', 'random_seed']
+STAGE2_KEYS = ['balance_floor', 'feature_blocks', 'learning_rate', 'loss', 'max_iter',
+               'max_leaf_nodes', 'min_samples_leaf', 'own_mean_prior_weeks', 'own_mean_window',
+               'random_seed', 'scale']
 LOSS_CHOICES = "['poisson', 'gamma', 'squared_error']"
 
 
@@ -3338,7 +3347,8 @@ def test_the_stage2_section_is_read(tmp_path, repo):
     assert isinstance(stage2, Stage2Settings)
     assert stage2 == Stage2Settings(
         loss="gamma", max_iter=200, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=10,
-        random_seed=7, feature_blocks=("history", "calendar"))
+        random_seed=7, feature_blocks=("history", "calendar"), scale="open balance",
+        balance_floor="mean", own_mean_window=13, own_mean_prior_weeks=2.0)
 
 
 def test_the_stage2_values_have_the_right_python_types(tmp_path, repo):
@@ -3378,7 +3388,8 @@ def test_changing_stage1_leaves_stage2_alone(tmp_path, repo):
 def test_stage2_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(Stage2Settings)] == [
         "loss", "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
-        "random_seed", "feature_blocks"]
+        "random_seed", "feature_blocks", "scale", "balance_floor", "own_mean_window",
+        "own_mean_prior_weeks"]
 
 
 def test_stage2_settings_has_no_company_as_feature_or_baseline():
@@ -3395,7 +3406,9 @@ def test_settings_has_a_stage2_field_between_stage1_and_diagnostic():
 
 def test_stage2_settings_is_frozen_and_hashable():
     stage2 = Stage2Settings(loss="poisson", max_iter=1, learning_rate=0.1, max_leaf_nodes=2,
-                            min_samples_leaf=1, random_seed=0, feature_blocks=("history",))
+                            min_samples_leaf=1, random_seed=0, feature_blocks=("history",),
+                            scale="none", balance_floor="median", own_mean_window=4,
+                            own_mean_prior_weeks=1.0)
     with pytest.raises(dataclasses.FrozenInstanceError):
         stage2.loss = "gamma"
     assert hash(stage2) == hash(dataclasses.replace(stage2))
@@ -3641,7 +3654,8 @@ def test_the_synthetic_stage2_settings():
     assert settings.stage2 == Stage2Settings(
         loss="poisson", max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
         min_samples_leaf=20, random_seed=1,
-        feature_blocks=("history", "calendar", "receivables"))
+        feature_blocks=("history", "calendar", "receivables"), scale="open balance",
+        balance_floor="own mean", own_mean_window=52, own_mean_prior_weeks=1.0)
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -3776,3 +3790,204 @@ def test_the_synthetic_amount_reference_window_is_52():
     assert settings.diagnostic.amount_reference_window == 52
     assert type(settings.diagnostic.amount_reference_window) is int
     assert settings.diagnostic.amount_reference_window in settings.history.windows
+
+
+# --- [stage2] scale, balance_floor, own_mean_window, own_mean_prior_weeks (U11.3b) -----------------
+# m = s x E. scale and balance_floor through choice_setting; own_mean_window through
+# reference_window_setting (one of the [history] windows); own_mean_prior_weeks through
+# positive_number_setting. All four are required. VALID: "open balance", "mean", 13, 2.0.
+
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    BALANCE_FLOORS,
+    STAGE2_SCALES,
+    choice_setting,
+)
+
+NEW_STAGE2_KEYS = ["scale", "balance_floor", "own_mean_window", "own_mean_prior_weeks"]
+
+
+def test_stage2_scales_and_balance_floors_constants():
+    assert STAGE2_SCALES == ("none", "open balance")
+    assert BALANCE_FLOORS == ("median", "mean", "own mean")
+    assert type(STAGE2_SCALES) is tuple and type(BALANCE_FLOORS) is tuple
+
+
+def test_the_new_stage2_values_are_read_with_the_right_types(tmp_path, repo):
+    stage2 = load(tmp_path, repo).stage2
+    assert (stage2.scale, stage2.balance_floor) == ("open balance", "mean")
+    assert stage2.own_mean_window == 13 and type(stage2.own_mean_window) is int
+    assert stage2.own_mean_prior_weeks == 2.0 and type(stage2.own_mean_prior_weeks) is float
+
+
+def test_the_new_stage2_values_change_nothing_else(tmp_path, repo):
+    base = load(tmp_path, repo)
+    other = load(tmp_path, repo, changes={("stage2", "scale"): '"none"',
+                                          ("stage2", "balance_floor"): '"own mean"',
+                                          ("stage2", "own_mean_window"): "52",
+                                          ("stage2", "own_mean_prior_weeks"): "3"})
+    assert other.stage2 == dataclasses.replace(base.stage2, scale="none",
+                                               balance_floor="own mean", own_mean_window=52,
+                                               own_mean_prior_weeks=3.0)
+    assert other.diagnostic == base.diagnostic and other.stage1 == base.stage1
+
+
+def test_own_mean_settings_are_separate_from_the_diagnostics_references(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    assert settings.stage2.own_mean_window == 13
+    assert settings.diagnostic.amount_reference_window == 52
+    assert settings.stage2.own_mean_prior_weeks == 2.0
+    assert settings.diagnostic.reference_prior_weeks == 1.0
+
+
+@pytest.mark.parametrize("key", NEW_STAGE2_KEYS)
+def test_a_missing_new_stage2_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("stage2", key): REMOVE})
+    assert message == f"{STAGE2}: missing [{key!r}]; expected exactly {STAGE2_KEYS}"
+
+
+@pytest.mark.parametrize("good", ["none", "open balance"])
+def test_scale_accepts_each_choice(tmp_path, repo, good):
+    value = load(tmp_path, repo, changes={("stage2", "scale"): f'"{good}"'}).stage2.scale
+    assert value == good and type(value) is str
+
+
+@pytest.mark.parametrize("good", ["median", "mean", "own mean"])
+def test_balance_floor_accepts_each_choice(tmp_path, repo, good):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "balance_floor"): f'"{good}"'}).stage2.balance_floor
+    assert value == good and type(value) is str
+
+
+def test_balance_floor_is_read_even_when_scale_is_none(tmp_path, repo):
+    value = load(tmp_path, repo, changes={("stage2", "scale"): '"none"',
+                                          ("stage2", "balance_floor"): '"median"'}).stage2
+    assert (value.scale, value.balance_floor) == ("none", "median")
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ('"None"', "'None'"), ('"open_balance"', "'open_balance'"), ('"Open balance"',
+                                                                  "'Open balance'"),
+    ('"balance"', "'balance'"), ('""', "''"), ("1", "1"), ("true", "True"),
+    ('["none"]', "['none']"),
+], ids=["capital", "underscore", "capital-o", "balance", "empty", "int", "bool", "list"])
+def test_a_bad_scale_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "scale"): bad})
+    assert message == f"{STAGE2}: scale is {shown}, not one of ['none', 'open balance']"
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ('"Median"', "'Median'"), ('"own_mean"', "'own_mean'"), ('"average"', "'average'"),
+    ('"min"', "'min'"), ('""', "''"), ("0", "0"), ("false", "False"),
+    ('{ f = "mean" }', "{'f': 'mean'}"),
+], ids=["capital", "underscore", "average", "min", "empty", "int", "bool", "table"])
+def test_a_bad_balance_floor_is_refused_even_with_scale_none(tmp_path, repo, bad, shown):
+    for scale in ('"open balance"', '"none"'):
+        message = exact_message(tmp_path, repo, {("stage2", "scale"): scale,
+                                                 ("stage2", "balance_floor"): bad})
+        assert message == (f"{STAGE2}: balance_floor is {shown}, not one of ['median', "
+                           f"'mean', 'own mean']")
+
+
+@pytest.mark.parametrize("good", ["4", "13", "52"])
+def test_own_mean_window_accepts_each_history_window(tmp_path, repo, good):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "own_mean_window"): good}).stage2.own_mean_window
+    assert value == int(good) and type(value) is int
+
+
+@pytest.mark.parametrize("bad", ["5", "26", "104"])
+def test_own_mean_window_not_a_history_window_has_the_exact_message(tmp_path, repo, bad):
+    message = exact_message(tmp_path, repo, {("stage2", "own_mean_window"): bad})
+    assert message == (f"{STAGE2}: own_mean_window is {bad}, not one of the [history] windows "
+                       f"[4, 13, 52]")
+
+
+def test_own_mean_window_follows_the_history_windows(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("history", "windows"): "[26, 13, 52, 4]",
+                                             ("stage2", "own_mean_window"): "26"})
+    assert settings.stage2.own_mean_window == 26
+
+
+@pytest.mark.parametrize("bad, shown", [("0", "0"), ("-13", "-13"), ("13.0", "13.0"),
+                                        ('"13"', "'13'"), ("true", "True"), ("[13]", "[13]")])
+def test_own_mean_window_not_a_count_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "own_mean_window"): bad})
+    assert message == f"{STAGE2}: own_mean_window is {shown}, not a whole number of 1 or more"
+
+
+@pytest.mark.parametrize("good, expected", [("1", 1.0), ("2.0", 2.0), ("0.5", 0.5),
+                                            ("1e-9", 1e-9), ("100", 100.0)])
+def test_own_mean_prior_weeks_accepts_numbers_above_0(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "own_mean_prior_weeks"): good}).stage2.own_mean_prior_weeks
+    assert value == expected and type(value) is float
+
+
+@pytest.mark.parametrize("bad, shown", [("0", "0"), ("0.0", "0.0"), ("-1", "-1"), ("inf", "inf"),
+                                        ("nan", "nan"), ('"1"', "'1'"), ("true", "True"),
+                                        ("[1]", "[1]")])
+def test_own_mean_prior_weeks_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "own_mean_prior_weeks"): bad})
+    assert message == f"{STAGE2}: own_mean_prior_weeks is {shown}, not a number above 0"
+
+
+def test_the_new_stage2_keys_are_checked_in_field_order(tmp_path, repo):
+    changes = {("stage2", "scale"): '"x"', ("stage2", "balance_floor"): '"x"',
+               ("stage2", "own_mean_window"): "5", ("stage2", "own_mean_prior_weeks"): "0"}
+    for key, good in (("scale", '"none"'), ("balance_floor", '"mean"'),
+                      ("own_mean_window", "13"), ("own_mean_prior_weeks", "1")):
+        assert exact_message(tmp_path, repo, changes).startswith(f"{STAGE2}: {key} is ")
+        changes[("stage2", key)] = good
+    assert load(tmp_path, repo, changes=changes).stage2.own_mean_prior_weeks == 1.0
+
+
+def test_the_new_stage2_keys_come_after_feature_blocks(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): "[]",
+                                             ("stage2", "scale"): '"x"'})
+    assert message.startswith(f"{STAGE2}: feature_blocks is ")
+
+
+@pytest.mark.parametrize("key, value", [("scale", '"none"'), ("balance_floor", '"mean"'),
+                                        ("own_mean_window", "13"),
+                                        ("own_mean_prior_weeks", "1.0")])
+def test_the_new_stage2_keys_are_unknown_in_stage1(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("stage1", key): value})
+    assert message.startswith(f"{FILE_NAME} [stage1]: unknown [{key!r}]; ")
+
+
+# choice_setting, by direct calls
+
+def test_choice_setting_accepts_each_choice():
+    for good in ("a", "b c"):
+        value = choice_setting({"k": good}, "k", "here", ("a", "b c"))
+        assert value == good and type(value) is str
+
+
+@pytest.mark.parametrize("bad", ["A", " a", "b", "", None, True, 1, ["a"], ("a",), {"a": 1}])
+def test_choice_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        choice_setting({"k": bad}, "k", "here", ("a", "b c"))
+    assert str(error.value) == f"here: k is {bad!r}, not one of ['a', 'b c']"
+
+
+def test_choice_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        choice_setting({}, "k", "here", ("a",))
+
+
+def test_choice_setting_does_not_change_the_table():
+    table = {"k": "a", "other": 1}
+    choice_setting(table, "k", "here", ("a",))
+    assert table == {"k": "a", "other": 1}
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_balance_scaling_settings():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert raw["stage2"]["scale"] == "open balance"
+    assert raw["stage2"]["balance_floor"] == "own mean"
+    assert raw["stage2"]["own_mean_window"] == 52
+    assert raw["stage2"]["own_mean_prior_weeks"] == 1
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.stage2.own_mean_window in settings.history.windows
+    assert type(settings.stage2.own_mean_prior_weeks) is float

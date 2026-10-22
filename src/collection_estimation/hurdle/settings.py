@@ -70,6 +70,10 @@ class Stage2Settings:
     min_samples_leaf: int             # rows per leaf, at least
     random_seed: int                  # makes a fit repeatable (0 or more)
     feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
+    scale: str                        # one of STAGE2_SCALES: what m = s x E is measured against
+    balance_floor: str                # one of BALANCE_FLOORS: E's floor under "open balance"
+    own_mean_window: int              # history window of the "own mean" floor
+    own_mean_prior_weeks: float       # imaginary weeks at the training mean in "own mean"
 
 
 @dataclass(frozen=True)
@@ -166,7 +170,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                         "baseline_c"}, f"{name} [stage1]")
     stage2 = raw["stage2"]
     check_keys(stage2, {"loss", "max_iter", "learning_rate", "max_leaf_nodes",
-                        "min_samples_leaf", "random_seed", "feature_blocks"}, f"{name} [stage2]")
+                        "min_samples_leaf", "random_seed", "feature_blocks", "scale",
+                        "balance_floor", "own_mean_window", "own_mean_prior_weeks"},
+               f"{name} [stage2]")
     diagnostic = raw["diagnostic"]
     check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
                             "hgb_max_leaf_nodes", "lr_c", "class_weights", "selection_metric",
@@ -237,6 +243,13 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             min_samples_leaf=count_setting(stage2, "min_samples_leaf", f"{name} [stage2]"),
             random_seed=seed_setting(stage2, "random_seed", f"{name} [stage2]"),
             feature_blocks=feature_blocks_setting(stage2, "feature_blocks", f"{name} [stage2]"),
+            scale=choice_setting(stage2, "scale", f"{name} [stage2]", STAGE2_SCALES),
+            balance_floor=choice_setting(stage2, "balance_floor", f"{name} [stage2]",
+                                         BALANCE_FLOORS),
+            own_mean_window=reference_window_setting(stage2, "own_mean_window",
+                                                     f"{name} [stage2]", windows),
+            own_mean_prior_weeks=positive_number_setting(stage2, "own_mean_prior_weeks",
+                                                         f"{name} [stage2]"),
         ),
         diagnostic=DiagnosticSettings(
             run=bool_setting(diagnostic, "run", f"{name} [diagnostic]"),
@@ -629,6 +642,22 @@ def stage2_loss_setting(table: dict, key: str, where: str) -> str:
     value = table[key]
     if value not in STAGE2_LOSSES:
         raise ValueError(f"{where}: {key} is {value!r}, not one of {list(STAGE2_LOSSES)}")
+    return value
+
+
+# What stage 2's m = s x E is measured against: E = 1 ("none": s is the amount) or the open
+# balance lifted to a floor ("open balance": s is the share of the balance paid).
+STAGE2_SCALES = ("none", "open balance")
+# The floor of E under "open balance": the median or mean paid training amount, or the
+# customer's own mean payment.
+BALANCE_FLOORS = ("median", "mean", "own mean")
+
+
+def choice_setting(table: dict, key: str, where: str, choices: tuple[str, ...]) -> str:
+    """One of `choices`."""
+    value = table[key]
+    if value not in choices:
+        raise ValueError(f"{where}: {key} is {value!r}, not one of {list(choices)}")
     return value
 
 

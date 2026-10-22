@@ -3,6 +3,10 @@
 Fitted on the paid rows only, applied to every row: m answers "how much, if it pays", which
 every row has an answer to, and is always multiplied by stage 1's p. The input is the same as
 stage 1's (`stage1.stage1_features`); choosing the rows happens in `training_table`.
+
+m = s x E. E, the exposure, sets the scale (`exposure`): 1 for every row (`[stage2] scale =
+"none"`: s is the amount itself) or the customer's open balance, lifted to a floor
+(`"open balance"`: s is the share of the balance paid). The trees learn s.
 """
 import numbers
 
@@ -32,19 +36,42 @@ def check_amounts(train_x: pd.DataFrame, amount: pd.Series) -> pd.Series:
     return amount
 
 
-def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, settings) -> HistGradientBoostingRegressor:
+def check_exposure(x: pd.DataFrame, exposure: pd.Series) -> pd.Series:
+    """`exposure` as floats, after checking that it lines up with `x` and is finite and above
+    0 in every row (m = s x E). Raises ValueError otherwise."""
+    if not exposure.index.equals(x.index):
+        raise ValueError("exposure and x must have the same rows (the same index)")
+    exposure = exposure.astype("float64")
+    usable = np.isfinite(exposure) & (exposure > 0)
+    if not usable.all():
+        raise ValueError(f"exposure is NaN, infinite, or 0 or below in "
+                         f"{int((~usable).sum())} rows")
+    return exposure
+
+
+# The Tweedie power of each stage-2 loss. Fitting s = amount / E with row weights
+# E ** (2 - power) is the same as fitting the amount with log E as a fixed offset: the model is
+# judged on the amount, and E only sets the scale.
+LOSS_POWER = {"poisson": 1, "gamma": 2, "squared_error": 0}
+
+
+def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, exposure: pd.Series,
+               settings) -> HistGradientBoostingRegressor:
     """Fit the "how much, if it pays?" regressor on the paid rows: `train_x` (from
-    `stage1_features`) and their `amount` (deflated, TRY of week 0), with the `[stage2]`
-    settings.
+    `stage1_features`), their `amount` (deflated, TRY of week 0) and their `exposure` (from
+    `exposure`), with the `[stage2]` settings. The model learns s = amount / exposure, each
+    row weighted by exposure ** (2 - power of the loss), so it is judged on the amount; with
+    an exposure of 1 everywhere this is the plain fit of the amount, unchanged.
 
     The loss is `settings.loss`: "poisson" (the default) keeps the predicted total close to
     the actual total on the training rows, which is what p x m needs when it is summed. Early
     stopping is off: sklearn would otherwise hold out a random tenth of the rows, mixing weeks.
     The company code, if present, is used as a category.
 
-    Raises ValueError as `check_amounts` does.
+    Raises ValueError as `check_amounts` and `check_exposure` do.
     """
     amount = check_amounts(train_x, amount)
+    exposure = check_exposure(train_x, exposure)
     model = HistGradientBoostingRegressor(
         loss=settings.loss,
         max_iter=settings.max_iter,
@@ -55,28 +82,43 @@ def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, settings) -> HistGradie
         categorical_features="from_dtype",
         random_state=settings.random_seed,
     )
-    model.fit(train_x, amount)
+    model.fit(train_x, amount / exposure,
+              sample_weight=exposure ** (2 - LOSS_POWER[settings.loss]))
     return model
 
 
-def predict_amount(model, x: pd.DataFrame) -> pd.Series:
+def predict_amount(model, x: pd.DataFrame, exposure: pd.Series) -> pd.Series:
     """m for each row of `x`: the amount the customer pays in the target week if it pays
-    (deflated, TRY of week 0). `model` is from `fit_stage2`. Nothing is clipped: a squared-error
-    model can predict below 0, and that should stay visible. Raises ValueError unless `x` has
-    the columns the model was fitted on, in order."""
+    (deflated, TRY of week 0), = the model's s x `exposure` (from `exposure`, with the
+    settings the model was fitted with). `model` is from `fit_stage2`. Nothing is clipped: a
+    squared-error model can predict below 0, and that should stay visible. Raises ValueError
+    unless `x` has the columns the model was fitted on, in order, or as `check_exposure`
+    does."""
     fitted = list(model.feature_names_in_)
     if list(x.columns) != fitted:
         raise ValueError(f"x has columns {list(x.columns)}, but the model was fitted on "
                          f"{fitted}")
-    return pd.Series(model.predict(x), index=x.index, name="m")
+    exposure = check_exposure(x, exposure)
+    return pd.Series(model.predict(x) * exposure.to_numpy(), index=x.index, name="m")
 
 
-def total_ratio(model, x: pd.DataFrame, amount: pd.Series) -> float:
+def total_ratio(model, x: pd.DataFrame, amount: pd.Series, exposure: pd.Series) -> float:
     """The predicted total over the actual total on paid rows: sum of m / sum of `amount`.
     Stage 2 alone (no p): 1.0 means that, given the customers paid, no cash was lost or
     invented in total. Raises ValueError as `check_amounts` and `predict_amount` do."""
     amount = check_amounts(x, amount)
-    return float(predict_amount(model, x).sum() / amount.sum())
+    return float(predict_amount(model, x, exposure).sum() / amount.sum())
+
+
+def paid_training_amounts(train_rows: pd.DataFrame) -> pd.Series:
+    """The deflated amounts of the paid rows of `train_rows`. Raises ValueError if there is no
+    paid row, or a paid row's amount is not above 0."""
+    paid_amounts = train_rows.loc[train_rows["paid"].astype(bool), "amount_deflated"]
+    if paid_amounts.empty:
+        raise ValueError("the training rows have no paid row to take a mean amount from")
+    if not (paid_amounts > 0).all():
+        raise ValueError("a paid training row has an amount that is not above 0")
+    return paid_amounts
 
 
 def amount_references(train_rows: pd.DataFrame, rows: pd.DataFrame, window: int,
@@ -114,18 +156,47 @@ def amount_references(train_rows: pd.DataFrame, rows: pd.DataFrame, window: int,
         raise ValueError(f"{int(impossible.sum())} rows have impossible history values for "
                          f"window {window} (paying weeks negative, NaN or above the observed "
                          f"weeks, or receipts NaN or below 0)")
-    paid_amounts = train_rows.loc[train_rows["paid"].astype(bool), "amount_deflated"]
-    if paid_amounts.empty:
-        raise ValueError("the training rows have no paid row to take a mean amount from")
-    if not (paid_amounts > 0).all():
-        raise ValueError("a paid training row has an amount that is not above 0")
-    training_mean = float(paid_amounts.mean())
+    training_mean = float(paid_training_amounts(train_rows).mean())
     own_mean = (receipts + prior_weeks * training_mean) / (rows[paying] + prior_weeks)
     # With no paying week the formula is the training mean, but floating point can miss it
     # by one last digit; set it exactly.
     own_mean = own_mean.where(rows[paying] > 0, training_mean)
     return pd.DataFrame({"training mean": training_mean,
                          "own mean": own_mean.astype("float64")}, index=rows.index)
+
+
+def exposure(train_rows: pd.DataFrame, rows: pd.DataFrame, settings) -> pd.Series:
+    """E for each of `rows` (m = s x E), from the `[stage2]` settings; learned from
+    `train_rows` only, so known at fit time:
+
+      scale "none"           1.0 for every row: s is the amount itself
+      scale "open balance"   the row's open_balance, lifted to the floor where it is lower:
+                             s is the share of the balance paid. balance_floor "median" /
+                             "mean": the median / mean deflated amount of the paid training
+                             rows; "own mean": the customer's own mean payment over
+                             own_mean_window weeks (see `amount_references`), for customers
+                             paying with little or nothing open (advances, invoices issued
+                             after the origin).
+
+    Raises ValueError if `rows` has no open_balance or a missing one, and as
+    `paid_training_amounts` and `amount_references` do.
+    """
+    if settings.scale == "none":
+        return pd.Series(1.0, index=rows.index, name="exposure")
+    if "open_balance" not in rows.columns:
+        raise ValueError("the rows have no open_balance column to scale by")
+    missing = int(rows["open_balance"].isna().sum())
+    if missing:
+        raise ValueError(f"open_balance is missing in {missing} rows")
+    if settings.balance_floor == "own mean":
+        floor = amount_references(train_rows, rows, settings.own_mean_window,
+                                  settings.own_mean_prior_weeks)["own mean"]
+    elif settings.balance_floor == "median":
+        floor = float(paid_training_amounts(train_rows).median())
+    else:
+        floor = float(paid_training_amounts(train_rows).mean())
+    balance = rows["open_balance"].astype("float64")
+    return balance.where(balance >= floor, floor).rename("exposure")
 
 
 def amount_scores(actual: pd.Series, h: pd.Series, predictions: dict[str, pd.Series],
@@ -148,10 +219,13 @@ def amount_scores(actual: pd.Series, h: pd.Series, predictions: dict[str, pd.Ser
                        counts the same, so small payments weigh as much as large ones
       total ratio      sum of guesses / sum of actual; 1.0 = no cash lost or invented
 
-    Raises ValueError if `h`, `reference` or a guess does not have the rows of `actual`, a
-    guess is NaN or infinite, `reference` is not above 0, or `actual` is not a valid paid
-    amount (see `check_amounts`).
+    Raises ValueError if `actual`'s index repeats a label, if `h`, `reference` or a guess does
+    not have the rows of `actual`, a guess is NaN or infinite, `reference` is not above 0, or
+    `actual` is not a valid paid amount (see `check_amounts`).
     """
+    # Rows are picked by label per horizon: a repeated label would be picked more than once.
+    if not actual.index.is_unique:
+        raise ValueError("actual's index has repeated labels; each row needs its own label")
     for name, series in (("h", h), ("reference", reference), *predictions.items()):
         if not series.index.equals(actual.index):
             raise ValueError(f"{name} must have the rows of actual (the same index)")

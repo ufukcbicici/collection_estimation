@@ -93,6 +93,7 @@ from collection_estimation.hurdle.stage1 import (  # noqa: E402
 from collection_estimation.hurdle.stage2 import (  # noqa: E402
     amount_references,
     amount_scores,
+    exposure,
     fit_stage2,
     predict_amount,
     total_ratio,
@@ -443,13 +444,20 @@ def main():
     paid_rows = train_rows[train_rows["paid"].astype(bool)]
     paid_x = stage1_features(paid_rows, stage2_columns, companies,
                              settings.stage1.company_as_feature)
+    # m = s x E: E is 1 ([stage2] scale "none") or the open balance lifted to a floor.
+    paid_exposure = exposure(train_rows, paid_rows, settings.stage2)
+    forecast_exposure = exposure(train_rows, forecast_rows, settings.stage2)
     started = time.perf_counter()
-    stage2_model = fit_stage2(paid_x, paid_rows["amount_deflated"], settings.stage2)
+    stage2_model = fit_stage2(paid_x, paid_rows["amount_deflated"], paid_exposure,
+                              settings.stage2)
     show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss,
                     time.perf_counter() - started)
-    training_ratio = total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"])
+    show_exposure(settings.stage2, paid_rows, paid_exposure, forecast_rows, forecast_exposure)
+    training_ratio = total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"],
+                                 paid_exposure)
     m = predict_amount(stage2_model, stage1_features(forecast_rows, stage2_columns, companies,
-                                                     settings.stage1.company_as_feature))
+                                                     settings.stage1.company_as_feature),
+                       forecast_exposure)
     show_stage2_forecast(forecast_rows, m, predictions["stage 1 (HGB)"], training_ratio)
 
     # Stage 2 alone, on the forecast rows that paid: m against the amount, beside two simple
@@ -867,6 +875,21 @@ def show_stage2_fit(origin, paid_rows, train_rows, paid_x, loss, fit_seconds):
     print(f"        deflated amount per paid row: median {amount.median():,.0f}, mean "
           f"{amount.mean():,.0f}, 99th percentile {amount.quantile(0.99):,.0f}, "
           f"max {amount.max():,.0f}")
+
+
+def show_exposure(stage2, paid_rows, paid_exposure, forecast_rows, forecast_exposure):
+    """Step 14's E (m = s x E): the scale, and with "open balance" the floor and how many rows
+    were lifted to it (their open balance was below it)."""
+    if stage2.scale == "none":
+        print("        scale 'none': E = 1, stage 2 learns the amount itself")
+        return
+    lifted = {name: int((rows["open_balance"] < e).sum())
+              for name, rows, e in (("paid training", paid_rows, paid_exposure),
+                                    ("forecast", forecast_rows, forecast_exposure))}
+    print(f"        scale 'open balance', floor {stage2.balance_floor!r}: stage 2 learns the "
+          f"share of the balance paid; lifted to the floor: {lifted['paid training']:,} of "
+          f"{len(paid_rows):,} paid training rows, {lifted['forecast']:,} of "
+          f"{len(forecast_rows):,} forecast rows")
 
 
 def show_stage2_forecast(forecast_rows, m, p, training_ratio):

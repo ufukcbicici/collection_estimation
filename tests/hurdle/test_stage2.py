@@ -5,13 +5,19 @@ the index equals train_x's (else "amount and train_x must have the same rows (th
 index)"), it is not empty, it has no NaN, every value is finite, every value is above 0. Each
 refusal is a ValueError with its own message.
 
-`fit_stage2(train_x, amount, settings)` runs `check_amounts`, then fits a
-HistGradientBoostingRegressor with the `[stage2]` loss, max_iter, learning_rate,
+`fit_stage2(train_x, amount, exposure, settings)` runs `check_amounts` and `check_exposure`,
+then fits a HistGradientBoostingRegressor with the `[stage2]` loss, max_iter, learning_rate,
 max_leaf_nodes, min_samples_leaf and random_seed, early_stopping=False and
-categorical_features="from_dtype" (a pandas categorical `company_code` is used as a category).
+categorical_features="from_dtype" (a pandas categorical `company_code` is used as a category),
+on s = amount / exposure with weights exposure ** (2 - LOSS_POWER[loss]) (U11.3b).
+
+The U11.1-U11.3 tests pass an exposure of 1 everywhere (`ones(x)`): with it the fit is the
+plain fit of the amount, bit for bit (pinned in the U11.3b section at the end).
 
 Small synthetic X / amount and few trees, so every fit takes well under a second.
 """
+import dataclasses
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -28,10 +34,19 @@ NO_ROWS = "there are no paid rows to learn the amount from"
 
 
 def stage2_settings(loss="poisson", max_iter=10, learning_rate=0.1, max_leaf_nodes=7,
-                    min_samples_leaf=5, random_seed=3):
+                    min_samples_leaf=5, random_seed=3, scale="none", balance_floor="median",
+                    own_mean_window=4, own_mean_prior_weeks=1.0):
     return Stage2Settings(loss=loss, max_iter=max_iter, learning_rate=learning_rate,
                           max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
-                          random_seed=random_seed, feature_blocks=FEATURE_BLOCKS)
+                          random_seed=random_seed, feature_blocks=FEATURE_BLOCKS,
+                          scale=scale, balance_floor=balance_floor,
+                          own_mean_window=own_mean_window,
+                          own_mean_prior_weeks=own_mean_prior_weeks)
+
+
+def ones(x):
+    """An exposure of 1 for every row of `x`: m = s x 1, the plain fit of the amount."""
+    return pd.Series(1.0, index=x.index, name="exposure")
 
 
 def synthetic_xa(n=400, seed=0, company=True, index_offset=1000):
@@ -289,7 +304,7 @@ def test_check_amounts_refusals_are_value_errors_not_other_types():
 
 def test_fit_stage2_returns_a_fitted_regressor():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     assert isinstance(model, HistGradientBoostingRegressor)
     assert list(model.feature_names_in_) == ["h", "s", "z", "company_code"]
     assert model.n_iter_ == 10
@@ -298,7 +313,7 @@ def test_fit_stage2_returns_a_fitted_regressor():
 @pytest.mark.parametrize("loss", STAGE2_LOSSES)
 def test_fit_stage2_fits_with_each_loss(loss):
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings(loss=loss))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss=loss))
     assert model.get_params()["loss"] == loss
     prediction = model.predict(x)
     assert prediction.shape == (len(x),)
@@ -308,14 +323,14 @@ def test_fit_stage2_fits_with_each_loss(loss):
 @pytest.mark.parametrize("loss", ["poisson", "gamma"])
 def test_fit_stage2_log_link_losses_predict_above_zero(loss):
     x, amount = synthetic_xa()
-    assert (fit_stage2(x, amount, stage2_settings(loss=loss)).predict(x) > 0).all()
+    assert (fit_stage2(x, amount, ones(x), stage2_settings(loss=loss)).predict(x) > 0).all()
 
 
 def test_fit_stage2_parameters_come_from_the_settings():
     x, amount = synthetic_xa()
     settings = stage2_settings(loss="gamma", max_iter=12, learning_rate=0.2, max_leaf_nodes=5,
                                min_samples_leaf=7, random_seed=11)
-    params = fit_stage2(x, amount, settings).get_params()
+    params = fit_stage2(x, amount, ones(x), settings).get_params()
     assert params["loss"] == "gamma"
     assert params["max_iter"] == 12
     assert params["learning_rate"] == 0.2
@@ -326,7 +341,7 @@ def test_fit_stage2_parameters_come_from_the_settings():
 
 def test_fit_stage2_fixed_parameters():
     x, amount = synthetic_xa()
-    params = fit_stage2(x, amount, stage2_settings()).get_params()
+    params = fit_stage2(x, amount, ones(x), stage2_settings()).get_params()
     assert params["early_stopping"] is False
     assert params["categorical_features"] == "from_dtype"
 
@@ -334,7 +349,7 @@ def test_fit_stage2_fixed_parameters():
 def test_fit_stage2_other_parameters_are_sklearns_defaults():
     # Nothing beyond the settings and the two fixed choices is set.
     x, amount = synthetic_xa()
-    params = fit_stage2(x, amount, stage2_settings()).get_params()
+    params = fit_stage2(x, amount, ones(x), stage2_settings()).get_params()
     defaults = HistGradientBoostingRegressor().get_params()
     set_here = {"loss", "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                 "random_state", "early_stopping", "categorical_features"}
@@ -346,17 +361,16 @@ def test_fit_stage2_other_parameters_are_sklearns_defaults():
 def test_fit_stage2_does_not_read_the_feature_blocks():
     # feature_blocks picks the input columns before the fit; the fit itself ignores it.
     x, amount = synthetic_xa()
-    one = fit_stage2(x, amount, stage2_settings())
-    other = Stage2Settings(loss="poisson", max_iter=10, learning_rate=0.1, max_leaf_nodes=7,
-                           min_samples_leaf=5, random_seed=3, feature_blocks=("history",))
-    two = fit_stage2(x, amount, other)
+    one = fit_stage2(x, amount, ones(x), stage2_settings())
+    other = dataclasses.replace(stage2_settings(), feature_blocks=("history",))
+    two = fit_stage2(x, amount, ones(x), other)
     np.testing.assert_array_equal(one.predict(x), two.predict(x))
 
 
 def test_fit_stage2_no_early_stopping_with_more_than_10000_rows():
     # sklearn's early_stopping="auto" switches on above 10,000 rows; off, every tree is built.
     x, amount = synthetic_xa(n=12_000, company=False)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=15, learning_rate=0.01))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=15, learning_rate=0.01))
     assert model.n_iter_ == 15
     assert model.do_early_stopping_ is False
 
@@ -365,13 +379,13 @@ def test_fit_stage2_no_early_stopping_with_more_than_10000_rows():
 
 def test_fit_stage2_company_code_is_treated_as_categorical():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     assert model.is_categorical_.tolist() == [False, False, False, True]
 
 
 def test_fit_stage2_without_company_nothing_is_categorical():
     x, amount = synthetic_xa(company=False)
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     assert model.is_categorical_ is None or not model.is_categorical_.any()
 
 
@@ -386,7 +400,7 @@ def test_fit_stage2_learns_an_amount_carried_only_by_the_company():
                                                      categories=["TR02", "TR04", "TR05"])})
     amount = pd.Series(np.where(codes == "TR02", 10_000.0, 100.0)
                        * rng.lognormal(sigma=0.2, size=n))
-    model = fit_stage2(x, amount, stage2_settings(max_iter=50, learning_rate=0.2))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=50, learning_rate=0.2))
     m = model.predict(x)
     assert np.median(m[codes == "TR02"]) > 5_000
     assert np.median(m[codes == "TR05"]) < 300
@@ -400,7 +414,7 @@ def test_fit_stage2_a_company_is_a_category_not_a_number():
     x = pd.DataFrame({"company_code": pd.Categorical(codes,
                                                      categories=["TR02", "TR04", "TR05"])})
     amount = pd.Series(np.where(codes == "TR04", 10.0, 1000.0))
-    model = fit_stage2(x, amount, stage2_settings(loss="squared_error", max_iter=1,
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss="squared_error", max_iter=1,
                                                   learning_rate=1.0, max_leaf_nodes=2,
                                                   min_samples_leaf=1))
     m = pd.Series(model.predict(x))
@@ -411,7 +425,7 @@ def test_fit_stage2_a_company_is_a_category_not_a_number():
 
 def test_fit_stage2_poisson_keeps_the_training_total():
     x, amount = synthetic_xa(n=2000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=100, learning_rate=0.05))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=100, learning_rate=0.05))
     ratio = model.predict(x).sum() / amount.sum()
     assert ratio == pytest.approx(1.0, abs=1e-3)
 
@@ -419,7 +433,7 @@ def test_fit_stage2_poisson_keeps_the_training_total():
 def test_fit_stage2_poisson_keeps_the_total_per_company_roughly():
     # The company is a category: each company's total is kept too, not only the grand total.
     x, amount = synthetic_xa(n=2000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=100, learning_rate=0.05))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=100, learning_rate=0.05))
     m = pd.Series(model.predict(x), index=x.index)
     for code in ("TR02", "TR04"):
         rows = x["company_code"] == code
@@ -429,13 +443,13 @@ def test_fit_stage2_poisson_keeps_the_total_per_company_roughly():
 def test_fit_stage2_poisson_with_one_tree_already_keeps_the_total_roughly():
     # The starting point is the mean amount (log link): the total holds from the first tree.
     x, amount = synthetic_xa(n=1000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=1))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=1))
     assert model.predict(x).sum() / amount.sum() == pytest.approx(1.0, abs=0.02)
 
 
 def test_fit_stage2_learns_the_signal():
     x, amount = synthetic_xa(n=2000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=100, learning_rate=0.1))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=100, learning_rate=0.1))
     m = model.predict(x)
     # The amount grows with s: the prediction ranks the rows the same way, mostly.
     assert np.corrcoef(np.log(m), x["s"])[0, 1] > 0.9
@@ -445,20 +459,20 @@ def test_fit_stage2_constant_amount_predicts_that_amount():
     x, _ = synthetic_xa(n=200)
     amount = pd.Series(250.0, index=x.index)
     for loss in STAGE2_LOSSES:
-        m = fit_stage2(x, amount, stage2_settings(loss=loss)).predict(x)
+        m = fit_stage2(x, amount, ones(x), stage2_settings(loss=loss)).predict(x)
         np.testing.assert_allclose(m, 250.0, rtol=1e-6, err_msg=loss)
 
 
 def test_fit_stage2_a_single_paid_row_fits():
     x = pd.DataFrame({"h": [1.0]}, index=[5])
-    model = fit_stage2(x, pd.Series([123.0], index=[5]), stage2_settings(min_samples_leaf=1))
+    model = fit_stage2(x, pd.Series([123.0], index=[5]), ones(x), stage2_settings(min_samples_leaf=1))
     assert model.predict(x)[0] == pytest.approx(123.0)
 
 
 def test_fit_stage2_same_seed_gives_identical_predictions():
     x, amount = synthetic_xa()
-    one = fit_stage2(x, amount, stage2_settings(random_seed=5)).predict(x)
-    two = fit_stage2(x, amount, stage2_settings(random_seed=5)).predict(x)
+    one = fit_stage2(x, amount, ones(x), stage2_settings(random_seed=5)).predict(x)
+    two = fit_stage2(x, amount, ones(x), stage2_settings(random_seed=5)).predict(x)
     np.testing.assert_array_equal(one, two)
 
 
@@ -467,14 +481,14 @@ def test_fit_stage2_same_seed_gives_identical_predictions():
 def test_fit_stage2_accepts_nan_features():
     x, amount = synthetic_xa()
     x.loc[x.index[:50], "s"] = np.nan
-    assert np.isfinite(fit_stage2(x, amount, stage2_settings()).predict(x)).all()
+    assert np.isfinite(fit_stage2(x, amount, ones(x), stage2_settings()).predict(x)).all()
 
 
 def test_fit_stage2_int_amounts_fit_like_their_floats():
     x, amount = synthetic_xa()
     amount = amount.round().astype("int64")
-    plain = fit_stage2(x, amount.astype("float64"), stage2_settings()).predict(x)
-    ints = fit_stage2(x, amount, stage2_settings()).predict(x)
+    plain = fit_stage2(x, amount.astype("float64"), ones(x), stage2_settings()).predict(x)
+    ints = fit_stage2(x, amount, ones(x), stage2_settings()).predict(x)
     np.testing.assert_array_equal(plain, ints)
 
 
@@ -482,7 +496,7 @@ def test_fit_stage2_does_not_change_its_inputs():
     x, amount = synthetic_xa()
     amount = amount.round().astype("int64")
     x_copy, amount_copy = x.copy(deep=True), amount.copy(deep=True)
-    fit_stage2(x, amount, stage2_settings())
+    fit_stage2(x, amount, ones(x), stage2_settings())
     pd.testing.assert_frame_equal(x, x_copy)
     pd.testing.assert_series_equal(amount, amount_copy)
 
@@ -491,7 +505,7 @@ def test_fit_stage2_does_not_change_the_settings():
     x, amount = synthetic_xa()
     settings = stage2_settings()
     copy = Stage2Settings(**vars(settings))
-    fit_stage2(x, amount, settings)
+    fit_stage2(x, amount, ones(x), settings)
     assert settings == copy
 
 
@@ -517,28 +531,30 @@ def no_fit(monkeypatch):
 def test_fit_stage2_refuses_bad_amounts_before_fitting(no_fit, change, message):
     x, amount = synthetic_xa()
     with pytest.raises(ValueError) as error:
-        fit_stage2(x, change(amount), stage2_settings())
+        fit_stage2(x, change(amount), ones(x), stage2_settings())
     assert str(error.value).startswith(message)
 
 
 def test_fit_stage2_refuses_empty_amounts_before_fitting(no_fit):
     x, amount = synthetic_xa()
     with pytest.raises(ValueError) as error:
-        fit_stage2(x.iloc[:0], amount.iloc[:0], stage2_settings())
+        fit_stage2(x.iloc[:0], amount.iloc[:0], ones(x.iloc[:0]), stage2_settings())
     assert str(error.value) == NO_ROWS
 
 
 def test_fit_stage2_no_fit_fixture_bites(no_fit):
     x, amount = synthetic_xa()
     with pytest.raises(AssertionError, match="fit was called"):
-        fit_stage2(x, amount, stage2_settings())
+        fit_stage2(x, amount, ones(x), stage2_settings())
 
 
-def test_fit_stage2_unknown_loss_is_left_to_sklearn():
+def test_fit_stage2_unknown_loss_is_not_checked_again():
     # The settings file only lets STAGE2_LOSSES through; fit_stage2 does not check again.
+    # Pinned behaviour since U11.3b: the loss's power is looked up in LOSS_POWER before sklearn
+    # sees the loss, so an unknown loss is a bare KeyError, not sklearn's ValueError.
     x, amount = synthetic_xa()
-    with pytest.raises(ValueError):
-        fit_stage2(x, amount, stage2_settings(loss="tweedie"))
+    with pytest.raises(KeyError, match="tweedie"):
+        fit_stage2(x, amount, ones(x), stage2_settings(loss="tweedie"))
 
 
 # --- U11.2: predict_amount ----------------------------------------------------------------------
@@ -566,8 +582,8 @@ def interaction_x_amount(repeats=25):
 
 def test_predict_amount_is_the_models_prediction_named_m_on_xs_index():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
-    m = predict_amount(model, x)
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
+    m = predict_amount(model, x, ones(x))
     assert isinstance(m, pd.Series)
     assert m.name == "m"
     assert m.index.equals(x.index)
@@ -577,37 +593,37 @@ def test_predict_amount_is_the_models_prediction_named_m_on_xs_index():
 
 def test_predict_amount_on_new_rows_with_their_own_index():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     new_x, _ = synthetic_xa(n=30, seed=9)
     new_x.index = pd.Index([f"row-{i}" for i in range(30)])
-    m = predict_amount(model, new_x)
+    m = predict_amount(model, new_x, ones(new_x))
     assert m.index.equals(new_x.index)
     assert len(m) == 30
 
 
 def test_predict_amount_keeps_a_shuffled_index_row_by_row():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     shuffled = x.sample(frac=1.0, random_state=0)
-    m = predict_amount(model, x)
-    pd.testing.assert_series_equal(predict_amount(model, shuffled), m.loc[shuffled.index])
+    m = predict_amount(model, x, ones(x))
+    pd.testing.assert_series_equal(predict_amount(model, shuffled, ones(shuffled)), m.loc[shuffled.index])
 
 
 def test_predict_amount_on_zero_rows_raises_sklearns_value_error():
     # Pinned behaviour (not in the spec): sklearn refuses an empty x, so predict_amount does
     # not return an empty m. Step 14 always has forecast rows at the demo origin.
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError, match="0 sample"):
-        predict_amount(model, x.iloc[:0])
+        predict_amount(model, x.iloc[:0], ones(x.iloc[:0]))
 
 
 def test_predict_amount_squared_error_below_zero_is_not_clipped():
     x, amount = interaction_x_amount()
-    model = fit_stage2(x, amount, stage2_settings(loss="squared_error", max_iter=200,
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss="squared_error", max_iter=200,
                                                   learning_rate=0.5, max_leaf_nodes=2,
                                                   min_samples_leaf=1))
-    m = predict_amount(model, x)
+    m = predict_amount(model, x, ones(x))
     corner = (x["a"] == 1) & (x["b"] == 1)
     assert (m[corner] < -20).all(), m[corner].iloc[0]
     np.testing.assert_allclose(m[corner], -23.75, atol=0.01)
@@ -617,9 +633,9 @@ def test_predict_amount_squared_error_below_zero_is_not_clipped():
 @pytest.mark.parametrize("loss", ["poisson", "gamma"])
 def test_predict_amount_log_link_losses_stay_above_zero_on_the_same_data(loss):
     x, amount = interaction_x_amount()
-    model = fit_stage2(x, amount, stage2_settings(loss=loss, max_iter=200, learning_rate=0.5,
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss=loss, max_iter=200, learning_rate=0.5,
                                                   max_leaf_nodes=2, min_samples_leaf=1))
-    assert (predict_amount(model, x) > 0).all()
+    assert (predict_amount(model, x, ones(x)) > 0).all()
 
 
 class NegativeModel:
@@ -632,47 +648,47 @@ class NegativeModel:
 
 def test_predict_amount_passes_negative_and_zero_predictions_through():
     x = pd.DataFrame({"h": [1.0, 2.0, 3.0], "s": [0.0, 0.0, 0.0]}, index=[7, 8, 9])
-    m = predict_amount(NegativeModel(), x)
+    m = predict_amount(NegativeModel(), x, ones(x))
     pd.testing.assert_series_equal(m, pd.Series([-5.0, 0.0, 3.0], index=[7, 8, 9], name="m"))
 
 
 def test_predict_amount_columns_in_another_order_exact_message():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError) as error:
-        predict_amount(model, x[["s", "h", "z", "company_code"]])
+        predict_amount(model, x[["s", "h", "z", "company_code"]], ones(x[["s", "h", "z", "company_code"]]))
     assert str(error.value) == columns_message(["s", "h", "z", "company_code"], FITTED)
 
 
 def test_predict_amount_a_missing_column_exact_message():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError) as error:
-        predict_amount(model, x.drop(columns="company_code"))
+        predict_amount(model, x.drop(columns="company_code"), ones(x.drop(columns="company_code")))
     assert str(error.value) == columns_message(["h", "s", "z"], FITTED)
 
 
 def test_predict_amount_an_extra_column_exact_message():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError) as error:
-        predict_amount(model, x.assign(extra=1.0))
+        predict_amount(model, x.assign(extra=1.0), ones(x.assign(extra=1.0)))
     assert str(error.value) == columns_message(FITTED + ["extra"], FITTED)
 
 
 def test_predict_amount_a_renamed_column_is_refused():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError, match="but the model was fitted on"):
-        predict_amount(model, x.rename(columns={"z": "Z"}))
+        predict_amount(model, x.rename(columns={"z": "Z"}), ones(x.rename(columns={"z": "Z"})))
 
 
 def test_predict_amount_message_matches_predict_paids():
     from collection_estimation.hurdle.stage1 import predict_paid
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError) as from_m:
-        predict_amount(model, x.drop(columns="z"))
+        predict_amount(model, x.drop(columns="z"), ones(x.drop(columns="z")))
     # predict_paid's check runs before it touches classes_, so the regressor reaches it too.
     with pytest.raises(ValueError) as from_p:
         predict_paid(model, x.drop(columns="z"))
@@ -681,17 +697,17 @@ def test_predict_amount_message_matches_predict_paids():
 
 def test_predict_amount_does_not_change_its_input():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     x_copy = x.copy(deep=True)
-    predict_amount(model, x)
+    predict_amount(model, x, ones(x))
     pd.testing.assert_frame_equal(x, x_copy)
 
 
 def test_predict_amount_on_x_with_nan_features_gives_finite_m():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     x.loc[x.index[:20], ["s", "z"]] = np.nan
-    assert np.isfinite(predict_amount(model, x)).all()
+    assert np.isfinite(predict_amount(model, x, ones(x))).all()
 
 
 # --- U11.2: total_ratio -----------------------------------------------------------------------
@@ -714,38 +730,38 @@ def test_total_ratio_by_hand():
     # m = 10, 20, 70 (sum 100); amount = 50, 30, 120 (sum 200): ratio 0.5.
     x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[4, 5, 6])
     ratio = total_ratio(FixedModel([10.0, 20.0, 70.0]), x,
-                        pd.Series([50.0, 30.0, 120.0], index=x.index))
+                        pd.Series([50.0, 30.0, 120.0], index=x.index), ones(x))
     assert ratio == 0.5
     assert type(ratio) is float
 
 
 def test_total_ratio_above_one_by_hand():
     x = pd.DataFrame({"h": [1.0, 2.0]})
-    assert total_ratio(FixedModel([30.0, 30.0]), x, pd.Series([10.0, 30.0])) == 1.5
+    assert total_ratio(FixedModel([30.0, 30.0]), x, pd.Series([10.0, 30.0]), ones(x)) == 1.5
 
 
 def test_total_ratio_is_a_ratio_of_totals_not_a_mean_of_ratios():
     # Row ratios 2.0 and 0.5 (mean 1.25); totals 52 over 101.
     x = pd.DataFrame({"h": [1.0, 2.0]})
-    ratio = total_ratio(FixedModel([2.0, 50.0]), x, pd.Series([1.0, 100.0]))
+    ratio = total_ratio(FixedModel([2.0, 50.0]), x, pd.Series([1.0, 100.0]), ones(x))
     assert ratio == pytest.approx(52.0 / 101.0)
 
 
 def test_total_ratio_counts_negative_predictions():
     # m = -10, 30 sums to 20; amount 10 + 10 = 20: ratio 1.0, the negative m is not clipped.
     x = pd.DataFrame({"h": [1.0, 2.0]})
-    assert total_ratio(FixedModel([-10.0, 30.0]), x, pd.Series([10.0, 10.0])) == 1.0
+    assert total_ratio(FixedModel([-10.0, 30.0]), x, pd.Series([10.0, 10.0]), ones(x)) == 1.0
 
 
 def test_total_ratio_accepts_int_amounts():
     x = pd.DataFrame({"h": [1.0, 2.0]})
-    assert total_ratio(FixedModel([5.0, 5.0]), x, pd.Series([4, 6], dtype="int64")) == 1.0
+    assert total_ratio(FixedModel([5.0, 5.0]), x, pd.Series([4, 6], dtype="int64"), ones(x)) == 1.0
 
 
 def test_total_ratio_poisson_on_its_training_rows_is_about_one():
     x, amount = synthetic_xa(n=2000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=100, learning_rate=0.05))
-    ratio = total_ratio(model, x, amount)
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=100, learning_rate=0.05))
+    ratio = total_ratio(model, x, amount, ones(x))
     assert ratio == pytest.approx(1.0, abs=1e-3)
     assert ratio == pytest.approx(float(model.predict(x).sum() / amount.sum()))
 
@@ -753,23 +769,24 @@ def test_total_ratio_poisson_on_its_training_rows_is_about_one():
 def test_total_ratio_squared_error_on_its_training_rows_is_about_one():
     # Squared error starts at the mean and every leaf is a mean of residuals: the total holds.
     x, amount = synthetic_xa(n=1000)
-    model = fit_stage2(x, amount, stage2_settings(loss="squared_error", max_iter=50))
-    assert total_ratio(model, x, amount) == pytest.approx(1.0, abs=1e-6)
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss="squared_error", max_iter=50))
+    assert total_ratio(model, x, amount, ones(x)) == pytest.approx(1.0, abs=1e-6)
 
 
 @pytest.mark.parametrize("loss", STAGE2_LOSSES)
 def test_total_ratio_is_finite_and_positive_for_each_loss(loss):
     x, amount = synthetic_xa()
-    ratio = total_ratio(fit_stage2(x, amount, stage2_settings(loss=loss)), x, amount)
+    model = fit_stage2(x, amount, ones(x), stage2_settings(loss=loss))
+    ratio = total_ratio(model, x, amount, ones(x))
     assert np.isfinite(ratio) and ratio > 0
 
 
 def test_total_ratio_on_other_rows_than_the_training_rows():
     # It is a check of any paid rows, not only the training ones.
     x, amount = synthetic_xa(n=1000)
-    model = fit_stage2(x, amount, stage2_settings(max_iter=50))
+    model = fit_stage2(x, amount, ones(x), stage2_settings(max_iter=50))
     other_x, other_amount = synthetic_xa(n=300, seed=4)
-    ratio = total_ratio(model, other_x, other_amount)
+    ratio = total_ratio(model, other_x, other_amount, ones(other_x))
     assert ratio == pytest.approx(float(model.predict(other_x).sum() / other_amount.sum()))
 
 
@@ -785,7 +802,7 @@ def test_total_ratio_refuses_bad_amounts_before_predicting(change, message):
     x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[4, 5, 6])
     model = FixedModel([1.0, 1.0, 1.0])
     with pytest.raises(ValueError) as error:
-        total_ratio(model, x, change(pd.Series([1.0, 2.0, 3.0], index=x.index)))
+        total_ratio(model, x, change(pd.Series([1.0, 2.0, 3.0], index=x.index)), ones(x))
     assert str(error.value).startswith(message)
     assert model.calls == 0
 
@@ -794,7 +811,7 @@ def test_total_ratio_refuses_empty_rows_before_predicting():
     x = pd.DataFrame({"h": pd.Series([], dtype="float64")})
     model = FixedModel([])
     with pytest.raises(ValueError) as error:
-        total_ratio(model, x, pd.Series([], index=x.index, dtype="float64"))
+        total_ratio(model, x, pd.Series([], index=x.index, dtype="float64"), ones(x))
     assert str(error.value) == NO_ROWS
     assert model.calls == 0
 
@@ -803,33 +820,33 @@ def test_total_ratio_fixed_model_counts_calls():
     # The call counter used above does count: one prediction per good call.
     x = pd.DataFrame({"h": [1.0]})
     model = FixedModel([1.0])
-    total_ratio(model, x, pd.Series([1.0]))
+    total_ratio(model, x, pd.Series([1.0]), ones(x))
     assert model.calls == 1
 
 
 def test_total_ratio_refuses_wrong_columns_like_predict_amount():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     with pytest.raises(ValueError) as error:
-        total_ratio(model, x[["s", "h", "z", "company_code"]], amount)
+        total_ratio(model, x[["s", "h", "z", "company_code"]], amount, ones(x[["s", "h", "z", "company_code"]]))
     assert str(error.value) == columns_message(["s", "h", "z", "company_code"], FITTED)
 
 
 def test_total_ratio_amounts_are_checked_before_the_columns():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     bad = amount.where(amount.index != amount.index[0], 0.0)
     with pytest.raises(ValueError) as error:
-        total_ratio(model, x.drop(columns="z"), bad)
+        total_ratio(model, x.drop(columns="z"), bad, ones(x.drop(columns="z")))
     assert str(error.value).startswith("amount is 0 or below in 1 rows")
 
 
 def test_total_ratio_does_not_change_its_inputs():
     x, amount = synthetic_xa()
-    model = fit_stage2(x, amount, stage2_settings())
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
     amount = amount.round().astype("int64")
     x_copy, amount_copy = x.copy(deep=True), amount.copy(deep=True)
-    total_ratio(model, x, amount)
+    total_ratio(model, x, amount, ones(x))
     pd.testing.assert_frame_equal(x, x_copy)
     pd.testing.assert_series_equal(amount, amount_copy)
 
@@ -1407,3 +1424,493 @@ def test_amount_scores_value_checks_come_after_the_index_checks_and_in_order():
         "stage 2 holds")
     assert scores_refusal(actual, h, {"stage 2": predictions["stage 2"]},
                           zero_reference).startswith("reference must be above 0")
+
+
+# --- U11.3 fix: amount_scores refuses repeated labels in actual's index, first ---------------------
+
+REPEATED = "actual's index has repeated labels; each row needs its own label"
+
+
+def test_amount_scores_refuses_repeated_labels_in_actual():
+    # Before the fix, [1, 1] with h 1, 2 reported 2 rows for h=1 and 4 for "all".
+    index = pd.Index([1, 1])
+    with pytest.raises(ValueError) as error:
+        amount_scores(pd.Series([10.0, 20.0], index=index), pd.Series([1, 2], index=index),
+                      {"g": pd.Series([10.0, 20.0], index=index)},
+                      pd.Series([15.0, 15.0], index=index))
+    assert str(error.value) == REPEATED
+
+
+def test_amount_scores_repeated_labels_are_checked_before_everything_else():
+    # h, reference and the guess all have other rows, and the amounts are bad too.
+    index = pd.Index([3, 3, 4])
+    other = pd.Index([7, 8, 9])
+    with pytest.raises(ValueError) as error:
+        amount_scores(pd.Series([0.0, nan, -1.0], index=index), pd.Series([1, 1, 1], index=other),
+                      {"g": pd.Series([1.0, 1.0, 1.0], index=other)},
+                      pd.Series([nan, 0.0, 1.0], index=other))
+    assert str(error.value) == REPEATED
+
+
+def test_amount_scores_unique_labels_in_any_order_are_fine():
+    actual, h, predictions, reference = score_case()
+    order = [13, 10, 12, 11]
+    scores = amount_scores(actual[order], h[order],
+                           {k: v[order] for k, v in predictions.items()}, reference[order])
+    pd.testing.assert_frame_equal(scores, scores_of())
+
+
+# --- U11.3b: check_exposure -------------------------------------------------------------------------
+
+from collection_estimation.hurdle.stage2 import (  # noqa: E402
+    LOSS_POWER,
+    check_exposure,
+    exposure,
+    paid_training_amounts,
+)
+
+EXPOSURE_ROWS = "exposure and x must have the same rows (the same index)"
+
+
+def exposure_refusal(x, values):
+    with pytest.raises(ValueError) as error:
+        check_exposure(x, values)
+    return str(error.value)
+
+
+def test_check_exposure_returns_float64_values_unchanged():
+    x = small_x()
+    e = pd.Series([0.5, 2.0, 1e9], index=x.index, name="exposure")
+    result = check_exposure(x, e)
+    assert result.dtype == "float64"
+    pd.testing.assert_series_equal(result, e)
+
+
+def test_check_exposure_converts_ints():
+    x = small_x()
+    result = check_exposure(x, pd.Series([1, 2, 3], index=x.index, dtype="int64"))
+    assert result.dtype == "float64" and result.tolist() == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("index", [[20, 21, 22], [12, 11, 10], [10, 11]],
+                         ids=["other-labels", "reversed", "shorter"])
+def test_check_exposure_index_mismatch_exact_message(index):
+    x = small_x((10, 11, 12))
+    assert exposure_refusal(x, pd.Series([1.0] * len(index), index=index)) == EXPOSURE_ROWS
+
+
+def test_check_exposure_index_mismatch_with_equal_length_is_refused():
+    x = small_x((10, 11, 12))
+    assert exposure_refusal(x, pd.Series([1.0, 1.0, 1.0])) == EXPOSURE_ROWS
+
+
+@pytest.mark.parametrize("values, count", [
+    ([nan, 1.0, 1.0], 1), ([inf, 1.0, 1.0], 1), ([-inf, 1.0, 1.0], 1), ([0.0, 1.0, 1.0], 1),
+    ([-1.0, -2.0, 1.0], 2), ([nan, inf, 0.0], 3), ([-0.0, 1.0, 1.0], 1),
+], ids=["nan", "inf", "minus-inf", "zero", "two-negative", "all-three", "minus-zero"])
+def test_check_exposure_refuses_unusable_values_with_their_count(values, count):
+    x = small_x()
+    assert exposure_refusal(x, pd.Series(values, index=x.index)) == (
+        f"exposure is NaN, infinite, or 0 or below in {count} rows")
+
+
+def test_check_exposure_index_is_checked_before_the_values():
+    x = small_x((10, 11, 12))
+    assert exposure_refusal(x, pd.Series([nan, 0.0, -1.0])) == EXPOSURE_ROWS
+
+
+def test_check_exposure_accepts_tiny_positive_values():
+    x = small_x()
+    result = check_exposure(x, pd.Series([5e-324, 1e-300, 1.0], index=x.index))
+    assert (result > 0).all()
+
+
+def test_check_exposure_does_not_change_its_input():
+    x = small_x()
+    e = pd.Series([1, 2, 3], index=x.index, dtype="int64")
+    copy = e.copy()
+    check_exposure(x, e)
+    pd.testing.assert_series_equal(e, copy)
+
+
+# --- U11.3b: fit_stage2 with an exposure ------------------------------------------------------------
+
+def test_loss_power_is_the_tweedie_power_of_each_loss():
+    assert LOSS_POWER == {"poisson": 1, "gamma": 2, "squared_error": 0}
+    assert set(LOSS_POWER) == set(STAGE2_LOSSES)
+
+
+@pytest.mark.parametrize("loss", STAGE2_LOSSES)
+def test_fit_stage2_with_exposure_one_is_bit_for_bit_the_plain_fit(loss):
+    # The key property of U11.3b: with E = 1 the target is amount / 1 and every weight is
+    # 1 ** k = 1, and the fit (hence m) equals a plain, unweighted fit of the amount exactly.
+    # Kept under 200,000 rows on purpose: above that, sklearn bins a random subsample, where
+    # passing sample_weight might change which rows are drawn.
+    x, amount = synthetic_xa(n=3000)
+    settings = stage2_settings(loss=loss, max_iter=50, max_leaf_nodes=15)
+    ours = predict_amount(fit_stage2(x, amount, ones(x), settings), x, ones(x)).to_numpy()
+    plain = HistGradientBoostingRegressor(
+        loss=loss, max_iter=50, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=5,
+        early_stopping=False, categorical_features="from_dtype", random_state=3,
+    ).fit(x, amount).predict(x)
+    assert np.array_equal(ours, plain)
+
+
+@pytest.fixture
+def captured_fit(monkeypatch):
+    """Replace HistGradientBoostingRegressor.fit by one that records X, y and sample_weight."""
+    calls = []
+
+    def record(self, X, y, sample_weight=None):
+        calls.append({"X": X, "y": y, "sample_weight": sample_weight})
+        return self
+    monkeypatch.setattr(HistGradientBoostingRegressor, "fit", record)
+    return calls
+
+
+@pytest.mark.parametrize("loss, weights", [
+    ("poisson", [10.0, 4.0, 0.5]),            # E ** 1
+    ("gamma", [1.0, 1.0, 1.0]),               # E ** 0
+    ("squared_error", [100.0, 16.0, 0.25]),   # E ** 2
+])
+def test_fit_stage2_fits_the_share_with_the_weights_of_its_loss(captured_fit, loss, weights):
+    x = small_x((10, 11, 12))
+    amount = pd.Series([50.0, 2.0, 3.0], index=x.index)
+    e = pd.Series([10.0, 4.0, 0.5], index=x.index)
+    fit_stage2(x, amount, e, stage2_settings(loss=loss))
+    (call,) = captured_fit
+    assert call["X"] is x
+    np.testing.assert_array_equal(np.asarray(call["y"]), [5.0, 0.5, 6.0])   # amount / E
+    np.testing.assert_allclose(np.asarray(call["sample_weight"]), weights)
+    assert list(call["y"].index) == [10, 11, 12]
+
+
+def test_fit_stage2_with_exposure_one_passes_weights_of_one(captured_fit):
+    x, amount = synthetic_xa(n=50)
+    fit_stage2(x, amount, ones(x), stage2_settings())
+    (call,) = captured_fit
+    assert (np.asarray(call["sample_weight"]) == 1.0).all()
+    np.testing.assert_array_equal(np.asarray(call["y"]), amount.to_numpy())
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda e: e.reset_index(drop=True), EXPOSURE_ROWS),
+    (lambda e: e.iloc[::-1], EXPOSURE_ROWS),
+    (lambda e: e.where(e.index != e.index[3], nan), "exposure is NaN, infinite, or 0 or below in 1"),
+    (lambda e: e.where(e.index != e.index[3], 0.0), "exposure is NaN, infinite, or 0 or below in 1"),
+    (lambda e: e.where(e.index != e.index[3], -5.0), "exposure is NaN, infinite, or 0 or below in 1"),
+], ids=["new-index", "reversed", "nan", "zero", "negative"])
+def test_fit_stage2_refuses_bad_exposure_before_fitting(no_fit, change, message):
+    x, amount = synthetic_xa()
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, amount, change(ones(x)), stage2_settings())
+    assert str(error.value).startswith(message)
+
+
+def test_fit_stage2_checks_the_amount_before_the_exposure(no_fit):
+    x, amount = synthetic_xa()
+    bad_amount = amount.where(amount.index != amount.index[0], 0.0)
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, bad_amount, ones(x).reset_index(drop=True), stage2_settings())
+    assert str(error.value).startswith("amount is 0 or below in 1 rows")
+
+
+def test_fit_stage2_exposure_is_a_required_argument():
+    x, amount = synthetic_xa()
+    with pytest.raises(TypeError):
+        fit_stage2(x, amount, stage2_settings())
+
+
+def balance_case(n=3000, seed=2):
+    """x as synthetic_xa; an exposure E (a lognormal 'open balance') and an amount that is
+    roughly a share of it: amount = E x share, share from s."""
+    x, share = synthetic_xa(n=n, seed=seed)
+    rng = np.random.default_rng(seed + 100)
+    e = pd.Series(np.exp(rng.normal(size=n)) * 5_000.0, index=x.index, name="exposure")
+    return x, share / 5_000.0 * e, e
+
+
+def test_fit_stage2_poisson_with_a_balance_exposure_keeps_the_training_total():
+    x, amount, e = balance_case()
+    model = fit_stage2(x, amount, e, stage2_settings(max_iter=100, learning_rate=0.05,
+                                                     max_leaf_nodes=15))
+    assert total_ratio(model, x, amount, e) == pytest.approx(1.0, abs=1e-3)
+
+
+@pytest.mark.parametrize("loss", STAGE2_LOSSES)
+def test_fit_stage2_a_constant_exposure_only_sets_the_scale(loss):
+    # E = 10 everywhere: s is a tenth of the amount and m = s x 10 is the amount again; the
+    # fitted m equals the E = 1 fit up to rounding (the weights scale every row alike).
+    x, amount = synthetic_xa(n=1000)
+    settings = stage2_settings(loss=loss, max_iter=30)
+    ten = pd.Series(10.0, index=x.index)
+    with_ten = predict_amount(fit_stage2(x, amount, ten, settings), x, ten)
+    with_one = predict_amount(fit_stage2(x, amount, ones(x), settings), x, ones(x))
+    np.testing.assert_allclose(with_ten, with_one, rtol=1e-6)
+
+
+def test_fit_stage2_with_exposure_does_not_change_its_inputs():
+    x, amount, e = balance_case(n=200)
+    copies = x.copy(deep=True), amount.copy(), e.copy()
+    fit_stage2(x, amount, e, stage2_settings())
+    pd.testing.assert_frame_equal(x, copies[0])
+    pd.testing.assert_series_equal(amount, copies[1])
+    pd.testing.assert_series_equal(e, copies[2])
+
+
+# --- U11.3b: predict_amount and total_ratio with an exposure ------------------------------------------
+
+class ShareModel:
+    """A stand-in model that predicts the shares s it is given, on columns ["h"]."""
+    feature_names_in_ = np.array(["h"], dtype=object)
+
+    def __init__(self, shares):
+        self.shares = np.asarray(shares, dtype="float64")
+
+    def predict(self, x):
+        return self.shares[:len(x)]
+
+
+def test_predict_amount_is_s_times_e_by_hand():
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[7, 8, 9])
+    e = pd.Series([1000.0, 50.0, 2.0], index=x.index)
+    m = predict_amount(ShareModel([0.1, 2.0, -3.0]), x, e)
+    pd.testing.assert_series_equal(m, pd.Series([100.0, 100.0, -6.0], index=[7, 8, 9], name="m"))
+
+
+def test_predict_amount_checks_the_columns_before_the_exposure():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
+    with pytest.raises(ValueError) as error:
+        predict_amount(model, x.drop(columns="z"), ones(x).reset_index(drop=True))
+    assert str(error.value).startswith("x has columns")
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda e: e.reset_index(drop=True), EXPOSURE_ROWS),
+    (lambda e: e.where(e.index != e.index[0], 0.0), "exposure is NaN, infinite, or 0 or below in 1"),
+    (lambda e: e.where(e.index != e.index[0], inf), "exposure is NaN, infinite, or 0 or below in 1"),
+], ids=["new-index", "zero", "inf"])
+def test_predict_amount_refuses_bad_exposure(change, message):
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[7, 8, 9])
+    with pytest.raises(ValueError) as error:
+        predict_amount(ShareModel([1.0, 1.0, 1.0]), x, change(pd.Series(2.0, index=x.index)))
+    assert str(error.value).startswith(message)
+
+
+def test_predict_amount_exposure_goes_row_by_row_on_a_shuffled_index():
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=["c", "a", "b"])
+    e = pd.Series([1.0, 10.0, 100.0], index=["c", "a", "b"])
+    m = predict_amount(ShareModel([1.0, 1.0, 1.0]), x, e)
+    assert m.to_dict() == {"c": 1.0, "a": 10.0, "b": 100.0}
+
+
+def test_total_ratio_with_exposure_by_hand():
+    # s = 0.1, 0.2 and E = 1,000, 500: m = 100, 100, sum 200; amount 150 + 250 = 400: 0.5.
+    x = pd.DataFrame({"h": [1.0, 2.0]}, index=[0, 1])
+    ratio = total_ratio(ShareModel([0.1, 0.2]), x, pd.Series([150.0, 250.0]),
+                        pd.Series([1000.0, 500.0]))
+    assert ratio == pytest.approx(0.5)
+
+
+def test_total_ratio_checks_amounts_then_columns_then_exposure():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, ones(x), stage2_settings())
+    bad_amount = amount.where(amount.index != amount.index[0], 0.0)
+    bad_e = ones(x).reset_index(drop=True)
+    with pytest.raises(ValueError, match="^amount is 0 or below"):
+        total_ratio(model, x.drop(columns="z"), bad_amount, bad_e)
+    with pytest.raises(ValueError, match="^x has columns"):
+        total_ratio(model, x.drop(columns="z"), amount, bad_e)
+    with pytest.raises(ValueError, match="^exposure and x must have the same rows"):
+        total_ratio(model, x, amount, bad_e)
+
+
+# --- U11.3b: paid_training_amounts --------------------------------------------------------------------
+
+def test_paid_training_amounts_are_the_paid_rows_amounts():
+    result = paid_training_amounts(train_table())
+    pd.testing.assert_series_equal(result, pd.Series([100.0, 300.0], index=[0, 2],
+                                                     name="amount_deflated"))
+
+
+def test_paid_training_amounts_accepts_plain_bool_and_int_paid():
+    for paid in ([True, False, True], [1, 0, 1]):
+        train = pd.DataFrame({"paid": paid, "amount_deflated": [100.0, 0.0, 300.0]})
+        assert paid_training_amounts(train).tolist() == [100.0, 300.0]
+
+
+@pytest.mark.parametrize("train, message", [
+    (lambda: train_table(paid=(False, False, False)),
+     "the training rows have no paid row to take a mean amount from"),
+    (lambda: train_table().iloc[:0],
+     "the training rows have no paid row to take a mean amount from"),
+    (lambda: train_table(amounts=(0.0, 0.0, 300.0)),
+     "a paid training row has an amount that is not above 0"),
+    (lambda: train_table(amounts=(nan, 0.0, 300.0)),
+     "a paid training row has an amount that is not above 0"),
+], ids=["none-paid", "empty", "zero", "nan"])
+def test_paid_training_amounts_refusals(train, message):
+    with pytest.raises(ValueError) as error:
+        paid_training_amounts(train())
+    assert str(error.value) == message
+
+
+def test_paid_training_amounts_does_not_change_its_input():
+    train = train_table()
+    copy = train.copy(deep=True)
+    paid_training_amounts(train)
+    pd.testing.assert_frame_equal(train, copy)
+
+
+def test_amount_references_uses_paid_training_amounts_messages():
+    # Factored out: amount_references refuses with the same two messages as before.
+    with pytest.raises(ValueError, match="^the training rows have no paid row"):
+        amount_references(train_table(paid=(False, False, False)), history_rows(), 4, 1.0)
+    with pytest.raises(ValueError, match="^a paid training row has an amount"):
+        amount_references(train_table(amounts=(-1.0, 0.0, 300.0)), history_rows(), 4, 1.0)
+
+
+# --- U11.3b: exposure ---------------------------------------------------------------------------------
+# floor_train's paid amounts are 100, 200 and 900, so the median (200) and the mean (400)
+# differ and a test can tell them apart. Own mean (window 4, prior 1, training mean 400):
+#   20: (200 + 400) / 3 = 200;   21, 22: 400 (no paying week);   23: (1000 + 400) / 5 = 280.
+
+def floor_train():
+    return pd.DataFrame({"paid": pd.array([True, True, False, True], dtype="boolean"),
+                         "amount_deflated": [100.0, 200.0, 0.0, 900.0]}, index=[0, 1, 2, 3])
+
+
+def balance_rows(balances=(150.0, 1000.0, -50.0, 280.0)):
+    return history_rows().assign(open_balance=list(balances))
+
+
+def exposure_settings(scale="open balance", floor="median", window=4, prior=1.0):
+    return stage2_settings(scale=scale, balance_floor=floor, own_mean_window=window,
+                           own_mean_prior_weeks=prior)
+
+
+def test_exposure_none_is_one_on_every_row_named_exposure():
+    rows = balance_rows()
+    e = exposure(floor_train(), rows, exposure_settings(scale="none"))
+    pd.testing.assert_series_equal(e, pd.Series(1.0, index=rows.index, name="exposure"))
+
+
+def test_exposure_none_needs_nothing_from_the_rows_or_the_training_rows():
+    # No open_balance, no history, no paid training row: "none" checks nothing.
+    rows = pd.DataFrame({"a": [1, 2]}, index=["x", "y"])
+    e = exposure(train_table(paid=(False, False, False)), rows, exposure_settings(scale="none"))
+    assert e.tolist() == [1.0, 1.0] and list(e.index) == ["x", "y"]
+    assert e.dtype == "float64"
+
+
+@pytest.mark.parametrize("floor, value", [("median", 200.0), ("mean", 400.0)])
+def test_exposure_open_balance_with_a_training_floor_by_hand(floor, value):
+    # Balances 150, 1,000, -50, 280: below the floor -> the floor; at or above -> kept.
+    e = exposure(floor_train(), balance_rows(), exposure_settings(floor=floor))
+    expected = [max(b, value) for b in (150.0, 1000.0, -50.0, 280.0)]
+    pd.testing.assert_series_equal(e, pd.Series(expected, index=[20, 21, 22, 23],
+                                                name="exposure"))
+
+
+def test_exposure_open_balance_with_the_own_mean_floor_by_hand():
+    # Own means 200, 400, 400, 280: 150 -> 200; 1,000 kept; -50 -> 400; 280 = its floor, kept.
+    e = exposure(floor_train(), balance_rows(), exposure_settings(floor="own mean"))
+    np.testing.assert_allclose(e, [200.0, 1000.0, 400.0, 280.0])
+    assert e.name == "exposure" and list(e.index) == [20, 21, 22, 23]
+
+
+def test_exposure_own_mean_floor_follows_its_window_and_prior():
+    rows = balance_rows(balances=(0.0, 0.0, 0.0, 0.0))
+    e = exposure(floor_train(), rows, exposure_settings(floor="own mean", prior=3.0))
+    # 20: (200 + 1200) / 5 = 280; 23: (1000 + 1200) / 7 = 314.29
+    np.testing.assert_allclose(e, [280.0, 400.0, 400.0, 2200 / 7])
+    with pytest.raises(ValueError, match="no history columns"):
+        exposure(floor_train(), rows, exposure_settings(floor="own mean", window=13))
+
+
+def test_exposure_a_balance_equal_to_the_floor_is_kept():
+    e = exposure(floor_train(), balance_rows(balances=(200.0, 200.0, 200.0, 200.0)),
+                 exposure_settings(floor="median"))
+    assert (e == 200.0).all()
+
+
+def test_exposure_zero_and_negative_balances_get_the_floor():
+    e = exposure(floor_train(), balance_rows(balances=(0.0, -1e9, -0.0, 1e-9)),
+                 exposure_settings(floor="mean"))
+    assert (e == 400.0).all()
+
+
+def test_exposure_is_always_above_zero_with_a_balance():
+    e = exposure(floor_train(), balance_rows(), exposure_settings(floor="own mean"))
+    assert (e > 0).all()
+
+
+def test_exposure_int_balances_are_read_as_floats():
+    rows = balance_rows().assign(open_balance=np.array([150, 1000, -50, 280], dtype="int64"))
+    e = exposure(floor_train(), rows, exposure_settings())
+    assert e.dtype == "float64" and e.tolist() == [200.0, 1000.0, 200.0, 280.0]
+
+
+def test_exposure_without_an_open_balance_column_exact_message():
+    with pytest.raises(ValueError) as error:
+        exposure(floor_train(), history_rows(), exposure_settings())
+    assert str(error.value) == "the rows have no open_balance column to scale by"
+
+
+def test_exposure_with_missing_open_balances_exact_message():
+    with pytest.raises(ValueError) as error:
+        exposure(floor_train(), balance_rows(balances=(nan, 1.0, nan, 3.0)),
+                 exposure_settings())
+    assert str(error.value) == "open_balance is missing in 2 rows"
+
+
+@pytest.mark.parametrize("floor", ["median", "mean", "own mean"])
+def test_exposure_refuses_no_paid_training_row_for_every_floor(floor):
+    with pytest.raises(ValueError, match="^the training rows have no paid row"):
+        exposure(train_table(paid=(False, False, False)), balance_rows(),
+                 exposure_settings(floor=floor))
+
+
+def test_exposure_refusal_order_column_then_missing_then_floor():
+    no_paid = train_table(paid=(False, False, False))
+    with pytest.raises(ValueError, match="no open_balance column"):
+        exposure(no_paid, history_rows(), exposure_settings())
+    with pytest.raises(ValueError, match="open_balance is missing in 1 rows"):
+        exposure(no_paid, balance_rows(balances=(nan, 1.0, 1.0, 1.0)), exposure_settings())
+    with pytest.raises(ValueError, match="no paid row"):
+        exposure(no_paid, balance_rows(), exposure_settings())
+
+
+def test_exposure_own_mean_refuses_impossible_history_like_amount_references():
+    rows = balance_rows().assign(paying_weeks_4=[-1, 0, 0, 4])
+    with pytest.raises(ValueError, match="impossible history values"):
+        exposure(floor_train(), rows, exposure_settings(floor="own mean"))
+
+
+def test_exposure_on_zero_rows_is_empty():
+    e = exposure(floor_train(), balance_rows().iloc[:0], exposure_settings())
+    assert len(e) == 0 and e.name == "exposure"
+
+
+def test_exposure_does_not_change_its_inputs():
+    train, rows = floor_train(), balance_rows()
+    copies = train.copy(deep=True), rows.copy(deep=True)
+    exposure(train, rows, exposure_settings(floor="own mean"))
+    pd.testing.assert_frame_equal(train, copies[0])
+    pd.testing.assert_frame_equal(rows, copies[1])
+
+
+def test_exposure_feeds_fit_and_predict_end_to_end():
+    # The chain step 14 runs: E for the paid training rows and for new rows, then fit and m.
+    x, amount = synthetic_xa(n=300)
+    rng = np.random.default_rng(5)
+    rows = pd.DataFrame({"open_balance": rng.normal(loc=500, scale=800, size=300),
+                         "paid": True, "amount_deflated": amount.to_numpy()}, index=x.index)
+    settings = exposure_settings(floor="median")
+    e = exposure(rows, rows, settings)
+    assert (e >= float(amount.median())).all()
+    model = fit_stage2(x, amount, e, settings)
+    m = predict_amount(model, x, e)
+    assert np.isfinite(m).all() and (m > 0).all()
+    assert total_ratio(model, x, amount, e) == pytest.approx(1.0, abs=0.02)

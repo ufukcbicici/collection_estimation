@@ -2980,15 +2980,22 @@ assert step_14 == [
     "paid_rows = train_rows[train_rows['paid'].astype(bool)]",
     "paid_x = stage1_features(paid_rows, stage2_columns, companies, "
     "settings.stage1.company_as_feature)",
+    # U11.3b: E for the paid training rows and for the forecast rows, both from the training
+    # rows and [stage2], before the clock starts.
+    "paid_exposure = exposure(train_rows, paid_rows, settings.stage2)",
+    "forecast_exposure = exposure(train_rows, forecast_rows, settings.stage2)",
     "started = time.perf_counter()",
-    "stage2_model = fit_stage2(paid_x, paid_rows['amount_deflated'], settings.stage2)",
+    "stage2_model = fit_stage2(paid_x, paid_rows['amount_deflated'], paid_exposure, "
+    "settings.stage2)",
     "show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss, "
     "time.perf_counter() - started)",
+    "show_exposure(settings.stage2, paid_rows, paid_exposure, forecast_rows, forecast_exposure)",
     # U11.2: the training total, m on step 12's forecast rows (stage 2's columns), and p x m
-    # against the cash, with stage 1's HGB p (not the baseline's).
-    "training_ratio = total_ratio(stage2_model, paid_x, paid_rows['amount_deflated'])",
+    # against the cash, with stage 1's HGB p (not the baseline's). U11.3b: each with its E.
+    "training_ratio = total_ratio(stage2_model, paid_x, paid_rows['amount_deflated'], "
+    "paid_exposure)",
     "m = predict_amount(stage2_model, stage1_features(forecast_rows, stage2_columns, "
-    "companies, settings.stage1.company_as_feature))",
+    "companies, settings.stage1.company_as_feature), forecast_exposure)",
     "show_stage2_forecast(forecast_rows, m, predictions['stage 1 (HGB)'], training_ratio)",
 ], step_14
 # U11.3: the paid labelled forecast rows (NA paid as not paid), then either a fallback line
@@ -3009,6 +3016,9 @@ assert [ast.unparse(n) for n in branch.orelse] == [
     "show_stage2_scores(stage2_scores)",
 ], [ast.unparse(n) for n in branch.orelse]
 assert script.amount_references is stage2.amount_references
+assert script.exposure is stage2.exposure   # U11.3b
+inspect.signature(script.show_exposure).bind("stage2", "paid_rows", "paid_exposure",
+                                             "forecast_rows", "forecast_exposure")
 assert script.amount_scores is stage2.amount_scores
 inspect.signature(script.show_stage2_scores).bind("scores")
 # Step 14 uses step 12's origin, rows, predictions and companies: nothing reassigns them after
@@ -3041,8 +3051,9 @@ def test_step_14_calls_fit_stage2_and_its_printout_once():
     tree = main_tree()
     for name in ("fit_stage2", "show_stage2_fit", "total_ratio", "predict_amount",
                  "show_stage2_forecast", "amount_references", "amount_scores",
-                 "show_stage2_scores"):
+                 "show_stage2_scores", "show_exposure"):
         assert len(calls_to(tree, name)) == 1, name
+    assert len(calls_to(tree, "exposure")) == 2   # paid training rows, forecast rows
 
 
 def test_step_14_imports_the_stage2_functions_in_one_parenthesised_import():
@@ -3051,13 +3062,13 @@ def test_step_14_imports_the_stage2_functions_in_one_parenthesised_import():
                and node.module == "collection_estimation.hurdle.stage2"]
     assert len(imports) == 1
     assert [alias.name for alias in imports[0].names] == [
-        "amount_references", "amount_scores", "fit_stage2", "predict_amount", "total_ratio"]
+        "amount_references", "amount_scores", "exposure", "fit_stage2", "predict_amount",
+        "total_ratio"]
 
 
 def test_step_14_never_fits_stage_2_with_the_stage_1_settings():
     source = main_source()
-    assert "fit_stage2(paid_x, paid_rows['amount_deflated'], settings.stage1)" not in source
-    assert 'fit_stage2(paid_x, paid_rows["amount_deflated"], settings.stage1)' not in source
+    assert "settings.stage1)" not in source.split("stage2_model = fit_stage2(")[1][:120]
     assert 'paid_rows["amount"]' not in source   # the target is the deflated amount
 
 
@@ -3129,24 +3140,38 @@ STEP_14_CHAIN = """
 import time
 from collection_estimation.hurdle.settings import Stage2Settings
 settings_stage2 = Stage2Settings(loss=LOSS, max_iter=5, learning_rate=0.1, max_leaf_nodes=2,
-                                 min_samples_leaf=1, random_seed=1, feature_blocks=("history",))
+                                 min_samples_leaf=1, random_seed=1, feature_blocks=("history",),
+                                 scale=SCALE, balance_floor="median", own_mean_window=4,
+                                 own_mean_prior_weeks=1.0)
+if SCALE == "open balance":
+    # The tiny table has no open balance: 50 everywhere, below the floor (the median paid
+    # training amount, 100), so every E is lifted to 100 and s = 1.
+    train_rows = train_rows.assign(open_balance=50.0)
+    forecast_rows = forecast_rows.assign(open_balance=50.0)
 stage2_columns = script.feature_columns(script.block_feature_columns(history, calendar, owed),
                                         settings_stage2.feature_blocks)
 assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
 paid_rows = train_rows[train_rows["paid"].astype(bool)]
 paid_x = script.stage1_features(paid_rows, stage2_columns, companies, COMPANY_AS_FEATURE)
+paid_exposure = script.exposure(train_rows, paid_rows, settings_stage2)
+forecast_exposure = script.exposure(train_rows, forecast_rows, settings_stage2)
+assert (paid_exposure == (1.0 if SCALE == "none" else 100.0)).all(), paid_exposure
 started = time.perf_counter()
-stage2_model = script.fit_stage2(paid_x, paid_rows["amount_deflated"], settings_stage2)
+stage2_model = script.fit_stage2(paid_x, paid_rows["amount_deflated"], paid_exposure,
+                                 settings_stage2)
 script.show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings_stage2.loss,
                        time.perf_counter() - started)
+script.show_exposure(settings_stage2, paid_rows, paid_exposure, forecast_rows,
+                     forecast_exposure)
 assert len(paid_rows) == 3 and paid_rows["key"].eq("TR02-A").all()
-m = stage2_model.predict(paid_x)
+m = stage2_model.predict(paid_x) * paid_exposure.to_numpy()
 assert abs(m - 100.0).max() < 1e-6, m
 # U11.2: the training ratio, m on the 4 forecast rows, and p x m with a hand-made p of 0.5.
-training_ratio = script.total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"])
+training_ratio = script.total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"],
+                                    paid_exposure)
 assert abs(training_ratio - 1.0) < 1e-9, training_ratio
 forecast_m = script.predict_amount(stage2_model, script.stage1_features(
-    forecast_rows, stage2_columns, companies, COMPANY_AS_FEATURE))
+    forecast_rows, stage2_columns, companies, COMPANY_AS_FEATURE), forecast_exposure)
 assert forecast_m.index.equals(forecast_rows.index) and forecast_m.name == "m"
 p = pd.Series(0.5, index=forecast_rows.index, name="p")
 script.show_stage2_forecast(forecast_rows, forecast_m, p, training_ratio)
@@ -3154,17 +3179,26 @@ print("chain ok")
 """
 
 
-def run_step_14_chain(company=True, loss="poisson"):
+def run_step_14_chain(company=True, loss="poisson", scale="none"):
     stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
     code = (stage1_part + STEP_14_CHAIN).replace("COMPANY_AS_FEATURE", str(company)) \
-        .replace("ORIGIN", "2").replace("LOSS", repr(loss))
+        .replace("ORIGIN", "2").replace("LOSS", repr(loss)).replace("SCALE", repr(scale))
     return run_code(code)
 
 
+EXPOSURE_LINES = {
+    "none": "        scale 'none': E = 1, stage 2 learns the amount itself",
+    "open balance": ("        scale 'open balance', floor 'median': stage 2 learns the share "
+                     "of the balance paid; lifted to the floor: 3 of 3 paid training rows, "
+                     "4 of 4 forecast rows"),
+}
+
+
+@pytest.mark.parametrize("scale", ["none", "open balance"])
 @pytest.mark.parametrize("company", [True, False])
 @pytest.mark.parametrize("loss", ["poisson", "gamma", "squared_error"])
-def test_step_14_real_chain_on_the_tiny_table(company, loss):
-    result = run_step_14_chain(company=company, loss=loss)
+def test_step_14_real_chain_on_the_tiny_table(company, loss, scale):
+    result = run_step_14_chain(company=company, loss=loss, scale=scale)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     assert lines[-1] == "chain ok"
@@ -3180,6 +3214,7 @@ def test_step_14_real_chain_on_the_tiny_table(company, loss):
     assert lines[start + 1:-1] == [
         "        deflated amount per paid row: median 100, mean 100, 99th percentile 100, "
         "max 100",
+        EXPOSURE_LINES[scale],
         "        training total ratio (sum of m / sum of actual, paid rows): 1.0000",
         "        m on the 4 forecast rows: median 100, mean 100",
         "        per h, the whole model (sum of p x m) against the actual cash, deflated:",
@@ -3519,7 +3554,8 @@ print("scores ok")
 def test_step_14_real_chain_through_the_scores():
     stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
     code = (stage1_part + STEP_14_CHAIN + STEP_14_SCORES).replace(
-        "COMPANY_AS_FEATURE", "True").replace("ORIGIN", "2").replace("LOSS", "'poisson'")
+        "COMPANY_AS_FEATURE", "True").replace("ORIGIN", "2").replace("LOSS", "'poisson'") \
+        .replace("SCALE", "'none'")
     result = run_code(code)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
@@ -3544,3 +3580,65 @@ def test_step_14_real_chain_through_the_scores():
         "training mean NaN  NaN",
         "own mean      NaN  NaN",
     ]
+
+
+# --- Step 14 (U11.3b): show_exposure on hand-made frames -------------------------------------------
+# Paid training rows: balances 50, 200, -10, 1,500 with E 100, 200, 100, 1,500: lifted where
+# open_balance < E, i.e. 50 and -10 (200 = E is not lifted): 2 of 4. Forecast rows: balances
+# 0, 300, 99.5 with E 100, 300, 100: 2 of 3. 1,234 forecast rows would show a comma: the
+# forecast frame is padded with 1,231 rows at their floor (balance 100 = E, not lifted).
+SHOW_EXPOSURE = """
+import pandas as pd
+from types import SimpleNamespace
+import run_hurdle_pipeline as script
+
+stage2 = SimpleNamespace(scale=SCALE, balance_floor=FLOOR)
+paid_rows = pd.DataFrame({"open_balance": [50.0, 200.0, -10.0, 1500.0]}, index=[1, 2, 3, 4])
+paid_exposure = pd.Series([100.0, 200.0, 100.0, 1500.0], index=paid_rows.index)
+balances = [0.0, 300.0, 99.5] + [100.0] * 1231
+forecast_rows = pd.DataFrame({"open_balance": balances})
+forecast_exposure = pd.Series([100.0, 300.0, 100.0] + [100.0] * 1231)
+if SCALE == "none":
+    # "none" reads nothing from the rows: no open_balance column at all.
+    paid_rows = paid_rows.drop(columns="open_balance")
+    forecast_rows = forecast_rows.drop(columns="open_balance")
+copies = (paid_rows.copy(deep=True), paid_exposure.copy(), forecast_rows.copy(deep=True),
+          forecast_exposure.copy())
+returned = script.show_exposure(stage2, paid_rows, paid_exposure, forecast_rows,
+                                forecast_exposure)
+assert returned is None
+pd.testing.assert_frame_equal(paid_rows, copies[0])
+pd.testing.assert_series_equal(paid_exposure, copies[1])
+pd.testing.assert_frame_equal(forecast_rows, copies[2])
+pd.testing.assert_series_equal(forecast_exposure, copies[3])
+print("ok")
+"""
+
+
+def run_show_exposure(scale, floor="own mean"):
+    return run_code(SHOW_EXPOSURE.replace("SCALE", repr(scale)).replace("FLOOR", repr(floor)))
+
+
+def test_show_exposure_scale_none_prints_one_line_and_returns():
+    result = run_show_exposure("none")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "        scale 'none': E = 1, stage 2 learns the amount itself", "ok"]
+
+
+def test_show_exposure_open_balance_counts_the_rows_lifted_to_the_floor_by_hand():
+    result = run_show_exposure("open balance")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "        scale 'open balance', floor 'own mean': stage 2 learns the share of the "
+        "balance paid; lifted to the floor: 2 of 4 paid training rows, 2 of 1,234 forecast "
+        "rows",
+        "ok",
+    ]
+
+
+@pytest.mark.parametrize("floor", ["median", "mean", "own mean"])
+def test_show_exposure_names_the_floor_it_is_given(floor):
+    result = run_show_exposure("open balance", floor=floor)
+    assert result.returncode == 0, result.stderr
+    assert f"floor {floor!r}: stage 2 learns" in result.stdout.splitlines()[0]
