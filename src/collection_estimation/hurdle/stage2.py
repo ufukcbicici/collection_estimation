@@ -68,8 +68,10 @@ def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, exposure: pd.Series,
     stopping is off: sklearn would otherwise hold out a random tenth of the rows, mixing weeks.
     The company code, if present, is used as a category.
 
-    Raises ValueError as `check_amounts` and `check_exposure` do.
+    Raises ValueError for an unknown loss, and as `check_amounts` and `check_exposure` do.
     """
+    if settings.loss not in LOSS_POWER:
+        raise ValueError(f"stage 2 loss {settings.loss!r} is not one of {list(LOSS_POWER)}")
     amount = check_amounts(train_x, amount)
     exposure = check_exposure(train_x, exposure)
     model = HistGradientBoostingRegressor(
@@ -178,11 +180,16 @@ def exposure(train_rows: pd.DataFrame, rows: pd.DataFrame, settings) -> pd.Serie
                              paying with little or nothing open (advances, invoices issued
                              after the origin).
 
-    Raises ValueError if `rows` has no open_balance or a missing one, and as
-    `paid_training_amounts` and `amount_references` do.
+    Raises ValueError for an unknown scale or floor, if `rows` has no open_balance or a
+    missing one, and as `paid_training_amounts` and `amount_references` do.
     """
+    if settings.scale not in ("none", "open balance"):
+        raise ValueError(f"stage 2 scale {settings.scale!r} is not 'none' or 'open balance'")
     if settings.scale == "none":
         return pd.Series(1.0, index=rows.index, name="exposure")
+    if settings.balance_floor not in ("median", "mean", "own mean"):
+        raise ValueError(f"stage 2 balance_floor {settings.balance_floor!r} is not 'median', "
+                         f"'mean' or 'own mean'")
     if "open_balance" not in rows.columns:
         raise ValueError("the rows have no open_balance column to scale by")
     missing = int(rows["open_balance"].isna().sum())

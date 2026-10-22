@@ -548,13 +548,33 @@ def test_fit_stage2_no_fit_fixture_bites(no_fit):
         fit_stage2(x, amount, ones(x), stage2_settings())
 
 
-def test_fit_stage2_unknown_loss_is_not_checked_again():
-    # The settings file only lets STAGE2_LOSSES through; fit_stage2 does not check again.
-    # Pinned behaviour since U11.3b: the loss's power is looked up in LOSS_POWER before sklearn
-    # sees the loss, so an unknown loss is a bare KeyError, not sklearn's ValueError.
+@pytest.mark.parametrize("loss", ["tweedie", "Poisson", "", "absolute_error"])
+def test_fit_stage2_unknown_loss_exact_message(no_fit, loss):
+    # U11.4 replaced the old pinned KeyError (from the LOSS_POWER lookup) with a ValueError
+    # that names the loss and the known ones, raised before any fitting.
     x, amount = synthetic_xa()
-    with pytest.raises(KeyError, match="tweedie"):
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, amount, ones(x), stage2_settings(loss=loss))
+    assert str(error.value) == (f"stage 2 loss {loss!r} is not one of "
+                                f"['poisson', 'gamma', 'squared_error']")
+
+
+def test_fit_stage2_unknown_loss_is_checked_before_the_amounts(no_fit):
+    x, amount = synthetic_xa()
+    with pytest.raises(ValueError, match="^stage 2 loss 'tweedie'"):
+        fit_stage2(x, amount.reset_index(drop=True), ones(x), stage2_settings(loss="tweedie"))
+
+
+def test_fit_stage2_unknown_loss_is_not_a_key_error():
+    x, amount = synthetic_xa()
+    try:
         fit_stage2(x, amount, ones(x), stage2_settings(loss="tweedie"))
+    except ValueError:
+        pass
+    except KeyError as error:   # pragma: no cover - the old behaviour
+        raise AssertionError(f"an unknown loss is still a KeyError: {error!r}")
+    else:   # pragma: no cover
+        raise AssertionError("an unknown loss was accepted")
 
 
 # --- U11.2: predict_amount ----------------------------------------------------------------------
@@ -1914,3 +1934,45 @@ def test_exposure_feeds_fit_and_predict_end_to_end():
     m = predict_amount(model, x, e)
     assert np.isfinite(m).all() and (m > 0).all()
     assert total_ratio(model, x, amount, e) == pytest.approx(1.0, abs=0.02)
+
+
+# --- U11.4: exposure refuses an unknown scale or balance floor --------------------------------------
+# Before, an unknown floor silently used the mean. The scale is checked first; the floor only
+# under "open balance" (under "none" it plays no part), and before the open_balance column.
+
+@pytest.mark.parametrize("scale", ["None", "open_balance", "balance", ""])
+def test_exposure_unknown_scale_exact_message(scale):
+    with pytest.raises(ValueError) as error:
+        exposure(floor_train(), balance_rows(), exposure_settings(scale=scale))
+    assert str(error.value) == f"stage 2 scale {scale!r} is not 'none' or 'open balance'"
+
+
+@pytest.mark.parametrize("floor", ["average", "Mean", "own_mean", "min", ""])
+def test_exposure_unknown_floor_exact_message(floor):
+    with pytest.raises(ValueError) as error:
+        exposure(floor_train(), balance_rows(), exposure_settings(floor=floor))
+    assert str(error.value) == (f"stage 2 balance_floor {floor!r} is not 'median', 'mean' or "
+                                f"'own mean'")
+
+
+def test_exposure_unknown_floor_no_longer_falls_back_to_the_mean():
+    with pytest.raises(ValueError, match="balance_floor 'average'"):
+        exposure(floor_train(), balance_rows(), exposure_settings(floor="average"))
+
+
+def test_exposure_unknown_floor_under_scale_none_is_ignored():
+    rows = balance_rows()
+    e = exposure(floor_train(), rows, exposure_settings(scale="none", floor="average"))
+    assert e.tolist() == [1.0] * len(rows)
+
+
+def test_exposure_unknown_scale_is_checked_before_anything_else():
+    # No open_balance column and no paid training row: the scale is still reported first.
+    with pytest.raises(ValueError, match="^stage 2 scale 'x'"):
+        exposure(train_table(paid=(False, False, False)), history_rows(),
+                 exposure_settings(scale="x", floor="average"))
+
+
+def test_exposure_unknown_floor_is_checked_before_the_open_balance_column():
+    with pytest.raises(ValueError, match="^stage 2 balance_floor 'average'"):
+        exposure(floor_train(), history_rows(), exposure_settings(floor="average"))

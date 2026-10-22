@@ -146,6 +146,28 @@ calibration_groups = 10         # groups of the reliability table: rows sorted b
 importance_repeats = 3          # shuffles per feature for the permutation importance
 output_folder = "data/interim/hurdle_diagnostic"   # the result tables, as CSV
 
+[joint_diagnostic]
+# U11.5: stage 1 and stage 2 chosen TOGETHER by the error of the weekly cash totals (the sum
+# of p x m per origin and h, all companies together) on the validation target weeks, then
+# tested once, beside the default pair ([stage1] + [stage2]) and the `deflated` benchmark.
+# Same splits as [diagnostic] (its origin). Each stage is still trained with its own loss.
+# Every stage-1 setting x every stage-2 setting is scored, but each is fitted only once.
+# Diagnostic only: nothing from it reaches the forecast.
+run = true
+stage1_max_iter = [900]          # stage 1's grid (kept small: one fit on ~570k rows takes
+stage1_learning_rate = [0.01]    # minutes; the stage-1 diagnostic already searched it)
+stage1_max_leaf_nodes = [63]
+stage2_loss = ["poisson", "gamma"]
+stage2_max_iter = [300]
+stage2_learning_rate = [0.05, 0.1]
+stage2_max_leaf_nodes = [31]
+stage2_scale = ["none", "open balance"]
+stage2_balance_floor = ["median", "own mean"]   # tried under "open balance" only
+selection_metric = "mape"       # "mape" (every week counts the same; favours forecasting
+                                # low, hence the bias column) or "wape" (weeks by size)
+bootstrap_samples = 2000        # resamples of the paired comparison with `deflated`
+output_folder = "data/interim/hurdle_joint_diagnostic"   # the result tables, as CSV
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)

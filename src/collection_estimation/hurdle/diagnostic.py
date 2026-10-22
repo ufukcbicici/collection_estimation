@@ -30,6 +30,7 @@ from sklearn.metrics import (average_precision_score, brier_score_loss, f1_score
                              roc_auc_score)
 
 from .stage1 import predict_paid
+from .stage2 import check_amounts
 
 
 @dataclass(frozen=True)
@@ -244,30 +245,101 @@ def check_outcomes(actual: pd.Series, p: pd.Series) -> pd.Series:
     return actual
 
 
-def reliability_table(actual: pd.Series, p: pd.Series, groups: int) -> pd.DataFrame:
-    """How well p matches what happened: the rows sorted by p and cut into `groups` groups of
-    (nearly) equal size, one row per group with its lowest and highest p, its mean p, the
-    share of its rows that actually paid, and its row count. A calibrated model has mean p
-    close to the share paid in every group.
+def equal_groups(prediction: pd.Series, groups: int) -> np.ndarray:
+    """The group (1 to `groups`) of each row when the rows are sorted by `prediction` and cut
+    into `groups` groups of (nearly) equal size: the lowest predictions are group 1. In the
+    order of `prediction`'s rows. Tied predictions keep their row order (a stable sort).
 
-    Equal-size groups, not equal-width ones: most p are small, so equal widths would leave
-    the top groups nearly empty. Raises ValueError if `groups` < 2 or there are fewer rows
-    than groups (and see `check_outcomes`).
+    Equal-size groups, not equal-width ones: most predictions are small, so equal widths would
+    leave the top groups nearly empty. Raises ValueError if `groups` < 2, there are fewer rows
+    than groups, or a prediction is NaN (it cannot be sorted).
     """
-    actual = check_outcomes(actual, p)
     if groups < 2:
         raise ValueError(f"groups is {groups}; at least 2 are needed")
-    if len(p) < groups:
-        raise ValueError(f"{len(p)} rows cannot be cut into {groups} groups")
-    # Position of each row in p's order (stable, so tied p keep their row order), then its
-    # group: the first len/groups positions are group 1, and so on.
-    order = np.argsort(p.to_numpy(), kind="mergesort")
-    group = np.empty(len(p), dtype=int)
-    group[order] = np.arange(len(p)) * groups // len(p) + 1
+    if len(prediction) < groups:
+        raise ValueError(f"{len(prediction)} rows cannot be cut into {groups} groups")
+    if prediction.isna().any():
+        raise ValueError(f"the prediction is NaN in {int(prediction.isna().sum())} rows")
+    # Position of each row in the sorted order, then its group: the first len/groups
+    # positions are group 1, and so on.
+    order = np.argsort(prediction.to_numpy(), kind="mergesort")
+    group = np.empty(len(prediction), dtype=int)
+    group[order] = np.arange(len(prediction)) * groups // len(prediction) + 1
+    return group
+
+
+def reliability_table(actual: pd.Series, p: pd.Series, groups: int) -> pd.DataFrame:
+    """How well p matches what happened: the rows in `groups` equal-size groups by p
+    (`equal_groups`), one row per group with its lowest and highest p, its mean p, the share
+    of its rows that actually paid, and its row count. A calibrated model has mean p close to
+    the share paid in every group.
+
+    Raises ValueError as `equal_groups` and `check_outcomes` do.
+    """
+    actual = check_outcomes(actual, p)
+    group = equal_groups(p, groups)
     rows = pd.DataFrame({"group": group, "p": p.to_numpy(), "paid": actual.to_numpy()})
     table = rows.groupby("group").agg(p_low=("p", "min"), p_high=("p", "max"),
                                       mean_p=("p", "mean"), share_paid=("paid", "mean"),
                                       rows=("p", "size"))
+    return table.reset_index()
+
+
+def cash_by_p_group(p: pd.Series, m: pd.Series, actual_amount: pd.Series,
+                    groups: int) -> pd.DataFrame:
+    """The amount-weighted calibration check of the whole model: the rows (paid or not) in
+    `groups` equal-size groups by p, one row per group with its lowest and highest p, its mean
+    p, the expected cash (the sum of p x m), the actual cash (the sum of `actual_amount`, 0
+    for rows that did not pay), their ratio (expected / actual; 1.0 = the cash adds up) and
+    the row count.
+
+    It shows whether m, learned on payers, adds cash on rows unlike any payer: on the low-p
+    groups p x m should still match the little cash that came. Raises ValueError if `m` or
+    `actual_amount` does not have the rows of `p`, either holds a NaN or infinite value, an
+    actual amount is below 0, and as `equal_groups` does.
+    """
+    for name, series in (("m", m), ("actual_amount", actual_amount)):
+        if not series.index.equals(p.index):
+            raise ValueError(f"{name} must have the rows of p (the same index)")
+        if not np.isfinite(series.astype("float64")).all():
+            raise ValueError(f"{name} holds a NaN or infinite value")
+    if (actual_amount < 0).any():
+        raise ValueError("actual_amount is below 0 in some rows; it is the cash received")
+    rows = pd.DataFrame({"group": equal_groups(p, groups), "p": p.to_numpy(),
+                         "expected": (p * m).to_numpy(),
+                         "actual": actual_amount.astype("float64").to_numpy()})
+    table = rows.groupby("group").agg(p_low=("p", "min"), p_high=("p", "max"),
+                                      mean_p=("p", "mean"), expected_cash=("expected", "sum"),
+                                      actual_cash=("actual", "sum"), rows=("p", "size"))
+    # A group that received no cash has no ratio.
+    table.insert(5, "ratio", (table["expected_cash"] / table["actual_cash"])
+                 .where(table["actual_cash"] > 0))
+    return table.reset_index()
+
+
+def amount_reliability(actual: pd.Series, m: pd.Series, groups: int) -> pd.DataFrame:
+    """Stage 2's reliability table: the paid rows in `groups` equal-size groups by m, one row
+    per group with its lowest and highest m, its mean m, the mean `actual` amount, their ratio
+    (mean actual / mean m; 1.0 = calibrated) and the row count. Calibrated m: the mean actual
+    equals the mean m in every group.
+
+    Grouped by m, not by the actual amount: grouped by the actual, small payments always look
+    over-predicted and large ones under-predicted, even for a perfect model of the mean
+    (regression to the mean). Raises ValueError if `m` does not have the rows of `actual`, is
+    NaN or infinite, `actual` is not a valid paid amount (`check_amounts`), and as
+    `equal_groups` does.
+    """
+    if not m.index.equals(actual.index):
+        raise ValueError("m must have the rows of actual (the same index)")
+    actual = check_amounts(actual.to_frame(), actual)
+    if not np.isfinite(m.astype("float64")).all():
+        raise ValueError("m holds a NaN or infinite value")
+    rows = pd.DataFrame({"group": equal_groups(m, groups), "m": m.to_numpy(),
+                         "actual": actual.to_numpy()})
+    table = rows.groupby("group").agg(m_low=("m", "min"), m_high=("m", "max"),
+                                      mean_m=("m", "mean"), mean_actual=("actual", "mean"),
+                                      rows=("m", "size"))
+    table.insert(4, "ratio", table["mean_actual"] / table["mean_m"])
     return table.reset_index()
 
 

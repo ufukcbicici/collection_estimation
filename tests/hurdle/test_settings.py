@@ -169,6 +169,18 @@ VALID = {
                    "reference_window": "13", "reference_prior_weeks": "1.0",
                    "amount_reference_window": "52",
                    "importance_repeats": "3", "output_folder": '"results/diagnostic"'},
+    # U11.5: the joint diagnostic of stage 1 and stage 2. Values differ from synthetic.toml's
+    # on purpose ("wape", 500 samples, two stage-1 rates), so a test can tell them apart.
+    "joint_diagnostic": {"run": "false", "stage1_max_iter": "[300, 900]",
+                         "stage1_learning_rate": "[0.01, 0.05]",
+                         "stage1_max_leaf_nodes": "[63]",
+                         "stage2_loss": '["poisson", "gamma"]', "stage2_max_iter": "[300]",
+                         "stage2_learning_rate": "[0.05, 0.1]",
+                         "stage2_max_leaf_nodes": "[15, 31]",
+                         "stage2_scale": '["none", "open balance"]',
+                         "stage2_balance_floor": '["median", "own mean"]',
+                         "selection_metric": '"wape"', "bootstrap_samples": "500",
+                         "output_folder": '"results/joint"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -300,7 +312,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
                                        "history", "stage1", "stage2", "diagnostic",
-                                       "debug"])
+                                       "joint_diagnostic", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -2183,7 +2195,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
 
@@ -2691,7 +2703,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="diagnostic")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
 
@@ -3418,7 +3430,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="stage2")
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
 
@@ -3991,3 +4003,354 @@ def test_the_synthetic_balance_scaling_settings():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.stage2.own_mean_window in settings.history.windows
     assert type(settings.stage2.own_mean_prior_weeks) is float
+
+
+# --- [joint_diagnostic] (U11.5) ------------------------------------------------------------------
+# A required section: the joint diagnostic of stage 1 and stage 2. Its grids are checked like
+# [diagnostic]'s (non-empty lists, each item checked, no repeats); the scale and floor items are
+# choices from STAGE2_SCALES and BALANCE_FLOORS; the metric is one of TOTAL_METRICS.
+
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    BALANCE_FLOORS,
+    STAGE2_SCALES,
+    TOTAL_METRICS,
+    JointDiagnosticSettings,
+    read_joint_diagnostic,
+)
+
+JOINT = f"{FILE_NAME} [joint_diagnostic]"
+JOINT_KEYS = ['bootstrap_samples', 'output_folder', 'run', 'selection_metric',
+              'stage1_learning_rate', 'stage1_max_iter', 'stage1_max_leaf_nodes',
+              'stage2_balance_floor', 'stage2_learning_rate', 'stage2_loss',
+              'stage2_max_iter', 'stage2_max_leaf_nodes', 'stage2_scale']
+
+
+def test_total_metrics():
+    assert TOTAL_METRICS == ("mape", "wape")
+
+
+def test_joint_diagnostic_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(JointDiagnosticSettings)] == [
+        "run", "stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
+        "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
+        "stage2_scale", "stage2_balance_floor", "selection_metric", "bootstrap_samples",
+        "output_folder"]
+
+
+def test_the_joint_diagnostic_section_is_read(tmp_path, repo):
+    joint = load(tmp_path, repo).joint_diagnostic
+    assert isinstance(joint, JointDiagnosticSettings)
+    assert joint == JointDiagnosticSettings(
+        run=False, stage1_max_iter=(300, 900), stage1_learning_rate=(0.01, 0.05),
+        stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
+        stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(15, 31),
+        stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        selection_metric="wape", bootstrap_samples=500,
+        output_folder=(repo / "results" / "joint").resolve())
+
+
+def test_the_joint_diagnostic_values_have_the_right_python_types(tmp_path, repo):
+    joint = load(tmp_path, repo).joint_diagnostic
+    assert joint.run is False
+    assert type(joint.bootstrap_samples) is int
+    assert type(joint.selection_metric) is str
+    for name, item_type in (("stage1_max_iter", int), ("stage1_learning_rate", float),
+                            ("stage1_max_leaf_nodes", int), ("stage2_loss", str),
+                            ("stage2_max_iter", int), ("stage2_learning_rate", float),
+                            ("stage2_max_leaf_nodes", int), ("stage2_scale", str),
+                            ("stage2_balance_floor", str)):
+        grid = getattr(joint, name)
+        assert type(grid) is tuple, name
+        assert all(type(item) is item_type for item in grid), (name, grid)
+    assert isinstance(joint.output_folder, Path) and joint.output_folder.is_absolute()
+
+
+def test_joint_diagnostic_settings_is_frozen_and_hashable(tmp_path, repo):
+    joint = load(tmp_path, repo).joint_diagnostic
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        joint.run = True
+    assert hash(joint) == hash(dataclasses.replace(joint))
+
+
+def test_settings_has_a_joint_diagnostic_field_between_diagnostic_and_debug():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("diagnostic") < names.index("joint_diagnostic") < names.index("debug")
+
+
+def test_the_joint_diagnostic_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("joint_diagnostic", "stage2_loss"): '["gamma"]',
+                                      ("joint_diagnostic", "run"): "true"})
+    assert a.stage1 == b.stage1 and a.stage2 == b.stage2 and a.diagnostic == b.diagnostic
+
+
+def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic")
+    assert message == (
+        f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['collections_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'ledger_layout', 'receivables', 'stage1', 'stage2']")
+
+
+def test_a_joint_diagnostic_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic",
+                                 top="joint_diagnostic = 5")
+    assert message == f"{JOINT} is 5, not a section"
+
+
+def test_an_empty_joint_diagnostic_section_names_every_setting(tmp_path, repo):
+    changes = {("joint_diagnostic", key): REMOVE for key in VALID["joint_diagnostic"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == f"{JOINT}: missing {JOINT_KEYS}; expected exactly {JOINT_KEYS}"
+
+
+@pytest.mark.parametrize("key", JOINT_KEYS)
+def test_each_missing_joint_diagnostic_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): REMOVE})
+    assert message == f"{JOINT}: missing [{key!r}]; expected exactly {JOINT_KEYS}"
+
+
+def test_a_joint_diagnostic_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", "stage2_scale"): REMOVE,
+                                             ("joint_diagnostic", "stage2_scales"): '["none"]'})
+    assert message == (f"{JOINT}: missing ['stage2_scale']; unknown ['stage2_scales']; "
+                       f"expected exactly {JOINT_KEYS}")
+
+
+@pytest.mark.parametrize("key, value", [("origin", "40"), ("class_weights", '["none"]'),
+                                        ("stage2_own_mean_window", "13")])
+def test_an_unknown_joint_diagnostic_key_is_refused(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): value})
+    assert message == f"{JOINT}: unknown [{key!r}]; expected exactly {JOINT_KEYS}"
+
+
+def test_the_joint_diagnostic_keys_are_unknown_in_diagnostic(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "bootstrap_samples"): "500"})
+    assert message.startswith(f"{DIAG}: unknown ['bootstrap_samples']; ")
+
+
+# run
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_joint_diagnostic_run_accepts_true_and_false(tmp_path, repo, text, expected):
+    joint = load(tmp_path, repo, changes={("joint_diagnostic", "run"): text}).joint_diagnostic
+    assert joint.run is expected
+
+
+@pytest.mark.parametrize("text, shown", [("1", "1"), ('"true"', "'true'"), ("0", "0")])
+def test_joint_diagnostic_run_not_a_bool_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", "run"): text})
+    assert message == f"{JOINT}: run is {shown}, not true or false"
+
+
+# grids: shape
+
+GRID_KEYS = ["stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes", "stage2_loss",
+             "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
+             "stage2_scale", "stage2_balance_floor"]
+
+
+@pytest.mark.parametrize("key", GRID_KEYS)
+@pytest.mark.parametrize("text, shown", [("[]", "[]"), ("5", "5"), ('"none"', "'none'")])
+def test_a_joint_grid_that_is_not_a_non_empty_list_has_the_exact_message(tmp_path, repo, key,
+                                                                         text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} is {shown}, not a non-empty list of values to try"
+
+
+@pytest.mark.parametrize("key, text, shown", [
+    ("stage1_max_iter", "[300, 300]", "[300, 300]"),
+    ("stage1_learning_rate", "[0.1, 0.1]", "[0.1, 0.1]"),
+    ("stage1_max_leaf_nodes", "[31, 15, 31]", "[31, 15, 31]"),
+    ("stage2_loss", '["gamma", "gamma"]', "['gamma', 'gamma']"),
+    ("stage2_max_iter", "[1, 1]", "[1, 1]"),
+    ("stage2_learning_rate", "[0.5, 0.5]", "[0.5, 0.5]"),
+    ("stage2_max_leaf_nodes", "[2, 2]", "[2, 2]"),
+    ("stage2_scale", '["none", "none"]', "['none', 'none']"),
+    ("stage2_balance_floor", '["mean", "median", "mean"]', "['mean', 'median', 'mean']"),
+])
+def test_a_joint_grid_with_a_repeat_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} lists a value more than once: {shown}"
+
+
+def test_joint_grids_keep_the_order_given(tmp_path, repo):
+    joint = load(tmp_path, repo, changes={
+        ("joint_diagnostic", "stage1_max_iter"): "[900, 100, 300]",
+        ("joint_diagnostic", "stage2_scale"): '["open balance", "none"]',
+        ("joint_diagnostic", "stage2_balance_floor"): '["own mean", "mean", "median"]',
+    }).joint_diagnostic
+    assert joint.stage1_max_iter == (900, 100, 300)
+    assert joint.stage2_scale == ("open balance", "none")
+    assert joint.stage2_balance_floor == ("own mean", "mean", "median")
+
+
+def test_joint_grids_accept_every_choice(tmp_path, repo):
+    joint = load(tmp_path, repo, changes={
+        ("joint_diagnostic", "stage2_loss"): '["poisson", "gamma", "squared_error"]',
+        ("joint_diagnostic", "stage2_scale"): '["none", "open balance"]',
+        ("joint_diagnostic", "stage2_balance_floor"): '["median", "mean", "own mean"]',
+    }).joint_diagnostic
+    assert joint.stage2_loss == STAGE2_LOSSES
+    assert joint.stage2_scale == STAGE2_SCALES
+    assert joint.stage2_balance_floor == BALANCE_FLOORS
+
+
+# grids: items
+
+@pytest.mark.parametrize("key, item, shown, reason", [
+    ("stage1_max_iter", "0", "0", "not a whole number of 1 or more"),
+    ("stage1_max_iter", "1.5", "1.5", "not a whole number of 1 or more"),
+    ("stage1_max_iter", "true", "True", "not a whole number of 1 or more"),
+    ("stage2_max_iter", "-3", "-3", "not a whole number of 1 or more"),
+    ("stage1_learning_rate", "0", "0", "not a number above 0 and at most 1"),
+    ("stage1_learning_rate", "1.5", "1.5", "not a number above 0 and at most 1"),
+    ("stage2_learning_rate", '"0.1"', "'0.1'", "not a number above 0 and at most 1"),
+    ("stage2_learning_rate", "true", "True", "not a number above 0 and at most 1"),
+    ("stage1_max_leaf_nodes", "1", "1", "not a whole number of 2 or more"),
+    ("stage2_max_leaf_nodes", "31.0", "31.0", "not a whole number of 2 or more"),
+    ("stage2_loss", '"tweedie"', "'tweedie'",
+     "not one of ['poisson', 'gamma', 'squared_error']"),
+    ("stage2_loss", '"Poisson"', "'Poisson'",
+     "not one of ['poisson', 'gamma', 'squared_error']"),
+    ("stage2_scale", '"open_balance"', "'open_balance'", "not one of ['none', 'open balance']"),
+    ("stage2_scale", "1", "1", "not one of ['none', 'open balance']"),
+    ("stage2_balance_floor", '"average"', "'average'",
+     "not one of ['median', 'mean', 'own mean']"),
+    ("stage2_balance_floor", '"own_mean"', "'own_mean'",
+     "not one of ['median', 'mean', 'own mean']"),
+])
+def test_a_bad_joint_grid_item_has_the_exact_message(tmp_path, repo, key, item, shown, reason):
+    good = {"stage1_max_iter": "100", "stage2_max_iter": "100", "stage1_learning_rate": "0.1",
+            "stage2_learning_rate": "0.1", "stage1_max_leaf_nodes": "15",
+            "stage2_max_leaf_nodes": "15", "stage2_loss": '"gamma"', "stage2_scale": '"none"',
+            "stage2_balance_floor": '"mean"'}[key]
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): f"[{good}, {item}]"})
+    assert message == f"{JOINT} {key} item: {key} is {shown}, {reason}"
+
+
+def test_a_floor_grid_is_checked_even_if_open_balance_is_not_tried(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {
+        ("joint_diagnostic", "stage2_scale"): '["none"]',
+        ("joint_diagnostic", "stage2_balance_floor"): '["average"]'})
+    assert message.startswith(f"{JOINT} stage2_balance_floor item:")
+
+
+def test_a_learning_rate_of_exactly_one_is_accepted(tmp_path, repo):
+    joint = load(tmp_path, repo, changes={("joint_diagnostic", "stage1_learning_rate"): "[1]",
+                                          ("joint_diagnostic", "stage2_learning_rate"): "[1.0]"}
+                 ).joint_diagnostic
+    assert joint.stage1_learning_rate == (1.0,) and joint.stage2_learning_rate == (1.0,)
+
+
+# selection_metric
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+def test_joint_selection_metric_accepts_each_total_metric(tmp_path, repo, metric):
+    joint = load(tmp_path, repo,
+                 changes={("joint_diagnostic", "selection_metric"): f'"{metric}"'}
+                 ).joint_diagnostic
+    assert joint.selection_metric == metric
+
+
+@pytest.mark.parametrize("text, shown", [('"MAPE"', "'MAPE'"), ('"log loss"', "'log loss'"),
+                                         ('"bias"', "'bias'"), ('""', "''"), ("1", "1"),
+                                         ('["mape"]', "['mape']")])
+def test_a_bad_joint_selection_metric_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", "selection_metric"): text})
+    assert message == f"{JOINT}: selection_metric is {shown}, not one of ['mape', 'wape']"
+
+
+def test_the_stage1_diagnostic_metrics_are_not_joint_metrics(tmp_path, repo):
+    message = exact_message(tmp_path, repo,
+                            {("joint_diagnostic", "selection_metric"): '"brier"'})
+    assert "not one of ['mape', 'wape']" in message
+
+
+# bootstrap_samples
+
+@pytest.mark.parametrize("value", [1, 2, 2000, 100000])
+def test_bootstrap_samples_accepts_counts(tmp_path, repo, value):
+    joint = load(tmp_path, repo,
+                 changes={("joint_diagnostic", "bootstrap_samples"): str(value)}
+                 ).joint_diagnostic
+    assert joint.bootstrap_samples == value
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("2000.0", "2000.0"),
+                                         ('"2000"', "'2000'"), ("true", "True"),
+                                         ("[2000]", "[2000]")])
+def test_a_bad_bootstrap_samples_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", "bootstrap_samples"): text})
+    assert message == f"{JOINT}: bootstrap_samples is {shown}, not a whole number of 1 or more"
+
+
+# output_folder
+
+def test_joint_output_folder_is_read_from_the_repo_root(tmp_path, repo):
+    joint = load(tmp_path, repo, changes={
+        ("joint_diagnostic", "output_folder"): '"data/interim/hurdle_joint_diagnostic"'}
+                 ).joint_diagnostic
+    assert joint.output_folder == (repo / "data" / "interim"
+                                   / "hurdle_joint_diagnostic").resolve()
+
+
+def test_a_bad_joint_output_folder_names_the_section(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", "output_folder"): "5"})
+    assert message.startswith(f"{JOINT}: output_folder")
+
+
+# read_joint_diagnostic on its own
+
+def joint_table(**changes):
+    table = {"run": True, "stage1_max_iter": [900], "stage1_learning_rate": [0.01],
+             "stage1_max_leaf_nodes": [63], "stage2_loss": ["poisson", "gamma"],
+             "stage2_max_iter": [300], "stage2_learning_rate": [0.05, 0.1],
+             "stage2_max_leaf_nodes": [31], "stage2_scale": ["none", "open balance"],
+             "stage2_balance_floor": ["median", "own mean"], "selection_metric": "mape",
+             "bootstrap_samples": 2000, "output_folder": "out"}
+    table.update(changes)
+    return table
+
+
+def test_read_joint_diagnostic_by_hand(tmp_path):
+    joint = read_joint_diagnostic(joint_table(), tmp_path, "here")
+    assert joint == JointDiagnosticSettings(
+        run=True, stage1_max_iter=(900,), stage1_learning_rate=(0.01,),
+        stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
+        stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
+        stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        selection_metric="mape", bootstrap_samples=2000,
+        output_folder=(tmp_path / "out").resolve())
+
+
+def test_read_joint_diagnostic_uses_where_in_its_messages(tmp_path):
+    with pytest.raises(ValueError) as error:
+        read_joint_diagnostic(joint_table(stage2_scale=["x"]), tmp_path, "here")
+    assert str(error.value) == ("here stage2_scale item: stage2_scale is 'x', not one of "
+                                "['none', 'open balance']")
+    with pytest.raises(ValueError) as error:
+        read_joint_diagnostic(joint_table(selection_metric="mae"), tmp_path, "here")
+    assert str(error.value) == "here: selection_metric is 'mae', not one of ['mape', 'wape']"
+
+
+def test_read_joint_diagnostic_does_not_change_its_table(tmp_path):
+    table = joint_table()
+    copy = {key: (list(value) if isinstance(value, list) else value)
+            for key, value in table.items()}
+    read_joint_diagnostic(table, tmp_path, "here")
+    assert table == copy
+
+
+# synthetic.toml
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_joint_diagnostic_settings():
+    joint = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).joint_diagnostic
+    assert joint == JointDiagnosticSettings(
+        run=True, stage1_max_iter=(900,), stage1_learning_rate=(0.01,),
+        stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
+        stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
+        stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        selection_metric="mape", bootstrap_samples=2000,
+        output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_joint_diagnostic").resolve())

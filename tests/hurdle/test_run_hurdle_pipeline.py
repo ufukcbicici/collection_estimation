@@ -1588,8 +1588,10 @@ def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
 
 # Step 7's second guard (U10.4a): when [diagnostic] run is on, its test weeks (up to origin +
 # 2 horizons) must have answers. Run from main()'s own syntax tree, like the demo_origin guard.
+# U11.5: step 15's joint diagnostic uses the same splits, so its run switch arms the guard too.
 DIAGNOSTIC_END = "settings.diagnostic.origin + 2 * settings.receivables.horizons"
-DIAGNOSTIC_GUARD_TEST = "settings.diagnostic.run and diagnostic_end > int(weeks['week'].max())"
+DIAGNOSTIC_GUARD_TEST = ("(settings.diagnostic.run or settings.joint_diagnostic.run) and "
+                         "diagnostic_end > int(weeks['week'].max())")
 
 
 def is_diagnostic_guard(node):
@@ -1612,7 +1614,7 @@ def diagnostic_guard_statements():
 
 
 def run_diagnostic_guard(run, origin, horizons, last_week, demo_origin=0, week_dtype="int64",
-                         weeks=None, with_demo_guard=False):
+                         weeks=None, with_demo_guard=False, joint_run=False):
     """Run the diagnostic guard (and, if asked, the demo_origin guard before it) with
     settings and a week calendar whose weeks run 0..last_week."""
     from types import SimpleNamespace
@@ -1624,6 +1626,7 @@ def run_diagnostic_guard(run, origin, horizons, last_week, demo_origin=0, week_d
     code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
     settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=demo_origin),
                                diagnostic=SimpleNamespace(run=run, origin=origin),
+                               joint_diagnostic=SimpleNamespace(run=joint_run),
                                receivables=SimpleNamespace(horizons=horizons))
     if weeks is None:
         weeks = pd.DataFrame({"week": pd.Series(range(0, last_week + 1), dtype=week_dtype)})
@@ -1660,6 +1663,31 @@ def test_diagnostic_guard_allows_test_weeks_up_to_the_last_week(origin, horizons
 @pytest.mark.parametrize("origin", [50, 60, 1000])
 def test_diagnostic_guard_does_not_raise_when_run_is_false(origin):
     run_diagnostic_guard(False, origin, horizons=5, last_week=59)
+
+
+# U11.5: the joint diagnostic's run switch arms the same guard, alone or with [diagnostic]'s.
+
+@pytest.mark.parametrize("run, joint_run", [(False, True), (True, True), (True, False)])
+def test_diagnostic_guard_raises_when_either_diagnostic_runs(run, joint_run):
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(run, origin=50, horizons=5, last_week=59, joint_run=joint_run)
+    assert str(error.value) == diagnostic_guard_message(50, 60, 59)
+
+
+@pytest.mark.parametrize("origin", [50, 60, 1000])
+def test_diagnostic_guard_does_not_raise_when_neither_diagnostic_runs(origin):
+    run_diagnostic_guard(False, origin, horizons=5, last_week=59, joint_run=False)
+
+
+def test_diagnostic_guard_allows_the_joint_diagnostic_up_to_the_last_week():
+    run_diagnostic_guard(False, origin=49, horizons=5, last_week=59, joint_run=True)
+
+
+def test_diagnostic_guard_with_only_the_joint_run_uses_the_diagnostic_origin():
+    # Step 15 has no origin of its own: [diagnostic] origin is checked even with run false.
+    with pytest.raises(ValueError) as error:
+        run_diagnostic_guard(False, origin=55, horizons=5, last_week=64, joint_run=True)
+    assert str(error.value) == diagnostic_guard_message(55, 65, 64)
 
 
 def test_diagnostic_guard_counts_two_horizons_not_one():
@@ -1723,7 +1751,7 @@ def test_diagnostic_guard_body_is_a_single_raise_of_value_error():
 
 def test_diagnostic_guard_comes_before_the_long_steps():
     source = main_source()
-    guard = source.index("if settings.diagnostic.run and diagnostic_end")
+    guard = source.index("and diagnostic_end > int(weeks")
     assert source.index("show_weeks(weeks)") < guard
     for later in ("weekly = weekly_amounts(", "exchange_rates(", "receivables_by_week(",
                   "table = join_features(", "diagnostic_splits("):
@@ -2971,9 +2999,10 @@ diagnostic = [i for i, node in enumerate(body)
               if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
 assert len(diagnostic) == 1, diagnostic
 step_14 = statements[diagnostic[0] + 1:]
-# U11.3: the stage 2 scores close step 14 (checked below): the last two statements.
-scores_part = body[-2:]
-step_14 = step_14[:-2]
+# U11.3: the stage 2 scores (checked below): two statements. U11.4 added the cash-by-p check
+# after them (two statements) and U11.5 step 15's `if` last: five statements in all.
+scores_part = body[-5:-3]
+step_14 = step_14[:-5]
 assert step_14 == [
     "stage2_columns = feature_columns(block_feature_columns(history, calendar, owed), "
     "settings.stage2.feature_blocks)",
@@ -3014,7 +3043,33 @@ assert [ast.unparse(n) for n in branch.orelse] == [
     "stage2_scores = amount_scores(paid_forecast['amount_deflated'], paid_forecast['h'], "
     "{'stage 2': m[paid_forecast.index], **amount_guesses}, amount_guesses['training mean'])",
     "show_stage2_scores(stage2_scores)",
+    # U11.4: stage 2's reliability table on the same paid forecast rows.
+    "show_amount_reliability(amount_reliability(paid_forecast['amount_deflated'], "
+    "m[paid_forecast.index], settings.diagnostic.calibration_groups))",
 ], [ast.unparse(n) for n in branch.orelse]
+# U11.4: the amount-weighted check of the whole model on the labelled forecast rows (paid or
+# not), with stage 1's HGB p and stage 2's m.
+assert ast.unparse(body[-3]) == "labelled = forecast_rows['label_status'] == 'labelled'"
+cash_check = body[-2]
+assert isinstance(cash_check, ast.If) and ast.unparse(cash_check.test) == "labelled.any()"
+assert cash_check.orelse == []
+assert [ast.unparse(n) for n in cash_check.body] == [
+    "show_cash_by_p_group(cash_by_p_group(predictions['stage 1 (HGB)'][labelled], "
+    "m[labelled], forecast_rows.loc[labelled, 'amount_deflated'], "
+    "settings.diagnostic.calibration_groups))"], [ast.unparse(n) for n in cash_check.body]
+# U11.5: step 15 closes main(), behind its own run switch.
+step_15 = body[-1]
+assert isinstance(step_15, ast.If) and ast.unparse(step_15.test) == "settings.joint_diagnostic.run"
+assert step_15.orelse == []
+assert [ast.unparse(n) for n in step_15.body] == [
+    "run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar)"]
+from collection_estimation.hurdle import diagnostic as diagnostic_module
+assert script.amount_reliability is diagnostic_module.amount_reliability
+assert script.cash_by_p_group is diagnostic_module.cash_by_p_group
+inspect.signature(script.show_amount_reliability).bind("table")
+inspect.signature(script.show_cash_by_p_group).bind("table")
+inspect.signature(script.run_joint_diagnostic).bind("settings", "table", "columns",
+                                                    "stage2_columns", "companies", "calendar")
 assert script.amount_references is stage2.amount_references
 assert script.exposure is stage2.exposure   # U11.3b
 inspect.signature(script.show_exposure).bind("stage2", "paid_rows", "paid_exposure",
@@ -3642,3 +3697,299 @@ def test_show_exposure_names_the_floor_it_is_given(floor):
     result = run_show_exposure("open balance", floor=floor)
     assert result.returncode == 0, result.stderr
     assert f"floor {floor!r}: stage 2 learns" in result.stdout.splitlines()[0]
+
+
+# --- Step 14 (U11.4): show_amount_reliability and show_cash_by_p_group -----------------------------
+# The printouts run on tables from the real functions (hand-made inputs); the header lines are
+# exact, the numbers rounded as documented (amounts to whole TRY, ratios to 3 decimals).
+
+SHOW_U11_4 = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.diagnostic import amount_reliability, cash_by_p_group
+
+actual = pd.Series([22.4, 12.0, 35.0, 24.0, 44.0, 35.0])
+m = pd.Series([50.0, 10.0, 40.0, 20.0, 60.0, 30.0])
+table = amount_reliability(actual, m, 3)
+copy = table.copy(deep=True)
+assert script.show_amount_reliability(table) is None
+pd.testing.assert_frame_equal(table, copy)
+p = pd.Series([0.1, 0.4, 0.2, 0.3, 0.8, 0.6])
+cash = cash_by_p_group(p, pd.Series([100.0, 200.0, 300.0, 400.0, 500.0, 600.0]),
+                       pd.Series([0.0, 500.0, 0.0, 0.0, 1000.0, 0.0]), 3)
+copy = cash.copy(deep=True)
+assert script.show_cash_by_p_group(cash) is None
+pd.testing.assert_frame_equal(cash, copy)
+print("ok")
+"""
+
+
+def test_show_amount_reliability_and_cash_by_p_group_printouts():
+    result = run_code(SHOW_U11_4)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    assert lines[0] == ("        stage 2 reliability, paid forecast rows in equal groups by m "
+                        "(calibrated: ratio = mean actual / mean m near 1 in every group):")
+    header = lines[1].split()
+    assert header == ["group", "m_low", "m_high", "mean_m", "mean_actual", "ratio", "rows"]
+    # Group 1: m 10, 20; actual 12, 24 -> mean 18, ratio 1.2. Group 3: actual 22.4 and 44
+    # -> mean 33.2 shown as 33, ratio 33.2 / 55 = 0.6036 shown as 0.604.
+    assert lines[2].split() == ["1", "10.0", "20.0", "15.0", "18.0", "1.200", "2"] or \
+        lines[2].split() == ["1", "10.0", "20.0", "15.0", "18.0", "1.2", "2"]
+    assert lines[4].split()[4] == "33.0" and lines[4].split()[5] == "0.604"
+    cash_start = lines.index("        whole model, labelled forecast rows in equal groups by p: "
+                             "expected cash (sum of p x m) vs actual cash, deflated (ratio = "
+                             "expected / actual):")
+    assert lines[cash_start + 1].split() == ["group", "p_low", "p_high", "mean_p",
+                                             "expected_cash", "actual_cash", "ratio", "rows"]
+    first = lines[cash_start + 2].split()
+    assert first[0] == "1" and first[4] == "70.0" and first[5] == "0.0" and first[6] == "NaN"
+    assert lines[cash_start + 4].split()[6] == "0.76"
+
+
+# --- Step 15 (U11.5): the joint diagnostic ------------------------------------------------------
+# Wiring on the script's syntax tree and module; then run_joint_diagnostic itself, end to end,
+# on a tiny hand-made table (2 companies x 8 customers, origins 0..33, h 1..3; T = 20, H = 3)
+# with tiny grids, writing its CSVs to tmp_path only.
+
+STEP_15_WIRING = """
+import ast
+import inspect
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import benchmark, diagnostic, diagnostic_joint
+
+for name in ("benchmark_forecasts", "cash_totals"):
+    assert getattr(script, name) is getattr(benchmark, name), name
+for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "stage2_grid",
+             "total_codes"):
+    assert getattr(script, name) is getattr(diagnostic_joint, name), name
+for name in ("amount_reliability", "cash_by_p_group", "calibration_summary"):
+    assert getattr(script, name) is getattr(diagnostic, name), name
+inspect.signature(script.show_joint_grid).bind("pairs", "mape")
+inspect.signature(script.show_joint_results).bind("tables", "chosen", 10)
+print("ok")
+"""
+
+
+def test_step_15_imports_and_signatures():
+    result = run_code(STEP_15_WIRING)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_15_run_joint_diagnostic_is_called_once_in_main():
+    tree = main_tree()
+    assert len(calls_to(tree, "run_joint_diagnostic")) == 1
+    for name in ("score_pairs", "benchmark_forecasts", "paired_bootstrap"):
+        assert calls_to(tree, name) == [], name
+
+
+def test_step_15_runs_after_step_14s_checks():
+    source = main_source()
+    assert (source.index("show_stage2_scores(stage2_scores)")
+            < source.index("show_cash_by_p_group(")
+            < source.index("if settings.joint_diagnostic.run:"))
+
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+STEP_15_RUN = """
+import dataclasses
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.settings import (JointDiagnosticSettings, Stage1Settings,
+                                                   Stage2Settings)
+
+OUT = Path(OUTPUT_FOLDER)
+rng = np.random.default_rng(3)
+rows = []
+for company in ("TR02", "TR04"):
+    for c in range(8):
+        size = 100.0 * (1 + c)
+        for origin in range(0, 34):
+            for h in (1, 2, 3):
+                x = rng.random()
+                paid = rng.random() < 0.2 + 0.6 * x
+                amount = size * (0.5 + x) if paid else 0.0
+                rows.append({"key": f"{company}-{c}", "company_code": company,
+                             "origin_week": origin, "h": h, "target_week": origin + h,
+                             "x": x, "amount": amount, "paid": paid,
+                             "open_balance": size * 2 * rng.random(),
+                             "mean_receipts_4": size, "paying_weeks_4": int(rng.integers(0, 5)),
+                             "observed_weeks_4": 4})
+table = pd.DataFrame(rows)
+table["label_status"] = np.where(table["target_week"] <= 33, "labelled", "future").astype(object)
+future = table["label_status"] == "future"
+table["amount_deflated"] = table["amount"].where(~future, np.nan)
+table["paid"] = pd.array([None if f else bool(p) for f, p in zip(future, table["paid"])],
+                         dtype="boolean")
+weeks = np.arange(0, 40)
+calendar = pd.DataFrame({"week": weeks, "business_days": 5 - (weeks % 6 == 0),
+                         "has_month_end": weeks % 4 == 3})
+table = table.merge(calendar.rename(columns={"week": "target_week"}), on="target_week")
+
+stage1 = Stage1Settings(max_iter=5, learning_rate=0.3, max_leaf_nodes=4, min_samples_leaf=5,
+                        random_seed=1, feature_blocks=("history",), company_as_feature=True,
+                        baseline_c=1.0)
+stage2 = Stage2Settings(loss="poisson", max_iter=5, learning_rate=0.3, max_leaf_nodes=4,
+                        min_samples_leaf=5, random_seed=1, feature_blocks=("history",),
+                        scale="none", balance_floor="median", own_mean_window=4,
+                        own_mean_prior_weeks=1.0)
+joint = JointDiagnosticSettings(
+    run=True, stage1_max_iter=(3, 8), stage1_learning_rate=(0.3,), stage1_max_leaf_nodes=(4,),
+    stage2_loss=("poisson", "gamma"), stage2_max_iter=(4,), stage2_learning_rate=(0.3,),
+    stage2_max_leaf_nodes=(4,), stage2_scale=("none", "open balance"),
+    stage2_balance_floor=("median", "own mean"), selection_metric=METRIC, bootstrap_samples=50,
+    output_folder=OUT)
+settings = SimpleNamespace(
+    stage1=stage1, stage2=stage2, joint_diagnostic=joint,
+    receivables=SimpleNamespace(horizons=3),
+    diagnostic=SimpleNamespace(origin=20, reference_window=4, reference_prior_weeks=1.0,
+                               calibration_groups=3, amount_reference_window=4))
+columns = ["h", "x", "business_days", "has_month_end"]
+stage2_columns = ["h", "x"]
+copy = table.copy(deep=True)
+script.run_joint_diagnostic(settings, table, columns, stage2_columns, ["TR02", "TR04"],
+                            calendar)
+pd.testing.assert_frame_equal(table, copy)
+print("run ok")
+"""
+
+
+@pytest.fixture(scope="module", params=["mape", "wape"])
+def step_15_run(request, tmp_path_factory):
+    folder = tmp_path_factory.mktemp(f"joint_{request.param}")
+    code = (STEP_15_RUN.replace("OUTPUT_FOLDER", repr(str(folder)))
+            .replace("METRIC", repr(request.param)))
+    return request.param, folder, run_code(code)
+
+
+def test_step_15_real_run_succeeds_and_does_not_change_the_table(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "run ok"
+
+
+def test_step_15_real_run_header_names_the_origin_and_the_split_weeks(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == (
+        "Step 15: joint diagnostic of stage 1 and stage 2 at origin 20 (diagnostic only); "
+        "validation target weeks 21-23, test 24-26")
+
+
+def test_step_15_real_run_writes_its_tables(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    names = sorted(path.name for path in folder.iterdir())
+    assert names == sorted(f"{name}.csv" for name in (
+        "pairs", "totals_validation_consolidated", "totals_validation_per_company",
+        "totals_test_consolidated", "totals_test_per_company", "scores", "paired",
+        "stage1_test", "stage2_test", "cash_by_p_group", "amount_reliability"))
+
+
+def test_step_15_real_run_tries_every_pair(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv")
+    # stage 1: 2 settings; stage 2: 2 losses x (1 "none" + 2 floors) = 6 settings.
+    assert len(pairs) == 12
+    assert len(pairs.drop_duplicates([c for c in pairs.columns if c.startswith("s")])) == 12
+
+
+def test_step_15_real_run_pairs_are_sorted_by_the_selection_metric(step_15_run):
+    metric, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv")
+    assert pairs[metric.upper()].is_monotonic_increasing
+
+
+def test_step_15_real_run_chosen_validation_score_equals_the_best_pair(step_15_run):
+    # The chosen pair, fitted on train and scored on the validation totals, is the grid's best
+    # pair: the same fits, the same totals, so the same number.
+    metric, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv")
+    scores = pd.read_csv(folder / "scores.csv")
+    chosen = scores[(scores["part"] == "validation") & (scores["level"] == "consolidated")
+                    & (scores["model"] == "chosen") & (scores["h"] == "all")]
+    assert len(chosen) == 1
+    assert chosen[metric.upper()].iloc[0] == pytest.approx(pairs[metric.upper()].iloc[0],
+                                                           rel=1e-9)
+
+
+def test_step_15_real_run_totals_add_up(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for part in ("validation", "test"):
+        consolidated = pd.read_csv(folder / f"totals_{part}_consolidated.csv")
+        per_company = pd.read_csv(folder / f"totals_{part}_per_company.csv")
+        assert set(per_company["company_code"]) == {"TR02", "TR04"}
+        for column in ("actual", "chosen", "default"):
+            summed = per_company.groupby(["origin_week", "h"])[column].sum()
+            mine = consolidated.set_index(["origin_week", "h"])[column]
+            np.testing.assert_allclose(summed.loc[mine.index], mine, rtol=1e-9)
+        weeks = consolidated["target_week"]
+        if part == "validation":
+            assert weeks.between(21, 23).all()
+        else:
+            assert weeks.between(24, 26).all()
+        assert (consolidated["target_week"]
+                == consolidated["origin_week"] + consolidated["h"]).all()
+
+
+def test_step_15_real_run_scores_cover_every_model_level_part_and_h(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    scores = pd.read_csv(folder / "scores.csv")
+    assert set(scores["model"]) == {"chosen", "default", "deflated", "deflated_nolevel"}
+    assert set(scores["part"]) == {"validation", "test"}
+    assert set(scores["level"]) == {"consolidated", "per company"}
+    assert set(scores["h"].astype(str)) == {"1", "2", "3", "all"}
+
+
+def test_step_15_real_run_paired_comparisons(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    paired = pd.read_csv(folder / "paired.csv")
+    assert paired[["part", "A", "B"]].values.tolist() == [
+        [part, a, b] for part in ("validation", "test")
+        for a in ("chosen", "default") for b in ("deflated", "deflated_nolevel")]
+    scores = pd.read_csv(folder / "scores.csv")
+    pooled = scores[(scores["level"] == "consolidated") & (scores["h"].astype(str) == "all")]
+    for _, row in paired.iterrows():
+        mape = pooled[pooled["part"] == row["part"]].set_index("model")["MAPE"]
+        assert row["mean difference"] == pytest.approx(mape[row["A"]] - mape[row["B"]],
+                                                       abs=1e-12)
+
+
+def test_step_15_real_run_deflated_benchmark_does_not_fall_back_with_enough_weeks(step_15_run):
+    # Training target weeks 1..20 (validation) and 1..23 (test): at least 12, so a model.
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for part in ("validation", "test"):
+        totals = pd.read_csv(folder / f"totals_{part}_consolidated.csv")
+        assert not totals["deflated_nolevel fallback"].any()
+        assert np.isfinite(totals["deflated"]).all()
+
+
+def test_step_15_real_run_prints_the_results(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    for text in ("the 10 best of 12 pairs by validation", "chosen pair: stage 1 ",
+                 "VALIDATION, consolidated weekly totals", "TEST, consolidated weekly totals",
+                 "PAIRED comparison on the consolidated totals",
+                 "TEST, the chosen pair's stage 1 alone",
+                 "TEST, the chosen pair's stage 2 alone on the paid rows, all h:",
+                 "whole model, labelled forecast rows in equal groups by p",
+                 "stage 2 reliability, paid forecast rows in equal groups by m",
+                 "tables written to "):
+        assert text in out, text

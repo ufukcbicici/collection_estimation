@@ -24,6 +24,7 @@ The settings (data paths, company codes, ...) are in settings/synthetic.toml. To
 other data (e.g. the real EY files), write another settings file and point the environment
 variable HURDLE_SETTINGS to it; nothing in the code needs to change.
 """
+import itertools
 import os
 import sys
 import time
@@ -68,10 +69,25 @@ from collection_estimation.hurdle.panel import (  # noqa: E402
     add_labels,
     panel_rows,
 )
+from collection_estimation.hurdle.benchmark import (  # noqa: E402
+    benchmark_forecasts,
+    cash_totals,
+)
+from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
+    paired_bootstrap,
+    score_pairs,
+    scores_by_h,
+    stage1_grid,
+    stage2_grid,
+    total_codes,
+)
 from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    amount_reliability,
     apply_platt,
     best_unweighted,
     calibration_comparison,
+    calibration_summary,
+    cash_by_p_group,
     choose_and_test,
     class_weight_argument,
     diagnostic_splits,
@@ -206,8 +222,10 @@ def main():
                          f", after the last week {int(weeks['week'].max())}, so step 12 would "
                          f"have no answers")
     # The same for step 13's diagnostic, which needs answers up to origin + 2 horizons.
+    # Step 15's joint diagnostic uses the same splits.
     diagnostic_end = settings.diagnostic.origin + 2 * settings.receivables.horizons
-    if settings.diagnostic.run and diagnostic_end > int(weeks["week"].max()):
+    if ((settings.diagnostic.run or settings.joint_diagnostic.run)
+            and diagnostic_end > int(weeks["week"].max())):
         raise ValueError(f"[diagnostic] origin {settings.diagnostic.origin}: its test weeks "
                          f"reach week {diagnostic_end}, after the last week "
                          f"{int(weeks['week'].max())}")
@@ -475,8 +493,149 @@ def main():
             {"stage 2": m[paid_forecast.index], **amount_guesses},
             amount_guesses["training mean"])
         show_stage2_scores(stage2_scores)
+        # Stage 2's reliability: the paid rows in equal groups by m, mean actual vs mean m.
+        show_amount_reliability(amount_reliability(
+            paid_forecast["amount_deflated"], m[paid_forecast.index],
+            settings.diagnostic.calibration_groups))
+
+    # The amount-weighted calibration check of the whole model: the labelled forecast rows
+    # (paid or not) in equal groups by p, the sum of p x m against the cash that came.
+    labelled = forecast_rows["label_status"] == "labelled"
+    if labelled.any():
+        show_cash_by_p_group(cash_by_p_group(
+            predictions["stage 1 (HGB)"][labelled], m[labelled],
+            forecast_rows.loc[labelled, "amount_deflated"],
+            settings.diagnostic.calibration_groups))
+
+    # Step 15: the joint diagnostic of stage 1 and stage 2 (diagnostic only, never the
+    # forecast): both stages' settings chosen together by the error of the weekly cash totals
+    # on validation, tested once beside the default pair and the `deflated` benchmark.
+    if settings.joint_diagnostic.run:
+        run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar)
 
     # Later steps follow as each unit is built.
+
+
+def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar):
+    """Step 15 (U11.5). The splits are the stage 1 diagnostic's ([diagnostic] origin)."""
+    joint, horizons = settings.joint_diagnostic, settings.receivables.horizons
+    origin = settings.diagnostic.origin
+    splits = diagnostic_splits(table, origin, horizons)
+    print(f"Step 15: joint diagnostic of stage 1 and stage 2 at origin {origin} (diagnostic "
+          f"only); validation target weeks {origin + 1}-{origin + horizons}, test "
+          f"{origin + horizons + 1}-{origin + 2 * horizons}")
+
+    def features(rows, chosen_columns):
+        return stage1_features(rows, chosen_columns, companies,
+                               settings.stage1.company_as_feature)
+
+    # Each fit is kept: the same setting on the same rows is never fitted twice.
+    fitted = {}
+
+    def predict_p(stage1_settings, fit_part, rows):
+        key = ("stage 1", stage1_settings, fit_part)
+        if key not in fitted:
+            fit_rows = getattr(splits, fit_part)
+            started = time.perf_counter()
+            fitted[key] = fit_stage1(features(fit_rows, columns), fit_rows["paid"],
+                                     stage1_settings)
+            print(f"  ... stage 1 fitted on {fit_part} ({time.perf_counter() - started:.0f} s)")
+        return predict_paid(fitted[key], features(rows, columns))
+
+    def predict_m(stage2_settings, fit_part, rows):
+        fit_rows = getattr(splits, fit_part)
+        key = ("stage 2", stage2_settings, fit_part)
+        if key not in fitted:
+            paid = fit_rows[fit_rows["paid"].astype(bool)]
+            started = time.perf_counter()
+            fitted[key] = fit_stage2(features(paid, stage2_columns), paid["amount_deflated"],
+                                     exposure(fit_rows, paid, stage2_settings), stage2_settings)
+            print(f"  ... stage 2 fitted on {fit_part} ({time.perf_counter() - started:.0f} s)")
+        return predict_amount(fitted[key], features(rows, stage2_columns),
+                              exposure(fit_rows, rows, stage2_settings))
+
+    # a, the grid: every setting fitted once on train, every pair scored on the validation
+    # totals (all companies together).
+    grid1 = stage1_grid(settings.stage1, joint)
+    grid2 = stage2_grid(settings.stage2, joint)
+    validation = splits.validation
+    p_by_stage1 = [predict_p(c.settings, "train", validation).to_numpy() for c in grid1]
+    m_by_stage2 = [predict_m(c.settings, "train", validation).to_numpy() for c in grid2]
+    validation_totals = cash_totals(validation, validation["amount_deflated"], by_company=False)
+    pairs = score_pairs(total_codes(validation, validation_totals),
+                        validation_totals["total"], p_by_stage1, m_by_stage2,
+                        joint.selection_metric)
+    best = pairs.iloc[0]
+    chosen = (grid1[int(best["stage1"])], grid2[int(best["stage2"])])
+    default = (settings.stage1, settings.stage2)
+    pairs = pd.concat([pd.DataFrame([{**{f"s1 {k}": v for k, v in grid1[i].params.items()},
+                                      **{f"s2 {k}": v for k, v in grid2[j].params.items()}}
+                                     for i, j in zip(pairs["stage1"], pairs["stage2"])]),
+                       pairs.drop(columns=["stage1", "stage2"])], axis=1)
+    show_joint_grid(pairs, joint.selection_metric)
+
+    # b, the chosen pair and the default pair: validation (fitted on train) and test (refitted
+    # on train + validation), with `deflated` fitted on the same target weeks.
+    labelled = table[table["label_status"] == "labelled"]
+    tables = {"pairs": pairs}
+    for part, fit_part, train_until in (("validation", "train", origin),
+                                        ("test", "refit", origin + horizons)):
+        rows = getattr(splits, part)
+        forecasts = {"chosen": (predict_p(chosen[0].settings, fit_part, rows)
+                                * predict_m(chosen[1].settings, fit_part, rows)),
+                     "default": (predict_p(default[0], fit_part, rows)
+                                 * predict_m(default[1], fit_part, rows))}
+        for by_company in (False, True):
+            totals = cash_totals(rows, rows["amount_deflated"], by_company)
+            totals = totals.rename(columns={"total": "actual"})
+            for name, values in forecasts.items():
+                totals[name] = cash_totals(rows, values, by_company)["total"].to_numpy()
+            history = cash_totals(labelled, labelled["amount_deflated"], by_company)
+            wanted = totals.drop(columns=["target_week", "actual", "chosen", "default"])
+            for name, with_level in (("deflated", True), ("deflated_nolevel", False)):
+                benchmark = benchmark_forecasts(history, calendar, train_until, wanted,
+                                                with_level)
+                totals[name] = benchmark["forecast"].to_numpy()
+                totals[f"{name} fallback"] = benchmark["fallback"].to_numpy()
+            level = "per company" if by_company else "consolidated"
+            tables[f"totals_{part}_{level.replace(' ', '_')}"] = totals
+            scores = scores_by_h(totals, ["chosen", "default", "deflated", "deflated_nolevel"])
+            scores.insert(0, "level", level)
+            scores.insert(0, "part", part)
+            tables.setdefault("scores", []).append(scores)
+        consolidated = tables[f"totals_{part}_consolidated"]
+        comparisons = []
+        for a, b in itertools.product(("chosen", "default"), ("deflated", "deflated_nolevel")):
+            comparisons.append({"part": part, "A": a, "B": b, **paired_bootstrap(
+                consolidated["actual"], consolidated[a], consolidated[b],
+                joint.bootstrap_samples, settings.stage1.random_seed)})
+        tables.setdefault("paired", []).extend(comparisons)
+        if part == "test":
+            # Each stage of the chosen pair alone on test, and the two calibration checks.
+            p = predict_p(chosen[0].settings, "refit", rows)
+            m = predict_m(chosen[1].settings, "refit", rows)
+            reference = reference_probabilities(splits.refit, rows,
+                                                settings.diagnostic.reference_window,
+                                                settings.diagnostic.reference_prior_weeks)
+            tables["stage1_test"] = pd.DataFrame([calibration_summary(
+                rows["paid"], p, reference["base rate"],
+                settings.diagnostic.calibration_groups)])
+            paid = rows[rows["paid"].astype(bool)]
+            guesses = amount_references(splits.refit, paid,
+                                        settings.diagnostic.amount_reference_window,
+                                        settings.diagnostic.reference_prior_weeks)
+            tables["stage2_test"] = amount_scores(paid["amount_deflated"], paid["h"],
+                                                  {"stage 2": m[paid.index], **guesses},
+                                                  guesses["training mean"])
+            tables["cash_by_p_group"] = cash_by_p_group(p, m, rows["amount_deflated"],
+                                                        settings.diagnostic.calibration_groups)
+            tables["amount_reliability"] = amount_reliability(
+                paid["amount_deflated"], m[paid.index], settings.diagnostic.calibration_groups)
+    tables["scores"] = pd.concat(tables["scores"], ignore_index=True)
+    tables["paired"] = pd.DataFrame(tables["paired"])
+    show_joint_results(tables, chosen, joint.bootstrap_samples)
+    paths = write_tables(joint.output_folder, tables)
+    print(f"        tables written to {joint.output_folder}: {[path.name for path in paths]}")
 
 
 def show_daily_files(daily_files):
@@ -924,6 +1083,69 @@ def show_stage2_scores(scores):
     print("        deviance skill per h:")
     by_h = scores.pivot(index="model", columns="h", values="deviance skill")
     print(by_h.loc[scores["model"].unique()].round(3).to_string())
+
+
+def show_amount_reliability(table):
+    """Stage 2's reliability table (`amount_reliability`): mean actual vs mean m per m group."""
+    print("        stage 2 reliability, paid forecast rows in equal groups by m (calibrated: "
+          "ratio = mean actual / mean m near 1 in every group):")
+    print(table.round({"m_low": 0, "m_high": 0, "mean_m": 0, "mean_actual": 0, "ratio": 3})
+          .to_string(index=False))
+
+
+def show_cash_by_p_group(table):
+    """The amount-weighted calibration check (`cash_by_p_group`)."""
+    print("        whole model, labelled forecast rows in equal groups by p: expected cash "
+          "(sum of p x m) vs actual cash, deflated (ratio = expected / actual):")
+    print(table.round({"p_low": 4, "p_high": 4, "mean_p": 4, "expected_cash": 0,
+                       "actual_cash": 0, "ratio": 3}).to_string(index=False))
+
+
+def show_joint_grid(pairs, metric):
+    """The best pairs of step 15's grid on the validation totals."""
+    print(f"        the 10 best of {len(pairs)} pairs by validation {metric} of the "
+          f"consolidated weekly totals:")
+    print(pairs.head(10).round(4).to_string(index=False))
+
+
+def show_joint_results(tables, chosen, samples):
+    """Step 15's results: per split, the consolidated errors per h of the chosen pair, the
+    default pair and `deflated`; the ratio hurdle / `deflated`; the paired comparisons; per
+    company pooled; then the chosen pair's stages alone and the calibration checks on test."""
+    print(f"        chosen pair: stage 1 {chosen[0].params}, stage 2 {chosen[1].params}")
+    scores = tables["scores"]
+    for part in ("validation", "test"):
+        mine = scores[(scores["part"] == part) & (scores["level"] == "consolidated")]
+        print(f"        {part.upper()}, consolidated weekly totals (deflated TRY), MAPE / bias "
+              f"/ WAPE per h:")
+        wide = mine.pivot(index="h", columns="model", values=["MAPE", "bias", "WAPE"])
+        print(wide.round(3).to_string())
+        mape = mine.pivot(index="h", columns="model", values="MAPE")
+        ratio = pd.DataFrame({f"{a} / deflated": mape[a] / mape["deflated"]
+                              for a in ("chosen", "default")})
+        print(f"        {part}: MAPE ratio hurdle / deflated per h (below 1 = hurdle better):")
+        print(ratio.round(3).T.to_string())
+        fallbacks = tables[f"totals_{part}_consolidated"][["deflated fallback",
+                                                            "deflated_nolevel fallback"]].sum()
+        print(f"        deflated totals that fell back to the recent level: "
+              f"{fallbacks.to_dict()}")
+        per_company = scores[(scores["part"] == part) & (scores["level"] == "per company")
+                             & (scores["h"] == "all")]
+        print(f"        {part}, per company, all h: MAPE")
+        print(per_company.pivot(index="company_code", columns="model", values="MAPE")
+              .round(3).to_string())
+    print(f"        PAIRED comparison on the consolidated totals (APE of A - APE of B; below 0 "
+          f"= A better; 95% interval over {samples} resamples, too narrow: totals overlap):")
+    print(tables["paired"].round(4).to_string(index=False))
+    print("        TEST, the chosen pair's stage 1 alone (calibration, skill against the base "
+          "rate):")
+    print(tables["stage1_test"][["mean p", "share paid", "ECE", "log loss skill", "AUC"]]
+          .round(4).to_string(index=False))
+    print("        TEST, the chosen pair's stage 2 alone on the paid rows, all h:")
+    stage2 = tables["stage2_test"]
+    print(stage2[stage2["h"] == "all"].drop(columns="h").round(3).to_string(index=False))
+    show_cash_by_p_group(tables["cash_by_p_group"])
+    show_amount_reliability(tables["amount_reliability"])
 
 
 if __name__ == "__main__":

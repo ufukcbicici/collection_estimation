@@ -755,6 +755,7 @@ def diagnostic_settings(**changes):
                               lr_c=(0.01, 1.0, 100.0), class_weights=("none", "balanced"),
                               selection_metric="log loss", calibration_groups=4,
                               reference_window=13, reference_prior_weeks=1.0,
+                              amount_reference_window=52,
                               importance_repeats=2, output_folder=Path("unused"))
     return dataclasses.replace(base, **changes)
 
@@ -2860,3 +2861,377 @@ def test_calibration_comparison_with_references_as_predictions():
     assert base_all["log loss skill"] == pytest.approx(0.0, abs=1e-12)
     assert base_all["brier skill"] == pytest.approx(0.0, abs=1e-12)
     assert base_all["AUC"] == 0.5
+
+
+# === U11.4: equal_groups, cash_by_p_group, amount_reliability ================================
+# equal_groups is the shared grouping (reliability_table now uses it; its tests above are
+# unchanged). cash_by_p_group checks p x m against the cash on all rows grouped by p;
+# amount_reliability checks m against the paid amounts grouped by m.
+
+from collection_estimation.hurdle.diagnostic import (  # noqa: E402
+    amount_reliability,
+    cash_by_p_group,
+    equal_groups,
+)
+
+NAN, INF = float("nan"), float("inf")
+CASH_COLUMNS = ["group", "p_low", "p_high", "mean_p", "expected_cash", "actual_cash", "ratio",
+                "rows"]
+AMOUNT_COLUMNS = ["group", "m_low", "m_high", "mean_m", "mean_actual", "ratio", "rows"]
+
+
+# --- equal_groups --------------------------------------------------------------------------------
+
+def test_equal_groups_by_hand():
+    # Sorted: 0.1 (row 0), 0.2 (2), 0.3 (3), 0.4 (1), 0.6 (5), 0.8 (4).
+    group = equal_groups(HAND_P, 3)
+    assert isinstance(group, np.ndarray)
+    assert group.tolist() == [1, 2, 1, 2, 3, 3]
+
+
+@pytest.mark.parametrize("n, groups, sizes", [(7, 3, [3, 2, 2]), (10, 4, [3, 2, 3, 2]),
+                                              (6, 6, [1] * 6), (5, 2, [3, 2]), (8, 2, [4, 4])])
+def test_equal_groups_sizes_follow_position_times_groups_over_n(n, groups, sizes):
+    group = equal_groups(pd.Series(np.linspace(0.0, 1.0, n)), groups)
+    assert np.bincount(group)[1:].tolist() == sizes
+
+
+def test_equal_groups_lowest_predictions_are_group_one_and_groups_are_ordered():
+    rng = np.random.default_rng(7)
+    prediction = pd.Series(rng.normal(size=97))
+    group = equal_groups(prediction, 5)
+    assert set(group) == {1, 2, 3, 4, 5}
+    for g in range(1, 5):
+        assert prediction[group == g].max() <= prediction[group == g + 1].min()
+
+
+def test_equal_groups_ties_keep_row_order():
+    assert equal_groups(pd.Series([0.5] * 4), 2).tolist() == [1, 1, 2, 2]
+
+
+def test_equal_groups_ties_keep_row_order_not_index_order():
+    prediction = pd.Series([0.3, 0.3, 0.3, 0.3], index=[9, 3, 7, 1])
+    assert equal_groups(prediction, 2).tolist() == [1, 1, 2, 2]
+
+
+def test_equal_groups_follow_row_positions_on_a_shuffled_index():
+    prediction = pd.Series([5.0, 1.0, 3.0, 2.0], index=["d", "a", "c", "b"])
+    assert equal_groups(prediction, 2).tolist() == [2, 1, 2, 1]
+
+
+def test_equal_groups_does_not_change_its_input():
+    prediction = HAND_P.copy()
+    equal_groups(prediction, 3)
+    pd.testing.assert_series_equal(prediction, HAND_P)
+
+
+def test_equal_groups_accepts_negative_and_large_predictions():
+    group = equal_groups(pd.Series([-5.0, 1e12, 0.0, -1e12]), 2)
+    assert group.tolist() == [1, 2, 2, 1]
+
+
+def test_equal_groups_accepts_ints():
+    assert equal_groups(pd.Series([3, 1, 2, 4]), 2).tolist() == [2, 1, 1, 2]
+
+
+@pytest.mark.parametrize("groups", [1, 0, -2])
+def test_equal_groups_refuses_fewer_than_two_groups(groups):
+    with pytest.raises(ValueError) as error:
+        equal_groups(HAND_P, groups)
+    assert str(error.value) == f"groups is {groups}; at least 2 are needed"
+
+
+@pytest.mark.parametrize("groups", [7, 100])
+def test_equal_groups_refuses_more_groups_than_rows(groups):
+    with pytest.raises(ValueError) as error:
+        equal_groups(HAND_P, groups)
+    assert str(error.value) == f"6 rows cannot be cut into {groups} groups"
+
+
+def test_equal_groups_refuses_empty():
+    with pytest.raises(ValueError, match="0 rows cannot be cut into 2 groups"):
+        equal_groups(pd.Series([], dtype=float), 2)
+
+
+def test_equal_groups_refuses_nan_and_counts_them():
+    with pytest.raises(ValueError) as error:
+        equal_groups(pd.Series([0.1, NAN, 0.3, NAN]), 2)
+    assert str(error.value) == "the prediction is NaN in 2 rows"
+
+
+def test_equal_groups_refuses_nullable_na():
+    with pytest.raises(ValueError, match="NaN in 1 rows"):
+        equal_groups(pd.Series(pd.array([0.1, None, 0.3], dtype="Float64")), 2)
+
+
+def test_equal_groups_checks_groups_before_rows_before_nan():
+    with pytest.raises(ValueError, match="at least 2"):
+        equal_groups(pd.Series([NAN]), 1)
+    with pytest.raises(ValueError, match="cannot be cut"):
+        equal_groups(pd.Series([NAN]), 2)
+
+
+def test_reliability_table_uses_equal_groups():
+    rng = np.random.default_rng(13)
+    p = pd.Series(rng.random(50), index=rng.permutation(50))
+    actual = pd.Series(rng.random(50) < p.to_numpy(), index=p.index)
+    table = reliability_table(actual, p, 4)
+    group = equal_groups(p, 4)
+    for g in range(1, 5):
+        row = table[table["group"] == g].iloc[0]
+        assert row["rows"] == (group == g).sum()
+        assert row["mean_p"] == pytest.approx(p[group == g].mean())
+        assert row["share_paid"] == pytest.approx(actual[group == g].mean())
+
+
+# --- cash_by_p_group -----------------------------------------------------------------------------
+# Six rows, p as HAND_P (groups of 3: rows 0, 2 | 3, 1 | 5, 4). m = 100 to 600; actual cash
+# 0, 500, 0, 0, 1000, 0.
+#   group 1: rows 0, 2: p x m = 10 + 60 = 70, actual 0 -> ratio NaN
+#   group 2: rows 3, 1: p x m = 120 + 80 = 200, actual 500 -> 0.4
+#   group 3: rows 5, 4: p x m = 360 + 400 = 760, actual 1000 -> 0.76
+
+CASH_M = pd.Series([100.0, 200.0, 300.0, 400.0, 500.0, 600.0])
+CASH_ACTUAL = pd.Series([0.0, 500.0, 0.0, 0.0, 1000.0, 0.0])
+
+
+def test_cash_by_p_group_by_hand():
+    table = cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL, 3)
+    assert list(table.columns) == CASH_COLUMNS
+    assert table["group"].tolist() == [1, 2, 3]
+    assert table["p_low"].tolist() == pytest.approx([0.1, 0.3, 0.6])
+    assert table["p_high"].tolist() == pytest.approx([0.2, 0.4, 0.8])
+    assert table["mean_p"].tolist() == pytest.approx([0.15, 0.35, 0.7])
+    assert table["expected_cash"].tolist() == pytest.approx([70.0, 200.0, 760.0])
+    assert table["actual_cash"].tolist() == pytest.approx([0.0, 500.0, 1000.0])
+    assert np.isnan(table["ratio"].iloc[0])
+    assert table["ratio"].iloc[1:].tolist() == pytest.approx([0.4, 0.76])
+    assert table["rows"].tolist() == [2, 2, 2]
+
+
+def test_cash_by_p_group_totals_add_up_to_the_whole():
+    rng = np.random.default_rng(2)
+    p = pd.Series(rng.random(103))
+    m = pd.Series(rng.random(103) * 1000)
+    actual = pd.Series(np.where(rng.random(103) < p, m * rng.random(103) * 2, 0.0))
+    table = cash_by_p_group(p, m, actual, 7)
+    assert table["expected_cash"].sum() == pytest.approx(float((p * m).sum()))
+    assert table["actual_cash"].sum() == pytest.approx(float(actual.sum()))
+    assert int(table["rows"].sum()) == 103
+
+
+def test_cash_by_p_group_groups_are_the_equal_groups_of_p():
+    rng = np.random.default_rng(3)
+    p = pd.Series(rng.random(40), index=rng.permutation(40) + 100)
+    m = pd.Series(rng.random(40) * 10, index=p.index)
+    actual = pd.Series(rng.random(40) * 10, index=p.index)
+    table = cash_by_p_group(p, m, actual, 4)
+    group = equal_groups(p, 4)
+    for g in range(1, 5):
+        mine = group == g
+        row = table.iloc[g - 1]
+        assert row["expected_cash"] == pytest.approx(float((p * m)[mine].sum()))
+        assert row["actual_cash"] == pytest.approx(float(actual[mine].sum()))
+
+
+def test_cash_by_p_group_a_calibrated_model_has_ratios_near_one():
+    rng = np.random.default_rng(4)
+    n = 40_000
+    p = pd.Series(rng.random(n))
+    m = pd.Series(rng.lognormal(mean=5, sigma=0.3, size=n))
+    actual = pd.Series(np.where(rng.random(n) < p, m, 0.0))
+    table = cash_by_p_group(p, m, actual, 5)
+    np.testing.assert_allclose(table["ratio"], 1.0, atol=0.05)
+
+
+def test_cash_by_p_group_does_not_depend_on_row_order():
+    shuffled = [4, 0, 5, 2, 1, 3]
+    a = cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL, 3)
+    b = cash_by_p_group(HAND_P[shuffled], CASH_M[shuffled], CASH_ACTUAL[shuffled], 3)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_cash_by_p_group_works_on_a_non_default_index():
+    index = ["f", "e", "d", "c", "b", "a"]
+    table = cash_by_p_group(HAND_P.set_axis(index), CASH_M.set_axis(index),
+                            CASH_ACTUAL.set_axis(index), 3)
+    assert table["expected_cash"].tolist() == pytest.approx([70.0, 200.0, 760.0])
+
+
+def test_cash_by_p_group_accepts_int_and_nullable_actuals():
+    table = cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL.astype("int64"), 3)
+    assert table["actual_cash"].dtype == "float64"
+    assert table["actual_cash"].tolist() == [0.0, 500.0, 1000.0]
+    table = cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL.astype("Float64"), 3)
+    assert table["actual_cash"].tolist() == [0.0, 500.0, 1000.0]
+
+
+def test_cash_by_p_group_a_negative_m_is_accepted():
+    # Stage 2 with squared error can predict m below 0; the check does not hide it.
+    table = cash_by_p_group(HAND_P, CASH_M.where(CASH_M.index != 0, -100.0), CASH_ACTUAL, 3)
+    assert table["expected_cash"].iloc[0] == pytest.approx(-10.0 + 60.0)
+
+
+def test_cash_by_p_group_all_actual_zero_gives_all_nan_ratios():
+    table = cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL * 0, 3)
+    assert table["ratio"].isna().all()
+
+
+def test_cash_by_p_group_does_not_change_its_inputs():
+    p, m, actual = HAND_P.copy(), CASH_M.copy(), CASH_ACTUAL.copy()
+    cash_by_p_group(p, m, actual, 3)
+    pd.testing.assert_series_equal(p, HAND_P)
+    pd.testing.assert_series_equal(m, CASH_M)
+    pd.testing.assert_series_equal(actual, CASH_ACTUAL)
+
+
+@pytest.mark.parametrize("which", ["m", "actual_amount"])
+@pytest.mark.parametrize("change", [lambda s: s.set_axis(range(1, 7)),
+                                    lambda s: s.iloc[::-1], lambda s: s.iloc[:-1]],
+                         ids=["shifted", "reversed", "shorter"])
+def test_cash_by_p_group_refuses_misaligned_inputs(which, change):
+    inputs = {"m": CASH_M, "actual_amount": CASH_ACTUAL}
+    inputs[which] = change(inputs[which])
+    with pytest.raises(ValueError) as error:
+        cash_by_p_group(HAND_P, inputs["m"], inputs["actual_amount"], 3)
+    assert str(error.value) == f"{which} must have the rows of p (the same index)"
+
+
+@pytest.mark.parametrize("bad", [NAN, INF, -INF])
+@pytest.mark.parametrize("which", ["m", "actual_amount"])
+def test_cash_by_p_group_refuses_nan_and_infinite(which, bad):
+    inputs = {"m": CASH_M.copy(), "actual_amount": CASH_ACTUAL.copy()}
+    inputs[which].iloc[2] = bad
+    with pytest.raises(ValueError) as error:
+        cash_by_p_group(HAND_P, inputs["m"], inputs["actual_amount"], 3)
+    assert str(error.value) == f"{which} holds a NaN or infinite value"
+
+
+def test_cash_by_p_group_refuses_a_negative_actual():
+    with pytest.raises(ValueError) as error:
+        cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL.where(CASH_ACTUAL.index != 3, -1.0), 3)
+    assert str(error.value) == ("actual_amount is below 0 in some rows; it is the cash "
+                                "received")
+
+
+def test_cash_by_p_group_refuses_bad_groups_and_nan_p_as_equal_groups_does():
+    with pytest.raises(ValueError, match="at least 2 are needed"):
+        cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL, 1)
+    with pytest.raises(ValueError, match="6 rows cannot be cut into 7 groups"):
+        cash_by_p_group(HAND_P, CASH_M, CASH_ACTUAL, 7)
+    with pytest.raises(ValueError, match="the prediction is NaN in 1 rows"):
+        cash_by_p_group(HAND_P.where(HAND_P.index != 0, NAN), CASH_M, CASH_ACTUAL, 3)
+
+
+# --- amount_reliability --------------------------------------------------------------------------
+# Six paid rows, m = 50, 10, 40, 20, 60, 30 (sorted rows 1, 3, 5, 2, 0, 4); groups of 3:
+#   group 1: rows 1, 3: m 10, 20 (mean 15); actual 12, 24 (mean 18) -> 1.2
+#   group 2: rows 5, 2: m 30, 40 (mean 35); actual 35, 35 (mean 35) -> 1.0
+#   group 3: rows 0, 4: m 50, 60 (mean 55); actual 22, 44 (mean 33) -> 0.6
+
+AMOUNT_M = pd.Series([50.0, 10.0, 40.0, 20.0, 60.0, 30.0])
+AMOUNT_ACTUAL = pd.Series([22.0, 12.0, 35.0, 24.0, 44.0, 35.0])
+
+
+def test_amount_reliability_by_hand():
+    table = amount_reliability(AMOUNT_ACTUAL, AMOUNT_M, 3)
+    assert list(table.columns) == AMOUNT_COLUMNS
+    assert table["group"].tolist() == [1, 2, 3]
+    assert table["m_low"].tolist() == [10.0, 30.0, 50.0]
+    assert table["m_high"].tolist() == [20.0, 40.0, 60.0]
+    assert table["mean_m"].tolist() == pytest.approx([15.0, 35.0, 55.0])
+    assert table["mean_actual"].tolist() == pytest.approx([18.0, 35.0, 33.0])
+    assert table["ratio"].tolist() == pytest.approx([1.2, 1.0, 0.6])
+    assert table["rows"].tolist() == [2, 2, 2]
+
+
+def test_amount_reliability_groups_by_m_not_by_the_actual():
+    group = equal_groups(AMOUNT_M, 3)
+    table = amount_reliability(AMOUNT_ACTUAL, AMOUNT_M, 3)
+    for g in range(1, 4):
+        assert table.iloc[g - 1]["mean_actual"] == pytest.approx(
+            AMOUNT_ACTUAL[group == g].mean())
+
+
+def test_amount_reliability_a_perfect_mean_model_is_calibrated_in_every_group():
+    # Regression to the mean: grouped by m (the true mean), the mean actual matches m.
+    rng = np.random.default_rng(6)
+    n = 60_000
+    m = pd.Series(rng.lognormal(mean=6, sigma=1.0, size=n))
+    actual = pd.Series(m * rng.gamma(shape=4.0, scale=0.25, size=n))   # mean 1 multiplier
+    table = amount_reliability(actual, m, 5)
+    np.testing.assert_allclose(table["ratio"], 1.0, atol=0.03)
+
+
+def test_amount_reliability_does_not_depend_on_row_order():
+    shuffled = [4, 0, 5, 2, 1, 3]
+    a = amount_reliability(AMOUNT_ACTUAL, AMOUNT_M, 3)
+    b = amount_reliability(AMOUNT_ACTUAL[shuffled], AMOUNT_M[shuffled], 3)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_amount_reliability_accepts_int_actuals():
+    table = amount_reliability(AMOUNT_ACTUAL.astype("int64"), AMOUNT_M, 3)
+    assert table["mean_actual"].tolist() == pytest.approx([18.0, 35.0, 33.0])
+
+
+def test_amount_reliability_does_not_change_its_inputs():
+    actual, m = AMOUNT_ACTUAL.copy(), AMOUNT_M.copy()
+    amount_reliability(actual, m, 3)
+    pd.testing.assert_series_equal(actual, AMOUNT_ACTUAL)
+    pd.testing.assert_series_equal(m, AMOUNT_M)
+
+
+@pytest.mark.parametrize("change", [lambda s: s.set_axis(range(1, 7)),
+                                    lambda s: s.iloc[::-1], lambda s: s.iloc[:-1]],
+                         ids=["shifted", "reversed", "shorter"])
+def test_amount_reliability_refuses_a_misaligned_m(change):
+    with pytest.raises(ValueError) as error:
+        amount_reliability(AMOUNT_ACTUAL, change(AMOUNT_M), 3)
+    assert str(error.value) == "m must have the rows of actual (the same index)"
+
+
+@pytest.mark.parametrize("bad, message", [
+    (0.0, "amount is 0 or below in 1 rows"),
+    (-5.0, "amount is 0 or below in 1 rows"),
+    (NAN, "amount has 1 missing values"),
+    (INF, "amount holds an infinite value"),
+], ids=["zero", "negative", "nan", "inf"])
+def test_amount_reliability_refuses_actuals_as_check_amounts_does(bad, message):
+    actual = AMOUNT_ACTUAL.copy()
+    actual.iloc[2] = bad
+    with pytest.raises(ValueError) as error:
+        amount_reliability(actual, AMOUNT_M, 3)
+    assert str(error.value).startswith(message)
+
+
+def test_amount_reliability_refuses_no_rows():
+    with pytest.raises(ValueError, match="there are no paid rows"):
+        amount_reliability(pd.Series([], dtype=float), pd.Series([], dtype=float), 2)
+
+
+@pytest.mark.parametrize("bad", [NAN, INF, -INF])
+def test_amount_reliability_refuses_nan_and_infinite_m(bad):
+    m = AMOUNT_M.copy()
+    m.iloc[0] = bad
+    with pytest.raises(ValueError) as error:
+        amount_reliability(AMOUNT_ACTUAL, m, 3)
+    assert str(error.value) == "m holds a NaN or infinite value"
+
+
+def test_amount_reliability_checks_the_index_then_the_actual_then_m():
+    bad_actual = AMOUNT_ACTUAL.where(AMOUNT_ACTUAL.index != 0, 0.0)
+    bad_m = AMOUNT_M.where(AMOUNT_M.index != 0, NAN)
+    with pytest.raises(ValueError, match="^m must have the rows"):
+        amount_reliability(bad_actual, bad_m.iloc[:-1], 3)
+    with pytest.raises(ValueError, match="^amount is 0 or below"):
+        amount_reliability(bad_actual, bad_m, 3)
+    with pytest.raises(ValueError, match="^m holds a NaN"):
+        amount_reliability(AMOUNT_ACTUAL, bad_m, 3)
+
+
+def test_amount_reliability_refuses_bad_groups_as_equal_groups_does():
+    with pytest.raises(ValueError, match="at least 2 are needed"):
+        amount_reliability(AMOUNT_ACTUAL, AMOUNT_M, 1)
+    with pytest.raises(ValueError, match="6 rows cannot be cut into 7 groups"):
+        amount_reliability(AMOUNT_ACTUAL, AMOUNT_M, 7)

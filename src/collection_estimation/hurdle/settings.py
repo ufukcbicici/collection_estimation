@@ -98,6 +98,27 @@ class DiagnosticSettings:
 
 
 @dataclass(frozen=True)
+class JointDiagnosticSettings:
+    """The joint diagnostic of stage 1 and stage 2 (U11.5): both stages' settings chosen
+    together by the error of the weekly cash totals on validation, tested once, and compared
+    with the `deflated` benchmark. Its splits are the stage 1 diagnostic's ([diagnostic]
+    origin). Diagnostic only: nothing from it reaches the forecast."""
+    run: bool                                 # run it at all (long; grows with the grids)
+    stage1_max_iter: tuple[int, ...]          # stage 1's grid (HGB classifier, no class weights)
+    stage1_learning_rate: tuple[float, ...]
+    stage1_max_leaf_nodes: tuple[int, ...]
+    stage2_loss: tuple[str, ...]              # stage 2's grid (HGB regressor)
+    stage2_max_iter: tuple[int, ...]
+    stage2_learning_rate: tuple[float, ...]
+    stage2_max_leaf_nodes: tuple[int, ...]
+    stage2_scale: tuple[str, ...]             # STAGE2_SCALES to try
+    stage2_balance_floor: tuple[str, ...]     # BALANCE_FLOORS to try (under "open balance" only)
+    selection_metric: str                     # one of TOTAL_METRICS: chooses the pair
+    bootstrap_samples: int                    # resamples of the paired comparison
+    output_folder: Path                       # where the result tables are written as CSV
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -136,6 +157,7 @@ class Settings:
     stage1: Stage1Settings
     stage2: Stage2Settings
     diagnostic: DiagnosticSettings
+    joint_diagnostic: JointDiagnosticSettings
     debug: DebugSettings
 
 
@@ -151,7 +173,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "stage1", "stage2", "diagnostic", "debug"}, name)
+                     "history", "stage1", "stage2", "diagnostic", "joint_diagnostic", "debug"},
+               name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -180,6 +203,12 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                             "reference_prior_weeks", "amount_reference_window",
                             "importance_repeats", "output_folder"},
                f"{name} [diagnostic]")
+    joint = raw["joint_diagnostic"]
+    check_keys(joint, {"run", "stage1_max_iter", "stage1_learning_rate",
+                       "stage1_max_leaf_nodes", "stage2_loss", "stage2_max_iter",
+                       "stage2_learning_rate", "stage2_max_leaf_nodes", "stage2_scale",
+                       "stage2_balance_floor", "selection_metric", "bootstrap_samples",
+                       "output_folder"}, f"{name} [joint_diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -280,11 +309,38 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             output_folder=path_setting(diagnostic, "output_folder", repo_root,
                                        f"{name} [diagnostic]"),
         ),
+        joint_diagnostic=read_joint_diagnostic(joint, repo_root,
+                                               f"{name} [joint_diagnostic]"),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
             demo_origin=week_setting(debug, "demo_origin", f"{name} [debug]"),
         ),
+    )
+
+
+def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiagnosticSettings:
+    """The [joint_diagnostic] section, checked."""
+    def one_of(choices):
+        return lambda item_table, key, item_where: choice_setting(item_table, key, item_where,
+                                                                  choices)
+    return JointDiagnosticSettings(
+        run=bool_setting(table, "run", where),
+        stage1_max_iter=grid_setting(table, "stage1_max_iter", where, count_setting),
+        stage1_learning_rate=grid_setting(table, "stage1_learning_rate", where, rate_setting),
+        stage1_max_leaf_nodes=grid_setting(table, "stage1_max_leaf_nodes", where,
+                                           leaf_count_setting),
+        stage2_loss=grid_setting(table, "stage2_loss", where, stage2_loss_setting),
+        stage2_max_iter=grid_setting(table, "stage2_max_iter", where, count_setting),
+        stage2_learning_rate=grid_setting(table, "stage2_learning_rate", where, rate_setting),
+        stage2_max_leaf_nodes=grid_setting(table, "stage2_max_leaf_nodes", where,
+                                           leaf_count_setting),
+        stage2_scale=grid_setting(table, "stage2_scale", where, one_of(STAGE2_SCALES)),
+        stage2_balance_floor=grid_setting(table, "stage2_balance_floor", where,
+                                          one_of(BALANCE_FLOORS)),
+        selection_metric=choice_setting(table, "selection_metric", where, TOTAL_METRICS),
+        bootstrap_samples=count_setting(table, "bootstrap_samples", where),
+        output_folder=path_setting(table, "output_folder", repo_root, where),
     )
 
 
@@ -659,6 +715,11 @@ def choice_setting(table: dict, key: str, where: str, choices: tuple[str, ...]) 
     if value not in choices:
         raise ValueError(f"{where}: {key} is {value!r}, not one of {list(choices)}")
     return value
+
+
+# The errors of the weekly cash totals the joint diagnostic can choose a pair by: "mape" (every
+# week counts the same) or "wape" (weeks weighed by their size).
+TOTAL_METRICS = ("mape", "wape")
 
 
 # The validation scores the diagnostic can choose a setting by.
