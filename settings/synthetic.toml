@@ -131,6 +131,9 @@ selection_metric = "log loss"   # chooses each model's setting on validation: "l
 reference_window = 13           # the "own rate" reference: the customer's paying share over
                                 # this many weeks (one of the [history] windows) ...
 reference_prior_weeks = 1       # ... plus this many imaginary weeks paid at the base rate
+                                # (stage 2's "own mean": at the training mean amount)
+amount_reference_window = 52    # stage 2's "own mean" reference: the customer's mean payment
+                                # over this many weeks (one of the [history] windows)
 calibration_groups = 10         # groups of the reliability table: rows sorted by p, equal size
 importance_repeats = 3          # shuffles per feature for the permutation importance
 output_folder = "data/interim/hurdle_diagnostic"   # the result tables, as CSV

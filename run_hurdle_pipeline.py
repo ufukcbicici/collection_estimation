@@ -91,6 +91,8 @@ from collection_estimation.hurdle.stage1 import (  # noqa: E402
     stage1_features,
 )
 from collection_estimation.hurdle.stage2 import (  # noqa: E402
+    amount_references,
+    amount_scores,
     fit_stage2,
     predict_amount,
     total_ratio,
@@ -449,6 +451,22 @@ def main():
     m = predict_amount(stage2_model, stage1_features(forecast_rows, stage2_columns, companies,
                                                      settings.stage1.company_as_feature))
     show_stage2_forecast(forecast_rows, m, predictions["stage 1 (HGB)"], training_ratio)
+
+    # Stage 2 alone, on the forecast rows that paid: m against the amount, beside two simple
+    # references (the training mean, the customer's own mean); skill against the first.
+    paid_forecast = forecast_rows[(forecast_rows["label_status"] == "labelled")
+                                  & forecast_rows["paid"].fillna(False).astype(bool)]
+    if paid_forecast.empty:
+        print("        no paid forecast rows: stage 2 cannot be scored here")
+    else:
+        amount_guesses = amount_references(train_rows, paid_forecast,
+                                           settings.diagnostic.amount_reference_window,
+                                           settings.diagnostic.reference_prior_weeks)
+        stage2_scores = amount_scores(
+            paid_forecast["amount_deflated"], paid_forecast["h"],
+            {"stage 2": m[paid_forecast.index], **amount_guesses},
+            amount_guesses["training mean"])
+        show_stage2_scores(stage2_scores)
 
     # Later steps follow as each unit is built.
 
@@ -870,6 +888,19 @@ def show_stage2_forecast(forecast_rows, m, p, training_ratio):
     by_h["ratio"] = by_h["p x m"] / by_h["actual cash"]
     print("        per h, the whole model (sum of p x m) against the actual cash, deflated:")
     print(by_h.round({"mean m": 0, "p x m": 0, "actual cash": 0, "ratio": 3}).to_string())
+
+
+def show_stage2_scores(scores):
+    """Step 14's scores of m on the paid forecast rows (`amount_scores`): all horizons
+    together, one line per model or reference, then the deviance skill per horizon."""
+    print("        STAGE 2 alone, on the paid forecast rows (skill against the training mean; "
+          "R2's baseline is the rows' own mean):")
+    pooled = scores[scores["h"] == "all"].drop(columns="h")
+    print(pooled.round({"mean deviance": 0, "deviance skill": 3, "R2 hindsight": 3,
+                        "WAPE": 3, "MAPE": 3, "total ratio": 3}).to_string(index=False))
+    print("        deviance skill per h:")
+    by_h = scores.pivot(index="model", columns="h", values="deviance skill")
+    print(by_h.loc[scores["model"].unique()].round(3).to_string())
 
 
 if __name__ == "__main__":

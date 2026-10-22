@@ -163,6 +163,7 @@ VALID = {
                    "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
                    "selection_metric": '"log loss"', "calibration_groups": "4",
                    "reference_window": "13", "reference_prior_weeks": "1.0",
+                   "amount_reference_window": "52",
                    "importance_repeats": "3", "output_folder": '"results/diagnostic"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
@@ -2028,9 +2029,12 @@ def test_a_missing_history_section_names_it(tmp_path, repo):
     ("[1]", (1,)), ("[8]", (8,)), ("[104, 1]", (1, 104)),
 ], ids=["sorted", "unsorted", "reversed", "one", "single", "two-unsorted"])
 def test_windows_are_returned_sorted(tmp_path, repo, good, expected):
-    # reference_window must be one of the windows (U10.4d), so it follows the list here.
+    # reference_window and (U11.3) amount_reference_window must be one of the windows, so
+    # they follow the list here.
     settings = load(tmp_path, repo, changes={("history", "windows"): good,
-                                             ("diagnostic", "reference_window"): str(expected[0])})
+                                             ("diagnostic", "reference_window"): str(expected[0]),
+                                             ("diagnostic", "amount_reference_window"):
+                                                 str(expected[0])})
     assert settings.history.windows == expected
     assert type(settings.history.windows) is tuple
 
@@ -2630,7 +2634,7 @@ def test_the_synthetic_stage1_and_demo_origin_settings():
 # the file and the section, exactly); grid_setting and class_weight_setting also by direct calls.
 
 DIAG = f"{FILE_NAME} [diagnostic]"
-DIAGNOSTIC_KEYS = ['calibration_groups', 'class_weights', 'hgb_learning_rate', 'hgb_max_iter',
+DIAGNOSTIC_KEYS = ['amount_reference_window', 'calibration_groups', 'class_weights', 'hgb_learning_rate', 'hgb_max_iter',
                    'hgb_max_leaf_nodes', 'importance_repeats', 'lr_c', 'origin',
                    'output_folder', 'reference_prior_weeks', 'reference_window', 'run',
                    'selection_metric']
@@ -2643,8 +2647,8 @@ def test_the_diagnostic_section_is_read(tmp_path, repo):
         run=True, origin=40, hgb_max_iter=(100, 300, 600), hgb_learning_rate=(0.05, 0.1),
         hgb_max_leaf_nodes=(15, 31, 63), lr_c=(0.01, 0.1, 1.0, 10.0),
         class_weights=("none", "balanced"), selection_metric="log loss", calibration_groups=4,
-        reference_window=13, reference_prior_weeks=1.0, importance_repeats=3,
-        output_folder=(repo / "results" / "diagnostic").resolve())
+        reference_window=13, reference_prior_weeks=1.0, amount_reference_window=52,
+        importance_repeats=3, output_folder=(repo / "results" / "diagnostic").resolve())
 
 
 def test_the_diagnostic_values_have_the_right_python_types(tmp_path, repo):
@@ -2667,7 +2671,8 @@ def test_diagnostic_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(DiagnosticSettings)] == [
         "run", "origin", "hgb_max_iter", "hgb_learning_rate", "hgb_max_leaf_nodes", "lr_c",
         "class_weights", "selection_metric", "calibration_groups", "reference_window",
-        "reference_prior_weeks", "importance_repeats", "output_folder"]
+        "reference_prior_weeks", "amount_reference_window", "importance_repeats",
+        "output_folder"]
 
 
 def test_settings_has_a_diagnostic_field_between_stage1_and_debug():
@@ -2968,7 +2973,7 @@ def test_the_synthetic_diagnostic_settings():
         hgb_learning_rate=(0.01, 0.05, 0.1, 0.15, 0.2, 0.5), hgb_max_leaf_nodes=(15, 31, 63),
         lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none",),
         selection_metric="log loss", calibration_groups=10, reference_window=13,
-        reference_prior_weeks=1.0, importance_repeats=3,
+        reference_prior_weeks=1.0, amount_reference_window=52, importance_repeats=3,
         output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_diagnostic").resolve())
 
 
@@ -3075,7 +3080,8 @@ def test_diagnostic_settings_selection_metric_sits_between_class_weights_and_cal
     # U10.4d put the three calibration settings between selection_metric and the repeats.
     names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
     assert (names.index("class_weights") + 1 == names.index("selection_metric")
-            == names.index("calibration_groups") - 1 == names.index("importance_repeats") - 4)
+            == names.index("calibration_groups") - 1 == names.index("importance_repeats") - 5)
+    # U11.3 put amount_reference_window between reference_prior_weeks and the repeats.
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -3201,7 +3207,8 @@ def test_reference_window_accepts_each_history_window(tmp_path, repo, good):
 
 def test_reference_window_follows_the_history_windows(tmp_path, repo):
     settings = load(tmp_path, repo, changes={("history", "windows"): "[26, 8]",
-                                             ("diagnostic", "reference_window"): "8"})
+                                             ("diagnostic", "reference_window"): "8",
+                                             ("diagnostic", "amount_reference_window"): "26"})
     assert settings.history.windows == (8, 26)
     assert settings.diagnostic.reference_window == 8
 
@@ -3289,9 +3296,9 @@ def test_the_calibration_settings_are_checked_in_field_order(tmp_path, repo):
 def test_diagnostic_settings_calibration_fields_sit_between_selection_metric_and_repeats():
     names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
     start = names.index("selection_metric")
-    assert names[start:start + 5] == ["selection_metric", "calibration_groups",
+    assert names[start:start + 6] == ["selection_metric", "calibration_groups",
                                       "reference_window", "reference_prior_weeks",
-                                      "importance_repeats"]
+                                      "amount_reference_window", "importance_repeats"]
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -3642,3 +3649,130 @@ def test_the_synthetic_file_stage2_section_has_exactly_the_stage2_keys():
     raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
     assert sorted(raw["stage2"]) == STAGE2_KEYS
     assert raw["stage2"]["loss"] in STAGE2_LOSSES
+
+
+# --- [diagnostic] amount_reference_window (U11.3) -----------------------------------------------
+# The history window of stage 2's "own mean" reference: read by reference_window_setting, so a
+# whole number of 1 or more that is one of the [history] windows. Required. VALID has 52 (and
+# reference_window 13), so a test can tell the two apart.
+
+def test_amount_reference_window_is_read(tmp_path, repo):
+    diagnostic = load(tmp_path, repo).diagnostic
+    assert diagnostic.amount_reference_window == 52
+    assert type(diagnostic.amount_reference_window) is int
+
+
+def test_amount_reference_window_is_not_reference_window(tmp_path, repo):
+    diagnostic = load(tmp_path, repo,
+                      changes={("diagnostic", "amount_reference_window"): "4"}).diagnostic
+    assert (diagnostic.reference_window, diagnostic.amount_reference_window) == (13, 4)
+
+
+def test_amount_reference_window_changes_nothing_else(tmp_path, repo):
+    base = load(tmp_path, repo)
+    other = load(tmp_path, repo, changes={("diagnostic", "amount_reference_window"): "13"})
+    assert other.diagnostic == dataclasses.replace(base.diagnostic, amount_reference_window=13)
+    assert other.stage2 == base.stage2 and other.history == base.history
+
+
+def test_diagnostic_settings_amount_reference_window_follows_reference_prior_weeks():
+    names = [field.name for field in dataclasses.fields(DiagnosticSettings)]
+    assert names.index("amount_reference_window") == names.index("reference_prior_weeks") + 1
+
+
+@pytest.mark.parametrize("good", ["4", "13", "52"])
+def test_amount_reference_window_accepts_each_history_window(tmp_path, repo, good):
+    value = load(tmp_path, repo, changes={("diagnostic", "amount_reference_window"): good}
+                 ).diagnostic.amount_reference_window
+    assert value == int(good) and type(value) is int
+
+
+def test_amount_reference_window_follows_the_history_windows(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("history", "windows"): "[104, 13]",
+                                             ("diagnostic", "amount_reference_window"): "104"})
+    assert settings.diagnostic.amount_reference_window == 104
+
+
+@pytest.mark.parametrize("bad", ["5", "12", "26", "104", "1"])
+def test_amount_reference_window_not_a_history_window_has_the_exact_message(tmp_path, repo, bad):
+    message = exact_message(tmp_path, repo, {("diagnostic", "amount_reference_window"): bad})
+    assert message == (f"{DIAG}: amount_reference_window is {bad}, not one of the [history] "
+                       f"windows [4, 13, 52]")
+
+
+def test_amount_reference_window_dropped_from_the_history_windows_is_refused(tmp_path, repo):
+    # 52 is the file's value: removing it from [history] makes the file invalid.
+    message = exact_message(tmp_path, repo, {("history", "windows"): "[13, 4]"})
+    assert message == (f"{DIAG}: amount_reference_window is 52, not one of the [history] "
+                       f"windows [4, 13]")
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("-52", "-52"), ("52.0", "52.0"), ("52.5", "52.5"), ('"52"', "'52'"),
+    ("true", "True"), ("false", "False"), ("[52]", "[52]"), ("nan", "nan"), ("inf", "inf"),
+    ("{ w = 52 }", "{'w': 52}"),
+], ids=["zero", "negative", "whole-float", "fraction", "string", "true", "false", "list",
+        "nan", "inf", "table"])
+def test_amount_reference_window_that_is_not_a_count_has_the_exact_message(tmp_path, repo, bad,
+                                                                          shown):
+    message = exact_message(tmp_path, repo, {("diagnostic", "amount_reference_window"): bad})
+    assert message == (f"{DIAG}: amount_reference_window is {shown}, not a whole number of 1 "
+                       f"or more")
+
+
+def test_true_is_not_window_1_for_amount_reference_window(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("history", "windows"): "[1, 13]",
+                                             ("diagnostic", "reference_window"): "13",
+                                             ("diagnostic", "amount_reference_window"): "true"})
+    assert message.startswith(f"{DIAG}: amount_reference_window is True")
+
+
+def test_a_missing_amount_reference_window_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "amount_reference_window"): REMOVE})
+    assert message == (f"{DIAG}: missing ['amount_reference_window']; expected exactly "
+                       f"{DIAGNOSTIC_KEYS}")
+
+
+def test_an_amount_reference_window_typo_is_both_missing_and_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo,
+                            {("diagnostic", "amount_reference_window"): REMOVE,
+                             ("diagnostic", "amount_reference_windows"): "52"})
+    assert message == (f"{DIAG}: missing ['amount_reference_window']; unknown "
+                       f"['amount_reference_windows']; expected exactly {DIAGNOSTIC_KEYS}")
+
+
+def test_amount_reference_window_in_the_stage2_section_is_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "amount_reference_window"): "52"})
+    assert message.startswith(f"{FILE_NAME} [stage2]: unknown ['amount_reference_window']; ")
+
+
+def test_amount_reference_window_is_checked_when_run_is_false(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "run"): "false",
+                                             ("diagnostic", "amount_reference_window"): "5"})
+    assert message.startswith(f"{DIAG}: amount_reference_window is 5")
+
+
+def test_amount_reference_window_is_checked_after_reference_prior_weeks(tmp_path, repo):
+    changes = {("diagnostic", "reference_prior_weeks"): "0",
+               ("diagnostic", "amount_reference_window"): "5"}
+    assert exact_message(tmp_path, repo, changes).startswith(
+        f"{DIAG}: reference_prior_weeks is ")
+    changes[("diagnostic", "reference_prior_weeks")] = "1.0"
+    assert exact_message(tmp_path, repo, changes).startswith(
+        f"{DIAG}: amount_reference_window is 5")
+
+
+def test_a_bad_reference_window_is_reported_before_amount_reference_window(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "reference_window"): "5",
+                                             ("diagnostic", "amount_reference_window"): "6"})
+    assert message.startswith(f"{DIAG}: reference_window is 5")
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_amount_reference_window_is_52():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert raw["diagnostic"]["amount_reference_window"] == 52
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.diagnostic.amount_reference_window == 52
+    assert type(settings.diagnostic.amount_reference_window) is int
+    assert settings.diagnostic.amount_reference_window in settings.history.windows

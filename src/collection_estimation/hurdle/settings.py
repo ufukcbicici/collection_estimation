@@ -87,6 +87,8 @@ class DiagnosticSettings:
     calibration_groups: int                   # groups of the reliability table (by p, equal size)
     reference_window: int                     # history window of the "own rate" reference
     reference_prior_weeks: float              # imaginary weeks at the base rate in "own rate"
+                                              # (and at the training mean in "own mean")
+    amount_reference_window: int              # history window of stage 2's "own mean" reference
     importance_repeats: int                   # shuffles per feature for permutation importance
     output_folder: Path                       # where the result tables are written as CSV
 
@@ -169,7 +171,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
                             "hgb_max_leaf_nodes", "lr_c", "class_weights", "selection_metric",
                             "calibration_groups", "reference_window",
-                            "reference_prior_weeks", "importance_repeats", "output_folder"},
+                            "reference_prior_weeks", "amount_reference_window",
+                            "importance_repeats", "output_folder"},
                f"{name} [diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
@@ -256,6 +259,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                                       f"{name} [diagnostic]", windows),
             reference_prior_weeks=positive_number_setting(diagnostic, "reference_prior_weeks",
                                                           f"{name} [diagnostic]"),
+            amount_reference_window=reference_window_setting(diagnostic,
+                                                             "amount_reference_window",
+                                                             f"{name} [diagnostic]", windows),
             importance_repeats=count_setting(diagnostic, "importance_repeats",
                                              f"{name} [diagnostic]"),
             output_folder=path_setting(diagnostic, "output_folder", repo_root,

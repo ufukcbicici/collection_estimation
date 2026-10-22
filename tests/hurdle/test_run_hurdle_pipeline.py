@@ -2971,6 +2971,9 @@ diagnostic = [i for i, node in enumerate(body)
               if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
 assert len(diagnostic) == 1, diagnostic
 step_14 = statements[diagnostic[0] + 1:]
+# U11.3: the stage 2 scores close step 14 (checked below): the last two statements.
+scores_part = body[-2:]
+step_14 = step_14[:-2]
 assert step_14 == [
     "stage2_columns = feature_columns(block_feature_columns(history, calendar, owed), "
     "settings.stage2.feature_blocks)",
@@ -2988,6 +2991,26 @@ assert step_14 == [
     "companies, settings.stage1.company_as_feature))",
     "show_stage2_forecast(forecast_rows, m, predictions['stage 1 (HGB)'], training_ratio)",
 ], step_14
+# U11.3: the paid labelled forecast rows (NA paid as not paid), then either a fallback line
+# or the references, the scores (stage 2's m on those rows, then the references, skill
+# against the training mean) and their printout.
+assert ast.unparse(scores_part[0]) == (
+    "paid_forecast = forecast_rows[(forecast_rows['label_status'] == 'labelled') & "
+    "forecast_rows['paid'].fillna(False).astype(bool)]"), ast.unparse(scores_part[0])
+branch = scores_part[1]
+assert isinstance(branch, ast.If) and ast.unparse(branch.test) == "paid_forecast.empty"
+assert [ast.unparse(n) for n in branch.body] == [
+    "print('        no paid forecast rows: stage 2 cannot be scored here')"]
+assert [ast.unparse(n) for n in branch.orelse] == [
+    "amount_guesses = amount_references(train_rows, paid_forecast, "
+    "settings.diagnostic.amount_reference_window, settings.diagnostic.reference_prior_weeks)",
+    "stage2_scores = amount_scores(paid_forecast['amount_deflated'], paid_forecast['h'], "
+    "{'stage 2': m[paid_forecast.index], **amount_guesses}, amount_guesses['training mean'])",
+    "show_stage2_scores(stage2_scores)",
+], [ast.unparse(n) for n in branch.orelse]
+assert script.amount_references is stage2.amount_references
+assert script.amount_scores is stage2.amount_scores
+inspect.signature(script.show_stage2_scores).bind("scores")
 # Step 14 uses step 12's origin, rows, predictions and companies: nothing reassigns them after
 # step 12 (step 13 works on its own rows and origin).
 def assigned(name):
@@ -3017,7 +3040,8 @@ def test_step_14_is_wired_in_last_after_step_13():
 def test_step_14_calls_fit_stage2_and_its_printout_once():
     tree = main_tree()
     for name in ("fit_stage2", "show_stage2_fit", "total_ratio", "predict_amount",
-                 "show_stage2_forecast"):
+                 "show_stage2_forecast", "amount_references", "amount_scores",
+                 "show_stage2_scores"):
         assert len(calls_to(tree, name)) == 1, name
 
 
@@ -3026,8 +3050,8 @@ def test_step_14_imports_the_stage2_functions_in_one_parenthesised_import():
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.stage2"]
     assert len(imports) == 1
-    assert [alias.name for alias in imports[0].names] == ["fit_stage2", "predict_amount",
-                                                          "total_ratio"]
+    assert [alias.name for alias in imports[0].names] == [
+        "amount_references", "amount_scores", "fit_stage2", "predict_amount", "total_ratio"]
 
 
 def test_step_14_never_fits_stage_2_with_the_stage_1_settings():
@@ -3295,3 +3319,228 @@ def test_show_stage2_forecast_uses_the_deflated_amount_not_the_nominal_one():
     result = run_show_forecast()
     assert result.returncode == 0, result.stderr
     assert "14.0" not in result.stdout and "28.0" not in result.stdout
+
+
+# --- Step 14 (U11.3): show_stage2_scores and the paid forecast rows ----------------------------------
+# show_stage2_scores on amount_scores' output for the hand case of test_stage2.py: rows 10..13,
+# h 2, 1, 2, 1, actual 100, 200, 50, 400, stage 2 110, 180, 60, 300, training mean 150.
+#   pooled, stage 2: deviance 8.749 -> 9; skill 1 - 8.749 / 102.195 = 0.914; R2 0.853;
+#     WAPE 140 / 750 = 0.187; MAPE (.1 + .1 + .2 + .25) / 4 = 0.1625 -> 0.162; total 650 / 750
+#   pooled, training mean: deviance 102.195 -> 102; skill 0; R2 -0.078; WAPE 450 / 750 = 0.6;
+#     MAPE (.5 + .25 + 2 + .625) / 4 = 0.844; total 600 / 750 = 0.8
+#   skill per h, stage 2: h=1 0.892, h=2 0.975
+SHOW_SCORES = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.stage2 import amount_scores
+
+index = pd.Index([10, 11, 12, 13])
+actual = pd.Series([100.0, 200.0, 50.0, 400.0], index=index)
+h = pd.Series(np.array(HORIZONS, dtype="int64"), index=index)
+reference = pd.Series(150.0, index=index)
+guesses = {"stage 2": pd.Series([110.0, 180.0, 60.0, 300.0], index=index),
+           "training mean": reference,
+           "own mean": pd.Series([90.0, 250.0, 40.0, 350.0], index=index)}
+predictions = {name: guesses[name] for name in MODELS}
+scores = amount_scores(actual, h, predictions, reference)
+copy = scores.copy(deep=True)
+returned = script.show_stage2_scores(scores)
+assert returned is None
+pd.testing.assert_frame_equal(scores, copy)
+print("ok")
+"""
+
+SCORES_HEADER = ("        STAGE 2 alone, on the paid forecast rows (skill against the training "
+                 "mean; R2's baseline is the rows' own mean):")
+
+
+def run_show_scores(models=("stage 2", "training mean"), h=(2, 1, 2, 1)):
+    return run_code(SHOW_SCORES.replace("MODELS", repr(list(models))).replace("HORIZONS", repr(list(h))))
+
+
+def test_show_stage2_scores_printout_by_hand():
+    result = run_show_scores()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        SCORES_HEADER,
+        "        model  rows  m <= 0  mean deviance  deviance skill  R2 hindsight  WAPE  MAPE  "
+        "total ratio",
+        "      stage 2     4       0            9.0           0.914         0.853 0.187 0.162   "
+        "     0.867",
+        "training mean     4       0          102.0           0.000        -0.078 0.600 0.844   "
+        "     0.800",
+        "        deviance skill per h:",
+        "h                  1      2    all",
+        "model                             ",
+        "stage 2        0.892  0.975  0.914",
+        "training mean  0.000  0.000  0.000",
+        "ok",
+    ]
+
+
+def test_show_stage2_scores_pooled_table_has_no_h_column_and_only_the_all_rows():
+    result = run_show_scores()
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[1].split()[:2] == ["model", "rows"]
+    assert " h " not in f" {lines[1]} "
+    assert [line.split()[-1] for line in lines[2:4]] == ["0.867", "0.800"]
+
+
+def test_show_stage2_scores_keeps_the_models_order_not_alphabetical():
+    # As in main(): stage 2, then the references in amount_references' order.
+    result = run_show_scores(models=("stage 2", "training mean", "own mean"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    # own mean: 90, 250, 40, 350 against 100, 200, 50, 400: WAPE 120 / 750 = 0.16, total
+    # 730 / 750 = 0.973. Alphabetical would put own mean first.
+    assert lines[2:5] == [
+        "      stage 2     4       0            9.0           0.914         0.853 0.187 0.162 "
+        "       0.867",
+        "training mean     4       0          102.0           0.000        -0.078 0.600 0.844 "
+        "       0.800",
+        "     own mean     4       0            5.0           0.949         0.928 0.160 0.169 "
+        "       0.973",
+    ]
+    assert lines[-4:-1] == ["stage 2        0.892  0.975  0.914",
+                            "training mean  0.000  0.000  0.000",
+                            "own mean       0.941  0.969  0.949"]
+
+
+def test_show_stage2_scores_per_h_columns_are_the_sorted_h_then_all():
+    result = run_show_scores(h=(5, 1, 3, 1))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    header = lines[lines.index("        deviance skill per h:") + 1]
+    assert header.split() == ["h", "1", "3", "5", "all"]
+
+
+def test_show_stage2_scores_shows_minus_inf_skill_for_a_guess_at_or_below_zero():
+    code = SHOW_SCORES.replace("MODELS", repr(["stage 2", "training mean"])) \
+        .replace("HORIZONS", repr([2, 1, 2, 1])) \
+        .replace("[110.0, 180.0, 60.0, 300.0]", "[110.0, 180.0, 60.0, -300.0]")
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    stage2 = lines[2].split()
+    assert stage2[:5] == ["stage", "2", "4", "1", "inf"]
+    assert stage2[5] == "-inf"
+
+
+# The paid forecast rows filter, run from main()'s own statement on a hand frame: labelled and
+# paid only; a missing week and a future row (paid NA) are left out, never an error.
+PAID_FILTER = """
+import ast
+import inspect
+import textwrap
+import pandas as pd
+import run_hurdle_pipeline as script
+
+body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
+statement = [node for node in body if isinstance(node, ast.Assign)
+             and ast.unparse(node.targets[0]) == "paid_forecast"]
+assert len(statement) == 1
+forecast_rows = pd.DataFrame({
+    "label_status": LABELS,
+    "paid": pd.array(PAID, dtype="boolean"),
+}, index=[30, 31, 32, 33, 34])
+namespace = {"forecast_rows": forecast_rows}
+exec(compile(ast.Module(body=statement, type_ignores=[]), "<step 14>", "exec"), namespace)
+print(list(namespace["paid_forecast"].index))
+"""
+
+
+def run_paid_filter(labels, paid):
+    return run_code(PAID_FILTER.replace("LABELS", repr(labels)).replace("PAID", repr(paid)))
+
+
+def test_paid_forecast_rows_are_the_labelled_paid_rows():
+    result = run_paid_filter(["labelled", "labelled", "missing_week", "future", "labelled"],
+                             [True, False, None, None, True])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[30, 34]"
+
+
+def test_paid_forecast_rows_ignore_a_paid_flag_on_an_unlabelled_row():
+    # A row marked paid but not labelled (should not happen) still stays out.
+    result = run_paid_filter(["missing_week", "future", "labelled", "labelled", "labelled"],
+                             [True, True, False, None, False])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"
+
+
+def test_paid_forecast_rows_when_nothing_paid_is_empty_and_the_fallback_is_printed():
+    # The fallback branch: main()'s own If statement, run with an empty paid_forecast.
+    code = """
+import ast
+import inspect
+import textwrap
+import pandas as pd
+import run_hurdle_pipeline as script
+
+body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
+branch = [node for node in body if isinstance(node, ast.If)
+          and ast.unparse(node.test) == "paid_forecast.empty"]
+assert len(branch) == 1
+def refuse(*args, **kwargs):
+    raise AssertionError("scored although no row paid")
+namespace = {"paid_forecast": pd.DataFrame({"h": []}), "amount_references": refuse,
+             "amount_scores": refuse, "show_stage2_scores": refuse}
+exec(compile(ast.Module(body=branch, type_ignores=[]), "<step 14>", "exec"), namespace)
+print("ok")
+"""
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "        no paid forecast rows: stage 2 cannot be scored here", "ok"]
+
+
+# The real chain on the tiny table, continued through the scores: at origin 2 the one paid
+# labelled forecast row is TR02-A, h=1, amount 100; m = 100 there. The tiny table has no
+# paying/observed weeks, so they are added here: window 4, 1 paying week of 2 observed, and
+# mean_receipts_4 = 1.0 (from the table): own mean (2 + 100) / 2 = 51; training mean 100.
+STEP_14_SCORES = """
+paid_forecast = forecast_rows[(forecast_rows["label_status"] == "labelled")
+                              & forecast_rows["paid"].fillna(False).astype(bool)]
+assert list(paid_forecast["key"]) == ["TR02-A"] and list(paid_forecast["h"]) == [1]
+paid_forecast = paid_forecast.assign(paying_weeks_4=1, observed_weeks_4=2)
+amount_guesses = script.amount_references(train_rows, paid_forecast, 4, 1.0)
+assert list(amount_guesses.iloc[0]) == [100.0, 51.0], amount_guesses
+stage2_scores = script.amount_scores(paid_forecast["amount_deflated"], paid_forecast["h"],
+                                     {"stage 2": forecast_m[paid_forecast.index],
+                                      **amount_guesses},
+                                     amount_guesses["training mean"])
+script.show_stage2_scores(stage2_scores)
+print("scores ok")
+"""
+
+
+def test_step_14_real_chain_through_the_scores():
+    stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
+    code = (stage1_part + STEP_14_CHAIN + STEP_14_SCORES).replace(
+        "COMPANY_AS_FEATURE", "True").replace("ORIGIN", "2").replace("LOSS", "'poisson'")
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "scores ok"
+    start = lines.index(SCORES_HEADER)
+    # m = actual = training mean = 100: the reference's deviance is 0, so every skill is
+    # undefined (NaN, printed, nothing fails); one row, so R2 is NaN too. Own mean 51 is off
+    # by 49: deviance 2 (100 ln(100 / 51) - 49) = 36.7, WAPE = MAPE = 0.49, total 0.51.
+    assert lines[start + 1:-1] == [
+        "        model  rows  m <= 0  mean deviance  deviance skill  R2 hindsight  WAPE  MAPE  "
+        "total ratio",
+        "      stage 2     1       0            0.0             NaN           NaN  0.00  0.00  "
+        "       1.00",
+        "training mean     1       0            0.0             NaN           NaN  0.00  0.00  "
+        "       1.00",
+        "     own mean     1       0           37.0             NaN           NaN  0.49  0.49  "
+        "       0.51",
+        "        deviance skill per h:",
+        "h               1  all",
+        "model                 ",
+        "stage 2       NaN  NaN",
+        "training mean NaN  NaN",
+        "own mean      NaN  NaN",
+    ]

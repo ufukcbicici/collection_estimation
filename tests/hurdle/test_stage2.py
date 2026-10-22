@@ -832,3 +832,578 @@ def test_total_ratio_does_not_change_its_inputs():
     total_ratio(model, x, amount)
     pd.testing.assert_frame_equal(x, x_copy)
     pd.testing.assert_series_equal(amount, amount_copy)
+
+
+# --- U11.3: amount_references ---------------------------------------------------------------
+# "training mean": mean amount_deflated of the paid training rows, on every row. "own mean":
+# (receipts + prior_weeks x training mean) / (paying weeks + prior_weeks), receipts =
+# mean_receipts_w x observed_weeks_w (0 where observed is 0), exactly the training mean where
+# paying weeks is 0.
+
+from collection_estimation.hurdle.stage2 import (  # noqa: E402
+    amount_references,
+    amount_scores,
+    amount_summary,
+)
+
+REFERENCE_COLUMNS = ["training mean", "own mean"]
+
+
+def train_table(paid=(True, False, True), amounts=(100.0, 0.0, 300.0)):
+    """Paid rows 100 and 300: training mean 200. The unpaid row's 0 is not counted."""
+    return pd.DataFrame({"paid": pd.array(list(paid), dtype="boolean"),
+                         "amount_deflated": list(amounts)}, index=[0, 1, 2])
+
+
+def history_rows(window=4, mean=(50.0, nan, 0.0, 250.0), paying=(2, 0, 0, 4),
+                 observed=(4, 0, 4, 4), index=(20, 21, 22, 23)):
+    """Four customers, window 4:
+      20: receipts 50 x 4 = 200 in 2 paying weeks   own mean (200 + 200) / 3 = 133.33
+      21: no data (observed 0, mean NaN)             exactly the training mean 200
+      22: data, never paid (receipts 0)              exactly 200
+      23: receipts 250 x 4 = 1,000 in 4 paying weeks (1,000 + 200) / 5 = 240
+    (own means for prior_weeks 1)."""
+    return pd.DataFrame({f"mean_receipts_{window}": list(mean),
+                         f"paying_weeks_{window}": np.array(paying, dtype="int64"),
+                         f"observed_weeks_{window}": np.array(observed, dtype="int64"),
+                         "other": ["a", "b", "c", "d"][:len(index)]},
+                        index=pd.Index(list(index)))
+
+
+def references_refusal(train, rows, window=4, prior_weeks=1.0):
+    with pytest.raises(ValueError) as error:
+        amount_references(train, rows, window, prior_weeks)
+    return str(error.value)
+
+
+def test_amount_references_by_hand():
+    result = amount_references(train_table(), history_rows(), 4, 1.0)
+    assert list(result.columns) == REFERENCE_COLUMNS
+    assert result.index.equals(pd.Index([20, 21, 22, 23]))
+    assert (result["training mean"] == 200.0).all()
+    np.testing.assert_allclose(result["own mean"], [400 / 3, 200.0, 200.0, 240.0])
+
+
+def test_amount_references_dtypes_are_float64():
+    result = amount_references(train_table(), history_rows(), 4, 1.0)
+    assert result["training mean"].dtype == "float64"
+    assert result["own mean"].dtype == "float64"
+
+
+def test_amount_references_shrinkage_grows_with_prior_weeks():
+    # Customer 20: (200 + k x 200) / (2 + k); k = 3: 800 / 5 = 160; k = 0.5: 300 / 2.5 = 120.
+    rows = history_rows()
+    assert amount_references(train_table(), rows, 4, 3.0)["own mean"][20] == pytest.approx(160)
+    assert amount_references(train_table(), rows, 4, 0.5)["own mean"][20] == pytest.approx(120)
+    assert amount_references(train_table(), rows, 4, 3)["own mean"][23] == pytest.approx(
+        (1000 + 600) / 7)
+
+
+def test_amount_references_a_tiny_prior_gives_the_customers_own_mean_per_paying_week():
+    # Customer 20 paid 200 in 2 paying weeks: 100 per paying week.
+    own = amount_references(train_table(), history_rows(), 4, 1e-9)["own mean"]
+    assert own[20] == pytest.approx(100.0, rel=1e-6)
+    assert own[23] == pytest.approx(250.0, rel=1e-6)
+
+
+def test_amount_references_a_huge_prior_gives_the_training_mean():
+    own = amount_references(train_table(), history_rows(), 4, 1e12)["own mean"]
+    np.testing.assert_allclose(own, 200.0, rtol=1e-6)
+
+
+@pytest.mark.parametrize("prior_weeks", [1.0, 3.0, 0.1, 7.3, 1e-6, 2])
+def test_amount_references_no_paying_week_is_exactly_the_training_mean(prior_weeks):
+    # A training mean with an awkward last digit: (0.1 + 0.2) / 2.
+    train = train_table(paid=(True, True, False), amounts=(0.1, 0.2, 0.0))
+    training_mean = float(pd.Series([0.1, 0.2]).mean())
+    own = amount_references(train, history_rows(), 4, prior_weeks)["own mean"]
+    assert own[21] == training_mean
+    assert own[22] == training_mean
+
+
+def test_amount_references_uses_the_window_it_is_given():
+    rows = history_rows(window=13).join(history_rows(window=4, mean=(10.0, nan, 0.0, 10.0))
+                                        .drop(columns="other"))
+    four = amount_references(train_table(), rows, 4, 1.0)["own mean"]
+    thirteen = amount_references(train_table(), rows, 13, 1.0)["own mean"]
+    assert four[20] == pytest.approx((40 + 200) / 3)
+    assert thirteen[20] == pytest.approx(400 / 3)
+
+
+def test_amount_references_ignores_unpaid_training_amounts():
+    # The unpaid row's amount (here 1,000,000) does not move the training mean.
+    train = train_table(amounts=(100.0, 1_000_000.0, 300.0))
+    assert (amount_references(train, history_rows(), 4, 1.0)["training mean"] == 200.0).all()
+
+
+def test_amount_references_accepts_plain_bool_and_int_paid():
+    for paid in ([True, False, True], [1, 0, 1]):
+        train = pd.DataFrame({"paid": paid, "amount_deflated": [100.0, 0.0, 300.0]})
+        assert (amount_references(train, history_rows(), 4, 1.0)["training mean"]
+                == 200.0).all()
+
+
+def test_amount_references_training_mean_is_the_same_on_every_row_and_a_python_mean():
+    train = train_table(paid=(True, True, True), amounts=(1.0, 2.0, 4.0))
+    result = amount_references(train, history_rows(), 4, 1.0)
+    assert result["training mean"].nunique() == 1
+    assert result["training mean"].iloc[0] == pytest.approx(7.0 / 3.0)
+
+
+def test_amount_references_keeps_rows_order_and_index():
+    rows = history_rows(index=("z", "a", "m", "b"))
+    result = amount_references(train_table(), rows, 4, 1.0)
+    assert list(result.index) == ["z", "a", "m", "b"]
+    assert result.loc["z", "own mean"] == pytest.approx(400 / 3)
+
+
+def test_amount_references_on_zero_rows_is_empty_with_the_columns():
+    result = amount_references(train_table(), history_rows().iloc[:0], 4, 1.0)
+    assert len(result) == 0
+    assert list(result.columns) == REFERENCE_COLUMNS
+
+
+def test_amount_references_does_not_change_its_inputs():
+    train, rows = train_table(), history_rows()
+    copies = train.copy(deep=True), rows.copy(deep=True)
+    amount_references(train, rows, 4, 1.0)
+    pd.testing.assert_frame_equal(train, copies[0])
+    pd.testing.assert_frame_equal(rows, copies[1])
+
+
+def test_amount_references_accepts_numpy_and_int_prior_weeks():
+    for prior in (np.float64(1.0), np.int64(1), 1):
+        own = amount_references(train_table(), history_rows(), 4, prior)["own mean"]
+        assert own[20] == pytest.approx(400 / 3)
+
+
+# amount_references: refusals
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("inf"), nan, True, False, "1", None,
+                                 [1.0]],
+                         ids=["zero", "zero-float", "negative", "inf", "nan", "true", "false",
+                              "string", "none", "list"])
+def test_amount_references_refuses_bad_prior_weeks_with_the_exact_message(bad):
+    message = references_refusal(train_table(), history_rows(), prior_weeks=bad)
+    assert message == f"prior_weeks is {bad!r}; it must be a number above 0"
+
+
+@pytest.mark.parametrize("drop, shown", [
+    (["mean_receipts_4"], "['mean_receipts_4']"),
+    (["paying_weeks_4"], "['paying_weeks_4']"),
+    (["observed_weeks_4"], "['observed_weeks_4']"),
+    (["mean_receipts_4", "observed_weeks_4"], "['mean_receipts_4', 'observed_weeks_4']"),
+], ids=["mean", "paying", "observed", "two"])
+def test_amount_references_refuses_missing_history_columns_with_the_exact_message(drop, shown):
+    message = references_refusal(train_table(), history_rows().drop(columns=drop))
+    assert message == f"the rows have no history columns {shown} for window 4"
+
+
+def test_amount_references_another_window_is_missing():
+    message = references_refusal(train_table(), history_rows(), window=13)
+    assert message == ("the rows have no history columns ['mean_receipts_13', "
+                       "'paying_weeks_13', 'observed_weeks_13'] for window 13")
+
+
+IMPOSSIBLE = ("rows have impossible history values for window 4 (paying weeks negative, NaN "
+              "or above the observed weeks, or receipts NaN or below 0)")
+
+
+@pytest.mark.parametrize("change, count", [
+    (lambda r: r.assign(paying_weeks_4=[-1, 0, 0, 4]), 1),
+    (lambda r: r.assign(paying_weeks_4=[2.0, nan, 0.0, 4.0]), 1),
+    (lambda r: r.assign(paying_weeks_4=[5, 1, 0, 4]), 2),        # above observed (4 and 0)
+    (lambda r: r.assign(mean_receipts_4=[nan, nan, 0.0, 250.0]), 1),   # NaN with data
+    (lambda r: r.assign(mean_receipts_4=[-1.0, nan, 0.0, 250.0]), 1),  # negative receipts
+    (lambda r: r.assign(observed_weeks_4=[4.0, nan, 4.0, 4.0]), 1),    # observed NaN
+], ids=["paying-negative", "paying-nan", "paying-above-observed", "receipts-nan",
+        "receipts-negative", "observed-nan"])
+def test_amount_references_refuses_impossible_history_with_the_exact_message(change, count):
+    message = references_refusal(train_table(), change(history_rows()))
+    assert message == f"{count} {IMPOSSIBLE}"
+
+
+def test_amount_references_nan_mean_without_data_is_not_impossible():
+    # Customer 21 has observed 0 and mean NaN: that is what a window without data looks like.
+    assert amount_references(train_table(), history_rows(), 4, 1.0)["own mean"][21] == 200.0
+
+
+def test_amount_references_negative_mean_without_data_is_ignored():
+    # With observed 0 the receipts are 0 whatever mean_receipts holds.
+    rows = history_rows(mean=(50.0, -7.0, 0.0, 250.0))
+    assert amount_references(train_table(), rows, 4, 1.0)["own mean"][21] == 200.0
+
+
+@pytest.mark.parametrize("train", [
+    lambda: train_table(paid=(False, False, False)),
+    lambda: train_table().iloc[:0],
+], ids=["none-paid", "empty"])
+def test_amount_references_refuses_no_paid_training_row(train):
+    assert references_refusal(train(), history_rows()) == (
+        "the training rows have no paid row to take a mean amount from")
+
+
+@pytest.mark.parametrize("amounts", [(0.0, 0.0, 300.0), (-5.0, 0.0, 300.0), (nan, 0.0, 300.0)],
+                         ids=["zero", "negative", "nan"])
+def test_amount_references_refuses_a_paid_amount_not_above_0(amounts):
+    assert references_refusal(train_table(amounts=amounts), history_rows()) == (
+        "a paid training row has an amount that is not above 0")
+
+
+def test_amount_references_an_unpaid_zero_amount_is_fine():
+    train = train_table(paid=(True, False, True), amounts=(100.0, 0.0, 300.0))
+    assert amount_references(train, history_rows(), 4, 1.0)["training mean"].iloc[0] == 200.0
+
+
+def test_amount_references_refusal_order():
+    # Everything broken: prior_weeks first, then the missing columns, then the impossible
+    # values, then no paid row, then a paid amount not above 0.
+    broken_rows = history_rows().assign(paying_weeks_4=[-1, 0, 0, 4])
+    no_paid = train_table(paid=(False, False, False))
+    assert references_refusal(no_paid, broken_rows.drop(columns="mean_receipts_4"),
+                              prior_weeks=0).startswith("prior_weeks is 0")
+    assert references_refusal(no_paid, broken_rows.drop(columns="mean_receipts_4")
+                              ).startswith("the rows have no history columns")
+    assert references_refusal(no_paid, broken_rows).endswith(IMPOSSIBLE)
+    assert references_refusal(no_paid, history_rows()).startswith(
+        "the training rows have no paid row")
+    assert references_refusal(train_table(amounts=(0.0, 0.0, 300.0)), history_rows()
+                              ).startswith("a paid training row")
+
+
+# --- U11.3: amount_scores and amount_summary --------------------------------------------------
+# A hand-checkable case, four paid rows (index 10..13) in two horizons, h given out of order:
+#   row  h  actual  stage 2  reference (training mean)
+#   10   2   100     110       150
+#   11   1   200     180       150
+#   12   2    50      60       150
+#   13   1   400     300       150
+# Poisson deviance of one row: 2 (y ln(y / g) - y + g).
+
+SCORE_COLUMNS = ["model", "h", "rows", "m <= 0", "mean deviance", "deviance skill",
+                 "R2 hindsight", "WAPE", "MAPE", "total ratio"]
+
+
+def deviance(y, g):
+    y, g = np.asarray(y, dtype="float64"), np.asarray(g, dtype="float64")
+    return float(np.mean(2 * (y * np.log(y / g) - y + g)))
+
+
+def r2(y, g):
+    y, g = np.asarray(y, dtype="float64"), np.asarray(g, dtype="float64")
+    return float(1 - ((y - g) ** 2).sum() / ((y - y.mean()) ** 2).sum())
+
+
+def score_case():
+    index = pd.Index([10, 11, 12, 13])
+    actual = pd.Series([100.0, 200.0, 50.0, 400.0], index=index, name="amount_deflated")
+    h = pd.Series(np.array([2, 1, 2, 1], dtype="int64"), index=index, name="h")
+    stage2 = pd.Series([110.0, 180.0, 60.0, 300.0], index=index, name="m")
+    reference = pd.Series(150.0, index=index, name="training mean")
+    return actual, h, {"stage 2": stage2, "training mean": reference}, reference
+
+
+def scores_of(case=None):
+    actual, h, predictions, reference = case or score_case()
+    return amount_scores(actual, h, predictions, reference)
+
+
+def row(scores, model, h):
+    found = scores[(scores["model"] == model) & (scores["h"] == h)]
+    assert len(found) == 1, (model, h)
+    return found.iloc[0]
+
+
+def test_amount_scores_columns_and_row_order():
+    scores = scores_of()
+    assert list(scores.columns) == SCORE_COLUMNS
+    assert list(scores["model"]) == ["stage 2"] * 3 + ["training mean"] * 3
+    assert list(scores["h"]) == [1, 2, "all"] * 2
+    assert list(scores.index) == list(range(6))
+
+
+def test_amount_scores_h1_by_hand():
+    s = row(scores_of(), "stage 2", 1)
+    assert s["rows"] == 2 and s["m <= 0"] == 0
+    assert s["mean deviance"] == pytest.approx(deviance([200, 400], [180, 300]))
+    assert s["mean deviance"] == pytest.approx(16.14494, abs=1e-4)
+    reference_deviance = deviance([200, 400], [150, 150])
+    assert s["deviance skill"] == pytest.approx(1 - s["mean deviance"] / reference_deviance)
+    # R2: mean 300, SS_res 20^2 + 100^2 = 10,400, SS_tot 2 x 100^2 = 20,000: 0.48.
+    assert s["R2 hindsight"] == pytest.approx(0.48)
+    assert s["WAPE"] == pytest.approx(120 / 600)            # (20 + 100) / 600
+    assert s["MAPE"] == pytest.approx((0.1 + 0.25) / 2)     # 20/200, 100/400
+    assert s["total ratio"] == pytest.approx(480 / 600)
+
+
+def test_amount_scores_h2_by_hand():
+    s = row(scores_of(), "stage 2", 2)
+    assert s["rows"] == 2
+    assert s["mean deviance"] == pytest.approx(deviance([100, 50], [110, 60]))
+    assert s["R2 hindsight"] == pytest.approx(r2([100, 50], [110, 60]))   # 1 - 200/1250
+    assert s["R2 hindsight"] == pytest.approx(0.84)
+    assert s["WAPE"] == pytest.approx(20 / 150)
+    assert s["MAPE"] == pytest.approx((0.1 + 0.2) / 2)
+    assert s["total ratio"] == pytest.approx(170 / 150)
+
+
+def test_amount_scores_all_row_pools_every_row_not_the_horizons_means():
+    s = row(scores_of(), "stage 2", "all")
+    y, g = [100, 200, 50, 400], [110, 180, 60, 300]
+    assert s["rows"] == 4
+    assert s["mean deviance"] == pytest.approx(deviance(y, g))
+    assert s["deviance skill"] == pytest.approx(1 - deviance(y, g) / deviance(y, [150] * 4))
+    assert s["R2 hindsight"] == pytest.approx(r2(y, g))
+    assert s["WAPE"] == pytest.approx(140 / 750)
+    assert s["MAPE"] == pytest.approx((0.1 + 0.1 + 0.2 + 0.25) / 4)
+    assert s["total ratio"] == pytest.approx(650 / 750)
+
+
+def test_amount_scores_the_reference_has_zero_skill_against_itself():
+    scores = scores_of()
+    assert (scores.loc[scores["model"] == "training mean", "deviance skill"] == 0.0).all()
+
+
+def test_amount_scores_reference_by_hand():
+    s = row(scores_of(), "training mean", "all")
+    assert s["total ratio"] == pytest.approx(600 / 750)
+    assert s["WAPE"] == pytest.approx((50 + 50 + 100 + 250) / 750)
+
+
+def test_amount_scores_values_are_python_numbers_of_the_right_kind():
+    s = row(scores_of(), "stage 2", "all")
+    assert int(s["rows"]) == 4 and int(s["m <= 0"]) == 0
+    scores = scores_of()
+    for column in ("mean deviance", "deviance skill", "R2 hindsight", "WAPE", "MAPE",
+                   "total ratio"):
+        assert scores[column].dtype == "float64", column
+
+
+def test_amount_scores_h_is_sorted_whatever_the_row_order():
+    actual, h, predictions, reference = score_case()
+    h = pd.Series(np.array([5, 3, 5, 1], dtype="int64"), index=h.index)
+    scores = amount_scores(actual, h, predictions, reference)
+    assert list(scores["h"]) == [1, 3, 5, "all"] * 2
+    assert list(row(scores, "stage 2", 3)[["rows"]]) == [1]
+
+
+def test_amount_scores_models_follow_the_dict_order():
+    actual, h, predictions, reference = score_case()
+    reordered = {"training mean": predictions["training mean"],
+                 "stage 2": predictions["stage 2"]}
+    scores = amount_scores(actual, h, reordered, reference)
+    assert list(scores["model"].unique()) == ["training mean", "stage 2"]
+
+
+def test_amount_scores_one_row_in_an_h_has_nan_r2_and_the_rest():
+    actual, h, predictions, reference = score_case()
+    h = pd.Series(np.array([2, 1, 1, 1], dtype="int64"), index=h.index)
+    s = row(amount_scores(actual, h, predictions, reference), "stage 2", 2)
+    assert s["rows"] == 1
+    assert np.isnan(s["R2 hindsight"])
+    assert s["MAPE"] == pytest.approx(0.1) and s["WAPE"] == pytest.approx(0.1)
+    assert s["total ratio"] == pytest.approx(1.1)
+    assert s["mean deviance"] == pytest.approx(deviance([100], [110]))
+
+
+def test_amount_scores_a_single_h_gives_that_h_and_all_with_the_same_numbers():
+    actual, h, predictions, reference = score_case()
+    h = pd.Series(np.ones(4, dtype="int64"), index=h.index)
+    scores = amount_scores(actual, h, predictions, reference)
+    assert list(scores["h"]) == [1, "all", 1, "all"]
+    one, everything = row(scores, "stage 2", 1), row(scores, "stage 2", "all")
+    pd.testing.assert_series_equal(one.drop("h"), everything.drop("h"), check_names=False)
+
+
+@pytest.mark.parametrize("bad", [0.0, -20.0], ids=["zero", "negative"])
+def test_amount_scores_a_guess_at_or_below_0_gives_infinite_deviance_and_minus_inf_skill(bad):
+    actual, h, predictions, reference = score_case()
+    guess = predictions["stage 2"].copy()
+    guess[13] = bad                               # h = 1
+    scores = amount_scores(actual, h, {"stage 2": guess}, reference)
+    for horizon in (1, "all"):
+        s = row(scores, "stage 2", horizon)
+        assert s["m <= 0"] == 1
+        assert s["mean deviance"] == float("inf")
+        assert s["deviance skill"] == float("-inf")
+    # h = 2 has no bad guess: finite.
+    s = row(scores, "stage 2", 2)
+    assert s["m <= 0"] == 0 and np.isfinite(s["mean deviance"])
+
+
+def test_amount_scores_a_guess_below_0_still_counts_in_the_other_scores():
+    actual, h, predictions, reference = score_case()
+    guess = predictions["stage 2"].copy()
+    guess[13] = -100.0                            # actual 400: error 500
+    s = row(amount_scores(actual, h, {"stage 2": guess}, reference), "stage 2", 1)
+    assert s["WAPE"] == pytest.approx((20 + 500) / 600)
+    assert s["total ratio"] == pytest.approx((180 - 100) / 600)
+    assert s["R2 hindsight"] == pytest.approx(r2([200, 400], [180, -100]))
+
+
+def test_amount_scores_counts_every_guess_at_or_below_0():
+    actual, h, predictions, reference = score_case()
+    guess = pd.Series([0.0, -1.0, -5.0, 300.0], index=actual.index)
+    scores = amount_scores(actual, h, {"bad": guess}, reference)
+    assert row(scores, "bad", 1)["m <= 0"] == 1
+    assert row(scores, "bad", 2)["m <= 0"] == 2
+    assert row(scores, "bad", "all")["m <= 0"] == 3
+
+
+def test_amount_scores_a_perfect_reference_leaves_the_skill_undefined():
+    actual, h, predictions, _ = score_case()
+    scores = amount_scores(actual, h, {"stage 2": predictions["stage 2"], "exact": actual},
+                           actual)
+    assert scores["deviance skill"].isna().all()
+    assert (row(scores, "exact", "all")[["mean deviance"]] == 0.0).all()
+
+
+def test_amount_scores_a_perfect_guess():
+    actual, h, _, reference = score_case()
+    s = row(amount_scores(actual, h, {"exact": actual.copy()}, reference), "exact", "all")
+    assert s["mean deviance"] == pytest.approx(0.0, abs=1e-12)
+    assert s["deviance skill"] == pytest.approx(1.0)
+    assert s["R2 hindsight"] == 1.0
+    assert s["WAPE"] == 0.0 and s["MAPE"] == 0.0 and s["total ratio"] == 1.0
+
+
+def test_amount_scores_mape_weighs_small_payments_like_large_ones_wape_does_not():
+    index = pd.Index([0, 1])
+    actual = pd.Series([1.0, 1000.0], index=index)
+    h = pd.Series([1, 1], index=index)
+    guess = pd.Series([2.0, 1000.0], index=index)    # 100% off on the small one only
+    s = row(amount_scores(actual, h, {"g": guess}, pd.Series(10.0, index=index)), "g", "all")
+    assert s["MAPE"] == pytest.approx(0.5)
+    assert s["WAPE"] == pytest.approx(1 / 1001)
+
+
+def test_amount_scores_does_not_change_its_inputs():
+    actual, h, predictions, reference = score_case()
+    copies = (actual.copy(), h.copy(), {k: v.copy() for k, v in predictions.items()},
+              reference.copy())
+    amount_scores(actual, h, predictions, reference)
+    pd.testing.assert_series_equal(actual, copies[0])
+    pd.testing.assert_series_equal(h, copies[1])
+    assert list(predictions) == list(copies[2])
+    for name in predictions:
+        pd.testing.assert_series_equal(predictions[name], copies[2][name])
+    pd.testing.assert_series_equal(reference, copies[3])
+
+
+def test_amount_scores_accepts_int_actual_amounts():
+    actual, h, predictions, reference = score_case()
+    as_float = amount_scores(actual, h, predictions, reference)
+    as_int = amount_scores(actual.astype("int64"), h, predictions, reference)
+    pd.testing.assert_frame_equal(as_float, as_int)
+
+
+def test_amount_summary_matches_one_row_of_amount_scores():
+    actual, h, predictions, reference = score_case()
+    summary = amount_summary(actual, predictions["stage 2"], reference)
+    expected = row(scores_of(), "stage 2", "all")
+    assert list(summary) == SCORE_COLUMNS[2:]
+    for key, value in summary.items():
+        assert value == pytest.approx(expected[key]), key
+
+
+# amount_scores: refusals, in order
+
+def scores_refusal(actual, h, predictions, reference):
+    with pytest.raises(ValueError) as error:
+        amount_scores(actual, h, predictions, reference)
+    return str(error.value)
+
+
+@pytest.mark.parametrize("target, name", [("h", "h"), ("reference", "reference"),
+                                          ("stage 2", "stage 2"),
+                                          ("training mean", "training mean")])
+@pytest.mark.parametrize("change", [
+    lambda s: s.reset_index(drop=True), lambda s: s.iloc[::-1], lambda s: s.iloc[:-1],
+], ids=["new-index", "reversed", "shorter"])
+def test_amount_scores_refuses_a_series_without_actuals_rows(target, name, change):
+    actual, h, predictions, reference = score_case()
+    if target == "h":
+        h = change(h)
+    elif target == "reference":
+        reference = change(reference)
+    else:
+        predictions = dict(predictions, **{target: change(predictions[target])})
+    assert scores_refusal(actual, h, predictions, reference) == (
+        f"{name} must have the rows of actual (the same index)")
+
+
+def test_amount_scores_index_checks_run_h_then_reference_then_predictions_in_order():
+    actual, h, predictions, reference = score_case()
+    bad = {name: s.reset_index(drop=True) for name, s in predictions.items()}
+    assert scores_refusal(actual, h.reset_index(drop=True), bad,
+                          reference.reset_index(drop=True)).startswith("h must")
+    assert scores_refusal(actual, h, bad, reference.reset_index(drop=True)).startswith(
+        "reference must")
+    assert scores_refusal(actual, h, bad, reference).startswith("stage 2 must")
+
+
+@pytest.mark.parametrize("values, message", [
+    ([nan, 200.0, 50.0, 400.0], "amount has 1 missing values"),
+    ([inf, 200.0, 50.0, 400.0], "amount holds an infinite value"),
+    ([0.0, 200.0, 50.0, 400.0], "amount is 0 or below in 1 rows"),
+    ([-1.0, -2.0, 50.0, 400.0], "amount is 0 or below in 2 rows"),
+], ids=["nan", "inf", "zero", "negative"])
+def test_amount_scores_refuses_actual_amounts_as_check_amounts_does(values, message):
+    actual, h, predictions, reference = score_case()
+    actual = pd.Series(values, index=actual.index)
+    assert scores_refusal(actual, h, predictions, reference).startswith(message)
+
+
+def test_amount_scores_refuses_no_rows():
+    actual, h, predictions, reference = score_case()
+    empty = {name: s.iloc[:0] for name, s in predictions.items()}
+    assert scores_refusal(actual.iloc[:0], h.iloc[:0], empty, reference.iloc[:0]) == NO_ROWS
+
+
+@pytest.mark.parametrize("bad", [nan, inf, -inf], ids=["nan", "inf", "minus-inf"])
+def test_amount_scores_refuses_a_guess_that_is_not_finite(bad):
+    actual, h, predictions, reference = score_case()
+    guess = predictions["stage 2"].copy()
+    guess[12] = bad
+    assert scores_refusal(actual, h, dict(predictions, **{"stage 2": guess}), reference) == (
+        "stage 2 holds a NaN or infinite amount")
+
+
+@pytest.mark.parametrize("bad", [nan, inf], ids=["nan", "inf"])
+def test_amount_scores_refuses_a_reference_that_is_not_finite(bad):
+    actual, h, predictions, reference = score_case()
+    reference = reference.copy()
+    reference[12] = bad
+    assert scores_refusal(actual, h, {"stage 2": predictions["stage 2"]}, reference) == (
+        "reference holds a NaN or infinite amount")
+
+
+@pytest.mark.parametrize("bad", [0.0, -3.0], ids=["zero", "negative"])
+def test_amount_scores_refuses_a_reference_not_above_0(bad):
+    actual, h, predictions, reference = score_case()
+    reference = reference.copy()
+    reference[12] = bad
+    assert scores_refusal(actual, h, {"stage 2": predictions["stage 2"]}, reference) == (
+        "reference must be above 0 in every row")
+
+
+def test_amount_scores_value_checks_come_after_the_index_checks_and_in_order():
+    actual, h, predictions, reference = score_case()
+    bad_actual = pd.Series([0.0, 200.0, 50.0, 400.0], index=actual.index)
+    nan_guess = predictions["stage 2"].where(predictions["stage 2"].index != 12, nan)
+    nan_reference = reference.where(reference.index != 12, nan)
+    zero_reference = reference.where(reference.index != 12, 0.0)
+    # index before actual
+    assert scores_refusal(bad_actual, h.reset_index(drop=True), predictions,
+                          reference).startswith("h must")
+    # actual before the guesses' values
+    assert scores_refusal(bad_actual, h, {"stage 2": nan_guess}, nan_reference).startswith(
+        "amount is 0 or below")
+    # the reference's finiteness before the guesses'
+    assert scores_refusal(actual, h, {"stage 2": nan_guess}, nan_reference).startswith(
+        "reference holds")
+    # every guess's finiteness before the reference's sign
+    assert scores_refusal(actual, h, {"stage 2": nan_guess}, zero_reference).startswith(
+        "stage 2 holds")
+    assert scores_refusal(actual, h, {"stage 2": predictions["stage 2"]},
+                          zero_reference).startswith("reference must be above 0")
