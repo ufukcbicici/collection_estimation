@@ -86,10 +86,12 @@ use_ledger_before_first_file = true   # the ledger's payments before the first d
 
 [stage1]
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
-# weights, early stopping off). Starting values; the settings grid (U16) tries others.
-max_iter = 300                  # number of trees
-learning_rate = 0.05
-max_leaf_nodes = 31             # leaves per tree
+# weights, early stopping off). The stage-1 diagnostic's choice at origin 40 (its grid on
+# validation weeks 41-45); was 300 / 0.05 / 31, within 0.0002 log loss and 4x faster. The
+# settings grid (U16) tries others.
+max_iter = 900                  # number of trees
+learning_rate = 0.01
+max_leaf_nodes = 63             # leaves per tree
 min_samples_leaf = 20           # rows per leaf, at least
 random_seed = 1
 feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in

@@ -54,3 +54,23 @@ def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, settings) -> HistGradie
     )
     model.fit(train_x, amount)
     return model
+
+
+def predict_amount(model, x: pd.DataFrame) -> pd.Series:
+    """m for each row of `x`: the amount the customer pays in the target week if it pays
+    (deflated, TRY of week 0). `model` is from `fit_stage2`. Nothing is clipped: a squared-error
+    model can predict below 0, and that should stay visible. Raises ValueError unless `x` has
+    the columns the model was fitted on, in order."""
+    fitted = list(model.feature_names_in_)
+    if list(x.columns) != fitted:
+        raise ValueError(f"x has columns {list(x.columns)}, but the model was fitted on "
+                         f"{fitted}")
+    return pd.Series(model.predict(x), index=x.index, name="m")
+
+
+def total_ratio(model, x: pd.DataFrame, amount: pd.Series) -> float:
+    """The predicted total over the actual total on paid rows: sum of m / sum of `amount`.
+    Stage 2 alone (no p): 1.0 means that, given the customers paid, no cash was lost or
+    invented in total. Raises ValueError as `check_amounts` and `predict_amount` do."""
+    amount = check_amounts(x, amount)
+    return float(predict_amount(model, x).sum() / amount.sum())

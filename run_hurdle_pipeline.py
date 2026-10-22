@@ -90,7 +90,11 @@ from collection_estimation.hurdle.stage1 import (  # noqa: E402
     predict_paid,
     stage1_features,
 )
-from collection_estimation.hurdle.stage2 import fit_stage2  # noqa: E402
+from collection_estimation.hurdle.stage2 import (  # noqa: E402
+    fit_stage2,
+    predict_amount,
+    total_ratio,
+)
 from collection_estimation.hurdle.training_table import (  # noqa: E402
     block_feature_columns,
     join_features,
@@ -430,7 +434,8 @@ def main():
 
     # Step 14: stage 2, "how much, if it pays?", at the same forecast week as step 12. It
     # learns from the paid training rows only; the target is the deflated amount (TRY of
-    # week 0). Built unit by unit; for now, the fit.
+    # week 0). Built unit by unit; for now, the fit, its total on the training rows, and m
+    # for the forecast rows of step 12, times step 12's p, against the cash that came.
     stage2_columns = feature_columns(block_feature_columns(history, calendar, owed),
                                      settings.stage2.feature_blocks)
     paid_rows = train_rows[train_rows["paid"].astype(bool)]
@@ -440,6 +445,10 @@ def main():
     stage2_model = fit_stage2(paid_x, paid_rows["amount_deflated"], settings.stage2)
     show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss,
                     time.perf_counter() - started)
+    training_ratio = total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"])
+    m = predict_amount(stage2_model, stage1_features(forecast_rows, stage2_columns, companies,
+                                                     settings.stage1.company_as_feature))
+    show_stage2_forecast(forecast_rows, m, predictions["stage 1 (HGB)"], training_ratio)
 
     # Later steps follow as each unit is built.
 
@@ -840,6 +849,27 @@ def show_stage2_fit(origin, paid_rows, train_rows, paid_x, loss, fit_seconds):
     print(f"        deflated amount per paid row: median {amount.median():,.0f}, mean "
           f"{amount.mean():,.0f}, 99th percentile {amount.quantile(0.99):,.0f}, "
           f"max {amount.max():,.0f}")
+
+
+def show_stage2_forecast(forecast_rows, m, p, training_ratio):
+    """Step 14's m on the forecast rows of step 12, and a first look at the whole model: per h,
+    the sum of p x m against the deflated cash that actually came (labelled rows only; a
+    missing week is not a zero). A ratio of 1.0 means the cash adds up."""
+    print(f"        training total ratio (sum of m / sum of actual, paid rows): "
+          f"{training_ratio:.4f}")
+    print(f"        m on the {len(m):,} forecast rows: median {m.median():,.0f}, "
+          f"mean {m.mean():,.0f}")
+    labelled = forecast_rows["label_status"] == "labelled"
+    if not labelled.any():
+        print("        no labelled forecast rows: p x m cannot be compared with actual cash")
+        return
+    rows = pd.DataFrame({"h": forecast_rows["h"], "mean m": m, "p x m": p * m,
+                         "actual cash": forecast_rows["amount_deflated"]})[labelled]
+    by_h = rows.groupby("h").agg({"mean m": "mean", "p x m": "sum", "actual cash": "sum"})
+    by_h.loc["all"] = [rows["mean m"].mean(), rows["p x m"].sum(), rows["actual cash"].sum()]
+    by_h["ratio"] = by_h["p x m"] / by_h["actual cash"]
+    print("        per h, the whole model (sum of p x m) against the actual cash, deflated:")
+    print(by_h.round({"mean m": 0, "p x m": 0, "actual cash": 0, "ratio": 3}).to_string())
 
 
 if __name__ == "__main__":
