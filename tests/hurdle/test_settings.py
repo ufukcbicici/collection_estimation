@@ -38,6 +38,8 @@ from collection_estimation.hurdle.settings import (
     ReceivablesSettings,
     Settings,
     Stage1Settings,
+    Stage2Settings,
+    STAGE2_LOSSES,
     check_keys,
     class_weight_setting,
     grid_setting,
@@ -45,6 +47,7 @@ from collection_estimation.hurdle.settings import (
     leaf_count_setting,
     rate_setting,
     seed_setting,
+    stage2_loss_setting,
     positive_number_setting,
     count_setting,
     date_format_setting,
@@ -150,6 +153,11 @@ VALID = {
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
                "company_as_feature": "true", "baseline_c": "1.0"},
+    # U11.1: stage 2's regressor. Values differ from [stage1] on purpose (loss "gamma", 200
+    # trees, ...), so a test can tell which section a value was read from.
+    "stage2": {"loss": '"gamma"', "max_iter": "200", "learning_rate": "0.1",
+               "max_leaf_nodes": "15", "min_samples_leaf": "10", "random_seed": "7",
+               "feature_blocks": '["calendar", "history"]'},
     "diagnostic": {"run": "true", "origin": "40", "hgb_max_iter": "[100, 300, 600]",
                    "hgb_learning_rate": "[0.05, 0.1]", "hgb_max_leaf_nodes": "[15, 31, 63]",
                    "lr_c": "[0.01, 0.1, 1.0, 10.0]", "class_weights": '["none", "balanced"]',
@@ -286,7 +294,8 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "stage1", "diagnostic", "debug"])
+                                       "history", "stage1", "stage2", "diagnostic",
+                                       "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -307,6 +316,9 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
+    ("stage2", "loss"), ("stage2", "max_iter"), ("stage2", "learning_rate"),
+    ("stage2", "max_leaf_nodes"), ("stage2", "min_samples_leaf"), ("stage2", "random_seed"),
+    ("stage2", "feature_blocks"),
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
@@ -435,6 +447,9 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
+    ("stage2", "loss"), ("stage2", "max_iter"), ("stage2", "learning_rate"),
+    ("stage2", "max_leaf_nodes"), ("stage2", "min_samples_leaf"), ("stage2", "random_seed"),
+    ("stage2", "feature_blocks"),
     ("diagnostic", "run"), ("diagnostic", "origin"), ("diagnostic", "hgb_max_iter"),
     ("diagnostic", "hgb_learning_rate"), ("diagnostic", "hgb_max_leaf_nodes"),
     ("diagnostic", "lr_c"), ("diagnostic", "class_weights"),
@@ -2160,7 +2175,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
-        f"'receivables', 'stage1']")
+        f"'receivables', 'stage1', 'stage2']")
 
 
 def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
@@ -2667,7 +2682,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
-        f"'receivables', 'stage1']")
+        f"'receivables', 'stage1', 'stage2']")
 
 
 def test_a_diagnostic_typo_has_the_exact_message(tmp_path, repo):
@@ -2950,8 +2965,8 @@ def test_the_synthetic_diagnostic_settings():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.diagnostic == DiagnosticSettings(
         run=True, origin=40, hgb_max_iter=(100, 300, 600, 900),
-        hgb_learning_rate=(0.01, 0.05, 0.1), hgb_max_leaf_nodes=(15, 31, 63),
-        lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none", "balanced"),
+        hgb_learning_rate=(0.01, 0.05, 0.1, 0.15, 0.2, 0.5), hgb_max_leaf_nodes=(15, 31, 63),
+        lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none",),
         selection_metric="log loss", calibration_groups=10, reference_window=13,
         reference_prior_weeks=1.0, importance_repeats=3,
         output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_diagnostic").resolve())
@@ -3291,3 +3306,339 @@ def test_the_synthetic_file_calibration_settings():
     assert settings.diagnostic.reference_window in settings.history.windows
     assert settings.diagnostic.reference_prior_weeks == 1.0
     assert type(settings.diagnostic.reference_prior_weeks) is float
+
+
+# --- [stage2] (U11.1) ------------------------------------------------------------------------
+# Stage 2, the "how much, if it pays?" regressor. Its own loss (stage2_loss_setting), and the
+# other six keys through the validators stage 1 already uses; every message names the file and
+# [stage2], exactly. VALID's [stage2] differs from its [stage1] on purpose, so a test can tell
+# which section a value was read from.
+
+STAGE2 = f"{FILE_NAME} [stage2]"
+STAGE2_KEYS = ['feature_blocks', 'learning_rate', 'loss', 'max_iter', 'max_leaf_nodes',
+               'min_samples_leaf', 'random_seed']
+LOSS_CHOICES = "['poisson', 'gamma', 'squared_error']"
+
+
+def exact_message_from(tmp_path, repo, **kwargs):
+    with pytest.raises(ValueError) as error:
+        load(tmp_path, repo, **kwargs)
+    return str(error.value)
+
+
+def test_the_stage2_section_is_read(tmp_path, repo):
+    stage2 = load(tmp_path, repo).stage2
+    assert isinstance(stage2, Stage2Settings)
+    assert stage2 == Stage2Settings(
+        loss="gamma", max_iter=200, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=10,
+        random_seed=7, feature_blocks=("history", "calendar"))
+
+
+def test_the_stage2_values_have_the_right_python_types(tmp_path, repo):
+    stage2 = load(tmp_path, repo).stage2
+    assert type(stage2.loss) is str
+    for name in ("max_iter", "max_leaf_nodes", "min_samples_leaf", "random_seed"):
+        assert type(getattr(stage2, name)) is int, name
+    assert type(stage2.learning_rate) is float
+    assert type(stage2.feature_blocks) is tuple
+
+
+def test_stage2_is_read_from_its_own_section_not_from_stage1(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    assert settings.stage1.max_iter == 300 and settings.stage2.max_iter == 200
+    assert settings.stage1.learning_rate == 0.05 and settings.stage2.learning_rate == 0.1
+    assert settings.stage1.max_leaf_nodes == 31 and settings.stage2.max_leaf_nodes == 15
+    assert settings.stage1.min_samples_leaf == 20 and settings.stage2.min_samples_leaf == 10
+    assert settings.stage1.random_seed == 1 and settings.stage2.random_seed == 7
+    assert settings.stage1.feature_blocks == ("history", "calendar", "receivables")
+    assert settings.stage2.feature_blocks == ("history", "calendar")
+
+
+def test_changing_stage2_leaves_stage1_alone(tmp_path, repo):
+    base = load(tmp_path, repo)
+    other = load(tmp_path, repo, changes={("stage2", "max_iter"): "5",
+                                          ("stage2", "loss"): '"poisson"'})
+    assert other.stage1 == base.stage1
+    assert other.stage2 == dataclasses.replace(base.stage2, max_iter=5, loss="poisson")
+
+
+def test_changing_stage1_leaves_stage2_alone(tmp_path, repo):
+    base = load(tmp_path, repo)
+    other = load(tmp_path, repo, changes={("stage1", "max_iter"): "5"})
+    assert other.stage2 == base.stage2
+
+
+def test_stage2_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(Stage2Settings)] == [
+        "loss", "max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
+        "random_seed", "feature_blocks"]
+
+
+def test_stage2_settings_has_no_company_as_feature_or_baseline():
+    # The company code goes in exactly when it does for stage 1; there is no stage 2 baseline.
+    names = [field.name for field in dataclasses.fields(Stage2Settings)]
+    assert "company_as_feature" not in names
+    assert "baseline_c" not in names
+
+
+def test_settings_has_a_stage2_field_between_stage1_and_diagnostic():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("stage1") < names.index("stage2") < names.index("diagnostic")
+
+
+def test_stage2_settings_is_frozen_and_hashable():
+    stage2 = Stage2Settings(loss="poisson", max_iter=1, learning_rate=0.1, max_leaf_nodes=2,
+                            min_samples_leaf=1, random_seed=0, feature_blocks=("history",))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        stage2.loss = "gamma"
+    assert hash(stage2) == hash(dataclasses.replace(stage2))
+
+
+def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="stage2")
+    assert message == (
+        f"{FILE_NAME}: missing ['stage2']; expected exactly ['collections_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'ledger_layout', "
+        f"'receivables', 'stage1', 'stage2']")
+
+
+def test_a_stage2_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="stage2", top="stage2 = 5")
+    assert message == f"{STAGE2} is 5, not a section"
+
+
+def test_an_empty_stage2_section_has_the_exact_message(tmp_path, repo):
+    changes = {("stage2", key): REMOVE for key in VALID["stage2"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == f"{STAGE2}: missing {STAGE2_KEYS}; expected exactly {STAGE2_KEYS}"
+
+
+@pytest.mark.parametrize("key", STAGE2_KEYS)
+def test_a_missing_stage2_setting_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("stage2", key): REMOVE})
+    assert message == f"{STAGE2}: missing [{key!r}]; expected exactly {STAGE2_KEYS}"
+
+
+@pytest.mark.parametrize("key, value", [
+    ("company_as_feature", "true"), ("baseline_c", "1.0"), ("early_stopping", "false"),
+    ("selection_metric", '"log loss"'), ("Loss", '"poisson"'),
+], ids=["company_as_feature", "baseline_c", "early_stopping", "selection_metric", "Loss"])
+def test_an_unknown_stage2_setting_has_the_exact_message(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("stage2", key): value})
+    assert message == f"{STAGE2}: unknown [{key!r}]; expected exactly {STAGE2_KEYS}"
+
+
+def test_a_stage2_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "loss"): REMOVE,
+                                             ("stage2", "losses"): '"poisson"'})
+    assert message == (f"{STAGE2}: missing ['loss']; unknown ['losses']; expected exactly "
+                       f"{STAGE2_KEYS}")
+
+
+def test_loss_in_the_stage1_section_is_unknown(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage1", "loss"): '"poisson"'})
+    assert message.startswith(f"{FILE_NAME} [stage1]: unknown ['loss']; ")
+
+
+# --- [stage2] loss (stage2_loss_setting) ------------------------------------------------------
+
+def test_stage2_losses_constant():
+    assert STAGE2_LOSSES == ("poisson", "gamma", "squared_error")
+    assert type(STAGE2_LOSSES) is tuple
+
+
+@pytest.mark.parametrize("good", ["poisson", "gamma", "squared_error"])
+def test_each_stage2_loss_is_read_from_the_file(tmp_path, repo, good):
+    value = load(tmp_path, repo, changes={("stage2", "loss"): f'"{good}"'}).stage2.loss
+    assert value == good
+    assert type(value) is str
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ('"Poisson"', "'Poisson'"), ('"POISSON"', "'POISSON'"), ('" poisson"', "' poisson'"),
+    ('"poisson "', "'poisson '"), ('"squared error"', "'squared error'"),
+    ('"squared-error"', "'squared-error'"), ('"absolute_error"', "'absolute_error'"),
+    ('"quantile"', "'quantile'"), ('"tweedie"', "'tweedie'"), ('"log_loss"', "'log_loss'"),
+    ('""', "''"), ("1", "1"), ("0.5", "0.5"), ("true", "True"), ("false", "False"),
+    ('["poisson"]', "['poisson']"), ('{ loss = "poisson" }', "{'loss': 'poisson'}"),
+    ("2025-06-02", "datetime.date(2025, 6, 2)"),
+], ids=["capital", "upper", "lead-space", "trail-space", "space", "dash", "absolute-error",
+        "quantile", "tweedie", "log-loss", "empty", "int", "float", "true", "false", "list",
+        "table", "date"])
+def test_a_bad_stage2_loss_in_the_file_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "loss"): bad})
+    assert message == f"{STAGE2}: loss is {shown}, not one of {LOSS_CHOICES}"
+
+
+@pytest.mark.parametrize("good", ["poisson", "gamma", "squared_error"])
+def test_stage2_loss_setting_accepts_each_loss(good):
+    value = stage2_loss_setting({"l": good}, "l", "here")
+    assert value == good and type(value) is str
+
+
+@pytest.mark.parametrize("bad", ["Poisson", "poisson ", "absolute_error", "quantile", "",
+                                 None, True, False, 0, 1, 1.5, float("nan"), ["poisson"],
+                                 ("poisson",), {"poisson": 1}],
+                         ids=["capital", "space", "absolute", "quantile", "empty", "none",
+                              "true", "false", "zero", "one", "float", "nan", "list", "tuple",
+                              "dict"])
+def test_stage2_loss_setting_rejects_with_the_exact_message(bad):
+    with pytest.raises(ValueError) as error:
+        stage2_loss_setting({"l": bad}, "l", "here")
+    assert str(error.value) == f"here: l is {bad!r}, not one of {LOSS_CHOICES}"
+
+
+def test_stage2_loss_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        stage2_loss_setting({}, "l", "here")
+
+
+def test_stage2_loss_setting_does_not_change_the_table():
+    table = {"l": "gamma", "other": 1}
+    stage2_loss_setting(table, "l", "here")
+    assert table == {"l": "gamma", "other": 1}
+
+
+def test_a_bad_stage2_loss_is_reported_before_the_other_stage2_settings(tmp_path, repo):
+    # loss is read first: with loss and max_iter both broken, loss is named.
+    message = exact_message(tmp_path, repo, {("stage2", "loss"): '"tweedie"',
+                                             ("stage2", "max_iter"): "0"})
+    assert message.startswith(f"{STAGE2}: loss is 'tweedie'")
+
+
+# --- [stage2] the reused validators -----------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["max_iter", "min_samples_leaf"])
+@pytest.mark.parametrize("good, expected", [("1", 1), ("2", 2), ("1_000", 1000)])
+def test_stage2_counts_accept_a_whole_number_of_1_or_more(tmp_path, repo, key, good, expected):
+    value = getattr(load(tmp_path, repo, changes={("stage2", key): good}).stage2, key)
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("key", ["max_iter", "min_samples_leaf"])
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("-1", "-1"), ("1.5", "1.5"), ("300.0", "300.0"), ('"300"', "'300'"),
+    ("true", "True"), ("[300]", "[300]"),
+], ids=["zero", "negative", "fraction", "whole-float", "string", "true", "list"])
+def test_stage2_counts_reject_with_the_exact_message(tmp_path, repo, key, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", key): bad})
+    assert message == f"{STAGE2}: {key} is {shown}, not a whole number of 1 or more"
+
+
+@pytest.mark.parametrize("good, expected", [("0.05", 0.05), ("1", 1.0), ("1e-9", 1e-9)])
+def test_stage2_learning_rate_accepts_above_0_and_at_most_1(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "learning_rate"): good}).stage2.learning_rate
+    assert value == expected
+    assert type(value) is float
+
+
+@pytest.mark.parametrize("bad, shown", [
+    ("0", "0"), ("-0.05", "-0.05"), ("1.0000001", "1.0000001"), ("nan", "nan"),
+    ("inf", "inf"), ('"0.05"', "'0.05'"), ("true", "True"),
+], ids=["zero", "negative", "above-one", "nan", "inf", "string", "true"])
+def test_stage2_learning_rate_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "learning_rate"): bad})
+    assert message == f"{STAGE2}: learning_rate is {shown}, not a number above 0 and at most 1"
+
+
+@pytest.mark.parametrize("good, expected", [("2", 2), ("63", 63)])
+def test_stage2_max_leaf_nodes_accepts_2_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "max_leaf_nodes"): good}).stage2.max_leaf_nodes
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [("1", "1"), ("0", "0"), ("31.0", "31.0"),
+                                        ('"31"', "'31'"), ("true", "True")],
+                         ids=["one", "zero", "whole-float", "string", "true"])
+def test_stage2_max_leaf_nodes_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "max_leaf_nodes"): bad})
+    assert message == f"{STAGE2}: max_leaf_nodes is {shown}, not a whole number of 2 or more"
+
+
+@pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("4294967295", 4294967295)])
+def test_stage2_random_seed_accepts_0_or_more(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo, changes={("stage2", "random_seed"): good}).stage2.random_seed
+    assert value == expected
+    assert type(value) is int
+
+
+@pytest.mark.parametrize("bad, shown", [("-1", "-1"), ("1.0", "1.0"), ('"1"', "'1'"),
+                                        ("false", "False")],
+                         ids=["negative", "whole-float", "string", "false"])
+def test_stage2_random_seed_rejects_with_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("stage2", "random_seed"): bad})
+    assert message == (f"{STAGE2}: random_seed is {shown}, not a random seed (a whole number, "
+                       f"0 or more)")
+
+
+@pytest.mark.parametrize("good, expected", [
+    ('["receivables", "calendar", "history"]', ("history", "calendar", "receivables")),
+    ('["receivables"]', ("receivables",)),
+], ids=["reordered", "one"])
+def test_stage2_feature_blocks_are_returned_in_feature_blocks_order(tmp_path, repo, good,
+                                                                   expected):
+    value = load(tmp_path, repo,
+                 changes={("stage2", "feature_blocks"): good}).stage2.feature_blocks
+    assert value == expected
+    assert type(value) is tuple
+
+
+def test_stage2_feature_blocks_empty_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): "[]"})
+    assert message == (f"{STAGE2}: feature_blocks is [], not a non-empty list of feature "
+                       f"blocks")
+
+
+def test_stage2_feature_blocks_unknown_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): '["weather"]'})
+    assert message == (f"{STAGE2}: feature_blocks holds ['weather']; the feature blocks are "
+                       f"['history', 'calendar', 'receivables']")
+
+
+def test_stage2_feature_blocks_twice_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo,
+                            {("stage2", "feature_blocks"): '["history", "history"]'})
+    assert message == (f"{STAGE2}: feature_blocks lists a feature block more than once: "
+                       f"['history', 'history']")
+
+
+def test_the_stage2_settings_are_checked_in_field_order(tmp_path, repo):
+    # All six broken: each is reported in turn, in field order, as the earlier ones are fixed.
+    changes = {("stage2", "max_iter"): "0", ("stage2", "learning_rate"): "2",
+               ("stage2", "max_leaf_nodes"): "1", ("stage2", "min_samples_leaf"): "0",
+               ("stage2", "random_seed"): "-1", ("stage2", "feature_blocks"): "[]"}
+    for key, good in (("max_iter", "200"), ("learning_rate", "0.1"),
+                      ("max_leaf_nodes", "15"), ("min_samples_leaf", "10"),
+                      ("random_seed", "7"), ("feature_blocks", '["history"]')):
+        assert exact_message(tmp_path, repo, changes).startswith(f"{STAGE2}: {key} is ")
+        changes[("stage2", key)] = good
+    assert load(tmp_path, repo, changes=changes).stage2.feature_blocks == ("history",)
+
+
+def test_a_bad_stage2_value_is_reported_after_stage1(tmp_path, repo):
+    # [stage1] is read before [stage2]: both broken, [stage1] is named.
+    message = exact_message(tmp_path, repo, {("stage1", "max_iter"): "0",
+                                             ("stage2", "max_iter"): "0"})
+    assert message.startswith(f"{STAGE1}: max_iter is 0")
+
+
+# --- [stage2] in the repo's own settings file ---------------------------------------------------
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_stage2_settings():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.stage2 == Stage2Settings(
+        loss="poisson", max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+        min_samples_leaf=20, random_seed=1,
+        feature_blocks=("history", "calendar", "receivables"))
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_file_stage2_section_has_exactly_the_stage2_keys():
+    raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
+    assert sorted(raw["stage2"]) == STAGE2_KEYS
+    assert raw["stage2"]["loss"] in STAGE2_LOSSES

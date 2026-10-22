@@ -1170,6 +1170,11 @@ assert script.predict_paid is stage1.predict_paid
 inspect.signature(script.show_stage1_scores).bind("forecast_rows", {}, "train_rows", {})
 
 source = " ".join(inspect.getsource(script.main).split())
+# Step 12 only: cut main() after its last call. Step 14 (U11.1) times its own fit with the same
+# `started = time.perf_counter()` line, which must not count against step 12's.
+end = "show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)"
+assert source.count(end) == 1, end
+source = source[:source.index(end) + len(end)]
 steps = [
     "show_stage1_rows(origin, train_rows, forecast_rows, train_x)",
     "predictions, fit_seconds = {}, {}",
@@ -2937,3 +2942,184 @@ def test_show_calibration_without_test_rows_does_not_fail():
     # Pinned behaviour: with no test rows the printout's tables are empty, nothing fails.
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "ok"
+
+
+# --- Step 14 (U11.1): fit stage 2 on the paid training rows at the demo origin -----------------
+# The wiring is checked on main()'s syntax tree: step 14 is the last part of main(), at its top
+# level after step 13's `if settings.diagnostic.run:` block (so it runs whether or not the
+# diagnostic does), with stage 2's own feature blocks and settings, and stage 1's company
+# switch. The printout runs on a hand-made frame, every number worked out by hand; the real
+# chain runs on step 12's tiny STAGE1 table.
+
+STEP_14_WIRING = """
+import ast
+import inspect
+import textwrap
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import stage2
+
+assert script.fit_stage2 is stage2.fit_stage2
+inspect.signature(script.show_stage2_fit).bind("origin", "paid_rows", "train_rows", "paid_x",
+                                               "loss", 1.0)
+
+body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
+statements = [ast.unparse(node) for node in body]
+diagnostic = [i for i, node in enumerate(body)
+              if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
+assert len(diagnostic) == 1, diagnostic
+step_14 = statements[diagnostic[0] + 1:]
+assert step_14 == [
+    "stage2_columns = feature_columns(block_feature_columns(history, calendar, owed), "
+    "settings.stage2.feature_blocks)",
+    "paid_rows = train_rows[train_rows['paid'].astype(bool)]",
+    "paid_x = stage1_features(paid_rows, stage2_columns, companies, "
+    "settings.stage1.company_as_feature)",
+    "started = time.perf_counter()",
+    "stage2_model = fit_stage2(paid_x, paid_rows['amount_deflated'], settings.stage2)",
+    "show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss, "
+    "time.perf_counter() - started)",
+], step_14
+# Step 14 uses step 12's origin, training rows and companies: nothing reassigns them after
+# step 12 (step 13 works on its own rows and origin).
+def assigned(name):
+    return [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)]
+for name in ("origin", "train_rows", "companies"):
+    assert len(assigned(name)) == 1, name
+    assert assigned(name)[0] < diagnostic[0], name
+for node in ast.walk(body[diagnostic[0]]):
+    if isinstance(node, (ast.Assign, ast.For)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        assert not names & {"origin", "train_rows", "companies", "history", "calendar",
+                            "owed"}, names
+print("ok")
+"""
+
+
+def test_step_14_is_wired_in_last_after_step_13():
+    result = run_code(STEP_14_WIRING)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_14_calls_fit_stage2_and_its_printout_once():
+    tree = main_tree()
+    assert len(calls_to(tree, "fit_stage2")) == 1
+    assert len(calls_to(tree, "show_stage2_fit")) == 1
+
+
+def test_step_14_never_fits_stage_2_with_the_stage_1_settings():
+    source = main_source()
+    assert "fit_stage2(paid_x, paid_rows['amount_deflated'], settings.stage1)" not in source
+    assert 'fit_stage2(paid_x, paid_rows["amount_deflated"], settings.stage1)' not in source
+    assert 'paid_rows["amount"]' not in source   # the target is the deflated amount
+
+
+# show_stage2_fit on a hand-made frame. Paid amounts 1,000, 2,000, 3,000 and 1,000,000:
+# median (2,000 + 3,000) / 2 = 2,500; mean 1,006,000 / 4 = 251,500; 99th percentile (linear,
+# position 0.99 x 3 = 2.97) 3,000 + 0.97 x 997,000 = 970,090; max 1,000,000. 1,234 training
+# rows, 5 input columns, 1.25 s shown as 1.2 s (one decimal).
+SHOW_STAGE2 = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+paid_rows = pd.DataFrame({"amount_deflated": [1_000.0, 2_000.0, 3_000.0, 1_000_000.0],
+                          "amount": [9.0, 9.0, 9.0, 9.0]}, index=[3, 7, 8, 20])
+train_rows = pd.DataFrame({"paid": np.zeros(1234, dtype=bool)})
+paid_x = pd.DataFrame(np.ones((4, 5)), columns=list("abcde"), index=paid_rows.index)
+copies = (paid_rows.copy(deep=True), train_rows.copy(deep=True), paid_x.copy(deep=True))
+returned = script.show_stage2_fit(40, paid_rows, train_rows, paid_x, LOSS, FIT_SECONDS)
+assert returned is None
+pd.testing.assert_frame_equal(paid_rows, copies[0])
+pd.testing.assert_frame_equal(train_rows, copies[1])
+pd.testing.assert_frame_equal(paid_x, copies[2])
+print("ok")
+"""
+
+
+def run_show_stage2(loss="poisson", fit_seconds=1.25):
+    return run_code(SHOW_STAGE2.replace("LOSS", repr(loss))
+                    .replace("FIT_SECONDS", repr(fit_seconds)))
+
+
+def test_show_stage2_fit_printout_by_hand():
+    result = run_show_stage2()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "Step 14: stage 2 at forecast week 40: 4 paid training rows (of 1,234), 5 input "
+        "columns, loss 'poisson', fitted in 1.2 s",
+        "        deflated amount per paid row: median 2,500, mean 251,500, 99th percentile "
+        "970,090, max 1,000,000",
+        "ok",
+    ]
+
+
+@pytest.mark.parametrize("loss", ["gamma", "squared_error"])
+def test_show_stage2_fit_names_the_loss_it_is_given(loss):
+    result = run_show_stage2(loss=loss)
+    assert result.returncode == 0, result.stderr
+    assert f"loss {loss!r}, fitted in" in result.stdout.splitlines()[0]
+
+
+@pytest.mark.parametrize("seconds, shown", [(0.04, "0.0"), (0.06, "0.1"), (12.345, "12.3")])
+def test_show_stage2_fit_time_has_one_decimal(seconds, shown):
+    result = run_show_stage2(fit_seconds=seconds)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0].endswith(f"fitted in {shown} s")
+
+
+def test_show_stage2_fit_reads_the_deflated_amount_not_the_nominal_one():
+    # The frame's `amount` column is 9 everywhere: none of the printed numbers is 9.
+    result = run_show_stage2()
+    assert result.returncode == 0, result.stderr
+    assert " 9," not in result.stdout and " 9\n" not in result.stdout
+
+
+# The real chain on step 12's tiny STAGE1 table at origin 2: 6 training rows, of which the 3
+# TR02-A rows are paid, each with amount_deflated 100. Stage 2's blocks are ("history",) only,
+# unlike stage 1's three: input h, mean_receipts_4 and (with the company) company_code.
+STEP_14_CHAIN = """
+import time
+from collection_estimation.hurdle.settings import Stage2Settings
+settings_stage2 = Stage2Settings(loss=LOSS, max_iter=5, learning_rate=0.1, max_leaf_nodes=2,
+                                 min_samples_leaf=1, random_seed=1, feature_blocks=("history",))
+stage2_columns = script.feature_columns(script.block_feature_columns(history, calendar, owed),
+                                        settings_stage2.feature_blocks)
+assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
+paid_rows = train_rows[train_rows["paid"].astype(bool)]
+paid_x = script.stage1_features(paid_rows, stage2_columns, companies, COMPANY_AS_FEATURE)
+started = time.perf_counter()
+stage2_model = script.fit_stage2(paid_x, paid_rows["amount_deflated"], settings_stage2)
+script.show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings_stage2.loss,
+                       time.perf_counter() - started)
+assert len(paid_rows) == 3 and paid_rows["key"].eq("TR02-A").all()
+m = stage2_model.predict(paid_x)
+assert abs(m - 100.0).max() < 1e-6, m
+print("chain ok")
+"""
+
+
+def run_step_14_chain(company=True, loss="poisson"):
+    stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
+    code = (stage1_part + STEP_14_CHAIN).replace("COMPANY_AS_FEATURE", str(company)) \
+        .replace("ORIGIN", "2").replace("LOSS", repr(loss))
+    return run_code(code)
+
+
+@pytest.mark.parametrize("company", [True, False])
+@pytest.mark.parametrize("loss", ["poisson", "gamma", "squared_error"])
+def test_step_14_real_chain_on_the_tiny_table(company, loss):
+    result = run_step_14_chain(company=company, loss=loss)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "chain ok"
+    step_14 = [line for line in lines if line.startswith("Step 14")]
+    assert len(step_14) == 1
+    columns = 3 if company else 2
+    assert step_14[0].startswith(f"Step 14: stage 2 at forecast week 2: 3 paid training rows "
+                                 f"(of 6), {columns} input columns, loss {loss!r}, fitted in ")
+    following = lines[lines.index(step_14[0]) + 1]
+    assert following == ("        deflated amount per paid row: median 100, mean 100, 99th "
+                         "percentile 100, max 100")

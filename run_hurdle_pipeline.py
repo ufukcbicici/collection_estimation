@@ -90,6 +90,7 @@ from collection_estimation.hurdle.stage1 import (  # noqa: E402
     predict_paid,
     stage1_features,
 )
+from collection_estimation.hurdle.stage2 import fit_stage2  # noqa: E402
 from collection_estimation.hurdle.training_table import (  # noqa: E402
     block_feature_columns,
     join_features,
@@ -427,7 +428,20 @@ def main():
         print(f"        tables written to {settings.diagnostic.output_folder}: "
               f"{[path.name for path in paths]}")
 
-    # Step 11 continues, and later steps follow, as each unit is built.
+    # Step 14: stage 2, "how much, if it pays?", at the same forecast week as step 12. It
+    # learns from the paid training rows only; the target is the deflated amount (TRY of
+    # week 0). Built unit by unit; for now, the fit.
+    stage2_columns = feature_columns(block_feature_columns(history, calendar, owed),
+                                     settings.stage2.feature_blocks)
+    paid_rows = train_rows[train_rows["paid"].astype(bool)]
+    paid_x = stage1_features(paid_rows, stage2_columns, companies,
+                             settings.stage1.company_as_feature)
+    started = time.perf_counter()
+    stage2_model = fit_stage2(paid_x, paid_rows["amount_deflated"], settings.stage2)
+    show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss,
+                    time.perf_counter() - started)
+
+    # Later steps follow as each unit is built.
 
 
 def show_daily_files(daily_files):
@@ -814,6 +828,18 @@ def show_diagnostic_test(test):
     print("        TEST (target weeks after the validation weeks), each model's chosen setting "
           "at its validation threshold:")
     print(test.round(4).to_string(index=False))
+
+
+def show_stage2_fit(origin, paid_rows, train_rows, paid_x, loss, fit_seconds):
+    """A short printout of step 14's fit: the paid training rows it learned from and the
+    spread of their deflated amounts (TRY of week 0)."""
+    amount = paid_rows["amount_deflated"]
+    print(f"Step 14: stage 2 at forecast week {origin}: {len(paid_rows):,} paid training rows "
+          f"(of {len(train_rows):,}), {paid_x.shape[1]} input columns, loss {loss!r}, "
+          f"fitted in {fit_seconds:.1f} s")
+    print(f"        deflated amount per paid row: median {amount.median():,.0f}, mean "
+          f"{amount.mean():,.0f}, 99th percentile {amount.quantile(0.99):,.0f}, "
+          f"max {amount.max():,.0f}")
 
 
 if __name__ == "__main__":

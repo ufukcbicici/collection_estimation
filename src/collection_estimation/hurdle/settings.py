@@ -60,6 +60,19 @@ class Stage1Settings:
 
 
 @dataclass(frozen=True)
+class Stage2Settings:
+    """Stage 2, the "how much, if it pays?" regressor. The company code goes in as a feature
+    exactly when it does for stage 1 (`Stage1Settings.company_as_feature`)."""
+    loss: str                         # one of STAGE2_LOSSES, e.g. "poisson"
+    max_iter: int                     # number of trees
+    learning_rate: float              # how much each tree adds (above 0, at most 1)
+    max_leaf_nodes: int               # leaves per tree (2 or more)
+    min_samples_leaf: int             # rows per leaf, at least
+    random_seed: int                  # makes a fit repeatable (0 or more)
+    feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
+
+
+@dataclass(frozen=True)
 class DiagnosticSettings:
     """The stage 1 diagnostic: a train / validation / test of stage 1 tuned on its own, with a
     grid per model. Diagnostic only: nothing from it reaches the forecast."""
@@ -115,6 +128,7 @@ class Settings:
     receivables: ReceivablesSettings
     history: HistorySettings
     stage1: Stage1Settings
+    stage2: Stage2Settings
     diagnostic: DiagnosticSettings
     debug: DebugSettings
 
@@ -131,7 +145,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "stage1", "diagnostic", "debug"}, name)
+                     "history", "stage1", "stage2", "diagnostic", "debug"}, name)
 
     data = raw["data"]
     check_keys(data, {"corpus_folder", "ledger_file", "ledger_as_of", "holidays_file",
@@ -148,6 +162,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
                         "baseline_c"}, f"{name} [stage1]")
+    stage2 = raw["stage2"]
+    check_keys(stage2, {"loss", "max_iter", "learning_rate", "max_leaf_nodes",
+                        "min_samples_leaf", "random_seed", "feature_blocks"}, f"{name} [stage2]")
     diagnostic = raw["diagnostic"]
     check_keys(diagnostic, {"run", "origin", "hgb_max_iter", "hgb_learning_rate",
                             "hgb_max_leaf_nodes", "lr_c", "class_weights", "selection_metric",
@@ -208,6 +225,15 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             feature_blocks=feature_blocks_setting(stage1, "feature_blocks", f"{name} [stage1]"),
             company_as_feature=bool_setting(stage1, "company_as_feature", f"{name} [stage1]"),
             baseline_c=positive_number_setting(stage1, "baseline_c", f"{name} [stage1]"),
+        ),
+        stage2=Stage2Settings(
+            loss=stage2_loss_setting(stage2, "loss", f"{name} [stage2]"),
+            max_iter=count_setting(stage2, "max_iter", f"{name} [stage2]"),
+            learning_rate=rate_setting(stage2, "learning_rate", f"{name} [stage2]"),
+            max_leaf_nodes=leaf_count_setting(stage2, "max_leaf_nodes", f"{name} [stage2]"),
+            min_samples_leaf=count_setting(stage2, "min_samples_leaf", f"{name} [stage2]"),
+            random_seed=seed_setting(stage2, "random_seed", f"{name} [stage2]"),
+            feature_blocks=feature_blocks_setting(stage2, "feature_blocks", f"{name} [stage2]"),
         ),
         diagnostic=DiagnosticSettings(
             run=bool_setting(diagnostic, "run", f"{name} [diagnostic]"),
@@ -584,6 +610,19 @@ def class_weight_setting(table: dict, key: str, where: str) -> str:
     value = table[key]
     if value not in CLASS_WEIGHTS:
         raise ValueError(f"{where}: {key} is {value!r}, not one of {list(CLASS_WEIGHTS)}")
+    return value
+
+
+# The losses stage 2 can be fitted with (sklearn's names). "poisson" and "gamma" use a log
+# link, so the predicted amount is always above 0.
+STAGE2_LOSSES = ("poisson", "gamma", "squared_error")
+
+
+def stage2_loss_setting(table: dict, key: str, where: str) -> str:
+    """Stage 2's loss: one of STAGE2_LOSSES."""
+    value = table[key]
+    if value not in STAGE2_LOSSES:
+        raise ValueError(f"{where}: {key} is {value!r}, not one of {list(STAGE2_LOSSES)}")
     return value
 
 

@@ -96,6 +96,20 @@ feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is alw
 company_as_feature = true       # the company code (one of the EY entities) as a category
 baseline_c = 1.0                # the logistic-regression baseline's C (inverse regularisation)
 
+[stage2]
+# Stage 2, the "how much, if it pays?" regressor (HistGradientBoostingRegressor on the paid
+# rows, target amount_deflated, early stopping off). The company code goes in exactly when it
+# does for stage 1. Starting values copy [stage1]; the stage-2 diagnostic (U11.5) tries others.
+loss = "poisson"                # "poisson" (keeps the cash total), "gamma" (relative errors:
+                                # big payments weigh little) or "squared_error" (big payments
+                                # dominate; can predict below 0)
+max_iter = 300                  # number of trees
+learning_rate = 0.05
+max_leaf_nodes = 31             # leaves per tree
+min_samples_leaf = 20           # rows per leaf, at least
+random_seed = 1
+feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
+
 [diagnostic]
 # A train / validation / test of stage 1 tuned on its own, with a grid per model, each chosen
 # by `selection_metric` on validation (F1 threshold also chosen on validation) and tested once.
