@@ -1193,7 +1193,7 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.debug.demo_origin == 40
     assert type(settings.debug.demo_origin) is int
     assert settings.stage1 == Stage1Settings(
-        max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+        max_iter=900, learning_rate=0.01, max_leaf_nodes=63, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
         company_as_feature=True, baseline_c=1.0)
 
@@ -2618,7 +2618,7 @@ def test_debug_settings_fields():
 def test_the_synthetic_stage1_and_demo_origin_settings():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.stage1 == Stage1Settings(
-        max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+        max_iter=900, learning_rate=0.01, max_leaf_nodes=63, min_samples_leaf=20,
         random_seed=1, feature_blocks=("history", "calendar", "receivables"),
         company_as_feature=True, baseline_c=1.0)
     assert settings.debug.demo_origin == 40

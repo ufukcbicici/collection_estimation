@@ -2959,8 +2959,11 @@ import run_hurdle_pipeline as script
 from collection_estimation.hurdle import stage2
 
 assert script.fit_stage2 is stage2.fit_stage2
+assert script.predict_amount is stage2.predict_amount   # U11.2
+assert script.total_ratio is stage2.total_ratio         # U11.2
 inspect.signature(script.show_stage2_fit).bind("origin", "paid_rows", "train_rows", "paid_x",
                                                "loss", 1.0)
+inspect.signature(script.show_stage2_forecast).bind("forecast_rows", "m", "p", 1.0)
 
 body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
 statements = [ast.unparse(node) for node in body]
@@ -2978,21 +2981,29 @@ assert step_14 == [
     "stage2_model = fit_stage2(paid_x, paid_rows['amount_deflated'], settings.stage2)",
     "show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings.stage2.loss, "
     "time.perf_counter() - started)",
+    # U11.2: the training total, m on step 12's forecast rows (stage 2's columns), and p x m
+    # against the cash, with stage 1's HGB p (not the baseline's).
+    "training_ratio = total_ratio(stage2_model, paid_x, paid_rows['amount_deflated'])",
+    "m = predict_amount(stage2_model, stage1_features(forecast_rows, stage2_columns, "
+    "companies, settings.stage1.company_as_feature))",
+    "show_stage2_forecast(forecast_rows, m, predictions['stage 1 (HGB)'], training_ratio)",
 ], step_14
-# Step 14 uses step 12's origin, training rows and companies: nothing reassigns them after
+# Step 14 uses step 12's origin, rows, predictions and companies: nothing reassigns them after
 # step 12 (step 13 works on its own rows and origin).
 def assigned(name):
+    # Names inside tuple targets count too (predictions, fit_seconds = {}, {}).
     return [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)]
-for name in ("origin", "train_rows", "companies"):
+            and any(isinstance(n, ast.Name) and n.id == name
+                    for t in node.targets for n in ast.walk(t))]
+for name in ("origin", "train_rows", "forecast_rows", "predictions", "companies"):
     assert len(assigned(name)) == 1, name
     assert assigned(name)[0] < diagnostic[0], name
 for node in ast.walk(body[diagnostic[0]]):
     if isinstance(node, (ast.Assign, ast.For)):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
-        assert not names & {"origin", "train_rows", "companies", "history", "calendar",
-                            "owed"}, names
+        assert not names & {"origin", "train_rows", "forecast_rows", "predictions",
+                            "companies", "history", "calendar", "owed"}, names
 print("ok")
 """
 
@@ -3005,8 +3016,18 @@ def test_step_14_is_wired_in_last_after_step_13():
 
 def test_step_14_calls_fit_stage2_and_its_printout_once():
     tree = main_tree()
-    assert len(calls_to(tree, "fit_stage2")) == 1
-    assert len(calls_to(tree, "show_stage2_fit")) == 1
+    for name in ("fit_stage2", "show_stage2_fit", "total_ratio", "predict_amount",
+                 "show_stage2_forecast"):
+        assert len(calls_to(tree, name)) == 1, name
+
+
+def test_step_14_imports_the_stage2_functions_in_one_parenthesised_import():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+               and node.module == "collection_estimation.hurdle.stage2"]
+    assert len(imports) == 1
+    assert [alias.name for alias in imports[0].names] == ["fit_stage2", "predict_amount",
+                                                          "total_ratio"]
 
 
 def test_step_14_never_fits_stage_2_with_the_stage_1_settings():
@@ -3097,6 +3118,14 @@ script.show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings_stage2.lo
 assert len(paid_rows) == 3 and paid_rows["key"].eq("TR02-A").all()
 m = stage2_model.predict(paid_x)
 assert abs(m - 100.0).max() < 1e-6, m
+# U11.2: the training ratio, m on the 4 forecast rows, and p x m with a hand-made p of 0.5.
+training_ratio = script.total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"])
+assert abs(training_ratio - 1.0) < 1e-9, training_ratio
+forecast_m = script.predict_amount(stage2_model, script.stage1_features(
+    forecast_rows, stage2_columns, companies, COMPANY_AS_FEATURE))
+assert forecast_m.index.equals(forecast_rows.index) and forecast_m.name == "m"
+p = pd.Series(0.5, index=forecast_rows.index, name="p")
+script.show_stage2_forecast(forecast_rows, forecast_m, p, training_ratio)
 print("chain ok")
 """
 
@@ -3120,6 +3149,149 @@ def test_step_14_real_chain_on_the_tiny_table(company, loss):
     columns = 3 if company else 2
     assert step_14[0].startswith(f"Step 14: stage 2 at forecast week 2: 3 paid training rows "
                                  f"(of 6), {columns} input columns, loss {loss!r}, fitted in ")
-    following = lines[lines.index(step_14[0]) + 1]
-    assert following == ("        deflated amount per paid row: median 100, mean 100, 99th "
-                         "percentile 100, max 100")
+    start = lines.index(step_14[0])
+    # At origin 2 the forecast targets are week 3 (h=1, labelled: TR02-A paid 100, TR04-B 0)
+    # and week 4 (h=2, future, left out). m = 100 everywhere, p = 0.5: p x m = 50 + 50 = 100
+    # against 100 actual.
+    assert lines[start + 1:-1] == [
+        "        deflated amount per paid row: median 100, mean 100, 99th percentile 100, "
+        "max 100",
+        "        training total ratio (sum of m / sum of actual, paid rows): 1.0000",
+        "        m on the 4 forecast rows: median 100, mean 100",
+        "        per h, the whole model (sum of p x m) against the actual cash, deflated:",
+        "     mean m  p x m  actual cash  ratio",
+        "h                                     ",
+        "1     100.0  100.0        100.0    1.0",
+        "all   100.0  100.0        100.0    1.0",
+    ]
+
+
+# --- Step 14 (U11.2): show_stage2_forecast on a hand-made frame -----------------------------------
+# Six forecast rows: h=1: labelled (actual 300), labelled (0), missing_week; h=2: labelled
+# (100), labelled (0), future. m = 100, 200, [999], 400, 50, [777]; p = .5, .25, [.9], .5, .2,
+# [.9] (bracketed rows are not labelled and must be left out of the table).
+#   h=1: mean m (100 + 200) / 2 = 150; p x m 50 + 50 = 100; actual 300; ratio 0.333
+#   h=2: mean m (400 + 50) / 2 = 225; p x m 200 + 10 = 210; actual 100; ratio 2.1
+#   all: mean m 750 / 4 = 187.5, shown 188 (half to even); p x m 310; actual 400; ratio 0.775
+# The second line uses every forecast row: m sorted 50, 100, 200, 400, 777, 999, median 300,
+# mean 2,526 / 6 = 421.
+SHOW_FORECAST = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+nan = float("nan")
+forecast_rows = pd.DataFrame({
+    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
+    "label_status": LABELS,
+    "amount_deflated": [300.0, 0.0, nan, 100.0, 0.0, nan],
+    "amount": [7.0] * 6,
+}, index=pd.Index([10, 11, 12, 13, 14, 15]))
+m = pd.Series([100.0, 200.0, 999.0, 400.0, 50.0, 777.0], index=forecast_rows.index, name="m")
+p = pd.Series([0.5, 0.25, 0.9, 0.5, 0.2, 0.9], index=forecast_rows.index, name="p")
+copies = (forecast_rows.copy(deep=True), m.copy(), p.copy())
+returned = script.show_stage2_forecast(forecast_rows, m, p, RATIO)
+assert returned is None
+pd.testing.assert_frame_equal(forecast_rows, copies[0])
+pd.testing.assert_series_equal(m, copies[1])
+pd.testing.assert_series_equal(p, copies[2])
+print("ok")
+"""
+
+FORECAST_LABELS = ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]
+FORECAST_HEAD = [
+    "        training total ratio (sum of m / sum of actual, paid rows): 1.0000",
+    "        m on the 6 forecast rows: median 300, mean 421",
+]
+
+
+def run_show_forecast(labels=None, ratio=1.00004):
+    labels = FORECAST_LABELS if labels is None else labels
+    return run_code(SHOW_FORECAST.replace("LABELS", repr(labels)).replace("RATIO", repr(ratio)))
+
+
+def test_show_stage2_forecast_printout_by_hand():
+    result = run_show_forecast()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == FORECAST_HEAD + [
+        "        per h, the whole model (sum of p x m) against the actual cash, deflated:",
+        "     mean m  p x m  actual cash  ratio",
+        "h                                     ",
+        "1     150.0  100.0        300.0  0.333",
+        "2     225.0  210.0        100.0  2.100",
+        "all   188.0  310.0        400.0  0.775",
+        "ok",
+    ]
+
+
+def test_show_stage2_forecast_training_ratio_has_four_decimals():
+    result = run_show_forecast(ratio=0.987654)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == (
+        "        training total ratio (sum of m / sum of actual, paid rows): 0.9877")
+
+
+def test_show_stage2_forecast_leaves_unlabelled_rows_out_of_the_table():
+    # Labelling the missing week and the future row would bring in m 999 / 777 and p 0.9;
+    # neither value appears in the hand-checked table above.
+    result = run_show_forecast()
+    assert result.returncode == 0, result.stdout
+    table = result.stdout.splitlines()[3:-1]
+    for gone in ("999", "777", "899", "699"):
+        assert not any(gone in line for line in table), gone
+
+
+def test_show_stage2_forecast_a_missing_week_is_not_a_zero():
+    # If the missing week were counted as 0 cash, h=1's mean m would be (100+200+999)/3 = 433.
+    result = run_show_forecast()
+    assert result.returncode == 0, result.stderr
+    assert "433" not in result.stdout
+
+
+def test_show_stage2_forecast_an_h_with_one_labelled_row():
+    # Only one h=2 row labelled: the table has h=2 from that row alone.
+    labels = ["labelled", "labelled", "missing_week", "labelled", "future", "future"]
+    result = run_show_forecast(labels=labels)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[5] == "1     150.0  100.0        300.0  0.333"
+    assert lines[6].split() == ["2", "400.0", "200.0", "100.0", "2.000"]
+    # all: mean m 700 / 3 = 233.3 -> 233; p x m 300; actual 400; ratio 0.75
+    assert lines[7].split() == ["all", "233.0", "300.0", "400.0", "0.750"]
+
+
+@pytest.mark.parametrize("labels", [
+    ["missing_week", "missing_week", "missing_week", "future", "future", "future"],
+    ["future"] * 6,
+], ids=["missing-and-future", "all-future"])
+def test_show_stage2_forecast_without_labelled_rows_prints_the_fallback_and_returns(labels):
+    result = run_show_forecast(labels=labels)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == FORECAST_HEAD + [
+        "        no labelled forecast rows: p x m cannot be compared with actual cash",
+        "ok",
+    ]
+
+
+def test_show_stage2_forecast_with_labelled_rows_does_not_print_the_fallback():
+    result = run_show_forecast()
+    assert result.returncode == 0, result.stderr
+    assert "no labelled forecast rows" not in result.stdout
+
+
+def test_show_stage2_forecast_an_h_with_no_cash_shows_an_infinite_ratio():
+    # Pinned behaviour: both labelled h=2 rows paid nothing (actual 0), so h=2's ratio is
+    # p x m / 0 = inf; it is printed, nothing fails.
+    code = SHOW_FORECAST.replace("LABELS", repr(FORECAST_LABELS)).replace("RATIO", "1.0") \
+        .replace("[300.0, 0.0, nan, 100.0, 0.0, nan]", "[300.0, 0.0, nan, 0.0, 0.0, nan]")
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[6].split() == ["2", "225.0", "210.0", "0.0", "inf"]
+
+
+def test_show_stage2_forecast_uses_the_deflated_amount_not_the_nominal_one():
+    # `amount` is 7 on every row; the actual cash column shows 300 / 100 / 400, never 14 or 28.
+    result = run_show_forecast()
+    assert result.returncode == 0, result.stderr
+    assert "14.0" not in result.stdout and "28.0" not in result.stdout

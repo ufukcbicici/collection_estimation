@@ -539,3 +539,296 @@ def test_fit_stage2_unknown_loss_is_left_to_sklearn():
     x, amount = synthetic_xa()
     with pytest.raises(ValueError):
         fit_stage2(x, amount, stage2_settings(loss="tweedie"))
+
+
+# --- U11.2: predict_amount ----------------------------------------------------------------------
+# m for each row: model.predict(x) as a Series named "m" on x's index, nothing clipped. Refuses
+# (ValueError, predict_paid's message) unless x's columns are the fitted ones, in order.
+
+from collection_estimation.hurdle.stage2 import predict_amount, total_ratio  # noqa: E402
+
+FITTED = ["h", "s", "z", "company_code"]
+
+
+def columns_message(given, fitted):
+    return f"x has columns {given}, but the model was fitted on {fitted}"
+
+
+def interaction_x_amount(repeats=25):
+    """Two 0/1 columns a, b; amount 100 at (0, 0) and 1 elsewhere, every cell `repeats` times.
+    Every amount is above 0, but the best additive fit (what stumps converge to) is
+    25.75 - 24.75 - 24.75 = -23.75 at (1, 1): a squared-error model predicts below 0 there."""
+    cells = [(0, 0, 100.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 1.0)] * repeats
+    x = pd.DataFrame({"a": [c[0] for c in cells], "b": [c[1] for c in cells]},
+                     dtype="float64")
+    return x, pd.Series([c[2] for c in cells])
+
+
+def test_predict_amount_is_the_models_prediction_named_m_on_xs_index():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    m = predict_amount(model, x)
+    assert isinstance(m, pd.Series)
+    assert m.name == "m"
+    assert m.index.equals(x.index)
+    assert m.dtype == "float64"
+    np.testing.assert_array_equal(m.to_numpy(), model.predict(x))
+
+
+def test_predict_amount_on_new_rows_with_their_own_index():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    new_x, _ = synthetic_xa(n=30, seed=9)
+    new_x.index = pd.Index([f"row-{i}" for i in range(30)])
+    m = predict_amount(model, new_x)
+    assert m.index.equals(new_x.index)
+    assert len(m) == 30
+
+
+def test_predict_amount_keeps_a_shuffled_index_row_by_row():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    shuffled = x.sample(frac=1.0, random_state=0)
+    m = predict_amount(model, x)
+    pd.testing.assert_series_equal(predict_amount(model, shuffled), m.loc[shuffled.index])
+
+
+def test_predict_amount_on_zero_rows_raises_sklearns_value_error():
+    # Pinned behaviour (not in the spec): sklearn refuses an empty x, so predict_amount does
+    # not return an empty m. Step 14 always has forecast rows at the demo origin.
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError, match="0 sample"):
+        predict_amount(model, x.iloc[:0])
+
+
+def test_predict_amount_squared_error_below_zero_is_not_clipped():
+    x, amount = interaction_x_amount()
+    model = fit_stage2(x, amount, stage2_settings(loss="squared_error", max_iter=200,
+                                                  learning_rate=0.5, max_leaf_nodes=2,
+                                                  min_samples_leaf=1))
+    m = predict_amount(model, x)
+    corner = (x["a"] == 1) & (x["b"] == 1)
+    assert (m[corner] < -20).all(), m[corner].iloc[0]
+    np.testing.assert_allclose(m[corner], -23.75, atol=0.01)
+    np.testing.assert_array_equal(m.to_numpy(), model.predict(x))
+
+
+@pytest.mark.parametrize("loss", ["poisson", "gamma"])
+def test_predict_amount_log_link_losses_stay_above_zero_on_the_same_data(loss):
+    x, amount = interaction_x_amount()
+    model = fit_stage2(x, amount, stage2_settings(loss=loss, max_iter=200, learning_rate=0.5,
+                                                  max_leaf_nodes=2, min_samples_leaf=1))
+    assert (predict_amount(model, x) > 0).all()
+
+
+class NegativeModel:
+    """A stand-in model whose predictions include values at and below 0."""
+    feature_names_in_ = np.array(["h", "s"], dtype=object)
+
+    def predict(self, x):
+        return np.array([-5.0, 0.0, 3.0])[:len(x)]
+
+
+def test_predict_amount_passes_negative_and_zero_predictions_through():
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0], "s": [0.0, 0.0, 0.0]}, index=[7, 8, 9])
+    m = predict_amount(NegativeModel(), x)
+    pd.testing.assert_series_equal(m, pd.Series([-5.0, 0.0, 3.0], index=[7, 8, 9], name="m"))
+
+
+def test_predict_amount_columns_in_another_order_exact_message():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError) as error:
+        predict_amount(model, x[["s", "h", "z", "company_code"]])
+    assert str(error.value) == columns_message(["s", "h", "z", "company_code"], FITTED)
+
+
+def test_predict_amount_a_missing_column_exact_message():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError) as error:
+        predict_amount(model, x.drop(columns="company_code"))
+    assert str(error.value) == columns_message(["h", "s", "z"], FITTED)
+
+
+def test_predict_amount_an_extra_column_exact_message():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError) as error:
+        predict_amount(model, x.assign(extra=1.0))
+    assert str(error.value) == columns_message(FITTED + ["extra"], FITTED)
+
+
+def test_predict_amount_a_renamed_column_is_refused():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError, match="but the model was fitted on"):
+        predict_amount(model, x.rename(columns={"z": "Z"}))
+
+
+def test_predict_amount_message_matches_predict_paids():
+    from collection_estimation.hurdle.stage1 import predict_paid
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError) as from_m:
+        predict_amount(model, x.drop(columns="z"))
+    # predict_paid's check runs before it touches classes_, so the regressor reaches it too.
+    with pytest.raises(ValueError) as from_p:
+        predict_paid(model, x.drop(columns="z"))
+    assert str(from_m.value) == str(from_p.value)
+
+
+def test_predict_amount_does_not_change_its_input():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    x_copy = x.copy(deep=True)
+    predict_amount(model, x)
+    pd.testing.assert_frame_equal(x, x_copy)
+
+
+def test_predict_amount_on_x_with_nan_features_gives_finite_m():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    x.loc[x.index[:20], ["s", "z"]] = np.nan
+    assert np.isfinite(predict_amount(model, x)).all()
+
+
+# --- U11.2: total_ratio -----------------------------------------------------------------------
+# check_amounts first (paid rows only), then sum(predict_amount) / sum(amount), as a float.
+
+class FixedModel:
+    """A stand-in model that predicts the given values, on columns ["h"]; counts its calls."""
+    feature_names_in_ = np.array(["h"], dtype=object)
+
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype="float64")
+        self.calls = 0
+
+    def predict(self, x):
+        self.calls += 1
+        return self.values[:len(x)]
+
+
+def test_total_ratio_by_hand():
+    # m = 10, 20, 70 (sum 100); amount = 50, 30, 120 (sum 200): ratio 0.5.
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[4, 5, 6])
+    ratio = total_ratio(FixedModel([10.0, 20.0, 70.0]), x,
+                        pd.Series([50.0, 30.0, 120.0], index=x.index))
+    assert ratio == 0.5
+    assert type(ratio) is float
+
+
+def test_total_ratio_above_one_by_hand():
+    x = pd.DataFrame({"h": [1.0, 2.0]})
+    assert total_ratio(FixedModel([30.0, 30.0]), x, pd.Series([10.0, 30.0])) == 1.5
+
+
+def test_total_ratio_is_a_ratio_of_totals_not_a_mean_of_ratios():
+    # Row ratios 2.0 and 0.5 (mean 1.25); totals 52 over 101.
+    x = pd.DataFrame({"h": [1.0, 2.0]})
+    ratio = total_ratio(FixedModel([2.0, 50.0]), x, pd.Series([1.0, 100.0]))
+    assert ratio == pytest.approx(52.0 / 101.0)
+
+
+def test_total_ratio_counts_negative_predictions():
+    # m = -10, 30 sums to 20; amount 10 + 10 = 20: ratio 1.0, the negative m is not clipped.
+    x = pd.DataFrame({"h": [1.0, 2.0]})
+    assert total_ratio(FixedModel([-10.0, 30.0]), x, pd.Series([10.0, 10.0])) == 1.0
+
+
+def test_total_ratio_accepts_int_amounts():
+    x = pd.DataFrame({"h": [1.0, 2.0]})
+    assert total_ratio(FixedModel([5.0, 5.0]), x, pd.Series([4, 6], dtype="int64")) == 1.0
+
+
+def test_total_ratio_poisson_on_its_training_rows_is_about_one():
+    x, amount = synthetic_xa(n=2000)
+    model = fit_stage2(x, amount, stage2_settings(max_iter=100, learning_rate=0.05))
+    ratio = total_ratio(model, x, amount)
+    assert ratio == pytest.approx(1.0, abs=1e-3)
+    assert ratio == pytest.approx(float(model.predict(x).sum() / amount.sum()))
+
+
+def test_total_ratio_squared_error_on_its_training_rows_is_about_one():
+    # Squared error starts at the mean and every leaf is a mean of residuals: the total holds.
+    x, amount = synthetic_xa(n=1000)
+    model = fit_stage2(x, amount, stage2_settings(loss="squared_error", max_iter=50))
+    assert total_ratio(model, x, amount) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("loss", STAGE2_LOSSES)
+def test_total_ratio_is_finite_and_positive_for_each_loss(loss):
+    x, amount = synthetic_xa()
+    ratio = total_ratio(fit_stage2(x, amount, stage2_settings(loss=loss)), x, amount)
+    assert np.isfinite(ratio) and ratio > 0
+
+
+def test_total_ratio_on_other_rows_than_the_training_rows():
+    # It is a check of any paid rows, not only the training ones.
+    x, amount = synthetic_xa(n=1000)
+    model = fit_stage2(x, amount, stage2_settings(max_iter=50))
+    other_x, other_amount = synthetic_xa(n=300, seed=4)
+    ratio = total_ratio(model, other_x, other_amount)
+    assert ratio == pytest.approx(float(model.predict(other_x).sum() / other_amount.sum()))
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda a: a.reset_index(drop=True), SAME_ROWS),
+    (lambda a: a.iloc[::-1], SAME_ROWS),
+    (lambda a: a.where(a.index != a.index[0], nan), "amount has 1 missing values"),
+    (lambda a: a.where(a.index != a.index[0], inf), "amount holds an infinite value"),
+    (lambda a: a.where(a.index != a.index[0], 0.0), "amount is 0 or below in 1 rows"),
+    (lambda a: a.where(a.index != a.index[0], -1.0), "amount is 0 or below in 1 rows"),
+], ids=["new-index", "reversed", "nan", "inf", "zero", "negative"])
+def test_total_ratio_refuses_bad_amounts_before_predicting(change, message):
+    x = pd.DataFrame({"h": [1.0, 2.0, 3.0]}, index=[4, 5, 6])
+    model = FixedModel([1.0, 1.0, 1.0])
+    with pytest.raises(ValueError) as error:
+        total_ratio(model, x, change(pd.Series([1.0, 2.0, 3.0], index=x.index)))
+    assert str(error.value).startswith(message)
+    assert model.calls == 0
+
+
+def test_total_ratio_refuses_empty_rows_before_predicting():
+    x = pd.DataFrame({"h": pd.Series([], dtype="float64")})
+    model = FixedModel([])
+    with pytest.raises(ValueError) as error:
+        total_ratio(model, x, pd.Series([], index=x.index, dtype="float64"))
+    assert str(error.value) == NO_ROWS
+    assert model.calls == 0
+
+
+def test_total_ratio_fixed_model_counts_calls():
+    # The call counter used above does count: one prediction per good call.
+    x = pd.DataFrame({"h": [1.0]})
+    model = FixedModel([1.0])
+    total_ratio(model, x, pd.Series([1.0]))
+    assert model.calls == 1
+
+
+def test_total_ratio_refuses_wrong_columns_like_predict_amount():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    with pytest.raises(ValueError) as error:
+        total_ratio(model, x[["s", "h", "z", "company_code"]], amount)
+    assert str(error.value) == columns_message(["s", "h", "z", "company_code"], FITTED)
+
+
+def test_total_ratio_amounts_are_checked_before_the_columns():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    bad = amount.where(amount.index != amount.index[0], 0.0)
+    with pytest.raises(ValueError) as error:
+        total_ratio(model, x.drop(columns="z"), bad)
+    assert str(error.value).startswith("amount is 0 or below in 1 rows")
+
+
+def test_total_ratio_does_not_change_its_inputs():
+    x, amount = synthetic_xa()
+    model = fit_stage2(x, amount, stage2_settings())
+    amount = amount.round().astype("int64")
+    x_copy, amount_copy = x.copy(deep=True), amount.copy(deep=True)
+    total_ratio(model, x, amount)
+    pd.testing.assert_frame_equal(x, x_copy)
+    pd.testing.assert_series_equal(amount, amount_copy)
