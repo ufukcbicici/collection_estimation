@@ -84,6 +84,17 @@ windows = [4, 13, 52]                 # look-back windows, in weeks
 use_ledger_before_first_file = true   # the ledger's payments before the first daily file
                                       # count as history (false: those weeks are unknown)
 
+[calendar]
+# Where the public holidays fall around each target week, added to the calendar block (stage 1,
+# stage 2 and the `deflated` benchmark). Weekday holidays only. A Friday holiday empties its
+# week into the next one; a mid-week holiday mostly moves cash inside its own week.
+holiday_encodings = ["drain"]   # any of "drain" (drain_days, catch_up_days) and "days" (each
+                                # weekday of the week before / itself / after: 1 business day,
+                                # 0 holiday); [] = none
+drain_window = 3                # calendar days before a holiday whose payments move past it
+catch_up_window = 5             # calendar days after a holiday that receive them (both copy
+                                # the synthetic generator's rule; to be chosen on EY data)
+
 [stage1]
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
 # weights, early stopping off). The stage-1 diagnostic's choice at origin 40 (its grid on

@@ -25,6 +25,7 @@ import itertools
 import numpy as np
 import pandas as pd
 
+from .benchmark import cash_totals
 from .diagnostic import Candidate
 
 
@@ -47,9 +48,11 @@ def stage2_grid(stage2, joint) -> list[Candidate]:
     settings with those values in place. The balance floor matters only under the scale
     "open balance", so under "none" each setting appears once (its floor shown as "-")."""
     candidates = []
-    for loss, trees, rate, leaves, scale in itertools.product(
+    cartesian = itertools.product(
             joint.stage2_loss, joint.stage2_max_iter, joint.stage2_learning_rate,
-            joint.stage2_max_leaf_nodes, joint.stage2_scale):
+            joint.stage2_max_leaf_nodes, joint.stage2_scale)
+    cartesian = [tpl for tpl in cartesian]
+    for loss, trees, rate, leaves, scale in cartesian:
         floors = joint.stage2_balance_floor if scale == "open balance" else (None,)
         for floor in floors:
             settings = dataclasses.replace(stage2, loss=loss, max_iter=trees,
@@ -112,34 +115,30 @@ def scores_by_h(totals: pd.DataFrame, models: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def total_codes(rows: pd.DataFrame, totals: pd.DataFrame) -> np.ndarray:
-    """For each of `rows` (panel rows), the position in `totals` (one row per origin_week and
-    h) of the total it belongs to: lets `score_pairs` add up p x m per total with one
-    `np.bincount`. Raises ValueError if a row's (origin_week, h) is not in `totals`."""
-    position = pd.Series(np.arange(len(totals)),
-                         index=pd.MultiIndex.from_frame(totals[["origin_week", "h"]]))
-    codes = position.reindex(pd.MultiIndex.from_frame(rows[["origin_week", "h"]]))
-    if codes.isna().any():
-        raise ValueError(f"{int(codes.isna().sum())} rows belong to no total")
-    return codes.to_numpy(dtype=int)
+def score_pairs(rows: pd.DataFrame, p_by_stage1: list[pd.Series],
+                m_by_stage2: list[pd.Series], metric: str) -> pd.DataFrame:
+    """Every pair of a stage-1 and a stage-2 setting, scored on the weekly cash totals of
+    `rows` (panel rows, all companies together).
 
+    p_by_stage1[i] is stage-1 setting i's p for each of `rows`, m_by_stage2[j] stage-2
+    setting j's m (both with the index of `rows`). For a pair (i, j), each row's forecast
+    cash is p x m; the forecast total of each (origin week, h) is the sum of that over its
+    rows, and the actual total the sum of the rows' deflated amounts. Both totals come from
+    `cash_totals` on the same rows, so they line up total by total.
 
-def score_pairs(codes: np.ndarray, actual: pd.Series, p_by_stage1: list[np.ndarray],
-                m_by_stage2: list[np.ndarray], metric: str) -> pd.DataFrame:
-    """Every pair of a stage-1 and a stage-2 setting, scored on cash totals: the forecast
-    total = the sum of p x m over the rows of each total (`codes` from `total_codes`;
-    `actual`: one value per total). p_by_stage1[i] and m_by_stage2[j] are the stored
-    predictions of setting i and j for the same rows. One row per pair (stage1, stage2: the
-    positions in the grids; then `total_scores`), sorted by `metric` ("mape" or "wape"),
-    best first."""
+    Returns one row per pair: stage1 = i, stage2 = j, then `total_scores`, sorted by
+    `metric` ("mape" or "wape"), best first.
+    """
     if metric not in ("mape", "wape"):
         raise ValueError(f"cannot rank pairs by {metric!r}; choose 'mape' or 'wape'")
-    rows = []
-    for (i, p), (j, m) in itertools.product(enumerate(p_by_stage1), enumerate(m_by_stage2)):
-        forecast = np.bincount(codes, weights=p * m, minlength=len(actual))
-        rows.append({"stage1": i, "stage2": j,
-                     **total_scores(actual, pd.Series(forecast, index=actual.index))})
-    table = pd.DataFrame(rows)
+    actual = cash_totals(rows, rows["amount_deflated"], by_company=False)
+    scored = []
+    for i, p in enumerate(p_by_stage1):
+        for j, m in enumerate(m_by_stage2):
+            forecast = cash_totals(rows, p * m, by_company=False)
+            scored.append({"stage1": i, "stage2": j,
+                           **total_scores(actual["total"], forecast["total"])})
+    table = pd.DataFrame(scored)
     # mergesort is stable: pairs with the same score keep their grid order.
     return table.sort_values(metric.upper(), kind="mergesort", ignore_index=True)
 

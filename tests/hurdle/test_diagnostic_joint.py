@@ -1,5 +1,6 @@
 """Tests for `hurdle/diagnostic_joint.py` (U11.5): `stage1_grid`, `stage2_grid`,
-`total_scores`, `scores_by_h`, `total_codes`, `score_pairs` and `paired_bootstrap`.
+`total_scores`, `scores_by_h`, `score_pairs` (on the panel rows, with p and m as Series;
+`total_codes` was removed) and `paired_bootstrap`.
 
 Every table is hand-made; nothing is read from data/ and nothing is fitted. Hypothesis is not
 installed in this env, so the brute-force checks use seeded random trials.
@@ -19,7 +20,6 @@ from collection_estimation.hurdle.diagnostic_joint import (
     scores_by_h,
     stage1_grid,
     stage2_grid,
-    total_codes,
     total_scores,
 )
 from collection_estimation.hurdle.settings import (
@@ -365,144 +365,293 @@ def test_scores_by_h_no_models_is_an_empty_table():
     assert len(scores_by_h(h_totals(), [])) == 0
 
 
-# --- total_codes -----------------------------------------------------------------------------
-
-def test_total_codes_by_hand():
-    totals = pd.DataFrame({"origin_week": [40, 40, 41], "h": [1, 2, 1], "total": [1, 2, 3]})
-    rows = pd.DataFrame({"origin_week": [41, 40, 40, 40, 41], "h": [1, 2, 1, 1, 1]},
-                        index=[9, 8, 7, 6, 5])
-    codes = total_codes(rows, totals)
-    assert codes.tolist() == [2, 1, 0, 0, 2]
-    assert codes.dtype.kind == "i"
-
-
-def test_total_codes_follow_totals_row_positions_not_their_index():
-    totals = pd.DataFrame({"origin_week": [41, 40], "h": [1, 1]}, index=[100, 200])
-    rows = pd.DataFrame({"origin_week": [40, 41], "h": [1, 1]})
-    assert total_codes(rows, totals).tolist() == [1, 0]
-
-
-def test_total_codes_empty_rows():
-    totals = pd.DataFrame({"origin_week": [40], "h": [1]})
-    assert total_codes(totals.iloc[:0], totals).tolist() == []
-
-
-def test_total_codes_refuses_rows_without_a_total():
-    totals = pd.DataFrame({"origin_week": [40], "h": [1]})
-    rows = pd.DataFrame({"origin_week": [40, 41, 40], "h": [1, 1, 2]})
-    with pytest.raises(ValueError) as error:
-        total_codes(rows, totals)
-    assert str(error.value) == "2 rows belong to no total"
-
-
-def test_total_codes_with_cash_totals_and_bincount_add_up_by_hand():
-    from collection_estimation.hurdle.benchmark import cash_totals
-    rows = pd.DataFrame({"origin_week": [40, 40, 41, 40], "h": [1, 2, 1, 1],
-                         "target_week": [41, 42, 42, 41]})
-    values = pd.Series([1.0, 2.0, 4.0, 8.0])
-    totals = cash_totals(rows, values, by_company=False)
-    codes = total_codes(rows, totals)
-    np.testing.assert_allclose(np.bincount(codes, weights=values, minlength=len(totals)),
-                               totals["total"])
-
-
 # --- score_pairs -----------------------------------------------------------------------------
+# score_pairs(rows, p_by_stage1, m_by_stage2, metric): the totals are summed per (origin_week,
+# h) from `rows` itself (actual = amount_deflated, forecast = p x m), all companies together.
 
-def pair_data(seed=0, rows=40, totals=6):
+def pair_rows(seed=0, n=40, origins=(40, 41, 42), horizons=(1, 2), index=None):
+    """Panel-like rows: every (origin_week, h) has at least one row; amounts >= 0, some 0."""
     rng = np.random.default_rng(seed)
-    codes = np.concatenate([np.arange(totals), rng.integers(0, totals, size=rows - totals)])
-    rng.shuffle(codes)
-    actual = pd.Series(rng.random(totals) * 1000 + 10, index=pd.RangeIndex(totals))
-    ps = [rng.random(rows) for _ in range(3)]
-    ms = [rng.random(rows) * 500 for _ in range(2)]
-    return codes, actual, ps, ms
+    keys = list(itertools.product(origins, horizons))
+    chosen = keys + [keys[k] for k in rng.integers(0, len(keys), size=n - len(keys))]
+    order = rng.permutation(n)
+    origin = np.array([chosen[k][0] for k in order])
+    h = np.array([chosen[k][1] for k in order])
+    paid = rng.random(n) < 0.6
+    amount = np.where(paid, rng.random(n) * 900 + 100, 0.0)
+    frame = pd.DataFrame({"origin_week": origin, "h": h, "target_week": origin + h,
+                          "company_code": rng.choice(["TR02", "TR04"], size=n),
+                          "amount_deflated": amount})
+    # Each (origin_week, h) total must be above 0 somewhere: give the first row of each one.
+    for o, hh in keys:
+        first = frame.index[(frame["origin_week"] == o) & (frame["h"] == hh)][0]
+        frame.loc[first, "amount_deflated"] = 50.0 + o + hh
+    if index is not None:
+        frame.index = index
+    return frame
+
+
+def pair_data(seed=0, n=40, index=None, stage1=3, stage2=2):
+    rows = pair_rows(seed, n, index=index)
+    rng = np.random.default_rng(1000 + seed)
+    ps = [pd.Series(rng.random(n), index=rows.index) for _ in range(stage1)]
+    ms = [pd.Series(rng.random(n) * 500, index=rows.index) for _ in range(stage2)]
+    return rows, ps, ms
+
+
+def by_hand(rows, p, m):
+    """total_scores of the pair, every total summed with a plain loop over the rows."""
+    keys = sorted({(int(o), int(h)) for o, h in zip(rows["origin_week"], rows["h"])})
+    actual, forecast = [], []
+    for o, h in keys:
+        a = f = 0.0
+        for label in rows.index:
+            if rows.at[label, "origin_week"] == o and rows.at[label, "h"] == h:
+                a += rows.at[label, "amount_deflated"]
+                f += p[label] * m[label]
+        actual.append(a)
+        forecast.append(f)
+    return total_scores(pd.Series(actual), pd.Series(forecast))
 
 
 def test_score_pairs_one_row_per_pair_with_its_columns():
-    codes, actual, ps, ms = pair_data()
-    table = score_pairs(codes, actual, ps, ms, "mape")
+    rows, ps, ms = pair_data()
+    table = score_pairs(rows, ps, ms, "mape")
     assert list(table.columns) == ["stage1", "stage2", *SCORE_KEYS]
+    assert len(table) == 6
     assert sorted(zip(table["stage1"], table["stage2"])) == list(
         itertools.product(range(3), range(2)))
+    assert table.index.tolist() == list(range(6))
 
 
-@pytest.mark.parametrize("seed", range(5))
+def test_score_pairs_counts_one_total_per_origin_week_and_h():
+    rows, ps, ms = pair_data()
+    table = score_pairs(rows, ps, ms, "mape")
+    # 3 origins x 2 horizons, all companies together.
+    assert (table["totals"] == 6).all()
+    assert (table["zero actual"] == 0).all()
+
+
+@pytest.mark.parametrize("seed", range(6))
 def test_score_pairs_equal_summing_p_times_m_per_total_by_hand(seed):
-    codes, actual, ps, ms = pair_data(seed)
-    table = score_pairs(codes, actual, ps, ms, "wape")
+    rows, ps, ms = pair_data(seed)
+    table = score_pairs(rows, ps, ms, "wape")
     for _, row in table.iterrows():
-        p, m = ps[int(row["stage1"])], ms[int(row["stage2"])]
-        forecast = [sum(p[k] * m[k] for k in range(len(codes)) if codes[k] == t)
-                    for t in range(len(actual))]
-        expected = total_scores(actual, pd.Series(forecast, index=actual.index))
+        expected = by_hand(rows, ps[int(row["stage1"])], ms[int(row["stage2"])])
         for key in SCORE_KEYS:
-            assert row[key] == pytest.approx(expected[key], rel=1e-12)
+            assert row[key] == pytest.approx(expected[key], rel=1e-12), (row["stage1"],
+                                                                         row["stage2"], key)
+
+
+def test_score_pairs_by_hand_small_example():
+    rows = pd.DataFrame({"origin_week": [40, 40, 40, 41], "h": [1, 1, 2, 1],
+                         "target_week": [41, 41, 42, 42],
+                         "amount_deflated": [100.0, 0.0, 50.0, 200.0]})
+    p = pd.Series([0.5, 1.0, 1.0, 0.25])
+    m = pd.Series([100.0, 60.0, 50.0, 400.0])
+    table = score_pairs(rows, [p], [m], "mape")
+    # (40, 1): actual 100, forecast 50 + 60 = 110 (10%); (40, 2): 50 vs 50 (0%);
+    # (41, 1): 200 vs 100 (50%). MAPE 0.2; bias (260 - 350) / 350; WAPE (10 + 0 + 100) / 350.
+    row = table.iloc[0]
+    assert row["totals"] == 3 and row["zero actual"] == 0
+    assert row["MAPE"] == pytest.approx(0.2)
+    assert row["bias"] == pytest.approx(-90 / 350)
+    assert row["WAPE"] == pytest.approx(110 / 350)
+
+
+def test_score_pairs_companies_are_summed_together():
+    rows = pd.DataFrame({"origin_week": [40, 40], "h": [1, 1], "target_week": [41, 41],
+                         "company_code": ["TR02", "TR04"], "amount_deflated": [10.0, 30.0]})
+    p, m = pd.Series([1.0, 1.0]), pd.Series([30.0, 10.0])
+    table = score_pairs(rows, [p], [m], "mape")
+    # Per company both are wrong; the consolidated total (40 vs 40) is right.
+    assert table["totals"].iloc[0] == 1
+    assert table["MAPE"].iloc[0] == pytest.approx(0.0)
+
+
+def test_score_pairs_a_total_with_zero_actual_is_counted_and_left_out_of_the_mape():
+    rows = pd.DataFrame({"origin_week": [40, 41], "h": [1, 1], "target_week": [41, 42],
+                         "amount_deflated": [100.0, 0.0]})
+    p, m = pd.Series([1.0, 1.0]), pd.Series([80.0, 30.0])
+    row = score_pairs(rows, [p], [m], "mape").iloc[0]
+    assert row["zero actual"] == 1
+    assert row["MAPE"] == pytest.approx(0.2)
+    assert row["WAPE"] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("metric, column", [("mape", "MAPE"), ("wape", "WAPE")])
-def test_score_pairs_sorted_by_the_metric_best_first(metric, column):
-    codes, actual, ps, ms = pair_data(3)
-    table = score_pairs(codes, actual, ps, ms, metric)
+@pytest.mark.parametrize("seed", range(3))
+def test_score_pairs_sorted_by_the_metric_best_first(metric, column, seed):
+    rows, ps, ms = pair_data(seed, stage1=4, stage2=3)
+    table = score_pairs(rows, ps, ms, metric)
     assert table[column].is_monotonic_increasing
     assert table.index.tolist() == list(range(len(table)))
 
 
 def test_score_pairs_ties_keep_the_grid_order():
-    codes, actual, ps, ms = pair_data(1)
+    rows, ps, ms = pair_data(1)
     same = [ps[0], ps[0].copy(), ps[0].copy()]
-    table = score_pairs(codes, actual, same, [ms[0], ms[0].copy()], "mape")
-    assert list(zip(table["stage1"], table["stage2"])) == list(
-        itertools.product(range(3), range(2)))
+    for metric in ("mape", "wape"):
+        table = score_pairs(rows, same, [ms[0], ms[0].copy()], metric)
+        assert list(zip(table["stage1"], table["stage2"])) == list(
+            itertools.product(range(3), range(2)))
 
 
-def test_score_pairs_the_perfect_pair_wins():
-    codes = np.array([0, 0, 1, 1])
-    actual = pd.Series([30.0, 70.0])
-    good_p, good_m = np.array([1.0, 1.0, 1.0, 1.0]), np.array([10.0, 20.0, 30.0, 40.0])
-    table = score_pairs(codes, actual, [good_p * 0.5, good_p], [good_m * 3, good_m], "mape")
-    assert (table["stage1"].iloc[0], table["stage2"].iloc[0]) == (1, 1)
-    assert table["MAPE"].iloc[0] == pytest.approx(0.0)
+def test_score_pairs_ties_among_others_keep_the_grid_order():
+    rows, ps, ms = pair_data(2)
+    # Pairs (0, j) and (2, j) are identical; (1, j) differ. Within equal scores, i order.
+    table = score_pairs(rows, [ps[0], ps[1], ps[0].copy()], ms, "mape")
+    for j in range(2):
+        positions = [k for k, (a, b) in enumerate(zip(table["stage1"], table["stage2"]))
+                     if b == j and a in (0, 2)]
+        assert [int(table["stage1"].iloc[k]) for k in positions] == [0, 2]
+        assert positions[1] == positions[0] + 1
 
 
-def test_score_pairs_a_total_without_rows_is_forecast_as_zero():
-    codes = np.array([0, 0])
-    actual = pd.Series([10.0, 10.0])
-    table = score_pairs(codes, actual, [np.array([1.0, 1.0])], [np.array([5.0, 5.0])], "mape")
-    # total 0: 10 vs 10 (0 error); total 1: 0 vs 10 (100%).
-    assert table["MAPE"].iloc[0] == pytest.approx(0.5)
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+def test_score_pairs_the_perfect_pair_wins(metric):
+    rows, _, _ = pair_data(4)
+    good_p = pd.Series(1.0, index=rows.index)
+    good_m = rows["amount_deflated"].copy()
+    table = score_pairs(rows, [good_p * 0.5, good_p, good_p * 0.9],
+                        [good_m * 3, good_m + 1.0, good_m], metric)
+    assert (table["stage1"].iloc[0], table["stage2"].iloc[0]) == (1, 2)
+    assert table["MAPE"].iloc[0] == pytest.approx(0.0, abs=1e-15)
+    assert table["WAPE"].iloc[0] == pytest.approx(0.0, abs=1e-15)
+    assert table["bias"].iloc[0] == pytest.approx(0.0, abs=1e-15)
 
 
-def test_score_pairs_keeps_actuals_non_default_index():
-    codes = np.array([0, 1])
-    actual = pd.Series([10.0, 20.0], index=[7, 3])
-    table = score_pairs(codes, actual, [np.array([1.0, 1.0])], [np.array([10.0, 40.0])], "mape")
-    assert table["MAPE"].iloc[0] == pytest.approx(0.5)
+def test_score_pairs_one_setting_each():
+    rows, ps, ms = pair_data(5, stage1=1, stage2=1)
+    table = score_pairs(rows, ps, ms, "wape")
+    assert table[["stage1", "stage2"]].values.tolist() == [[0, 0]]
 
 
-@pytest.mark.parametrize("metric", ["MAPE", "bias", "log loss", ""])
+@pytest.mark.parametrize("index", [
+    pd.RangeIndex(100, 140),
+    pd.Index(np.arange(40)[::-1] * 7 + 3),
+    pd.Index([f"r{k}" for k in range(40)]),
+])
+def test_score_pairs_rows_with_a_non_default_index(index):
+    rows, ps, ms = pair_data(6, index=index)
+    table = score_pairs(rows, ps, ms, "mape")
+    plain_rows, plain_ps, plain_ms = (rows.reset_index(drop=True),
+                                      [p.reset_index(drop=True) for p in ps],
+                                      [m.reset_index(drop=True) for m in ms])
+    pd.testing.assert_frame_equal(table, score_pairs(plain_rows, plain_ps, plain_ms, "mape"))
+    for _, row in table.iterrows():
+        expected = by_hand(rows, ps[int(row["stage1"])], ms[int(row["stage2"])])
+        assert row["MAPE"] == pytest.approx(expected["MAPE"], rel=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_score_pairs_shuffled_rows_give_the_same_table(seed):
+    rows, ps, ms = pair_data(seed)
+    order = np.random.default_rng(seed).permutation(len(rows))
+    shuffled = rows.iloc[order]
+    table = score_pairs(shuffled, [p.iloc[order] for p in ps], [m.iloc[order] for m in ms],
+                        "mape")
+    expected = score_pairs(rows, ps, ms, "mape")
+    pd.testing.assert_frame_equal(table, expected, check_exact=False, rtol=1e-12)
+
+
+def test_score_pairs_predictions_in_another_order_are_refused_not_misaligned():
+    # Same labels, another order: p x m would align by label into a new order, which no longer
+    # matches the rows; cash_totals refuses it rather than summing the wrong rows.
+    rows, ps, ms = pair_data(7, index=pd.Index(np.arange(40)[::-1]))
+    with pytest.raises(ValueError, match=r"^values must have the rows of rows \(the same "
+                                         r"index\)$"):
+        score_pairs(rows, ps, [ms[0].sort_index(), ms[1]], "mape")
+
+
+def test_score_pairs_predictions_with_other_labels_are_refused():
+    rows, ps, ms = pair_data(8)
+    other = ps[0].copy()
+    other.index = other.index + 1000
+    with pytest.raises(ValueError):
+        score_pairs(rows, [other], ms, "mape")
+
+
+@pytest.mark.parametrize("metric", ["MAPE", "WAPE", "bias", "log loss", "", None])
 def test_score_pairs_refuses_an_unknown_metric(metric):
-    codes, actual, ps, ms = pair_data()
+    rows, ps, ms = pair_data()
     with pytest.raises(ValueError) as error:
-        score_pairs(codes, actual, ps, ms, metric)
+        score_pairs(rows, ps, ms, metric)
     assert str(error.value) == f"cannot rank pairs by {metric!r}; choose 'mape' or 'wape'"
 
 
-def test_score_pairs_refuses_a_nan_prediction_through_total_scores():
-    codes, actual, ps, ms = pair_data()
-    ps[1] = ps[1].copy()
-    ps[1][0] = nan
-    with pytest.raises(ValueError, match="forecast holds a NaN or infinite value"):
-        score_pairs(codes, actual, ps, ms, "mape")
+def test_score_pairs_checks_the_metric_before_anything_else():
+    # Even with rows it could not total, an unknown metric is the error reported.
+    rows = pd.DataFrame({"origin_week": [40], "h": [1], "target_week": [41]})
+    with pytest.raises(ValueError, match="^cannot rank pairs by 'r2'"):
+        score_pairs(rows, [pd.Series([1.0])], [pd.Series([1.0])], "r2")
+
+
+@pytest.mark.parametrize("bad", [nan, inf, -inf])
+@pytest.mark.parametrize("which", ["p", "m"])
+def test_score_pairs_refuses_a_nan_or_infinite_prediction(bad, which):
+    rows, ps, ms = pair_data()
+    if which == "p":
+        ps[1] = ps[1].copy()
+        ps[1].iloc[3] = bad
+    else:
+        ms[1] = ms[1].copy()
+        ms[1].iloc[3] = bad
+    # Refused when the pair's cash is totalled (cash_totals), before total_scores sees it.
+    with pytest.raises(ValueError, match="^values holds a NaN or infinite value$"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_refuses_a_nan_actual_amount():
+    rows, ps, ms = pair_data()
+    rows.loc[rows.index[0], "amount_deflated"] = nan
+    with pytest.raises(ValueError, match="^values holds a NaN or infinite value$"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_refuses_actual_totals_all_zero_through_total_scores():
+    rows, ps, ms = pair_data()
+    rows["amount_deflated"] = 0.0
+    with pytest.raises(ValueError, match="every actual total is 0"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_refuses_a_negative_actual_total_through_total_scores():
+    rows, ps, ms = pair_data()
+    rows["amount_deflated"] = -1.0
+    with pytest.raises(ValueError, match="an actual total is below 0"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_accepts_a_zero_forecast():
+    rows, _, _ = pair_data()
+    zero = pd.Series(0.0, index=rows.index)
+    row = score_pairs(rows, [zero], [zero + 5.0], "mape").iloc[0]
+    assert row["MAPE"] == pytest.approx(1.0)
+    assert row["bias"] == pytest.approx(-1.0)
 
 
 def test_score_pairs_does_not_change_its_inputs():
-    codes, actual, ps, ms = pair_data()
-    copies = codes.copy(), actual.copy(), [p.copy() for p in ps], [m.copy() for m in ms]
-    score_pairs(codes, actual, ps, ms, "mape")
-    np.testing.assert_array_equal(codes, copies[0])
-    pd.testing.assert_series_equal(actual, copies[1])
-    for a, b in zip(ps + ms, copies[2] + copies[3]):
-        np.testing.assert_array_equal(a, b)
+    rows, ps, ms = pair_data()
+    copies = rows.copy(deep=True), [p.copy() for p in ps], [m.copy() for m in ms]
+    lists = list(ps), list(ms)
+    score_pairs(rows, ps, ms, "mape")
+    pd.testing.assert_frame_equal(rows, copies[0])
+    for a, b in zip(ps + ms, copies[1] + copies[2]):
+        pd.testing.assert_series_equal(a, b)
+    assert all(a is b for a, b in zip(ps, lists[0])) and len(ps) == len(lists[0])
+    assert all(a is b for a, b in zip(ms, lists[1])) and len(ms) == len(lists[1])
+
+
+def test_score_pairs_is_deterministic():
+    rows, ps, ms = pair_data(9)
+    pd.testing.assert_frame_equal(score_pairs(rows, ps, ms, "wape"),
+                                  score_pairs(rows, ps, ms, "wape"))
+
+
+def test_total_codes_was_removed():
+    from collection_estimation.hurdle import diagnostic_joint
+    assert not hasattr(diagnostic_joint, "total_codes")
 
 
 # --- paired_bootstrap ------------------------------------------------------------------------

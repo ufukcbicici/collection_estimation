@@ -3762,9 +3762,11 @@ from collection_estimation.hurdle import benchmark, diagnostic, diagnostic_joint
 
 for name in ("benchmark_forecasts", "cash_totals"):
     assert getattr(script, name) is getattr(benchmark, name), name
-for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "stage2_grid",
-             "total_codes"):
+for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "stage2_grid"):
     assert getattr(script, name) is getattr(diagnostic_joint, name), name
+# total_codes was removed: score_pairs sums p x m per total with cash_totals itself.
+assert not hasattr(diagnostic_joint, "total_codes")
+assert not hasattr(script, "total_codes")
 for name in ("amount_reliability", "cash_by_p_group", "calibration_summary"):
     assert getattr(script, name) is getattr(diagnostic, name), name
 inspect.signature(script.show_joint_grid).bind("pairs", "mape")
@@ -3784,6 +3786,33 @@ def test_step_15_run_joint_diagnostic_is_called_once_in_main():
     assert len(calls_to(tree, "run_joint_diagnostic")) == 1
     for name in ("score_pairs", "benchmark_forecasts", "paired_bootstrap"):
         assert calls_to(tree, name) == [], name
+
+
+def run_joint_diagnostic_source():
+    text = SCRIPT.read_text(encoding="utf-8")
+    nodes = [node for node in ast.parse(text).body
+             if isinstance(node, ast.FunctionDef) and node.name == "run_joint_diagnostic"]
+    assert len(nodes) == 1
+    return " ".join(ast.get_source_segment(text, nodes[0]).split())
+
+
+def test_step_15_scores_the_pairs_on_the_validation_rows_with_series_predictions():
+    # score_pairs now takes the validation rows and the predictions as Series (with the rows'
+    # index, so p x m aligns by label): no .to_numpy(), no separate totals, no total_codes.
+    source = run_joint_diagnostic_source()
+    for line in ('p_by_stage1 = [predict_p(c.settings, "train", validation) for c in grid1]',
+                 'm_by_stage2 = [predict_m(c.settings, "train", validation) for c in grid2]',
+                 "pairs = score_pairs(validation, p_by_stage1, m_by_stage2, "
+                 "joint.selection_metric)"):
+        assert line in source, line
+    assert source.count("score_pairs(") == 1
+    assert source.index("p_by_stage1 = [") < source.index("pairs = score_pairs(")
+    assert source.index("m_by_stage2 = [") < source.index("pairs = score_pairs(")
+    for gone in ("total_codes", "validation_totals", "predict_p(c.settings, \"train\", "
+                 "validation).to_numpy()", "predict_m(c.settings, \"train\", "
+                 "validation).to_numpy()"):
+        assert gone not in source, gone
+    assert "total_codes" not in SCRIPT.read_text(encoding="utf-8")
 
 
 def test_step_15_runs_after_step_14s_checks():
@@ -3993,3 +4022,132 @@ def test_step_15_real_run_prints_the_results(step_15_run):
                  "stage 2 reliability, paid forecast rows in equal groups by m",
                  "tables written to "):
         assert text in out, text
+
+
+# Step 11, U7b: the holiday positions of every target week, with the [calendar] settings, over
+# the same weeks as the calendar features, merged into the calendar block (on week, one to
+# one), and their printout. Run on the real settings/holidays_tr.toml (read only), in a
+# separate process like the checks above.
+HOLIDAY_POSITIONS = """
+import inspect
+from datetime import date, timedelta
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.features_calendar import CALENDAR_COLUMNS
+
+assert script.holiday_position_features.__module__ == (
+    "collection_estimation.hurdle.features_calendar")
+inspect.signature(script.show_holiday_positions).bind("positions", "week_zero", "holidays")
+source = " ".join(inspect.getsource(script.main).split())
+call = ("positions = holiday_position_features( week_zero, 0, last_week + "
+        "settings.receivables.horizons, holidays, settings.calendar.holiday_encodings, "
+        "settings.calendar.drain_window, settings.calendar.catch_up_window)")
+assert call in source, "holiday_position_features is not called as expected"
+merge = 'calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")'
+assert merge in source, "the positions are not merged into the calendar as expected"
+show = "show_holiday_positions(positions, week_zero, holidays)"
+assert show in source, "show_holiday_positions is not called as expected"
+assert source.count("holiday_position_features(") == 1
+assert source.count(show) == 1
+order = [source.index("show_calendar(calendar, week_zero, holidays)"),
+         source.index("holiday_position_features("), source.index(merge), source.index(show),
+         source.index("receivables_features("),
+         source.index("table = join_features(panel, history, calendar, owed)")]
+assert order == sorted(order), order
+
+holidays = script.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
+week_zero = date(2025, 6, 2)
+calendar = script.calendar_features(week_zero, 0, 69, holidays)
+for encodings in (("drain",), ("days",), ("drain", "days"), ()):
+    positions = script.holiday_position_features(week_zero, 0, 69, holidays, encodings, 3, 5)
+    merged = calendar.merge(positions, on="week", how="left", validate="one_to_one")
+    added = [column for column in positions.columns if column != "week"]
+    assert list(merged.columns) == CALENDAR_COLUMNS + added, list(merged.columns)
+    assert len(merged) == 70
+    assert merged[added].notna().all().all()
+    assert all(merged[column].dtype == "int64" for column in added)
+    pd.testing.assert_frame_equal(merged[CALENDAR_COLUMNS], calendar)
+    # The number of unusual weeks, counted here independently of the printout.
+    if added:
+        normal = pd.Series({c: 0 if c in ("drain_days", "catch_up_days") else 1 for c in added})
+        unusual = int((positions[added] != normal).any(axis=1).sum())
+    print(f"=== {encodings} unusual {unusual if added else '-'}")
+    script.show_holiday_positions(positions, week_zero, holidays)
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def holiday_positions_run():
+    result = subprocess.run([sys.executable, "-c", HOLIDAY_POSITIONS], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    # The printout of each encoding, keyed by the encodings' text.
+    parts = {}
+    for chunk in result.stdout.strip().removesuffix("ok").split("=== ")[1:]:
+        header, _, body = chunk.partition("\n")
+        parts[header.split(" unusual ")[0]] = (header.split(" unusual ")[1], body)
+    return parts
+
+
+def test_holiday_positions_are_wired_in_merged_and_printed(holiday_positions_run):
+    assert set(holiday_positions_run) == {"('drain',)", "('days',)", "('drain', 'days')", "()"}
+
+
+def test_holiday_positions_printout_drain_counts_the_unusual_weeks(holiday_positions_run):
+    unusual, body = holiday_positions_run["('drain',)"]
+    assert unusual == "17"
+    assert ("holiday positions: 2 columns; 17 of 70 weeks differ from a normal week:"
+            in body)
+    assert "np.int64" not in body
+
+
+def test_holiday_positions_printout_drain_shows_the_known_weeks(holiday_positions_run):
+    _, body = holiday_positions_run["('drain',)"]
+    for line in ("week 41 (Monday 2026-03-16): drain_days 3, catch_up_days 0",
+                 "week 42 (Monday 2026-03-23): drain_days 0, catch_up_days 3",
+                 "week 50 (Monday 2026-05-18): drain_days 1, catch_up_days 3",
+                 "week 51 (Monday 2026-05-25): drain_days 2, catch_up_days 0"):
+        assert line in body, line
+    # Victory Day, Sat 30 Aug 2025, changes nothing: weeks 12 and 13 are normal.
+    assert "week 12 (" not in body and "week 13 (" not in body
+    assert "Sat 30 Aug" not in body
+
+
+def test_holiday_positions_printout_names_the_weekday_holidays_around_a_week(
+        holiday_positions_run):
+    _, body = holiday_positions_run["('drain',)"]
+    line = next(line for line in body.splitlines() if "week 41 (" in line)
+    assert "Fri 20 Mar" in line
+    assert "Sat 21 Mar" not in line and "Sun 22 Mar" not in line
+
+
+def test_holiday_positions_printout_days_counts_the_unusual_weeks(holiday_positions_run):
+    unusual, body = holiday_positions_run["('days',)"]
+    assert ("holiday positions: 15 columns; " + unusual + " of 70 weeks differ from a normal "
+            "week:") in body
+    assert unusual == "26"
+    # No drain columns to show; the week is listed with its holidays.
+    assert "drain_days" not in body
+    assert "week 49 (Monday 2026-05-11)" in body  # next_tue = 0 (Tue 19 May)
+
+
+def test_holiday_positions_printout_both_encodings(holiday_positions_run):
+    unusual, body = holiday_positions_run["('drain', 'days')"]
+    assert ("holiday positions: 17 columns; " + unusual + " of 70 weeks differ from a normal "
+            "week:") in body
+    assert "week 51 (Monday 2026-05-25): drain_days 2, catch_up_days 0" in body
+
+
+def test_holiday_positions_printout_without_encodings(holiday_positions_run):
+    _, body = holiday_positions_run["()"]
+    assert body.strip() == "holiday positions: none ([calendar] holiday_encodings is empty)"
+
+
+def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday_positions_run):
+    # Week 50 sees Tue 19 May and the Kurban Bayramı Wed 27 .. Fri 29 May 2026: a date list
+    # should read in date order, not sorted by the weekday's name.
+    _, body = holiday_positions_run["('drain',)"]
+    line = next(line for line in body.splitlines() if "week 50 (" in line)
+    assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line

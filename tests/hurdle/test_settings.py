@@ -26,6 +26,7 @@ from collection_estimation.hurdle.read_ledger import (
 )
 from collection_estimation.hurdle.settings import (
     FORMAT_SAMPLE_DATES,
+    CalendarSettings,
     CollectionsLayout,
     CompanySettings,
     DataSettings,
@@ -149,6 +150,10 @@ VALID = {
     "receivables": {"min_cleared_for_delay": "3", "horizons": "5",
                     "leak_check_weeks": "[0, 30]", "overdue_age_days": "[30, 90]"},
     "history": {"windows": "[4, 13, 52]", "use_ledger_before_first_file": "true"},
+    # U7b: the holiday positions. Values differ from synthetic.toml's on purpose (both
+    # encodings, in the non-code order; windows 4 and 6 against 3 and 5).
+    "calendar": {"holiday_encodings": '["days", "drain"]', "drain_window": "4",
+                 "catch_up_window": "6"},
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
@@ -246,6 +251,7 @@ def test_returns_a_settings_object(tmp_path, repo):
     assert isinstance(settings.ledger_layout, LedgerLayout)
     assert isinstance(settings.receivables, ReceivablesSettings)
     assert isinstance(settings.history, HistorySettings)
+    assert isinstance(settings.calendar, CalendarSettings)
 
 
 def test_paths_are_read_from_the_repo_root(tmp_path, repo):
@@ -311,8 +317,8 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "stage1", "stage2", "diagnostic",
-                                       "joint_diagnostic", "debug"])
+                                       "history", "calendar", "stage1", "stage2",
+                                       "diagnostic", "joint_diagnostic", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -330,6 +336,8 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("receivables", "min_cleared_for_delay"), ("receivables", "horizons"),
     ("receivables", "leak_check_weeks"), ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
+    ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
+    ("calendar", "catch_up_window"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -461,6 +469,8 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("receivables", "horizons"), ("receivables", "leak_check_weeks"),
     ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
+    ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
+    ("calendar", "catch_up_window"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -2194,7 +2204,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     with pytest.raises(ValueError) as error:
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
-        f"{FILE_NAME}: missing ['stage1']; expected exactly ['collections_layout', "
+        f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
@@ -2702,7 +2712,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     with pytest.raises(ValueError) as error:
         load(tmp_path, repo, drop_section="diagnostic")
     assert str(error.value) == (
-        f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['collections_layout', "
+        f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
@@ -3429,7 +3439,7 @@ def test_stage2_settings_is_frozen_and_hashable():
 def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="stage2")
     assert message == (
-        f"{FILE_NAME}: missing ['stage2']; expected exactly ['collections_layout', "
+        f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2']")
 
@@ -4087,7 +4097,7 @@ def test_the_joint_diagnostic_does_not_change_the_other_sections(tmp_path, repo)
 def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic")
     assert message == (
-        f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['collections_layout', "
+        f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2']")
 
@@ -4354,3 +4364,238 @@ def test_the_synthetic_joint_diagnostic_settings():
         stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
         selection_metric="mape", bootstrap_samples=2000,
         output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_joint_diagnostic").resolve())
+
+
+# --- [calendar] (U7b) ------------------------------------------------------------------------------
+# A required section: which holiday-position columns the calendar block gets
+# (`features_calendar.holiday_position_features`). holiday_encodings is a list of choices from
+# HOLIDAY_ENCODINGS (may be empty, no repeats, order kept); the two windows are counts.
+
+from collection_estimation.hurdle import features_calendar  # noqa: E402
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    HOLIDAY_ENCODINGS,
+    holiday_encodings_setting,
+)
+
+CALENDAR = f"{FILE_NAME} [calendar]"
+CALENDAR_KEYS = ['catch_up_window', 'drain_window', 'holiday_encodings']
+
+
+def test_holiday_encodings_constant():
+    assert HOLIDAY_ENCODINGS == ("drain", "days")
+
+
+def test_the_settings_copy_of_holiday_encodings_equals_the_features_one():
+    # settings.py cannot import it (a circular import): the two copies must not drift apart.
+    assert HOLIDAY_ENCODINGS == features_calendar.HOLIDAY_ENCODINGS
+
+
+def test_calendar_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(CalendarSettings)] == [
+        "holiday_encodings", "drain_window", "catch_up_window"]
+
+
+def test_the_calendar_section_is_read(tmp_path, repo):
+    calendar = load(tmp_path, repo).calendar
+    assert isinstance(calendar, CalendarSettings)
+    assert calendar == CalendarSettings(holiday_encodings=("days", "drain"), drain_window=4,
+                                        catch_up_window=6)
+
+
+def test_the_calendar_values_have_the_right_python_types(tmp_path, repo):
+    calendar = load(tmp_path, repo).calendar
+    assert type(calendar.holiday_encodings) is tuple
+    assert all(type(item) is str for item in calendar.holiday_encodings)
+    assert type(calendar.drain_window) is int
+    assert type(calendar.catch_up_window) is int
+
+
+def test_calendar_settings_is_frozen_and_hashable(tmp_path, repo):
+    calendar = load(tmp_path, repo).calendar
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        calendar.drain_window = 1
+    assert hash(calendar) == hash(dataclasses.replace(calendar))
+
+
+def test_settings_has_a_calendar_field_right_after_history():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("calendar") == names.index("history") + 1
+    assert names.index("calendar") < names.index("stage1")
+
+
+def test_the_calendar_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("calendar", "holiday_encodings"): "[]",
+                                      ("calendar", "drain_window"): "9"})
+    for name in ("data", "history", "stage1", "stage2", "diagnostic", "joint_diagnostic",
+                 "debug"):
+        assert getattr(a, name) == getattr(b, name), name
+    assert a.calendar != b.calendar
+
+
+def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="calendar")
+    assert message == (
+        f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'collections_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'ledger_layout', 'receivables', 'stage1', 'stage2']")
+
+
+def test_a_calendar_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="calendar", top="calendar = 5")
+    assert message == f"{CALENDAR} is 5, not a section"
+
+
+def test_an_empty_calendar_section_names_every_setting(tmp_path, repo):
+    changes = {("calendar", key): REMOVE for key in VALID["calendar"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == f"{CALENDAR}: missing {CALENDAR_KEYS}; expected exactly {CALENDAR_KEYS}"
+
+
+@pytest.mark.parametrize("key", CALENDAR_KEYS)
+def test_each_missing_calendar_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("calendar", key): REMOVE})
+    assert message == f"{CALENDAR}: missing [{key!r}]; expected exactly {CALENDAR_KEYS}"
+
+
+def test_a_calendar_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): REMOVE,
+                                             ("calendar", "holiday_encoding"): '["drain"]'})
+    assert message == (f"{CALENDAR}: missing ['holiday_encodings']; unknown "
+                       f"['holiday_encoding']; expected exactly {CALENDAR_KEYS}")
+
+
+@pytest.mark.parametrize("key, value", [("windows", "[4]"), ("encodings", '["drain"]'),
+                                        ("feature_blocks", '["calendar"]')])
+def test_an_unknown_calendar_key_is_refused(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("calendar", key): value})
+    assert message == f"{CALENDAR}: unknown [{key!r}]; expected exactly {CALENDAR_KEYS}"
+
+
+def test_the_calendar_keys_are_unknown_in_history(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("history", "drain_window"): "3"})
+    assert message.startswith(f"{FILE_NAME} [history]: unknown ['drain_window']; ")
+
+
+# [calendar] holiday_encodings
+
+@pytest.mark.parametrize("text, expected", [
+    ("[]", ()), ('["drain"]', ("drain",)), ('["days"]', ("days",)),
+    ('["drain", "days"]', ("drain", "days")), ('["days", "drain"]', ("days", "drain")),
+])
+def test_holiday_encodings_are_read_in_the_order_given(tmp_path, repo, text, expected):
+    calendar = load(tmp_path, repo, changes={("calendar", "holiday_encodings"): text}).calendar
+    assert calendar.holiday_encodings == expected
+    assert type(calendar.holiday_encodings) is tuple
+
+
+@pytest.mark.parametrize("text, shown", [
+    ('"drain"', "'drain'"), ("1", "1"), ("true", "True"), ("{ drain = 1 }", "{'drain': 1}"),
+])
+def test_holiday_encodings_that_is_not_a_list_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): text})
+    assert message == (f"{CALENDAR}: holiday_encodings is {shown}, not a list of holiday "
+                       f"encodings")
+
+
+@pytest.mark.parametrize("text, unknown", [
+    ('["weekly"]', "['weekly']"), ('["Drain"]', "['Drain']"), ('["drain", "DAYS"]', "['DAYS']"),
+    ('["drain_days"]', "['drain_days']"), ('[""]', "['']"), ("[1, 2]", "[1, 2]"),
+    ('["drain", "x", "days", "y"]', "['x', 'y']"),
+])
+def test_an_unknown_holiday_encoding_has_the_exact_message(tmp_path, repo, text, unknown):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): text})
+    assert message == (f"{CALENDAR}: holiday_encodings holds {unknown}; the holiday encodings "
+                       f"are ['drain', 'days']")
+
+
+@pytest.mark.parametrize("text, shown", [
+    ('["drain", "drain"]', "['drain', 'drain']"),
+    ('["days", "drain", "days"]', "['days', 'drain', 'days']"),
+])
+def test_a_repeated_holiday_encoding_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): text})
+    assert message == f"{CALENDAR}: holiday_encodings lists an encoding more than once: {shown}"
+
+
+def test_an_unknown_holiday_encoding_is_reported_before_a_repeat(tmp_path, repo):
+    message = exact_message(tmp_path, repo,
+                            {("calendar", "holiday_encodings"): '["x", "x", "drain", "drain"]'})
+    assert message == (f"{CALENDAR}: holiday_encodings holds ['x', 'x']; the holiday encodings "
+                       f"are ['drain', 'days']")
+
+
+def test_holiday_encodings_setting_direct_calls():
+    assert holiday_encodings_setting({"e": []}, "e", "here") == ()
+    assert holiday_encodings_setting({"e": ["days", "drain"]}, "e", "here") == ("days", "drain")
+    with pytest.raises(ValueError) as error:
+        holiday_encodings_setting({"e": ("drain",)}, "e", "here")  # a tuple is not a TOML list
+    assert str(error.value) == "here: e is ('drain',), not a list of holiday encodings"
+    with pytest.raises(ValueError) as error:
+        holiday_encodings_setting({"e": ["drain", "drain"]}, "e", "here")
+    assert str(error.value) == "here: e lists an encoding more than once: ['drain', 'drain']"
+
+
+def test_holiday_encodings_setting_with_the_key_absent_raises_key_error():
+    with pytest.raises(KeyError):
+        holiday_encodings_setting({}, "e", "here")
+
+
+def test_holiday_encodings_setting_does_not_modify_or_alias_the_list():
+    value = ["days", "drain"]
+    result = holiday_encodings_setting({"e": value}, "e", "here")
+    value.append("drain")
+    assert result == ("days", "drain")
+    assert value == ["days", "drain", "drain"]
+
+
+# [calendar] drain_window and catch_up_window (count_setting)
+
+@pytest.mark.parametrize("key", ["drain_window", "catch_up_window"])
+@pytest.mark.parametrize("text, expected", [("1", 1), ("3", 3), ("30", 30), ("400", 400)])
+def test_a_window_accepts_a_count(tmp_path, repo, key, text, expected):
+    calendar = load(tmp_path, repo, changes={("calendar", key): text}).calendar
+    assert getattr(calendar, key) == expected
+    assert type(getattr(calendar, key)) is int
+
+
+@pytest.mark.parametrize("key", ["drain_window", "catch_up_window"])
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("1.5", "1.5"),
+                                         ("3.0", "3.0"), ('"3"', "'3'"), ("true", "True"),
+                                         ("false", "False"), ("[3]", "[3]")])
+def test_a_bad_window_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("calendar", key): text})
+    assert message == f"{CALENDAR}: {key} is {shown}, not a whole number of 1 or more"
+
+
+def test_the_windows_do_not_borrow_from_each_other(tmp_path, repo):
+    calendar = load(tmp_path, repo, changes={("calendar", "drain_window"): "11",
+                                             ("calendar", "catch_up_window"): "2"}).calendar
+    assert (calendar.drain_window, calendar.catch_up_window) == (11, 2)
+
+
+def test_the_windows_are_checked_even_with_no_encodings(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): "[]",
+                                             ("calendar", "catch_up_window"): "0"})
+    assert message == f"{CALENDAR}: catch_up_window is 0, not a whole number of 1 or more"
+
+
+def test_holiday_encodings_are_checked_before_the_windows(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("calendar", "holiday_encodings"): '["x"]',
+                                             ("calendar", "drain_window"): "0"})
+    assert message.startswith(f"{CALENDAR}: holiday_encodings holds ['x']")
+
+
+def test_the_drain_window_is_checked_before_the_catch_up_window(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("calendar", "drain_window"): "0",
+                                             ("calendar", "catch_up_window"): "0"})
+    assert message.startswith(f"{CALENDAR}: drain_window is 0")
+
+
+# synthetic.toml
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_calendar_settings():
+    calendar = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).calendar
+    assert calendar == CalendarSettings(holiday_encodings=("drain",), drain_window=3,
+                                        catch_up_window=5)

@@ -49,7 +49,10 @@ from collection_estimation.hurdle.read_collections import (  # noqa: E402
     read_one_file,
 )
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
-from collection_estimation.hurdle.features_calendar import calendar_features  # noqa: E402
+from collection_estimation.hurdle.features_calendar import (  # noqa: E402
+    calendar_features,
+    holiday_position_features,
+)
 from collection_estimation.hurdle.features_receivables import (  # noqa: E402
     before_first_ledger_week,
     receivables_features,
@@ -79,7 +82,6 @@ from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
     scores_by_h,
     stage1_grid,
     stage2_grid,
-    total_codes,
 )
 from collection_estimation.hurdle.diagnostic import (  # noqa: E402
     amount_reliability,
@@ -341,6 +343,15 @@ def main():
                                  holidays)
     show_calendar(calendar, week_zero, holidays)
 
+    # Where the holidays fall around each week ([calendar] holiday_encodings), joined to the
+    # calendar block: tells a week whose cash moves into the next one from one that keeps it.
+    positions = holiday_position_features(
+        week_zero, 0, last_week + settings.receivables.horizons, holidays,
+        settings.calendar.holiday_encodings, settings.calendar.drain_window,
+        settings.calendar.catch_up_window)
+    calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")
+    show_holiday_positions(positions, week_zero, holidays)
+
     # The receivables features: per panel row, what the customer owed at t, split at its
     # target week t+h (deflated, like the history features).
     owed = receivables_features(panel, receivables, levels, settings.receivables.horizons,
@@ -559,12 +570,9 @@ def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, ca
     grid1 = stage1_grid(settings.stage1, joint)
     grid2 = stage2_grid(settings.stage2, joint)
     validation = splits.validation
-    p_by_stage1 = [predict_p(c.settings, "train", validation).to_numpy() for c in grid1]
-    m_by_stage2 = [predict_m(c.settings, "train", validation).to_numpy() for c in grid2]
-    validation_totals = cash_totals(validation, validation["amount_deflated"], by_company=False)
-    pairs = score_pairs(total_codes(validation, validation_totals),
-                        validation_totals["total"], p_by_stage1, m_by_stage2,
-                        joint.selection_metric)
+    p_by_stage1 = [predict_p(c.settings, "train", validation) for c in grid1]
+    m_by_stage2 = [predict_m(c.settings, "train", validation) for c in grid2]
+    pairs = score_pairs(validation, p_by_stage1, m_by_stage2, joint.selection_metric)
     best = pairs.iloc[0]
     chosen = (grid1[int(best["stage1"])], grid2[int(best["stage2"])])
     default = (settings.stage1, settings.stage2)
@@ -885,6 +893,30 @@ def show_calendar(calendar, week_zero, holidays):
     after = calendar[calendar["holidays_week_before"] > 0]
     print(f"        weeks after a holiday week (holidays_week_before): "
           f"{dict(zip(after['week'], after['holidays_week_before']))}")
+
+
+def show_holiday_positions(positions, week_zero, holidays):
+    """A short printout of the holiday-position columns: every week where one differs from a
+    normal week (drain and catch-up 0, every weekday a business day), with its holidays."""
+    columns = [column for column in positions.columns if column != "week"]
+    if not columns:
+        print("        holiday positions: none ([calendar] holiday_encodings is empty)")
+        return
+    normal = {column: 0 if column in ("drain_days", "catch_up_days") else 1
+              for column in columns}
+    unusual = positions[(positions[columns] != pd.Series(normal)).any(axis=1)]
+    print(f"        holiday positions: {len(columns)} columns; {len(unusual)} of "
+          f"{len(positions)} weeks differ from a normal week:")
+    shown = [column for column in ("drain_days", "catch_up_days") if column in columns]
+    for row in unusual.itertuples(index=False):
+        monday = week_zero + timedelta(days=7 * row.week)
+        nearby = public_holidays(monday - timedelta(days=7), monday + timedelta(days=13),
+                                 holidays)
+        # Sorted as dates, then written as text ("Fri 29 May" would sort before "Tue 19 May").
+        names = [f"{day:%a %d %b}" for day in sorted(nearby) if day.weekday() < 5]
+        values = ", ".join(f"{column} {getattr(row, column)}" for column in shown)
+        print(f"          week {row.week} (Monday {monday}): {values}  "
+              f"[weekday holidays in weeks {row.week - 1}-{row.week + 1}: {', '.join(names)}]")
 
 
 def show_owed(owed, not_yet_in_ledger):

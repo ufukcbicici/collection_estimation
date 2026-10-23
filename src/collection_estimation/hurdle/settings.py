@@ -47,6 +47,15 @@ class HistorySettings:
 
 
 @dataclass(frozen=True)
+class CalendarSettings:
+    """Which holiday-position columns the calendar block gets (see
+    `features_calendar.holiday_position_features`)."""
+    holiday_encodings: tuple[str, ...]   # any of HOLIDAY_ENCODINGS; empty = none
+    drain_window: int                    # calendar days before a holiday whose payments move
+    catch_up_window: int                 # calendar days after a holiday that receive them
+
+
+@dataclass(frozen=True)
 class Stage1Settings:
     """Stage 1, the "will it pay?" classifier."""
     max_iter: int                     # number of trees
@@ -154,6 +163,7 @@ class Settings:
     ledger_layout: LedgerLayout
     receivables: ReceivablesSettings
     history: HistorySettings
+    calendar: CalendarSettings
     stage1: Stage1Settings
     stage2: Stage2Settings
     diagnostic: DiagnosticSettings
@@ -173,7 +183,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "stage1", "stage2", "diagnostic", "joint_diagnostic", "debug"},
+                     "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
+                     "debug"},
                name)
 
     data = raw["data"]
@@ -187,6 +198,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                              "overdue_age_days"}, f"{name} [receivables]")
     history = raw["history"]
     check_keys(history, {"windows", "use_ledger_before_first_file"}, f"{name} [history]")
+    calendar = raw["calendar"]
+    check_keys(calendar, {"holiday_encodings", "drain_window", "catch_up_window"},
+               f"{name} [calendar]")
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
@@ -253,6 +267,12 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             windows=windows,
             use_ledger_before_first_file=bool_setting(history, "use_ledger_before_first_file",
                                                       f"{name} [history]"),
+        ),
+        calendar=CalendarSettings(
+            holiday_encodings=holiday_encodings_setting(calendar, "holiday_encodings",
+                                                        f"{name} [calendar]"),
+            drain_window=count_setting(calendar, "drain_window", f"{name} [calendar]"),
+            catch_up_window=count_setting(calendar, "catch_up_window", f"{name} [calendar]"),
         ),
         stage1=Stage1Settings(
             max_iter=count_setting(stage1, "max_iter", f"{name} [stage1]"),
@@ -621,6 +641,25 @@ def day_edges_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
 
 # The feature blocks a model can use, in the order their columns are taken.
 FEATURE_BLOCKS = ("history", "calendar", "receivables")
+
+
+# The holiday encodings the calendar block can get (`features_calendar.HOLIDAY_ENCODINGS`).
+HOLIDAY_ENCODINGS = ("drain", "days")
+
+
+def holiday_encodings_setting(table: dict, key: str, where: str) -> tuple[str, ...]:
+    """A list of holiday encodings, each once, from HOLIDAY_ENCODINGS; may be empty (the
+    calendar block without holiday-position columns). Returned in the order given."""
+    value = table[key]
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} is {value!r}, not a list of holiday encodings")
+    unknown = [item for item in value if item not in HOLIDAY_ENCODINGS]
+    if unknown:
+        raise ValueError(f"{where}: {key} holds {unknown}; the holiday encodings are "
+                         f"{list(HOLIDAY_ENCODINGS)}")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{where}: {key} lists an encoding more than once: {value}")
+    return tuple(value)
 
 
 def rate_setting(table: dict, key: str, where: str) -> float:
