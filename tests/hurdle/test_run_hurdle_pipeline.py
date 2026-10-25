@@ -6,6 +6,7 @@ stubbed and stopped right after step 6), run in a separate Python process: the s
 reconfigures sys.stdout and puts src/ on sys.path, which should not leak into the rest of the
 test session.
 """
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -3799,18 +3800,27 @@ def run_joint_diagnostic_source():
 def test_step_15_scores_the_pairs_on_the_validation_rows_with_series_predictions():
     # score_pairs now takes the validation rows and the predictions as Series (with the rows'
     # index, so p x m aligns by label): no .to_numpy(), no separate totals, no total_codes.
+    # Since the progress lines, the grid predictions go through a local predict_grid helper:
+    # one prediction per grid setting, in grid order, each fitted on train and predicted on
+    # the validation rows (still Series: no .to_numpy()).
     source = run_joint_diagnostic_source()
-    for line in ('p_by_stage1 = [predict_p(c.settings, "train", validation) for c in grid1]',
-                 'm_by_stage2 = [predict_m(c.settings, "train", validation) for c in grid2]',
+    for line in ("def predict_grid(stage, grid, predict):",
+                 "for done, candidate in enumerate(grid, start=1):",
+                 'predictions.append(predict(candidate.settings, "train", validation))',
+                 "return predictions",
+                 'p_by_stage1 = predict_grid("stage 1", grid1, predict_p)',
+                 'm_by_stage2 = predict_grid("stage 2", grid2, predict_m)',
                  "pairs = score_pairs(validation, p_by_stage1, m_by_stage2, "
                  "joint.selection_metric)"):
         assert line in source, line
     assert source.count("score_pairs(") == 1
-    assert source.index("p_by_stage1 = [") < source.index("pairs = score_pairs(")
-    assert source.index("m_by_stage2 = [") < source.index("pairs = score_pairs(")
-    for gone in ("total_codes", "validation_totals", "predict_p(c.settings, \"train\", "
-                 "validation).to_numpy()", "predict_m(c.settings, \"train\", "
-                 "validation).to_numpy()"):
+    assert source.count("predictions.append(") == 1
+    assert source.count("predict_grid(") == 3  # the definition and the two calls
+    assert (source.index("def predict_grid(") < source.index("p_by_stage1 = predict_grid(")
+            < source.index("m_by_stage2 = predict_grid(") < source.index("pairs = score_pairs("))
+    for gone in ("total_codes", "validation_totals",
+                 'predict(candidate.settings, "train", validation).to_numpy()',
+                 'p_by_stage1 = [', 'm_by_stage2 = ['):
         assert gone not in source, gone
     assert "total_codes" not in SCRIPT.read_text(encoding="utf-8")
 
@@ -4022,6 +4032,170 @@ def test_step_15_real_run_prints_the_results(step_15_run):
                  "stage 2 reliability, paid forecast rows in equal groups by m",
                  "tables written to "):
         assert text in out, text
+
+
+GRID_PROGRESS = re.compile(r"^  (stage [12]) grid: (\d+) of (\d+) done \((.*)\); "
+                           r"(\d+) s so far, about (\d+) s left$")
+
+
+def grid_progress_lines(stdout):
+    return [GRID_PROGRESS.match(line) for line in stdout.splitlines()
+            if GRID_PROGRESS.match(line)]
+
+
+def test_step_15_real_run_prints_one_progress_line_per_grid_setting(step_15_run):
+    # The fixture's grids: stage 1 has 2 settings, stage 2 has 6 (see tries_every_pair).
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    found = [(m.group(1), int(m.group(2)), int(m.group(3))) for m in
+             grid_progress_lines(result.stdout)]
+    assert found == ([("stage 1", done, 2) for done in (1, 2)]
+                     + [("stage 2", done, 6) for done in range(1, 7)])
+
+
+def test_step_15_real_run_progress_lines_name_distinct_settings(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for stage, size in (("stage 1", 2), ("stage 2", 6)):
+        params = [m.group(4) for m in grid_progress_lines(result.stdout) if m.group(1) == stage]
+        assert len(params) == size
+        assert len(set(params)) == size, params
+        assert all(p.startswith("{") and p.endswith("}") for p in params), params
+
+
+def test_step_15_real_run_last_progress_line_of_each_grid_has_nothing_left(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for stage in ("stage 1", "stage 2"):
+        lines = [m for m in grid_progress_lines(result.stdout) if m.group(1) == stage]
+        assert lines[-1].group(0).endswith("s so far, about 0 s left"), lines[-1].group(0)
+        elapsed = [int(m.group(5)) for m in lines]
+        assert elapsed == sorted(elapsed)  # time so far never goes back
+
+
+def test_step_15_real_run_progress_lines_come_before_the_grid_table(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    progress = [i for i, line in enumerate(lines) if GRID_PROGRESS.match(line)]
+    table = next(i for i, line in enumerate(lines) if "the 10 best of 12 pairs by validation"
+                 in line)
+    assert progress and max(progress) < table
+
+
+def test_step_15_real_run_with_every_pair_scored_prints_no_not_scored_line(step_15_run):
+    metric, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    assert "NOT scored" not in result.stdout
+    pairs = pd.read_csv(folder / "pairs.csv")
+    assert pairs.columns[-1] == "non-finite rows"
+    assert (pairs["non-finite rows"] == 0).all()
+
+
+# Step 15 with stage-2 settings whose m is NaN on one validation row: the same tiny run, with
+# fit_stage2 / predict_amount wrapped (in the child process only) so a model remembers its
+# settings and the poisoned ones predict a NaN m on their first row.
+STEP_15_POISON = """
+_real_fit_stage2, _real_predict_amount = script.fit_stage2, script.predict_amount
+
+def _fit_stage2(x, amount, exposure, settings):
+    return (_real_fit_stage2(x, amount, exposure, settings), settings)
+
+def _predict_amount(model, x, exposure):
+    model, settings = model
+    m = _real_predict_amount(model, x, exposure)
+    if POISONED(settings):
+        m = m.copy()
+        m.iloc[0] = float("nan")
+    return m
+
+script.fit_stage2, script.predict_amount = _fit_stage2, _predict_amount
+copy = table.copy(deep=True)
+"""
+
+
+def run_poisoned_step_15(folder, poisoned):
+    code = (STEP_15_RUN.replace("OUTPUT_FOLDER", repr(str(folder)))
+            .replace("METRIC", repr("mape"))
+            .replace("copy = table.copy(deep=True)\n",
+                     STEP_15_POISON.replace("POISONED", poisoned)))
+    assert "_predict_amount" in code  # the patch went in
+    return run_code(code)
+
+
+@pytest.fixture(scope="module")
+def step_15_gamma_poisoned(tmp_path_factory):
+    # The 3 gamma settings (x 2 stage-1 settings = 6 pairs) give a NaN m; poisson ones,
+    # including the default [stage2], do not.
+    folder = tmp_path_factory.mktemp("joint_gamma_nan")
+    return folder, run_poisoned_step_15(folder, '(lambda s: s.loss == "gamma")')
+
+
+NOT_SCORED_LINE = ("        6 pairs NOT scored (a NaN or infinite p x m on some rows; ranked last "
+                   "with infinite scores):")
+
+
+def test_step_15_some_non_finite_pairs_the_run_still_succeeds(step_15_gamma_poisoned):
+    _, result = step_15_gamma_poisoned
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "run ok"
+
+
+def test_step_15_some_non_finite_pairs_are_ranked_last_with_infinite_scores(
+        step_15_gamma_poisoned):
+    folder, result = step_15_gamma_poisoned
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv")
+    assert len(pairs) == 12
+    assert (pairs["s2 loss"].iloc[:6] == "poisson").all()
+    assert (pairs["s2 loss"].iloc[6:] == "gamma").all()
+    assert (pairs["non-finite rows"].iloc[:6] == 0).all()
+    assert (pairs["non-finite rows"].iloc[6:] == 1).all()
+    for column in ("MAPE", "bias", "WAPE"):
+        assert np.isfinite(pairs[column].iloc[:6]).all(), column
+        assert (pairs[column].iloc[6:] == np.inf).all(), column
+
+
+def test_step_15_some_non_finite_pairs_the_chosen_pair_is_a_scored_one(step_15_gamma_poisoned):
+    folder, result = step_15_gamma_poisoned
+    assert result.returncode == 0, result.stderr
+    chosen = next(line for line in result.stdout.splitlines() if "chosen pair:" in line)
+    assert "'loss': 'poisson'" in chosen and "gamma" not in chosen
+    pairs = pd.read_csv(folder / "pairs.csv")
+    scores = pd.read_csv(folder / "scores.csv")
+    best = scores[(scores["part"] == "validation") & (scores["level"] == "consolidated")
+                  & (scores["model"] == "chosen") & (scores["h"] == "all")]
+    assert best["MAPE"].iloc[0] == pytest.approx(pairs["MAPE"].iloc[0], rel=1e-9)
+
+
+def test_step_15_some_non_finite_pairs_prints_the_not_scored_block(step_15_gamma_poisoned):
+    _, result = step_15_gamma_poisoned
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines.count(NOT_SCORED_LINE) == 1
+    start = lines.index(NOT_SCORED_LINE)
+    # After the 10 best (header + 10 rows), then a header and one line per failed pair.
+    best = next(i for i, line in enumerate(lines) if "the 10 best of 12 pairs" in line)
+    assert start == best + 12
+    header, failed = lines[start + 1], lines[start + 2:start + 8]
+    assert "non-finite rows" in header and "s2 loss" in header
+    assert all("gamma" in line and "inf" in line for line in failed), failed
+    assert all(line.split()[-1] == "1" for line in failed), failed
+    # Exactly 6 failed rows: the next line is no longer part of the table.
+    assert "gamma" not in lines[start + 8] and "inf" not in lines[start + 8]
+
+
+def test_step_15_every_pair_non_finite_raises_and_writes_nothing(tmp_path):
+    folder = tmp_path / "joint_all_nan"
+    result = run_poisoned_step_15(folder, "(lambda s: True)")
+    assert result.returncode != 0
+    assert ("ValueError: step 15: every pair of the grid gave a NaN or infinite forecast on "
+            "some validation rows, so none can be chosen") in result.stderr
+    assert "run ok" not in result.stdout
+    # Raised right after the scoring: no grid printout, no tables.
+    assert "the 10 best of" not in result.stdout
+    assert "NOT scored" not in result.stdout
+    assert not folder.exists() or list(folder.iterdir()) == []
 
 
 # Step 11, U7b: the holiday positions of every target week, with the [calendar] settings, over

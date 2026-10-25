@@ -66,25 +66,32 @@ def stage2_grid(stage2, joint) -> list[Candidate]:
     return candidates
 
 
+def check_actual_totals(actual: pd.Series) -> None:
+    """Raises ValueError if the actual cash totals cannot be scored against: empty, a NaN or
+    infinite value, a total below 0, or every total 0."""
+    if actual.empty:
+        raise ValueError("there are no totals to score")
+    if not np.isfinite(actual.astype("float64")).all():
+        raise ValueError("actual holds a NaN or infinite value")
+    if (actual < 0).any():
+        raise ValueError("an actual total is below 0; the totals are cash received")
+    if actual.sum() == 0:
+        raise ValueError("every actual total is 0: no error relative to the cash exists")
+
+
 def total_scores(actual: pd.Series, forecast: pd.Series) -> dict:
     """The errors of `forecast` against `actual` cash totals (one value per total, same
     index): totals, zero actual (totals with an actual of 0, left out of the MAPE: no
     percentage error exists), MAPE, bias and WAPE (see the module's description).
 
-    Raises ValueError if the two do not line up, are empty, hold a NaN or infinite value, or
-    an actual total is below 0 or all are 0.
+    Raises ValueError if the two do not line up, `check_actual_totals` refuses the actual
+    totals, or the forecast holds a NaN or infinite value.
     """
     if not forecast.index.equals(actual.index):
         raise ValueError("forecast and actual must have the same totals (the same index)")
-    if actual.empty:
-        raise ValueError("there are no totals to score")
-    for name, series in (("actual", actual), ("forecast", forecast)):
-        if not np.isfinite(series.astype("float64")).all():
-            raise ValueError(f"{name} holds a NaN or infinite value")
-    if (actual < 0).any():
-        raise ValueError("an actual total is below 0; the totals are cash received")
-    if actual.sum() == 0:
-        raise ValueError("every actual total is 0: no error relative to the cash exists")
+    check_actual_totals(actual)
+    if not np.isfinite(forecast.astype("float64")).all():
+        raise ValueError("forecast holds a NaN or infinite value")
     error = forecast - actual
     positive = actual > 0
     return {
@@ -126,18 +133,38 @@ def score_pairs(rows: pd.DataFrame, p_by_stage1: list[pd.Series],
     rows, and the actual total the sum of the rows' deflated amounts. Both totals come from
     `cash_totals` on the same rows, so they line up total by total.
 
-    Returns one row per pair: stage1 = i, stage2 = j, then `total_scores`, sorted by
+    A pair whose p x m is NaN or infinite on any row (e.g. a stage-2 setting whose m
+    overflows) is not scored: its MAPE, bias and WAPE are infinite, so it ranks last and the
+    rest of the grid still runs.
+
+    Returns one row per pair: stage1 = i, stage2 = j, then `total_scores` and "non-finite
+    rows" (how many rows had a NaN or infinite p x m; 0 for a scored pair), sorted by
     `metric` ("mape" or "wape"), best first.
     """
     if metric not in ("mape", "wape"):
         raise ValueError(f"cannot rank pairs by {metric!r}; choose 'mape' or 'wape'")
+    # Checked here, not left to cash_totals: p x m of misaligned series is NaN wherever the
+    # labels differ, which would pass as a failed setting instead of a mistake.
+    for predictions in (*p_by_stage1, *m_by_stage2):
+        if not predictions.index.equals(rows.index):
+            raise ValueError("values must have the rows of rows (the same index)")
     actual = cash_totals(rows, rows["amount_deflated"], by_company=False)
+    # Checked once here: an unscored pair never reaches total_scores, so a fault in the
+    # actual totals would otherwise hide behind "every pair is NaN".
+    check_actual_totals(actual["total"])
     scored = []
     for i, p in enumerate(p_by_stage1):
         for j, m in enumerate(m_by_stage2):
-            forecast = cash_totals(rows, p * m, by_company=False)
-            scored.append({"stage1": i, "stage2": j,
-                           **total_scores(actual["total"], forecast["total"])})
+            cash = (p * m).astype("float64")
+            non_finite = int((~np.isfinite(cash)).sum())
+            if non_finite:
+                scores = {"totals": len(actual),
+                          "zero actual": int((actual["total"] == 0).sum()),
+                          "MAPE": np.inf, "bias": np.inf, "WAPE": np.inf}
+            else:
+                forecast = cash_totals(rows, cash, by_company=False)
+                scores = total_scores(actual["total"], forecast["total"])
+            scored.append({"stage1": i, "stage2": j, **scores, "non-finite rows": non_finite})
     table = pd.DataFrame(scored)
     # mergesort is stable: pairs with the same score keep their grid order.
     return table.sort_values(metric.upper(), kind="mergesort", ignore_index=True)

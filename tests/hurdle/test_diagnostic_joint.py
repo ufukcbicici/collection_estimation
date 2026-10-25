@@ -15,6 +15,7 @@ import pytest
 
 from collection_estimation.hurdle.diagnostic import Candidate
 from collection_estimation.hurdle.diagnostic_joint import (
+    check_actual_totals,
     paired_bootstrap,
     score_pairs,
     scores_by_h,
@@ -417,8 +418,12 @@ def by_hand(rows, p, m):
 def test_score_pairs_one_row_per_pair_with_its_columns():
     rows, ps, ms = pair_data()
     table = score_pairs(rows, ps, ms, "mape")
-    assert list(table.columns) == ["stage1", "stage2", *SCORE_KEYS]
+    assert list(table.columns) == ["stage1", "stage2", *SCORE_KEYS, "non-finite rows"]
     assert len(table) == 6
+    # Every pair of a clean grid is scored: no non-finite row anywhere, an integer count.
+    assert (table["non-finite rows"] == 0).all()
+    assert pd.api.types.is_integer_dtype(table["non-finite rows"])
+    assert np.isfinite(table[["MAPE", "bias", "WAPE"]].to_numpy()).all()
     assert sorted(zip(table["stage1"], table["stage2"])) == list(
         itertools.product(range(3), range(2)))
     assert table.index.tolist() == list(range(6))
@@ -587,19 +592,254 @@ def test_score_pairs_checks_the_metric_before_anything_else():
         score_pairs(rows, [pd.Series([1.0])], [pd.Series([1.0])], "r2")
 
 
+# A NaN or infinite p x m on any row: the pair is not scored (infinite MAPE, bias and WAPE,
+# ranked last, "non-finite rows" counts the rows) and the rest of the grid still runs.
+
+def poisoned(series, positions, bad):
+    """A copy of `series` with `bad` at the given positions."""
+    series = series.copy()
+    for k in positions:
+        series.iloc[k] = bad
+    return series
+
+
+def without(items, k):
+    return [x for i, x in enumerate(items) if i != k]
+
+
+def scored_part(table):
+    """The scored pairs of a score_pairs table, keyed by (stage1, stage2)."""
+    good = table[table["non-finite rows"] == 0]
+    return {(int(r["stage1"]), int(r["stage2"])): tuple(r[k] for k in SCORE_KEYS)
+            for _, r in good.iterrows()}
+
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
 @pytest.mark.parametrize("bad", [nan, inf, -inf])
 @pytest.mark.parametrize("which", ["p", "m"])
-def test_score_pairs_refuses_a_nan_or_infinite_prediction(bad, which):
+def test_score_pairs_a_non_finite_prediction_is_not_scored(bad, which, metric):
     rows, ps, ms = pair_data()
     if which == "p":
-        ps[1] = ps[1].copy()
-        ps[1].iloc[3] = bad
+        ps[1] = poisoned(ps[1], [3], bad)
+        bad_pairs = {(1, 0), (1, 1)}
     else:
-        ms[1] = ms[1].copy()
-        ms[1].iloc[3] = bad
-    # Refused when the pair's cash is totalled (cash_totals), before total_scores sees it.
-    with pytest.raises(ValueError, match="^values holds a NaN or infinite value$"):
+        ms[1] = poisoned(ms[1], [3], bad)
+        bad_pairs = {(0, 1), (1, 1), (2, 1)}
+    table = score_pairs(rows, ps, ms, metric)
+    assert len(table) == 6
+    failed = table[table["non-finite rows"] > 0]
+    assert set(zip(failed["stage1"], failed["stage2"])) == bad_pairs
+    assert (failed["non-finite rows"] == 1).all()
+    for column in ("MAPE", "bias", "WAPE"):
+        assert (failed[column] == np.inf).all(), column  # +inf, never NaN or -inf
+    # The totals are still counted: 3 origins x 2 horizons, none with a zero actual.
+    assert (failed["totals"] == 6).all() and (failed["zero actual"] == 0).all()
+
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+@pytest.mark.parametrize("which", ["p", "m"])
+def test_score_pairs_non_finite_pairs_rank_last_in_grid_order(which, metric):
+    rows, ps, ms = pair_data(3, stage1=4, stage2=3)
+    if which == "p":
+        ps[2] = poisoned(ps[2], [0], nan)
+    else:
+        ms[0] = poisoned(ms[0], [0], inf)
+    table = score_pairs(rows, ps, ms, metric)
+    flags = (table["non-finite rows"] > 0).tolist()
+    n_bad = 3 if which == "p" else 4
+    assert flags == [False] * (12 - n_bad) + [True] * n_bad
+    # The scored part is still sorted best first, the failed tail keeps the grid order.
+    assert table[metric.upper()].iloc[:12 - n_bad].is_monotonic_increasing
+    tail = list(zip(table["stage1"].iloc[12 - n_bad:], table["stage2"].iloc[12 - n_bad:]))
+    assert tail == sorted(tail)
+    assert table.index.tolist() == list(range(12))
+
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+@pytest.mark.parametrize("which", ["p", "m"])
+@pytest.mark.parametrize("seed", range(3))
+def test_score_pairs_a_non_finite_setting_leaves_the_other_pairs_scores_unchanged(
+        which, metric, seed):
+    rows, ps, ms = pair_data(seed, stage1=3, stage2=3)
+    k = 1
+    if which == "p":
+        bad_ps, bad_ms = [*ps[:k], poisoned(ps[k], [5, 9], nan), *ps[k + 1:]], ms
+        clean = score_pairs(rows, without(ps, k), ms, metric)
+        remap = {(i, j): (i + (i >= k), j) for i, j in scored_part(clean)}
+    else:
+        bad_ps, bad_ms = ps, [*ms[:k], poisoned(ms[k], [5, 9], -inf), *ms[k + 1:]]
+        clean = score_pairs(rows, ps, without(ms, k), metric)
+        remap = {(i, j): (i, j + (j >= k)) for i, j in scored_part(clean)}
+    table = score_pairs(rows, bad_ps, bad_ms, metric)
+    expected = {remap[key]: value for key, value in scored_part(clean).items()}
+    assert scored_part(table) == expected  # exactly the same numbers
+    # And in the same order, with the failed pairs after them.
+    n_good = len(expected)
+    order = list(zip(table["stage1"].iloc[:n_good], table["stage2"].iloc[:n_good]))
+    clean_order = [remap[(int(i), int(j))] for i, j in zip(clean["stage1"], clean["stage2"])]
+    assert order == clean_order
+    assert (table["non-finite rows"].iloc[n_good:] == 2).all()
+
+
+def test_score_pairs_several_non_finite_settings():
+    rows, ps, ms = pair_data(4, stage1=3, stage2=2)
+    ps[0] = poisoned(ps[0], [2], nan)
+    ms[1] = poisoned(ms[1], [7, 8], inf)
+    table = score_pairs(rows, ps, ms, "mape")
+    counts = {(int(i), int(j)): int(n) for i, j, n in
+              zip(table["stage1"], table["stage2"], table["non-finite rows"])}
+    # p0 bad on row 2; m1 bad on rows 7, 8: (0, 1) is bad on all three rows.
+    assert counts == {(0, 0): 1, (0, 1): 3, (1, 0): 0, (1, 1): 2, (2, 0): 0, (2, 1): 2}
+    assert list(zip(table["stage1"], table["stage2"]))[2:] == [(0, 0), (0, 1), (1, 1), (2, 1)]
+    assert np.isfinite(table["MAPE"].iloc[:2]).all()
+    assert (table["MAPE"].iloc[2:] == np.inf).all()
+
+
+def test_score_pairs_a_row_bad_in_both_p_and_m_counts_once():
+    rows, ps, ms = pair_data(5, stage1=1, stage2=1)
+    table = score_pairs(rows, [poisoned(ps[0], [4], nan)], [poisoned(ms[0], [4], inf)],
+                        "mape")
+    assert table["non-finite rows"].tolist() == [1]
+
+
+def test_score_pairs_counts_every_non_finite_row():
+    rows, ps, ms = pair_data(6, stage1=1, stage2=1)
+    table = score_pairs(rows, ps, [poisoned(ms[0], range(0, 40, 4), nan)], "wape")
+    assert table["non-finite rows"].tolist() == [10]
+    assert table["WAPE"].tolist() == [np.inf]
+
+
+def test_score_pairs_every_pair_non_finite_keeps_the_grid_order():
+    rows, ps, ms = pair_data(7, stage1=2, stage2=2)
+    ms = [poisoned(m, [0], nan) for m in ms]
+    for metric in ("mape", "wape"):
+        table = score_pairs(rows, ps, ms, metric)
+        assert list(zip(table["stage1"], table["stage2"])) == list(
+            itertools.product(range(2), range(2)))
+        assert (table["non-finite rows"] == 1).all()
+        assert (table[["MAPE", "bias", "WAPE"]] == np.inf).all().all()
+
+
+@pytest.mark.parametrize("p_value, m_value", [(0.0, inf), (inf, 0.0), (0.0, -inf),
+                                              (-inf, 0.0)])
+def test_score_pairs_zero_times_infinity_is_non_finite(p_value, m_value):
+    # 0 x inf is NaN: the pair is not scored, even though one of the two is a plain 0.
+    rows, ps, ms = pair_data(8, stage1=1, stage2=1)
+    p, m = poisoned(ps[0], [6], p_value), poisoned(ms[0], [6], m_value)
+    table = score_pairs(rows, [p], [m], "mape")
+    assert table["non-finite rows"].tolist() == [1]
+    assert table["MAPE"].tolist() == [np.inf]
+
+
+def test_score_pairs_a_finite_p_and_m_whose_product_overflows_is_non_finite():
+    rows, ps, ms = pair_data(9, stage1=1, stage2=1)
+    p, m = poisoned(ps[0], [1], 1e200), poisoned(ms[0], [1], 1e200)
+    assert np.isfinite(p).all() and np.isfinite(m).all()
+    table = score_pairs(rows, [p], [m], "mape")
+    assert table["non-finite rows"].tolist() == [1]
+    assert table["bias"].tolist() == [np.inf]
+
+
+@pytest.mark.parametrize("which", ["p", "m"])
+def test_score_pairs_an_all_zero_finite_prediction_is_scored_normally(which):
+    rows, ps, ms = pair_data(10, stage1=2, stage2=2)
+    zero = pd.Series(0.0, index=rows.index)
+    if which == "p":
+        ps[1] = zero
+        zero_pairs = {(1, 0), (1, 1)}
+    else:
+        ms[0] = zero
+        zero_pairs = {(0, 0), (1, 0)}
+    table = score_pairs(rows, ps, ms, "mape")
+    assert (table["non-finite rows"] == 0).all()
+    for _, row in table.iterrows():
+        if (int(row["stage1"]), int(row["stage2"])) in zero_pairs:
+            # A forecast of 0 everywhere: every error is the whole actual.
+            assert row["MAPE"] == pytest.approx(1.0)
+            assert row["bias"] == pytest.approx(-1.0)
+            assert row["WAPE"] == pytest.approx(1.0)
+    # Being finite, they rank by their score like any other pair: last only if worst.
+    assert table["MAPE"].is_monotonic_increasing
+
+
+def test_score_pairs_an_all_zero_forecast_beats_a_non_finite_one():
+    rows, ps, ms = pair_data(11, stage1=1, stage2=2)
+    zero = pd.Series(0.0, index=rows.index)
+    table = score_pairs(rows, ps, [poisoned(ms[0], [0], nan), zero], "mape")
+    assert list(zip(table["stage1"], table["stage2"])) == [(0, 1), (0, 0)]
+    assert table["non-finite rows"].tolist() == [0, 1]
+
+
+def test_score_pairs_a_non_finite_pair_counts_the_zero_actual_totals_like_a_scored_one():
+    rows = pd.DataFrame({"origin_week": [40, 41], "h": [1, 1], "target_week": [41, 42],
+                         "amount_deflated": [100.0, 0.0]})
+    p = pd.Series([1.0, 1.0])
+    table = score_pairs(rows, [p], [pd.Series([80.0, 30.0]), pd.Series([nan, 30.0])],
+                        "mape")
+    assert table["totals"].tolist() == [2, 2]
+    assert table["zero actual"].tolist() == [1, 1]
+    assert table["non-finite rows"].tolist() == [0, 1]
+
+
+def test_score_pairs_int_predictions_are_scored():
+    rows, _, _ = pair_data(12)
+    p = pd.Series(1, index=rows.index, dtype="int64")
+    m = pd.Series(np.arange(40), index=rows.index, dtype="int64")
+    table = score_pairs(rows, [p], [m], "mape")
+    assert table["non-finite rows"].tolist() == [0]
+    expected = by_hand(rows, p.astype(float), m.astype(float))
+    assert table["MAPE"].iloc[0] == pytest.approx(expected["MAPE"], rel=1e-12)
+
+
+# The index check comes before any pair is formed: misaligned series are refused, never
+# turned into a NaN pair.
+
+@pytest.mark.parametrize("which", ["p", "m"])
+@pytest.mark.parametrize("change", ["shifted", "shorter", "longer", "reordered"])
+def test_score_pairs_refuses_a_series_without_the_rows_index(which, change):
+    rows, ps, ms = pair_data(13)
+    target = ps[2] if which == "p" else ms[1]
+    if change == "shifted":
+        target = target.set_axis(target.index + 1)
+    elif change == "shorter":
+        target = target.iloc[:-1]
+    elif change == "longer":
+        target = pd.concat([target, pd.Series([1.0], index=[999])])
+    else:
+        target = target.iloc[::-1]
+    if which == "p":
+        ps[2] = target
+    else:
+        ms[1] = target
+    with pytest.raises(ValueError, match=r"^values must have the rows of rows \(the same "
+                                         r"index\)$"):
         score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_index_check_comes_before_the_non_finite_handling():
+    # A grid holding both a NaN setting and a misaligned one is refused, not partly scored.
+    rows, ps, ms = pair_data(14)
+    ms[0] = poisoned(ms[0], [0], nan)
+    ps[1] = ps[1].set_axis(ps[1].index + 1000)
+    with pytest.raises(ValueError, match="^values must have the rows of rows"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_unknown_metric_is_reported_before_the_index_check():
+    rows, ps, ms = pair_data(15)
+    ps[0] = ps[0].set_axis(ps[0].index + 1000)
+    with pytest.raises(ValueError, match="^cannot rank pairs by 'r2'"):
+        score_pairs(rows, ps, ms, "r2")
+
+
+def test_score_pairs_with_a_non_finite_setting_does_not_change_its_inputs():
+    rows, ps, ms = pair_data(16)
+    ms[1] = poisoned(ms[1], [3], nan)
+    copies = rows.copy(deep=True), [p.copy() for p in ps], [m.copy() for m in ms]
+    score_pairs(rows, ps, ms, "mape")
+    pd.testing.assert_frame_equal(rows, copies[0])
+    for a, b in zip(ps + ms, copies[1] + copies[2]):
+        pd.testing.assert_series_equal(a, b)
 
 
 def test_score_pairs_refuses_a_nan_actual_amount():
@@ -647,6 +887,192 @@ def test_score_pairs_is_deterministic():
     rows, ps, ms = pair_data(9)
     pd.testing.assert_frame_equal(score_pairs(rows, ps, ms, "wape"),
                                   score_pairs(rows, ps, ms, "wape"))
+
+
+# check_actual_totals: the actual-total faults, checked on their own, by total_scores and once
+# by score_pairs before any pair (so they cannot hide behind "every pair is non-finite").
+
+MSG_EMPTY = "there are no totals to score"
+MSG_NONFINITE = "actual holds a NaN or infinite value"
+MSG_NEGATIVE = "an actual total is below 0; the totals are cash received"
+MSG_ALL_ZERO = "every actual total is 0: no error relative to the cash exists"
+
+
+def raises_exactly(message, call, *args):
+    with pytest.raises(ValueError) as error:
+        call(*args)
+    assert str(error.value) == message
+
+
+def test_check_actual_totals_refuses_empty():
+    raises_exactly(MSG_EMPTY, check_actual_totals, pd.Series([], dtype=float))
+
+
+@pytest.mark.parametrize("bad", [nan, inf, -inf])
+def test_check_actual_totals_refuses_nan_and_infinite(bad):
+    raises_exactly(MSG_NONFINITE, check_actual_totals, pd.Series([1.0, bad, 2.0]))
+
+
+def test_check_actual_totals_refuses_a_none_in_an_object_series():
+    raises_exactly(MSG_NONFINITE, check_actual_totals, pd.Series([1.0, None], dtype=object))
+
+
+@pytest.mark.parametrize("values", [[-0.5], [1.0, -1e-12], [-3.0, -1.0]])
+def test_check_actual_totals_refuses_a_negative_total(values):
+    raises_exactly(MSG_NEGATIVE, check_actual_totals, pd.Series(values))
+
+
+@pytest.mark.parametrize("values", [[0.0], [0.0, 0.0, 0.0], [0, 0]])
+def test_check_actual_totals_refuses_all_zero(values):
+    raises_exactly(MSG_ALL_ZERO, check_actual_totals, pd.Series(values))
+
+
+def test_check_actual_totals_negative_is_reported_even_when_the_sum_is_zero():
+    # -1 + 1 = 0: the negative check comes first, so it is not mistaken for "all zero".
+    raises_exactly(MSG_NEGATIVE, check_actual_totals, pd.Series([-1.0, 1.0]))
+
+
+def test_check_actual_totals_nan_is_reported_before_a_negative():
+    raises_exactly(MSG_NONFINITE, check_actual_totals, pd.Series([-1.0, nan]))
+
+
+def test_check_actual_totals_minus_zero_is_not_below_zero():
+    assert check_actual_totals(pd.Series([-0.0, 5.0])) is None
+
+
+@pytest.mark.parametrize("values", [
+    [0.0, 3.0, 0.0], [1.0], [0, 7], [1e-300, 0.0], [0.0] * 9 + [0.01],
+], ids=["zeros-around", "single", "ints", "tiny", "one-nonzero"])
+def test_check_actual_totals_accepts_valid_totals_with_some_zeros(values):
+    assert check_actual_totals(pd.Series(values)) is None
+
+
+def test_check_actual_totals_accepts_a_non_default_index():
+    assert check_actual_totals(pd.Series([0.0, 2.0], index=["b", "a"])) is None
+
+
+def test_check_actual_totals_does_not_change_its_input():
+    actual = pd.Series([0.0, 2.0, 0.0], index=[5, 3, 1])
+    copy = actual.copy()
+    check_actual_totals(actual)
+    pd.testing.assert_series_equal(actual, copy)
+
+
+# total_scores: the order of the checks is index, actual totals, then the forecast.
+
+@pytest.mark.parametrize("actual, message", [
+    ([1.0, nan], MSG_NONFINITE),
+    ([1.0, inf], MSG_NONFINITE),
+    ([1.0, -2.0], MSG_NEGATIVE),
+    ([0.0, 0.0], MSG_ALL_ZERO),
+], ids=["nan", "inf", "negative", "all-zero"])
+@pytest.mark.parametrize("bad_forecast", [nan, inf, -inf])
+def test_total_scores_reports_a_bad_actual_before_a_bad_forecast(actual, message,
+                                                                  bad_forecast):
+    raises_exactly(message, total_scores, pd.Series(actual), pd.Series([bad_forecast, 1.0]))
+
+
+def test_total_scores_empty_actual_and_forecast_reports_no_totals():
+    raises_exactly(MSG_EMPTY, total_scores, pd.Series([], dtype=float),
+                   pd.Series([], dtype=float))
+
+
+def test_total_scores_index_check_still_comes_before_a_bad_actual():
+    raises_exactly("forecast and actual must have the same totals (the same index)",
+                   total_scores, pd.Series([-1.0, nan]), pd.Series([nan], index=[7]))
+
+
+def test_total_scores_a_good_actual_with_a_bad_forecast_reports_the_forecast():
+    raises_exactly("forecast holds a NaN or infinite value", total_scores,
+                   pd.Series([0.0, 2.0]), pd.Series([1.0, nan]))
+
+
+# score_pairs: the actual totals are checked once, before the loop.
+
+def every_pair_non_finite(rows, ps, ms):
+    """The grid of ps x ms with every m poisoned, so no pair would reach total_scores."""
+    return ps, [poisoned(m, [0], nan) for m in ms]
+
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+def test_score_pairs_every_pair_non_finite_with_a_negative_actual_raises(metric):
+    rows, ps, ms = pair_data(20, stage1=2, stage2=2)
+    rows.loc[rows.index[0], "amount_deflated"] = -1e6  # its total goes below 0
+    ps, ms = every_pair_non_finite(rows, ps, ms)
+    raises_exactly(MSG_NEGATIVE, score_pairs, rows, ps, ms, metric)
+
+
+@pytest.mark.parametrize("metric", ["mape", "wape"])
+def test_score_pairs_every_pair_non_finite_with_all_zero_actuals_raises(metric):
+    rows, ps, ms = pair_data(21, stage1=2, stage2=2)
+    rows["amount_deflated"] = 0.0
+    ps, ms = every_pair_non_finite(rows, ps, ms)
+    raises_exactly(MSG_ALL_ZERO, score_pairs, rows, ps, ms, metric)
+
+
+@pytest.mark.parametrize("bad", ["p", "m", "overflow"])
+def test_score_pairs_single_non_finite_pair_with_a_negative_actual_raises(bad):
+    rows, ps, ms = pair_data(22, stage1=1, stage2=1)
+    rows["amount_deflated"] = -1.0
+    p, m = ps[0], ms[0]
+    if bad == "p":
+        p = poisoned(p, [3], inf)
+    elif bad == "m":
+        m = poisoned(m, [3], -inf)
+    else:
+        p, m = poisoned(p, [3], 1e200), poisoned(m, [3], 1e200)
+    raises_exactly(MSG_NEGATIVE, score_pairs, rows, [p], [m], "mape")
+
+
+def test_score_pairs_a_negative_row_whose_total_stays_positive_is_scored():
+    # The check is on the totals, not the rows: a refund row inside a positive total is fine.
+    rows, ps, ms = pair_data(23, stage1=1, stage2=1)
+    first = rows.index[0]
+    key = rows.loc[first, ["origin_week", "h"]]
+    same = rows.index[(rows["origin_week"] == key["origin_week"]) & (rows["h"] == key["h"])]
+    rows.loc[same, "amount_deflated"] = 10.0
+    rows.loc[first, "amount_deflated"] = -1.0
+    assert len(same) > 1
+    table = score_pairs(rows, ps, ms, "mape")
+    assert table["non-finite rows"].tolist() == [0]
+    assert np.isfinite(table["MAPE"]).all()
+
+
+@pytest.mark.parametrize("stage1, stage2", [(0, 2), (2, 0), (0, 0)])
+def test_score_pairs_an_empty_grid_still_refuses_bad_actuals(stage1, stage2):
+    rows, ps, ms = pair_data(24, stage1=stage1, stage2=stage2)
+    rows["amount_deflated"] = 0.0
+    raises_exactly(MSG_ALL_ZERO, score_pairs, rows, ps, ms, "mape")
+
+
+def test_score_pairs_no_rows_reports_no_totals():
+    rows = pair_rows(25).iloc[0:0]
+    empty = pd.Series([], dtype=float, index=rows.index)
+    raises_exactly(MSG_EMPTY, score_pairs, rows, [empty], [empty], "mape")
+
+
+def test_score_pairs_metric_check_comes_before_the_actual_totals_check():
+    rows, ps, ms = pair_data(26)
+    rows["amount_deflated"] = 0.0
+    with pytest.raises(ValueError, match="^cannot rank pairs by 'r2'"):
+        score_pairs(rows, ps, ms, "r2")
+
+
+def test_score_pairs_index_check_comes_before_the_actual_totals_check():
+    rows, ps, ms = pair_data(27)
+    rows["amount_deflated"] = -1.0
+    ps[0] = ps[0].set_axis(ps[0].index + 1000)
+    with pytest.raises(ValueError, match="^values must have the rows of rows"):
+        score_pairs(rows, ps, ms, "mape")
+
+
+def test_score_pairs_valid_actuals_with_a_zero_total_and_every_pair_non_finite_is_a_table():
+    rows = pd.DataFrame({"origin_week": [40, 41], "h": [1, 1], "target_week": [41, 42],
+                         "amount_deflated": [100.0, 0.0]})
+    table = score_pairs(rows, [pd.Series([1.0, 1.0])], [pd.Series([nan, 1.0])], "mape")
+    assert table["non-finite rows"].tolist() == [1]
+    assert table["zero actual"].tolist() == [1]
+    assert table["MAPE"].tolist() == [np.inf]
 
 
 def test_total_codes_was_removed():

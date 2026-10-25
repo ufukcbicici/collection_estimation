@@ -570,10 +570,26 @@ def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, ca
     grid1 = stage1_grid(settings.stage1, joint)
     grid2 = stage2_grid(settings.stage2, joint)
     validation = splits.validation
-    p_by_stage1 = [predict_p(c.settings, "train", validation) for c in grid1]
-    m_by_stage2 = [predict_m(c.settings, "train", validation) for c in grid2]
+
+    def predict_grid(stage, grid, predict):
+        """Fits and predicts every setting of one grid, printing a line after each."""
+        predictions = []
+        started = time.perf_counter()
+        for done, candidate in enumerate(grid, start=1):
+            predictions.append(predict(candidate.settings, "train", validation))
+            elapsed = time.perf_counter() - started
+            left = elapsed / done * (len(grid) - done)
+            print(f"  {stage} grid: {done} of {len(grid)} done ({candidate.params}); "
+                  f"{elapsed:.0f} s so far, about {left:.0f} s left")
+        return predictions
+
+    p_by_stage1 = predict_grid("stage 1", grid1, predict_p)
+    m_by_stage2 = predict_grid("stage 2", grid2, predict_m)
     pairs = score_pairs(validation, p_by_stage1, m_by_stage2, joint.selection_metric)
     best = pairs.iloc[0]
+    if best["non-finite rows"] > 0:
+        raise ValueError("step 15: every pair of the grid gave a NaN or infinite forecast "
+                         "on some validation rows, so none can be chosen")
     chosen = (grid1[int(best["stage1"])], grid2[int(best["stage2"])])
     default = (settings.stage1, settings.stage2)
     pairs = pd.concat([pd.DataFrame([{**{f"s1 {k}": v for k, v in grid1[i].params.items()},
@@ -1138,6 +1154,11 @@ def show_joint_grid(pairs, metric):
     print(f"        the 10 best of {len(pairs)} pairs by validation {metric} of the "
           f"consolidated weekly totals:")
     print(pairs.head(10).round(4).to_string(index=False))
+    failed = pairs[pairs["non-finite rows"] > 0]
+    if not failed.empty:
+        print(f"        {len(failed)} pairs NOT scored (a NaN or infinite p x m on some rows; "
+              f"ranked last with infinite scores):")
+        print(failed.to_string(index=False))
 
 
 def show_joint_results(tables, chosen, samples):
