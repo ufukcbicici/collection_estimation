@@ -191,6 +191,120 @@ def test_recent_level_does_not_need_a_sorted_index():
     assert recent_level(series, 9) == pytest.approx(7.5)
 
 
+# --- recent_level: the `weeks` parameter (U12.1) --------------------------------------------
+
+def powers_of_two(first=0, last=30):
+    """Week w holds 2**w: every subset of weeks has its own sum, so a wrong window shows."""
+    weeks = list(range(first, last + 1))
+    return pd.Series([float(2 ** w) for w in weeks], index=weeks)
+
+
+@pytest.mark.parametrize("weeks", [1, 2, 4, 8, 13])
+def test_recent_level_weeks_is_the_mean_of_that_many_weeks_ending_at_the_origin(weeks):
+    series = powers_of_two()
+    origin = 20
+    expected = sum(2.0 ** w for w in range(origin - weeks + 1, origin + 1)) / weeks
+    assert recent_level(series, origin, weeks=weeks) == pytest.approx(expected, rel=1e-15)
+
+
+def test_recent_level_one_week_is_the_origins_own_value():
+    series = powers_of_two()
+    assert recent_level(series, 17, weeks=1) == 2.0 ** 17
+    # Week 17 missing: nothing else is in a one-week window.
+    assert np.isnan(recent_level(series.drop(17), 17, weeks=1))
+
+
+def test_recent_level_weeks_can_be_passed_by_position():
+    series = powers_of_two()
+    assert recent_level(series, 20, 8) == recent_level(series, 20, weeks=8)
+
+
+@pytest.mark.parametrize("weeks", [1, 8, 13])
+def test_recent_level_window_edges_with_a_custom_weeks(weeks):
+    # Week origin - weeks is just outside; origin - weeks + 1 and the origin are inside.
+    origin = 40
+    values = {origin - weeks: 1e9, origin - weeks + 1: 3.0, origin: 5.0}   # one key if weeks 1
+    series = pd.Series(values)
+    expected = 5.0 if weeks == 1 else 4.0
+    assert recent_level(series, origin, weeks=weeks) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("weeks", [8, 13])
+def test_recent_level_custom_weeks_skips_missing_weeks_rather_than_counting_them_as_zero(weeks):
+    # Two weeks with data in the window: their mean, not their sum divided by `weeks`.
+    series = pd.Series([100.0, 300.0], index=[40 - weeks + 1, 40])
+    assert recent_level(series, 40, weeks=weeks) == pytest.approx(200.0)
+
+
+def test_recent_level_custom_weeks_a_zero_week_counts_unlike_a_missing_one():
+    series = pd.Series([100.0, 0.0, 300.0], index=[33, 35, 40])
+    assert recent_level(series, 40, weeks=8) == pytest.approx(400.0 / 3)
+    assert recent_level(series.drop(35), 40, weeks=8) == pytest.approx(200.0)
+
+
+@pytest.mark.parametrize("weeks", [1, 8, 13])
+def test_recent_level_custom_weeks_is_nan_when_the_window_has_no_data(weeks):
+    # Data only just outside the window, and after the origin.
+    series = pd.Series([5.0, 7.0], index=[40 - weeks, 41])
+    assert np.isnan(recent_level(series, 40, weeks=weeks))
+    assert np.isnan(recent_level(pd.Series([], dtype=float), 40, weeks=weeks))
+
+
+@pytest.mark.parametrize("weeks", [1, 2, 4, 8, 13, 52])
+def test_recent_level_never_reads_a_week_after_the_origin_for_any_weeks(weeks):
+    base = pd.Series(np.arange(1.0, 81.0), index=range(0, 80))
+    origin = 40
+    expected = recent_level(base, origin, weeks=weeks)
+    for week in range(origin + 1, 80):
+        changed = base.copy()
+        changed[week] = 1e9
+        assert recent_level(changed, origin, weeks=weeks) == expected, week
+    assert recent_level(base.loc[:origin], origin, weeks=weeks) == expected
+
+
+def test_recent_level_weeks_longer_than_the_history_uses_all_weeks_up_to_the_origin():
+    series = pd.Series([2.0, 4.0, 6.0, 100.0], index=[0, 1, 2, 3])
+    assert recent_level(series, 2, weeks=500) == pytest.approx(4.0)
+
+
+def test_recent_level_custom_weeks_does_not_need_a_sorted_index():
+    series = pd.Series([16.0, 2.0, 8.0, 4.0, 1e6], index=[9, 6, 8, 7, 1])
+    assert recent_level(series, 9, weeks=8) == pytest.approx(7.5)
+
+
+@pytest.mark.parametrize("weeks", [0, -1, -4])
+def test_recent_level_refuses_weeks_below_one(weeks):
+    with pytest.raises(ValueError) as error:
+        recent_level(powers_of_two(), 20, weeks=weeks)
+    assert str(error.value) == f"weeks is {weeks}; the level needs at least 1 week"
+
+
+def test_recent_level_refuses_weeks_below_one_even_on_an_empty_series():
+    with pytest.raises(ValueError):
+        recent_level(pd.Series([], dtype=float), 20, weeks=0)
+
+
+@pytest.mark.parametrize("origin", [3, 10, 20, 30])
+def test_recent_level_default_equals_weeks_level_weeks(origin):
+    series = powers_of_two().drop([9, 18])
+    default = recent_level(series, origin)
+    explicit = recent_level(series, origin, weeks=LEVEL_WEEKS)
+    assert default == explicit or (np.isnan(default) and np.isnan(explicit))
+
+
+def test_recent_level_default_window_is_four_weeks():
+    series = powers_of_two()
+    assert recent_level(series, 20) == pytest.approx((2 ** 17 + 2 ** 18 + 2 ** 19 + 2 ** 20) / 4)
+    assert recent_level(series, 20) != recent_level(series, 20, weeks=5)
+
+
+def test_recent_level_does_not_change_its_input():
+    series = powers_of_two()
+    copy = series.copy(deep=True)
+    recent_level(series, 20, weeks=13)
+    pd.testing.assert_series_equal(series, copy)
+
+
 # --- deflated_forecasts: shape ---------------------------------------------------------------
 
 def test_deflated_forecasts_one_row_per_origin_in_the_given_order():

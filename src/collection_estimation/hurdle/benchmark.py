@@ -50,11 +50,13 @@ def cash_totals(rows: pd.DataFrame, values: pd.Series, by_company: bool) -> pd.D
     return frame.groupby(keys, as_index=False, observed=True)["total"].sum()
 
 
-def recent_level(series: pd.Series, origin: int) -> float:
+def recent_level(series: pd.Series, origin: int, weeks: int = LEVEL_WEEKS) -> float:
     """The mean of `series` (cash per week, indexed by week, weeks without data absent) over
-    the LEVEL_WEEKS weeks ending at `origin`; weeks without data are left out. NaN if none of
-    them has data. Reads no week after `origin`."""
-    window = series[(series.index > origin - LEVEL_WEEKS) & (series.index <= origin)]
+    the `weeks` weeks ending at `origin`; weeks without data are left out. NaN if none of
+    them has data. Reads no week after `origin`. Raises ValueError if `weeks` is below 1."""
+    if weeks < 1:
+        raise ValueError(f"weeks is {weeks}; the level needs at least 1 week")
+    window = series[(series.index > origin - weeks) & (series.index <= origin)]
     return float(window.mean()) if len(window) else float("nan")
 
 

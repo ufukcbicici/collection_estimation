@@ -4644,3 +4644,169 @@ def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday
     _, body = holiday_positions_run["('drain',)"]
     line = next(line for line in body.splitlines() if "week 50 (" in line)
     assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line
+
+
+# U12.1: the top-ups' trailing means at the diagnostic origin, printed after the deflated
+# label. The wiring is checked on main()'s source; the printout is run on hand-built side
+# tables in a separate process. Two companies, origin 13, horizons 2, price levels that move
+# every week (so deflating by the wrong week shows). TR04 has no refund row in weeks 11 and 12,
+# so the sum of each company's own mean differs from the mean of the summed series. The
+# expected values are computed in the script by plain loops over dicts, not by the module.
+TRAILING = """
+import inspect
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import prices, topups
+
+source = " ".join(inspect.getsource(script.main).split())
+call = ("show_trailing_means(new_cash, refunds, unidentified, levels, "
+        "settings.diagnostic.origin, settings.receivables.horizons, companies)")
+assert call in source, "show_trailing_means is not called as expected"
+assert (source.index("show_deflated_label(panel, levels)") < source.index(call)
+        < source.index("table = join_features(panel, history, calendar, owed)"))
+for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
+              "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
+              "companies = list(settings.companies.known)"):
+    assert source.index(built) < source.index(call), built
+assert script.TOPUP_WINDOWS == (4, 8, 13)
+assert script.deflate is prices.deflate
+assert script.trailing_mean_forecasts is topups.trailing_mean_forecasts
+inspect.signature(script.show_trailing_means).bind(
+    "new_cash", "refunds", "unidentified", "levels", 13, 2, ["TR02"])
+
+companies = ["TR02", "TR04"]
+origin, horizons = 13, 2
+last = 15
+level_of = {w: 1.0 + 0.1 * w for w in range(0, last + 1)}   # plain floats, by hand
+levels = pd.Series(level_of)
+
+new_rows = []
+for company, scale in (("TR02", 1e6), ("TR04", 2.5e6)):
+    for o in range(0, last):
+        for h in (1, 2):
+            if o + h <= last:
+                new_rows.append({"company_code": company, "origin_week": o, "h": h,
+                                 "target_week": o + h,
+                                 "new_customer_cash": scale * (1 + (o + h) % 5) * h})
+new_cash = pd.DataFrame(new_rows)
+refund_rows = []
+for company, scale in (("TR02", -1e5), ("TR04", -7e5)):
+    for w in range(0, last + 1):
+        if company == "TR04" and w in (11, 12):
+            continue
+        refund_rows.append({"company_code": company, "week": w, "refunds": scale * (w + 1)})
+refunds = pd.DataFrame(refund_rows)
+g_rows = []
+for company, scale in (("TR02", 3e5), ("TR04", 4e5)):
+    for w in range(0, last + 1):
+        g_rows.append({"company_code": company, "week": w,
+                       "unidentified_cash": scale * (w % 4)})
+unidentified = pd.DataFrame(g_rows)
+copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified)]
+
+
+def by_hand(rows, week_key, value_key, window, h):
+    total = 0.0
+    for company in companies:
+        values = [r[value_key] / level_of[r[week_key]] for r in rows
+                  if r["company_code"] == company and (h is None or r["h"] == h)
+                  and origin - window < r[week_key] <= origin]
+        total += sum(values) / len(values)
+    return total / 1e6
+
+
+def actual(rows, week_key, value_key, h, target):
+    return sum(r[value_key] / level_of[r[week_key]] for r in rows
+               if r[week_key] == target and (h is None or r["h"] == h)) / 1e6
+
+
+expected = []
+for h_ in (1, 2):
+    line = [h_, origin + h_]
+    for rows, week_key, value_key, hh in (
+            (new_rows, "target_week", "new_customer_cash", h_),
+            (refund_rows, "week", "refunds", None), (g_rows, "week", "unidentified_cash", None)):
+        for window in (4, 8, 13):
+            line.append(by_hand(rows, week_key, value_key, window, hh))
+        line.append(actual(rows, week_key, value_key, hh, origin + h_))
+    expected.append(line)
+
+# The case is discriminating: R's mean of the summed series differs from the sum of means.
+summed = {}
+for r in refund_rows:
+    if origin - 4 < r["week"] <= origin:
+        summed[r["week"]] = summed.get(r["week"], 0.0) + r["refunds"] / level_of[r["week"]]
+mean_of_sum = sum(summed.values()) / len(summed) / 1e6
+assert abs(mean_of_sum - expected[0][6]) > 0.01, (mean_of_sum, expected[0][6])
+
+script.show_trailing_means(new_cash, refunds, unidentified, levels, origin, horizons, companies)
+for table, copy in zip((new_cash, refunds, unidentified), copies):
+    pd.testing.assert_frame_equal(table, copy)
+print("EXPECTED " + repr(expected))
+print("MEANOFSUM " + repr(mean_of_sum))
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def trailing_run():
+    result = subprocess.run([sys.executable, "-c", TRAILING], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    expected = eval(next(line for line in lines if line.startswith("EXPECTED "))[9:])
+    mean_of_sum = float(next(line for line in lines if line.startswith("MEANOFSUM "))[10:])
+    title = ("top-ups, trailing mean at origin 13, all companies, million TRY of week 0 "
+             "(actual = what came, hindsight):")
+    assert title in lines, result.stdout
+    table = lines[lines.index(title) + 1:]
+    return {"header": table[0], "rows": [row.split() for row in table[1:3]],
+            "expected": expected, "mean_of_sum": mean_of_sum}
+
+
+def test_trailing_means_are_wired_in_after_the_deflated_label(trailing_run):
+    # The source checks (call text, order, imports, TOPUP_WINDOWS) ran in the fixture.
+    assert len(trailing_run["rows"]) == 2
+
+
+def test_trailing_means_printout_columns(trailing_run):
+    names = ["h", "target", "week"]
+    for top_up in ("A", "R", "G"):
+        for window in (4, 8, 13):
+            names += [top_up, "mean", str(window)]
+        names += [top_up, "actual"]
+    assert trailing_run["header"].split() == names
+
+
+def test_trailing_means_printout_one_row_per_h_with_its_target_week(trailing_run):
+    assert [row[:2] for row in trailing_run["rows"]] == [["1", "14"], ["2", "15"]]
+
+
+def test_trailing_means_printout_matches_the_hand_computed_values(trailing_run):
+    # Each company's own trailing mean (A deflated by target week, R and G by week), summed
+    # over the companies, and the actual at origin + h, in million TRY rounded to 3 places.
+    for row, expected in zip(trailing_run["rows"], trailing_run["expected"]):
+        printed = [float(value) for value in row[2:]]
+        assert printed == pytest.approx(expected[2:], abs=6e-4), (printed, expected)
+
+
+def test_trailing_means_printout_sums_each_companys_own_mean(trailing_run):
+    # R, window 4: the sum of the per-company means, not the mean of the summed series.
+    printed = float(trailing_run["rows"][0][6])
+    assert printed == pytest.approx(trailing_run["expected"][0][6], abs=6e-4)
+    assert abs(printed - trailing_run["mean_of_sum"]) > 0.01
+
+
+def test_trailing_means_printout_r_and_g_are_flat_over_h_and_a_is_not(trailing_run):
+    h1, h2 = ([float(value) for value in row[2:]] for row in trailing_run["rows"])
+    # Columns: A 4/8/13/actual (0-3), R 4/8/13/actual (4-7), G 4/8/13/actual (8-11).
+    assert h1[4:7] == h2[4:7] and h1[8:11] == h2[8:11]
+    assert h1[0:3] != h2[0:3]
+
+
+def test_trailing_means_printout_is_in_million_try(trailing_run):
+    # TR02 + TR04 G mean over 4 weeks, deflated: about a million, printed as such (not TRY).
+    value = float(trailing_run["rows"][0][10])
+    assert 0.1 < abs(value) < 10.0
+    assert value == pytest.approx(trailing_run["expected"][0][10], abs=6e-4)

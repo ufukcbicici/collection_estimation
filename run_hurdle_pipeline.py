@@ -124,6 +124,7 @@ from collection_estimation.hurdle.training_table import (  # noqa: E402
     rows_at_origin,
     rows_known_at,
 )
+from collection_estimation.hurdle.topups import trailing_mean_forecasts  # noqa: E402
 from collection_estimation.hurdle.side_tables import (  # noqa: E402
     check_side_tables,
     is_unidentified,
@@ -140,7 +141,7 @@ from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
     load_ledger,
 )
-from collection_estimation.hurdle.prices import price_weeks, published_levels  # noqa: E402
+from collection_estimation.hurdle.prices import deflate, price_weeks, published_levels  # noqa: E402
 from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 from collection_estimation.hurdle.series import (  # noqa: E402
     add_week_index,
@@ -155,6 +156,8 @@ from collection_estimation.hurdle.series import (  # noqa: E402
 # ----------------------------------------------------------------------------------------
 DEFAULT_SETTINGS_FILE = REPO_ROOT / "settings" / "synthetic.toml"
 SETTINGS_FILE = Path(os.environ.get("HURDLE_SETTINGS", DEFAULT_SETTINGS_FILE))
+# The trailing-mean windows the top-ups' printout shows (U12.1); U12.3 compares them.
+TOPUP_WINDOWS = (4, 8, 13)
 
 
 def main():
@@ -363,6 +366,11 @@ def main():
     # The label in TRY of week 0, like the features: divided by its target week's level.
     panel = add_deflated_label(panel, levels)
     show_deflated_label(panel, levels)
+
+    # U12.1, the top-ups' trailing mean: each company's A, R and G forecast at the diagnostic
+    # origin, the mean of its last 4, 8 or 13 target weeks (deflated), beside what came.
+    show_trailing_means(new_cash, refunds, unidentified, levels, settings.diagnostic.origin,
+                        settings.receivables.horizons, companies)
 
     # The training table: one row per panel row, with its label and every feature block.
     table = join_features(panel, history, calendar, owed)
@@ -995,6 +1003,40 @@ def show_deflated_label(panel, levels):
     per_week["level"] = per_week.index.map(levels)
     print("        at h=1, label per target week, million TRY (nominal / of week 0), every 16th:")
     print((per_week.loc[per_week.index % 16 == 0] / [1e6, 1e6, 1, 1]).round(3).to_string())
+
+
+def show_trailing_means(new_cash, refunds, unidentified, levels, origin, horizons, companies):
+    """A short printout of U12.1: the trailing-mean forecasts of A, R and G made at `origin`,
+    all companies added up (each company forecast on its own series), for every window in
+    TOPUP_WINDOWS, beside the actual cash (hindsight). Million TRY of week 0."""
+    new_cash = new_cash.assign(deflated=deflate(new_cash["new_customer_cash"],
+                                                new_cash["target_week"], levels))
+    refunds = refunds.assign(deflated=deflate(refunds["refunds"], refunds["week"], levels))
+    unidentified = unidentified.assign(deflated=deflate(unidentified["unidentified_cash"],
+                                                        unidentified["week"], levels))
+
+    def forecast(table, week_column, h, window):
+        """The trailing mean at `origin`, every company's series on its own, added up."""
+        total = 0.0
+        for company in companies:
+            series = table[table["company_code"] == company].set_index(week_column)["deflated"]
+            total += trailing_mean_forecasts(series, h, [origin], window)["forecast"].iloc[0]
+        return total / 1e6
+
+    print(f"        top-ups, trailing mean at origin {origin}, all companies, million TRY of "
+          f"week 0 (actual = what came, hindsight):")
+    lines = []
+    for h in range(1, horizons + 1):
+        a_h = new_cash[new_cash["h"] == h]
+        line = {"h": h, "target week": origin + h}
+        for name, table, week_column in (("A", a_h, "target_week"), ("R", refunds, "week"),
+                                         ("G", unidentified, "week")):
+            for window in TOPUP_WINDOWS:
+                line[f"{name} mean {window}"] = forecast(table, week_column, h, window)
+            line[f"{name} actual"] = table.loc[table[week_column] == origin + h,
+                                               "deflated"].sum() / 1e6
+        lines.append(line)
+    print(pd.DataFrame(lines).round(3).to_string(index=False))
 
 
 def show_table(table, panel):
