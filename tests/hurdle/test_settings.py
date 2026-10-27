@@ -4383,7 +4383,7 @@ def test_the_synthetic_joint_diagnostic_settings():
     assert joint.run is True
     assert (joint.stage1_log_loss_tolerance, joint.stage1_slope_band) == (0.10, (0.8, 1.25))
     assert (joint.stage2_skill_tolerance, joint.stage2_ratio_band) == (0.05, (0.9, 1.1))
-    assert joint.selection_metric == "mape"
+    assert joint.selection_metric == "wape"
     assert joint.bootstrap_samples == 2000
     assert joint.output_folder == (REPO_ROOT / "data" / "interim"
                                    / "hurdle_joint_diagnostic").resolve()

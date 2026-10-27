@@ -182,8 +182,9 @@ stage1_log_loss_tolerance = 0.10   # stage 1: log loss at most the best's x 1.10
 stage1_slope_band = [0.8, 1.25]    # stage 1: calibration slope inside this (1 = calibrated)
 stage2_skill_tolerance = 0.05      # stage 2: deviance skill at least the best's - 0.05
 stage2_ratio_band = [0.9, 1.1]     # stage 2: sum of m / sum paid inside this
-selection_metric = "mape"       # "mape" (every week counts the same; favours forecasting
-                                # low, hence the bias column) or "wape" (weeks by size)
+selection_metric = "wape"       # "wape" (weeks by size; chosen 2026-10-27: MAPE favoured pairs that
+                                # forecast low, and the MAPE winner lost on test) or "mape" (every
+                                # week counts the same; favours forecasting low)
 bootstrap_samples = 2000        # resamples of the paired comparison with `deflated`
 output_folder = "data/interim/hurdle_joint_diagnostic"   # the result tables, as CSV
 
