@@ -80,7 +80,9 @@ from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
     paired_bootstrap,
     score_pairs,
     scores_by_h,
+    stage1_gates,
     stage1_grid,
+    stage2_gates,
     stage2_grid,
 )
 from collection_estimation.hurdle.diagnostic import (  # noqa: E402
@@ -585,7 +587,36 @@ def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, ca
 
     p_by_stage1 = predict_grid("stage 1", grid1, predict_p)
     m_by_stage2 = predict_grid("stage 2", grid2, predict_m)
-    pairs = score_pairs(validation, p_by_stage1, m_by_stage2, joint.selection_metric)
+
+    # U11.5b, the eligibility gates: each setting checked on its own on validation, so a pair
+    # can win only if both halves make sense alone (a lucky pair of a broken stage 1 and an
+    # m that goes negative once won validation 0.103 and lost test 0.282).
+    base_rate = reference_probabilities(splits.train, validation,
+                                        settings.diagnostic.reference_window,
+                                        settings.diagnostic.reference_prior_weeks)["base rate"]
+    gates1 = stage1_gates(validation["paid"], p_by_stage1, base_rate,
+                          joint.stage1_log_loss_tolerance, joint.stage1_slope_band)
+    paid = validation[validation["paid"].astype(bool)]
+    training_mean = amount_references(splits.train, paid,
+                                      settings.diagnostic.amount_reference_window,
+                                      settings.diagnostic.reference_prior_weeks)["training mean"]
+    gates2 = stage2_gates(paid["amount_deflated"], [m[paid.index] for m in m_by_stage2],
+                          training_mean, joint.stage2_skill_tolerance, joint.stage2_ratio_band)
+    gates1 = with_params(gates1, grid1, "stage1")
+    gates2 = with_params(gates2, grid2, "stage2")
+    show_gates("stage 1", gates1, "log loss", ascending=True)
+    show_gates("stage 2", gates2, "deviance skill", ascending=False)
+    eligible1 = [int(i) for i in gates1.loc[gates1["eligible"], "stage1"]]
+    eligible2 = [int(j) for j in gates2.loc[gates2["eligible"], "stage2"]]
+    if not eligible1 or not eligible2:
+        raise ValueError(f"step 15: {len(eligible1)} stage-1 and {len(eligible2)} stage-2 "
+                         f"settings passed the eligibility gates, so no pair can be scored")
+
+    pairs = score_pairs(validation, [p_by_stage1[i] for i in eligible1],
+                        [m_by_stage2[j] for j in eligible2], joint.selection_metric)
+    # score_pairs numbers the settings it was given from 0; back to their grid numbers.
+    pairs["stage1"] = [eligible1[k] for k in pairs["stage1"]]
+    pairs["stage2"] = [eligible2[k] for k in pairs["stage2"]]
     best = pairs.iloc[0]
     if best["non-finite rows"] > 0:
         raise ValueError("step 15: every pair of the grid gave a NaN or infinite forecast "
@@ -601,7 +632,7 @@ def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, ca
     # b, the chosen pair and the default pair: validation (fitted on train) and test (refitted
     # on train + validation), with `deflated` fitted on the same target weeks.
     labelled = table[table["label_status"] == "labelled"]
-    tables = {"pairs": pairs}
+    tables = {"pairs": pairs, "stage1_gates": gates1, "stage2_gates": gates2}
     for part, fit_part, train_until in (("validation", "train", origin),
                                         ("test", "refit", origin + horizons)):
         rows = getattr(splits, part)
@@ -1147,6 +1178,25 @@ def show_cash_by_p_group(table):
           "(sum of p x m) vs actual cash, deflated (ratio = expected / actual):")
     print(table.round({"p_low": 4, "p_high": 4, "mean_p": 4, "expected_cash": 0,
                        "actual_cash": 0, "ratio": 3}).to_string(index=False))
+
+
+def with_params(gates, grid, number_column):
+    """A gate table with each setting's grid parameters added after its number."""
+    params = pd.DataFrame([grid[int(i)].params for i in gates[number_column]])
+    return pd.concat([gates[[number_column]], params, gates.drop(columns=number_column)],
+                     axis=1)
+
+
+def show_gates(stage, gates, score, ascending):
+    """Step 15's eligibility gates for one stage: how many settings passed, why the others
+    failed, and the best few that passed by `score`."""
+    gate_columns = [column for column in gates.columns if column.endswith(" gate")]
+    passed = gates[gates["eligible"]]
+    failed = {column: int((~gates[column]).sum()) for column in gate_columns}
+    print(f"        {stage} gates: {len(passed)} of {len(gates)} settings eligible; settings "
+          f"failing each gate: {failed}")
+    best = passed.sort_values(score, ascending=ascending).head(5)
+    print(best.drop(columns=[*gate_columns, "eligible"]).round(4).to_string(index=False))
 
 
 def show_joint_grid(pairs, metric):

@@ -3763,8 +3763,11 @@ from collection_estimation.hurdle import benchmark, diagnostic, diagnostic_joint
 
 for name in ("benchmark_forecasts", "cash_totals"):
     assert getattr(script, name) is getattr(benchmark, name), name
-for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "stage2_grid"):
+for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "stage2_grid",
+             "stage1_gates", "stage2_gates"):
     assert getattr(script, name) is getattr(diagnostic_joint, name), name
+inspect.signature(script.with_params).bind("gates", "grid", "stage1")
+inspect.signature(script.show_gates).bind("stage 1", "gates", "log loss", ascending=True)
 # total_codes was removed: score_pairs sums p x m per total with cash_totals itself.
 assert not hasattr(diagnostic_joint, "total_codes")
 assert not hasattr(script, "total_codes")
@@ -3810,8 +3813,9 @@ def test_step_15_scores_the_pairs_on_the_validation_rows_with_series_predictions
                  "return predictions",
                  'p_by_stage1 = predict_grid("stage 1", grid1, predict_p)',
                  'm_by_stage2 = predict_grid("stage 2", grid2, predict_m)',
-                 "pairs = score_pairs(validation, p_by_stage1, m_by_stage2, "
-                 "joint.selection_metric)"):
+                 # U11.5b: only the settings that passed the eligibility gates are paired.
+                 "pairs = score_pairs(validation, [p_by_stage1[i] for i in eligible1], "
+                 "[m_by_stage2[j] for j in eligible2], joint.selection_metric)"):
         assert line in source, line
     assert source.count("score_pairs(") == 1
     assert source.count("predictions.append(") == 1
@@ -3881,12 +3885,15 @@ stage2 = Stage2Settings(loss="poisson", max_iter=5, learning_rate=0.3, max_leaf_
                         min_samples_leaf=5, random_seed=1, feature_blocks=("history",),
                         scale="none", balance_floor="median", own_mean_window=4,
                         own_mean_prior_weeks=1.0)
+# U11.5b: gates wide open (every setting of this tiny grid passes them), so the run scores
+# every pair; the gate tests replace this line with tighter gates.
+GATES = dict(stage1_log_loss_tolerance=1e9, stage1_slope_band=(1e-9, 1e9), stage2_skill_tolerance=1e9, stage2_ratio_band=(1e-9, 1e9))
 joint = JointDiagnosticSettings(
     run=True, stage1_max_iter=(3, 8), stage1_learning_rate=(0.3,), stage1_max_leaf_nodes=(4,),
     stage2_loss=("poisson", "gamma"), stage2_max_iter=(4,), stage2_learning_rate=(0.3,),
     stage2_max_leaf_nodes=(4,), stage2_scale=("none", "open balance"),
     stage2_balance_floor=("median", "own mean"), selection_metric=METRIC, bootstrap_samples=50,
-    output_folder=OUT)
+    output_folder=OUT, **GATES)
 settings = SimpleNamespace(
     stage1=stage1, stage2=stage2, joint_diagnostic=joint,
     receivables=SimpleNamespace(horizons=3),
@@ -3929,7 +3936,8 @@ def test_step_15_real_run_writes_its_tables(step_15_run):
     assert result.returncode == 0, result.stderr
     names = sorted(path.name for path in folder.iterdir())
     assert names == sorted(f"{name}.csv" for name in (
-        "pairs", "totals_validation_consolidated", "totals_validation_per_company",
+        "pairs", "stage1_gates", "stage2_gates",
+        "totals_validation_consolidated", "totals_validation_per_company",
         "totals_test_consolidated", "totals_test_per_company", "scores", "paired",
         "stage1_test", "stage2_test", "cash_by_p_group", "amount_reliability"))
 
@@ -4092,21 +4100,32 @@ def test_step_15_real_run_with_every_pair_scored_prints_no_not_scored_line(step_
     assert (pairs["non-finite rows"] == 0).all()
 
 
-# Step 15 with stage-2 settings whose m is NaN on one validation row: the same tiny run, with
+# Step 15 with stage-2 settings whose m is NaN on one row: the same tiny run, with
 # fit_stage2 / predict_amount wrapped (in the child process only) so a model remembers its
-# settings and the poisoned ones predict a NaN m on their first row.
+# settings and the poisoned ones predict a NaN m on one row of every prediction.
+#
+# Since U11.5b, WHERE matters: the stage-2 gates look at the paid validation rows only, so a NaN
+# m on a PAID row fails that setting's m gate (it is never paired), while a NaN m on an UNPAID
+# row passes the gates and still reaches score_pairs, which ranks the pair last (the
+# "NOT scored" path). The first validation row is a paid one in this table.
 STEP_15_POISON = """
 _real_fit_stage2, _real_predict_amount = script.fit_stage2, script.predict_amount
 
 def _fit_stage2(x, amount, exposure, settings):
     return (_real_fit_stage2(x, amount, exposure, settings), settings)
 
+def _poisoned_position(m):
+    if WHERE == "first row":
+        return 0
+    paid = table.loc[m.index, "paid"].astype("boolean").fillna(True).to_numpy(dtype=bool)
+    return int(np.flatnonzero(~paid)[0])  # the first unpaid row
+
 def _predict_amount(model, x, exposure):
     model, settings = model
     m = _real_predict_amount(model, x, exposure)
     if POISONED(settings):
         m = m.copy()
-        m.iloc[0] = float("nan")
+        m.iloc[_poisoned_position(m)] = float("nan")
     return m
 
 script.fit_stage2, script.predict_amount = _fit_stage2, _predict_amount
@@ -4114,19 +4133,20 @@ copy = table.copy(deep=True)
 """
 
 
-def run_poisoned_step_15(folder, poisoned):
+def run_poisoned_step_15(folder, poisoned, where="first unpaid row"):
     code = (STEP_15_RUN.replace("OUTPUT_FOLDER", repr(str(folder)))
             .replace("METRIC", repr("mape"))
             .replace("copy = table.copy(deep=True)\n",
-                     STEP_15_POISON.replace("POISONED", poisoned)))
+                     STEP_15_POISON.replace("POISONED", poisoned)
+                     .replace("WHERE", repr(where))))
     assert "_predict_amount" in code  # the patch went in
     return run_code(code)
 
 
 @pytest.fixture(scope="module")
 def step_15_gamma_poisoned(tmp_path_factory):
-    # The 3 gamma settings (x 2 stage-1 settings = 6 pairs) give a NaN m; poisson ones,
-    # including the default [stage2], do not.
+    # The 3 gamma settings (x 2 stage-1 settings = 6 pairs) give a NaN m on an unpaid row;
+    # poisson ones, including the default [stage2], do not.
     folder = tmp_path_factory.mktemp("joint_gamma_nan")
     return folder, run_poisoned_step_15(folder, '(lambda s: s.loss == "gamma")')
 
@@ -4195,6 +4215,305 @@ def test_step_15_every_pair_non_finite_raises_and_writes_nothing(tmp_path):
     # Raised right after the scoring: no grid printout, no tables.
     assert "the 10 best of" not in result.stdout
     assert "NOT scored" not in result.stdout
+    assert not folder.exists() or list(folder.iterdir()) == []
+
+
+# --- Step 15, U11.5b: the eligibility gates ------------------------------------------------------
+# The same tiny run. With the wide-open gates of STEP_15_RUN every setting passes (the tests
+# above); here the GATES line is replaced to make some settings fail. Measured on this table:
+# stage 1's two settings have slopes of about 1.69 (max_iter 3) and 1.12 (max_iter 8); stage 2's
+# deviance skills run from about 0.17 to 0.59 with total ratios of 1.03 to 1.07.
+
+import ast as _ast  # noqa: E402
+
+WIDE_OPEN_GATES = ("GATES = dict(stage1_log_loss_tolerance=1e9, stage1_slope_band=(1e-9, 1e9), "
+                   "stage2_skill_tolerance=1e9, stage2_ratio_band=(1e-9, 1e9))")
+WIDE_OPEN = dict(stage1_log_loss_tolerance=1e9, stage1_slope_band=(1e-9, 1e9),
+                 stage2_skill_tolerance=1e9, stage2_ratio_band=(1e-9, 1e9))
+# The synthetic.toml values: on this table they keep one stage-1 setting and some stage-2 ones.
+TIGHT_GATES = dict(stage1_log_loss_tolerance=0.10, stage1_slope_band=(0.8, 1.25),
+                   stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1))
+STAGE1_GATES_CSV_COLUMNS = ["stage1", "max_iter", "learning_rate", "max_leaf_nodes", "bad p",
+                            "log loss", "log loss skill", "slope", "log loss gate", "skill gate",
+                            "slope gate", "eligible"]
+STAGE2_GATES_CSV_COLUMNS = ["stage2", "loss", "max_iter", "learning_rate", "max_leaf_nodes",
+                            "scale", "balance_floor", "bad m", "deviance skill", "total ratio",
+                            "m gate", "skill gate", "ratio gate", "eligible"]
+STAGE1_PARAMS = ["max_iter", "learning_rate", "max_leaf_nodes"]
+STAGE2_PARAMS = ["loss", "max_iter", "learning_rate", "max_leaf_nodes", "scale", "balance_floor"]
+
+
+def run_step_15_with_gates(folder, gates, metric="mape"):
+    assert WIDE_OPEN_GATES in STEP_15_RUN
+    code = (STEP_15_RUN.replace("OUTPUT_FOLDER", repr(str(folder)))
+            .replace("METRIC", repr(metric))
+            .replace(WIDE_OPEN_GATES, f"GATES = {gates!r}"))
+    return run_code(code)
+
+
+def gate_csv(folder, stage):
+    # keep_default_na=False: the "-" and "none" texts of the stage-2 params stay texts.
+    return pd.read_csv(folder / f"stage{stage}_gates.csv", keep_default_na=False)
+
+
+def progress_params(stdout, stage):
+    """The params of each grid setting, from its progress line, in grid order."""
+    return [_ast.literal_eval(m.group(4)) for m in grid_progress_lines(stdout)
+            if m.group(1) == f"stage {stage}"]
+
+
+def gate_line(stdout, stage):
+    lines = [line for line in stdout.splitlines()
+             if line.startswith(f"        stage {stage} gates: ")]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def expected_gate_line(stage, gates):
+    gate_columns = [c for c in gates.columns if c.endswith(" gate")]
+    failing = {c: int((~gates[c].astype(bool)).sum()) for c in gate_columns}
+    return (f"        stage {stage} gates: {int(gates['eligible'].sum())} of {len(gates)} "
+            f"settings eligible; settings failing each gate: {failing}")
+
+
+# wide-open gates (the step_15_run fixture: every setting eligible)
+
+def test_step_15_real_run_prints_both_gate_lines_with_everything_eligible(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    assert gate_line(result.stdout, 1) == (
+        "        stage 1 gates: 2 of 2 settings eligible; settings failing each gate: "
+        "{'log loss gate': 0, 'skill gate': 0, 'slope gate': 0}")
+    assert gate_line(result.stdout, 2) == (
+        "        stage 2 gates: 6 of 6 settings eligible; settings failing each gate: "
+        "{'m gate': 0, 'skill gate': 0, 'ratio gate': 0}")
+
+
+def test_step_15_real_run_gate_lines_come_after_the_grids_and_before_the_pairs(step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    last_progress = max(i for i, line in enumerate(lines) if GRID_PROGRESS.match(line))
+    stage1 = lines.index(gate_line(result.stdout, 1))
+    stage2 = lines.index(gate_line(result.stdout, 2))
+    pairs = next(i for i, line in enumerate(lines) if "the 10 best of" in line)
+    assert last_progress < stage1 < stage2 < pairs
+
+
+def test_step_15_real_run_gate_tables_print_the_best_eligible_settings_without_gate_columns(
+        step_15_run):
+    _, _, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    stage1 = lines.index(gate_line(result.stdout, 1))
+    assert lines[stage1 + 1].split() == ["stage1", "max_iter", "learning_rate", "max_leaf_nodes",
+                                         "bad", "p", "log", "loss", "log", "loss", "skill",
+                                         "slope"]
+    # Both stage-1 settings, best (lowest) log loss first; neither has a bad p.
+    rows1 = [line.split() for line in lines[stage1 + 2:stage1 + 4]]
+    assert sorted(int(row[0]) for row in rows1) == [0, 1]
+    assert [int(row[4]) for row in rows1] == [0, 0]
+    assert float(rows1[0][5]) <= float(rows1[1][5])
+    assert lines[stage1 + 4] == gate_line(result.stdout, 2)
+    stage2 = stage1 + 4
+    assert lines[stage2 + 1].split() == ["stage2", "loss", "max_iter", "learning_rate",
+                                         "max_leaf_nodes", "scale", "balance_floor", "bad", "m",
+                                         "deviance", "skill", "total", "ratio"]
+    # The 5 best of 6, best (highest) deviance skill first; then the pairs table starts.
+    rows2 = lines[stage2 + 2:stage2 + 7]
+    skills = [float(line.split()[-2]) for line in rows2]
+    assert skills == sorted(skills, reverse=True)
+    assert "the 10 best of" in lines[stage2 + 7]
+    for line in lines[stage1:stage2 + 7]:
+        assert "True" not in line and "False" not in line, line
+
+
+def test_step_15_real_run_gate_csvs_have_one_row_per_setting_with_its_grid_params(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for stage, columns, params in ((1, STAGE1_GATES_CSV_COLUMNS, STAGE1_PARAMS),
+                                   (2, STAGE2_GATES_CSV_COLUMNS, STAGE2_PARAMS)):
+        gates = gate_csv(folder, stage)
+        assert list(gates.columns) == columns
+        grid = progress_params(result.stdout, stage)
+        assert gates[f"stage{stage}"].tolist() == list(range(len(grid)))
+        assert gates[params].to_dict("records") == grid
+
+
+def test_step_15_real_run_gate_csvs_eligible_is_every_gate_passed(step_15_run):
+    _, folder, result = step_15_run
+    assert result.returncode == 0, result.stderr
+    for stage in (1, 2):
+        gates = gate_csv(folder, stage)
+        gate_columns = [c for c in gates.columns if c.endswith(" gate")]
+        assert len(gate_columns) == 3
+        assert gates["eligible"].tolist() == gates[gate_columns].all(axis=1).tolist()
+        assert gates["eligible"].all()
+        assert gate_line(result.stdout, stage) == expected_gate_line(stage, gates)
+
+
+# tight gates: some settings drop out
+
+@pytest.fixture(scope="module")
+def step_15_tight(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("joint_tight_gates")
+    return folder, run_step_15_with_gates(folder, TIGHT_GATES)
+
+
+def eligible_params(folder, stage, params):
+    gates = gate_csv(folder, stage)
+    return gates.loc[gates["eligible"].astype(bool), [f"stage{stage}", *params]]
+
+
+def test_step_15_tight_gates_the_run_succeeds(step_15_tight):
+    _, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "run ok"
+
+
+def test_step_15_tight_gates_drop_some_settings_of_each_stage_and_keep_some(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    eligible1 = eligible_params(folder, 1, STAGE1_PARAMS)["stage1"].tolist()
+    eligible2 = eligible_params(folder, 2, STAGE2_PARAMS)["stage2"].tolist()
+    assert 0 < len(eligible1) < 2 and 0 < len(eligible2) < 6, (eligible1, eligible2)
+    # The grid numbers of the eligible settings are not simply 0, 1, ...: so a pair numbered
+    # from 0 by score_pairs must be mapped back to its grid number to name the right setting.
+    assert (eligible1 != list(range(len(eligible1)))
+            or eligible2 != list(range(len(eligible2)))), (eligible1, eligible2)
+
+
+def test_step_15_tight_gates_every_setting_is_still_fitted_and_gated(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    assert len(progress_params(result.stdout, 1)) == 2
+    assert len(progress_params(result.stdout, 2)) == 6
+    assert len(gate_csv(folder, 1)) == 2 and len(gate_csv(folder, 2)) == 6
+
+
+def test_step_15_tight_gates_the_gate_lines_match_the_csvs(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    for stage in (1, 2):
+        assert gate_line(result.stdout, stage) == expected_gate_line(stage, gate_csv(folder, stage))
+
+
+def test_step_15_tight_gates_the_printed_best_settings_are_eligible_ones(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    for stage in (1, 2):
+        eligible = set(eligible_params(folder, stage, [])[f"stage{stage}"])
+        start = lines.index(gate_line(result.stdout, stage)) + 2
+        printed = [int(line.split()[0]) for line in lines[start:start + min(5, len(eligible))]]
+        assert set(printed) == eligible, (stage, printed, eligible)
+
+
+def test_step_15_tight_gates_pairs_are_exactly_the_eligible_by_eligible_settings(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv", keep_default_na=False)
+    s1 = eligible_params(folder, 1, STAGE1_PARAMS)
+    s2 = eligible_params(folder, 2, STAGE2_PARAMS)
+    assert len(pairs) == len(s1) * len(s2)
+    found = {(tuple(row[f"s1 {p}"] for p in STAGE1_PARAMS),
+              tuple(row[f"s2 {p}"] for p in STAGE2_PARAMS)) for _, row in pairs.iterrows()}
+    expected = {(tuple(a[p] for p in STAGE1_PARAMS), tuple(b[p] for p in STAGE2_PARAMS))
+                for _, a in s1.iterrows() for _, b in s2.iterrows()}
+    assert found == expected
+    assert f"the 10 best of {len(pairs)} pairs by validation" in result.stdout
+
+
+def test_step_15_tight_gates_the_chosen_pair_is_the_best_eligible_pair(step_15_tight):
+    # The chosen pair is refitted from its grid numbers: if they were not mapped back from
+    # score_pairs' 0-based numbers, the chosen pair would be another setting and its validation
+    # score would not equal the best pair's.
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv", keep_default_na=False)
+    scores = pd.read_csv(folder / "scores.csv")
+    chosen = scores[(scores["part"] == "validation") & (scores["level"] == "consolidated")
+                    & (scores["model"] == "chosen") & (scores["h"] == "all")]
+    assert chosen["MAPE"].iloc[0] == pytest.approx(pairs["MAPE"].iloc[0], rel=1e-9)
+    line = next(line for line in result.stdout.splitlines() if "chosen pair:" in line)
+    s1 = {p: pairs[f"s1 {p}"].iloc[0].item() for p in STAGE1_PARAMS}
+    s2 = {p: pairs[f"s2 {p}"].tolist()[0] for p in STAGE2_PARAMS}
+    assert f"stage 1 {s1}" in line and f"stage 2 {s2}" in line, line
+
+
+def test_step_15_tight_gates_writes_the_same_tables(step_15_tight):
+    folder, result = step_15_tight
+    assert result.returncode == 0, result.stderr
+    assert {"pairs.csv", "stage1_gates.csv", "stage2_gates.csv"} <= {
+        path.name for path in folder.iterdir()}
+
+
+# no setting eligible at one stage: the run stops before scoring any pair
+
+@pytest.mark.parametrize("changes, counts, failing_line", [
+    ({"stage1_slope_band": (50.0, 100.0)}, (0, 6),
+     "        stage 1 gates: 0 of 2 settings eligible; settings failing each gate: "
+     "{'log loss gate': 0, 'skill gate': 0, 'slope gate': 2}"),
+    ({"stage2_ratio_band": (50.0, 100.0)}, (2, 0),
+     "        stage 2 gates: 0 of 6 settings eligible; settings failing each gate: "
+     "{'m gate': 0, 'skill gate': 0, 'ratio gate': 6}"),
+], ids=["no stage 1", "no stage 2"])
+def test_step_15_no_eligible_setting_raises_and_writes_nothing(tmp_path, changes, counts,
+                                                               failing_line):
+    folder = tmp_path / "joint_none_eligible"
+    result = run_step_15_with_gates(folder, {**WIDE_OPEN, **changes})
+    assert result.returncode != 0
+    assert (f"ValueError: step 15: {counts[0]} stage-1 and {counts[1]} stage-2 settings passed "
+            f"the eligibility gates, so no pair can be scored") in result.stderr
+    assert "run ok" not in result.stdout
+    # The gates are printed (they say why), then nothing is scored or written.
+    assert failing_line in result.stdout.splitlines()
+    assert "the 10 best of" not in result.stdout
+    assert "chosen pair:" not in result.stdout
+    assert not folder.exists() or list(folder.iterdir()) == []
+
+
+# a NaN m on a PAID validation row: the m gate catches it
+
+@pytest.fixture(scope="module")
+def step_15_gamma_poisoned_on_a_paid_row(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("joint_gamma_nan_paid")
+    return folder, run_poisoned_step_15(folder, '(lambda s: s.loss == "gamma")',
+                                        where="first row")
+
+
+def test_step_15_nan_m_on_a_paid_row_fails_the_m_gate_and_the_run_succeeds(
+        step_15_gamma_poisoned_on_a_paid_row):
+    folder, result = step_15_gamma_poisoned_on_a_paid_row
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "run ok"
+    gates = gate_csv(folder, 2)
+    gamma = gates["loss"] == "gamma"
+    assert gates.loc[gamma, "bad m"].tolist() == [1, 1, 1]
+    assert gates.loc[~gamma, "bad m"].tolist() == [0, 0, 0]
+    assert gates["eligible"].tolist() == (~gamma).tolist()
+    assert gate_line(result.stdout, 2) == (
+        "        stage 2 gates: 3 of 6 settings eligible; settings failing each gate: "
+        "{'m gate': 3, 'skill gate': 3, 'ratio gate': 3}")
+
+
+def test_step_15_nan_m_on_a_paid_row_its_settings_are_never_paired(
+        step_15_gamma_poisoned_on_a_paid_row):
+    folder, result = step_15_gamma_poisoned_on_a_paid_row
+    assert result.returncode == 0, result.stderr
+    pairs = pd.read_csv(folder / "pairs.csv")
+    assert len(pairs) == 2 * 3
+    assert set(pairs["s2 loss"]) == {"poisson"}
+    assert (pairs["non-finite rows"] == 0).all()
+    assert "NOT scored" not in result.stdout
+
+
+def test_step_15_nan_m_on_a_paid_row_in_every_setting_raises_the_gate_error(tmp_path):
+    folder = tmp_path / "joint_all_nan_paid"
+    result = run_poisoned_step_15(folder, "(lambda s: True)", where="first row")
+    assert result.returncode != 0
+    assert ("ValueError: step 15: 2 stage-1 and 0 stage-2 settings passed the eligibility "
+            "gates, so no pair can be scored") in result.stderr
     assert not folder.exists() or list(folder.iterdir()) == []
 
 

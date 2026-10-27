@@ -184,6 +184,13 @@ VALID = {
                          "stage2_max_leaf_nodes": "[15, 31]",
                          "stage2_scale": '["none", "open balance"]',
                          "stage2_balance_floor": '["median", "own mean"]',
+                         # U11.5b: the eligibility gates. Values differ from synthetic.toml's
+                         # on purpose (0.2, [0.7, 1.5], 0.02, [0.95, 1.05] against 0.1,
+                         # [0.8, 1.25], 0.05, [0.9, 1.1]).
+                         "stage1_log_loss_tolerance": "0.2",
+                         "stage1_slope_band": "[0.7, 1.5]",
+                         "stage2_skill_tolerance": "0.02",
+                         "stage2_ratio_band": "[0.95, 1.05]",
                          "selection_metric": '"wape"', "bootstrap_samples": "500",
                          "output_folder": '"results/joint"'},
     "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
@@ -4030,9 +4037,10 @@ from collection_estimation.hurdle.settings import (  # noqa: E402
 
 JOINT = f"{FILE_NAME} [joint_diagnostic]"
 JOINT_KEYS = ['bootstrap_samples', 'output_folder', 'run', 'selection_metric',
-              'stage1_learning_rate', 'stage1_max_iter', 'stage1_max_leaf_nodes',
-              'stage2_balance_floor', 'stage2_learning_rate', 'stage2_loss',
-              'stage2_max_iter', 'stage2_max_leaf_nodes', 'stage2_scale']
+              'stage1_learning_rate', 'stage1_log_loss_tolerance', 'stage1_max_iter',
+              'stage1_max_leaf_nodes', 'stage1_slope_band', 'stage2_balance_floor',
+              'stage2_learning_rate', 'stage2_loss', 'stage2_max_iter', 'stage2_max_leaf_nodes',
+              'stage2_ratio_band', 'stage2_scale', 'stage2_skill_tolerance']
 
 
 def test_total_metrics():
@@ -4043,8 +4051,9 @@ def test_joint_diagnostic_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(JointDiagnosticSettings)] == [
         "run", "stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
         "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
-        "stage2_scale", "stage2_balance_floor", "selection_metric", "bootstrap_samples",
-        "output_folder"]
+        "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance",
+        "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band", "selection_metric",
+        "bootstrap_samples", "output_folder"]
 
 
 def test_the_joint_diagnostic_section_is_read(tmp_path, repo):
@@ -4055,6 +4064,8 @@ def test_the_joint_diagnostic_section_is_read(tmp_path, repo):
         stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
         stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(15, 31),
         stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        stage1_log_loss_tolerance=0.2, stage1_slope_band=(0.7, 1.5),
+        stage2_skill_tolerance=0.02, stage2_ratio_band=(0.95, 1.05),
         selection_metric="wape", bootstrap_samples=500,
         output_folder=(repo / "results" / "joint").resolve())
 
@@ -4073,6 +4084,12 @@ def test_the_joint_diagnostic_values_have_the_right_python_types(tmp_path, repo)
         assert type(grid) is tuple, name
         assert all(type(item) is item_type for item in grid), (name, grid)
     assert isinstance(joint.output_folder, Path) and joint.output_folder.is_absolute()
+    assert type(joint.stage1_log_loss_tolerance) is float
+    assert type(joint.stage2_skill_tolerance) is float
+    for name in ("stage1_slope_band", "stage2_ratio_band"):
+        band = getattr(joint, name)
+        assert type(band) is tuple and len(band) == 2, name
+        assert all(type(end) is float for end in band), (name, band)
 
 
 def test_joint_diagnostic_settings_is_frozen_and_hashable(tmp_path, repo):
@@ -4317,8 +4334,10 @@ def joint_table(**changes):
              "stage1_max_leaf_nodes": [63], "stage2_loss": ["poisson", "gamma"],
              "stage2_max_iter": [300], "stage2_learning_rate": [0.05, 0.1],
              "stage2_max_leaf_nodes": [31], "stage2_scale": ["none", "open balance"],
-             "stage2_balance_floor": ["median", "own mean"], "selection_metric": "mape",
-             "bootstrap_samples": 2000, "output_folder": "out"}
+             "stage2_balance_floor": ["median", "own mean"],
+             "stage1_log_loss_tolerance": 0.1, "stage1_slope_band": [0.8, 1.25],
+             "stage2_skill_tolerance": 0.05, "stage2_ratio_band": [0.9, 1.1],
+             "selection_metric": "mape", "bootstrap_samples": 2000, "output_folder": "out"}
     table.update(changes)
     return table
 
@@ -4330,6 +4349,8 @@ def test_read_joint_diagnostic_by_hand(tmp_path):
         stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
         stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
         stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        stage1_log_loss_tolerance=0.1, stage1_slope_band=(0.8, 1.25),
+        stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1),
         selection_metric="mape", bootstrap_samples=2000,
         output_folder=(tmp_path / "out").resolve())
 
@@ -4356,14 +4377,173 @@ def test_read_joint_diagnostic_does_not_change_its_table(tmp_path):
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_joint_diagnostic_settings():
+    # The grids are left out on purpose: they are the owner's to widen or narrow while tuning
+    # (U11.5b). Everything else is pinned, including the four gate settings.
     joint = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).joint_diagnostic
-    assert joint == JointDiagnosticSettings(
-        run=True, stage1_max_iter=(900,), stage1_learning_rate=(0.01,),
-        stage1_max_leaf_nodes=(63,), stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
-        stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
-        stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
-        selection_metric="mape", bootstrap_samples=2000,
-        output_folder=(REPO_ROOT / "data" / "interim" / "hurdle_joint_diagnostic").resolve())
+    assert joint.run is True
+    assert (joint.stage1_log_loss_tolerance, joint.stage1_slope_band) == (0.10, (0.8, 1.25))
+    assert (joint.stage2_skill_tolerance, joint.stage2_ratio_band) == (0.05, (0.9, 1.1))
+    assert joint.selection_metric == "mape"
+    assert joint.bootstrap_samples == 2000
+    assert joint.output_folder == (REPO_ROOT / "data" / "interim"
+                                   / "hurdle_joint_diagnostic").resolve()
+
+
+# --- [joint_diagnostic] eligibility gates (U11.5b) -------------------------------------------------
+# Two tolerances (positive_number_setting: a number above 0, finite, not a bool) and two bands
+# (band_setting: a list of exactly two such numbers, low below high, returned as a tuple of
+# floats). An item of a band is checked by positive_number_setting under the band's own key.
+
+from collection_estimation.hurdle.settings import band_setting  # noqa: E402
+
+TOLERANCE_KEYS = ["stage1_log_loss_tolerance", "stage2_skill_tolerance"]
+BAND_KEYS = ["stage1_slope_band", "stage2_ratio_band"]
+
+
+@pytest.mark.parametrize("key", TOLERANCE_KEYS + BAND_KEYS)
+def test_each_gate_setting_is_required(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): REMOVE})
+    assert message == f"{JOINT}: missing [{key!r}]; expected exactly {JOINT_KEYS}"
+
+
+@pytest.mark.parametrize("key", TOLERANCE_KEYS + BAND_KEYS)
+def test_a_gate_setting_is_unknown_in_diagnostic(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("diagnostic", key): "0.1"})
+    assert message.startswith(f"{DIAG}: unknown [{key!r}]; ")
+
+
+def test_the_gate_settings_do_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("joint_diagnostic", "stage1_slope_band"): "[0.5, 2]",
+                                      ("joint_diagnostic", "stage2_skill_tolerance"): "0.3"})
+    assert a.stage1 == b.stage1 and a.stage2 == b.stage2 and a.diagnostic == b.diagnostic
+    assert b.joint_diagnostic.stage1_slope_band == (0.5, 2.0)
+    assert b.joint_diagnostic.stage2_skill_tolerance == 0.3
+
+
+# tolerances
+
+@pytest.mark.parametrize("key", TOLERANCE_KEYS)
+@pytest.mark.parametrize("text, expected", [("0.1", 0.1), ("1", 1.0), ("2.5", 2.5),
+                                            ("1e-6", 1e-6), ("100", 100.0)])
+def test_a_gate_tolerance_accepts_a_number_above_zero_as_a_float(tmp_path, repo, key, text,
+                                                                  expected):
+    joint = load(tmp_path, repo, changes={("joint_diagnostic", key): text}).joint_diagnostic
+    value = getattr(joint, key)
+    assert value == expected and type(value) is float
+
+
+@pytest.mark.parametrize("key", TOLERANCE_KEYS)
+@pytest.mark.parametrize("text, shown", [
+    ("0", "0"), ("0.0", "0.0"), ("-0.1", "-0.1"), ("true", "True"), ("false", "False"),
+    ('"0.1"', "'0.1'"), ("[0.1]", "[0.1]"), ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf"),
+])
+def test_a_bad_gate_tolerance_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} is {shown}, not a number above 0"
+
+
+# bands
+
+@pytest.mark.parametrize("key", BAND_KEYS)
+@pytest.mark.parametrize("text, expected", [
+    ("[0.8, 1.25]", (0.8, 1.25)), ("[1, 2]", (1.0, 2.0)), ("[0.5, 2.0]", (0.5, 2.0)),
+    ("[1e-9, 1e9]", (1e-9, 1e9)),
+])
+def test_a_gate_band_accepts_two_rising_numbers_above_zero(tmp_path, repo, key, text, expected):
+    joint = load(tmp_path, repo, changes={("joint_diagnostic", key): text}).joint_diagnostic
+    band = getattr(joint, key)
+    assert band == expected
+    assert type(band) is tuple and all(type(end) is float for end in band)
+
+
+@pytest.mark.parametrize("key", BAND_KEYS)
+@pytest.mark.parametrize("text, shown", [
+    ("[]", "[]"), ("[1.0]", "[1.0]"), ("[0.8, 1.0, 1.25]", "[0.8, 1.0, 1.25]"),
+    ("1.0", "1.0"), ('"0.8, 1.25"', "'0.8, 1.25'"), ("true", "True"),
+    ("{ low = 0.8, high = 1.25 }", "{'low': 0.8, 'high': 1.25}"),
+])
+def test_a_gate_band_that_is_not_a_list_of_two_has_the_exact_message(tmp_path, repo, key,
+                                                                      text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} is {shown}, not a band [low, high]"
+
+
+@pytest.mark.parametrize("key", BAND_KEYS)
+@pytest.mark.parametrize("text, shown", [
+    ("[0, 1.25]", "0"), ("[-0.8, 1.25]", "-0.8"), ("[0.8, -1]", "-1"), ("[true, 1.25]", "True"),
+    ("[0.8, false]", "False"), ('["0.8", 1.25]', "'0.8'"), ("[nan, 1.25]", "nan"),
+    ("[0.8, inf]", "inf"), ("[[0.8], 1.25]", "[0.8]"),
+])
+def test_a_bad_gate_band_end_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} is {shown}, not a number above 0"
+
+
+@pytest.mark.parametrize("key", BAND_KEYS)
+@pytest.mark.parametrize("text, shown", [("[1.25, 0.8]", "[1.25, 0.8]"),
+                                         ("[1.0, 1.0]", "[1.0, 1.0]"), ("[1, 1.0]", "[1, 1.0]")])
+def test_a_gate_band_whose_low_is_not_below_its_high_has_the_exact_message(tmp_path, repo, key,
+                                                                           text, shown):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): text})
+    assert message == f"{JOINT}: {key} is {shown}; low must be below high"
+
+
+# band_setting on its own
+
+def test_band_setting_returns_a_tuple_of_floats():
+    band = band_setting({"b": [1, 2.5]}, "b", "here")
+    assert band == (1.0, 2.5)
+    assert type(band) is tuple and all(type(end) is float for end in band)
+
+
+def test_band_setting_does_not_change_its_list():
+    value = [0.8, 1.25]
+    band_setting({"b": value}, "b", "here")
+    assert value == [0.8, 1.25]
+
+
+@pytest.mark.parametrize("value", [(0.8, 1.25), [0.8], [0.8, 1.0, 1.25], None, 1.0, "0.8,1.25"])
+def test_band_setting_refuses_anything_but_a_list_of_two(value):
+    with pytest.raises(ValueError) as error:
+        band_setting({"b": value}, "b", "here")
+    assert str(error.value) == f"here: b is {value!r}, not a band [low, high]"
+
+
+@pytest.mark.parametrize("value, shown", [([0, 1], "0"), ([1, -2], "-2"), ([True, 2], "True"),
+                                          ([float("nan"), 2], "nan"),
+                                          ([1, float("inf")], "inf")])
+def test_band_setting_refuses_an_end_that_is_not_a_number_above_zero(value, shown):
+    with pytest.raises(ValueError) as error:
+        band_setting({"b": value}, "b", "here")
+    assert str(error.value) == f"here: b is {shown}, not a number above 0"
+
+
+@pytest.mark.parametrize("value", [[2.0, 1.0], [1.0, 1.0]])
+def test_band_setting_refuses_low_not_below_high(value):
+    with pytest.raises(ValueError) as error:
+        band_setting({"b": value}, "b", "here")
+    assert str(error.value) == f"here: b is {value!r}; low must be below high"
+
+
+def test_band_setting_a_missing_key_raises_key_error():
+    # Like every other *_setting helper: a missing key is caught earlier, by check_keys.
+    with pytest.raises(KeyError):
+        band_setting({}, "b", "here")
+
+
+@pytest.mark.parametrize("key", ["stage1_slope_band", "stage2_ratio_band"])
+def test_read_joint_diagnostic_checks_each_band(tmp_path, key):
+    with pytest.raises(ValueError) as error:
+        read_joint_diagnostic(joint_table(**{key: [2, 1]}), tmp_path, "here")
+    assert str(error.value) == f"here: {key} is [2, 1]; low must be below high"
+
+
+@pytest.mark.parametrize("key", ["stage1_log_loss_tolerance", "stage2_skill_tolerance"])
+def test_read_joint_diagnostic_checks_each_tolerance(tmp_path, key):
+    with pytest.raises(ValueError) as error:
+        read_joint_diagnostic(joint_table(**{key: 0}), tmp_path, "here")
+    assert str(error.value) == f"here: {key} is 0, not a number above 0"
 
 
 # --- [calendar] (U7b) ------------------------------------------------------------------------------

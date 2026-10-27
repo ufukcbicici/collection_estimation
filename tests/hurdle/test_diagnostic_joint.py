@@ -1,6 +1,7 @@
 """Tests for `hurdle/diagnostic_joint.py` (U11.5): `stage1_grid`, `stage2_grid`,
 `total_scores`, `scores_by_h`, `score_pairs` (on the panel rows, with p and m as Series;
-`total_codes` was removed) and `paired_bootstrap`.
+`total_codes` was removed) and `paired_bootstrap`; and (U11.5b) the eligibility gates
+`stage1_gates` and `stage2_gates`, at the end of the file.
 
 Every table is hand-made; nothing is read from data/ and nothing is fitted. Hypothesis is not
 installed in this env, so the brute-force checks use seeded random trials.
@@ -55,6 +56,8 @@ def joint_settings(**changes):
         stage1_max_leaf_nodes=(15, 31, 63), stage2_loss=("poisson", "gamma"),
         stage2_max_iter=(200,), stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
         stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "own mean"),
+        stage1_log_loss_tolerance=0.10, stage1_slope_band=(0.8, 1.25),
+        stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1),
         selection_metric="mape", bootstrap_samples=200, output_folder=Path("unused"))
     return dataclasses.replace(base, **changes)
 
@@ -1221,3 +1224,683 @@ def test_paired_bootstrap_refuses_no_totals():
     empty = pd.Series([], dtype=float)
     with pytest.raises(ValueError):
         paired_bootstrap(empty, empty.copy(), empty.copy(), 10, 0)
+
+
+# --- the eligibility gates (U11.5b) ---------------------------------------------------------------
+# Each setting of a grid is checked on its own on validation before any pair is scored.
+# stage1_gates: log loss within (1 + tolerance) of the grid's best, log-loss skill above 0,
+# calibration slope inside the band (ends included). stage2_gates: every m finite and above 0,
+# deviance skill within `tolerance` of the best m-gate passer, total ratio inside the band
+# (ends included).
+
+from sklearn.metrics import log_loss  # noqa: E402
+
+from collection_estimation.hurdle.diagnostic import calibration_slope_intercept  # noqa: E402
+from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
+    stage1_gates,
+    stage2_gates,
+)
+from collection_estimation.hurdle.stage2 import amount_summary  # noqa: E402
+
+STAGE1_GATE_COLUMNS = ["stage1", "bad p", "log loss", "log loss skill", "slope",
+                       "log loss gate", "skill gate", "slope gate", "eligible"]
+STAGE2_GATE_COLUMNS = ["stage2", "bad m", "deviance skill", "total ratio", "m gate",
+                       "skill gate", "ratio gate", "eligible"]
+S1_GATES = ["log loss gate", "skill gate", "slope gate", "eligible"]
+S2_GATES = ["m gate", "skill gate", "ratio gate", "eligible"]
+
+
+def sigmoid(values):
+    return 1 / (1 + np.exp(-values))
+
+
+def stage1_data():
+    """4000 validation rows whose outcome follows p = sigmoid(z), and five stage-1 settings
+    built from z. Measured on these rows (seed 0):
+
+        setting   log loss   / true's   slope
+        true      0.5240     1           1.01   (the right p)
+        shift     0.5375     1.026       1.01   (every logit + 0.4: worse, slope still ~1)
+        under     0.5585     1.066       2.02   (too timid)
+        over      0.5937     1.133       0.51   (too confident)
+        anti      1.326      2.53       -1.01   (backwards: worse than the base rate)
+    """
+    rng = np.random.default_rng(0)
+    index = pd.RangeIndex(100, 4100, name="row")  # not 0..n-1, so rows are matched by label
+    z = pd.Series(rng.normal(0, 1.5, len(index)), index=index)
+    paid = pd.Series(rng.random(len(index)) < sigmoid(z), index=index)
+    base_rate = pd.Series(paid.mean(), index=index)
+    p = {"true": sigmoid(z), "shift": sigmoid(z + 0.4), "under": sigmoid(0.5 * z),
+         "over": sigmoid(2 * z), "anti": sigmoid(-z)}
+    return paid, p, base_rate
+
+
+def gates1(names, tolerance=0.10, band=(0.8, 1.25), base_rate=None):
+    """stage1_gates on the named settings of stage1_data, indexed by name."""
+    paid, p, default_base = stage1_data()
+    table = stage1_gates(paid, [p[name] for name in names],
+                         default_base if base_rate is None else base_rate, tolerance, band)
+    table.insert(0, "name", list(names))
+    return table.set_index("name")
+
+
+def gate_flags(row, columns):
+    return {column: bool(row[column]) for column in columns}
+
+
+# stage1_gates: shape and values
+
+def test_stage1_gates_one_row_per_setting_numbered_in_grid_order():
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [p["true"], p["shift"], p["under"]], base_rate, 0.1, (0.8, 1.25))
+    assert list(table.columns) == STAGE1_GATE_COLUMNS
+    assert table["stage1"].tolist() == [0, 1, 2]
+    assert list(table.index) == [0, 1, 2]
+    for column in S1_GATES:
+        assert table[column].dtype == bool, column
+
+
+def test_stage1_gates_measures_log_loss_skill_and_slope_like_the_diagnostic():
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [p["true"], p["over"]], base_rate, 0.1, (0.8, 1.25))
+    base_loss = log_loss(paid, base_rate, labels=[False, True])
+    for i, name in enumerate(("true", "over")):
+        loss = log_loss(paid, p[name], labels=[False, True])
+        assert table.loc[i, "log loss"] == pytest.approx(loss, rel=1e-12)
+        assert table.loc[i, "log loss skill"] == pytest.approx(1 - loss / base_loss, rel=1e-12)
+        slope, _ = calibration_slope_intercept(paid, p[name])
+        assert table.loc[i, "slope"] == pytest.approx(slope, rel=1e-9)
+
+
+def test_stage1_gates_the_right_p_is_eligible():
+    row = gates1(["true"]).loc["true"]
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": True,
+                                         "slope gate": True, "eligible": True}
+
+
+# stage1_gates: each gate alone
+
+def test_stage1_log_loss_gate_alone_fails_a_setting_too_far_from_the_best():
+    # shift's log loss is 2.6% above true's: outside a 1% tolerance, while its skill is above
+    # 0 and its slope inside the band.
+    row = gates1(["true", "shift"], tolerance=0.01).loc["shift"]
+    assert gate_flags(row, S1_GATES) == {"log loss gate": False, "skill gate": True,
+                                         "slope gate": True, "eligible": False}
+
+
+def test_stage1_log_loss_gate_passes_the_same_setting_with_a_wider_tolerance():
+    row = gates1(["true", "shift"], tolerance=0.05).loc["shift"]
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": True,
+                                         "slope gate": True, "eligible": True}
+
+
+def test_stage1_skill_gate_alone_fails_a_skill_of_exactly_zero():
+    # With the right p itself as the base rate, the right p's skill is exactly 0: not above 0.
+    _, p, _ = stage1_data()
+    row = gates1(["true"], base_rate=p["true"]).loc["true"]
+    assert row["log loss skill"] == 0.0
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": False,
+                                         "slope gate": True, "eligible": False}
+
+
+def test_stage1_skill_gate_alone_fails_a_setting_worse_than_the_base_rate():
+    # shift judged against the right p as the "base rate": negative skill; alone in its grid
+    # (so the best log loss); slope 1.01.
+    _, p, _ = stage1_data()
+    row = gates1(["shift"], base_rate=p["true"]).loc["shift"]
+    assert row["log loss skill"] < 0
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": False,
+                                         "slope gate": True, "eligible": False}
+
+
+def test_stage1_slope_gate_alone_fails_a_slope_above_the_band():
+    row = gates1(["true", "under"], tolerance=0.10).loc["under"]
+    assert row["slope"] > 1.25
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": True,
+                                         "slope gate": False, "eligible": False}
+
+
+def test_stage1_slope_gate_alone_fails_a_slope_below_the_band():
+    row = gates1(["true", "over"], tolerance=0.20).loc["over"]
+    assert row["slope"] < 0.8
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": True,
+                                         "slope gate": False, "eligible": False}
+
+
+def test_stage1_a_backwards_setting_fails_skill_and_slope():
+    row = gates1(["true", "anti"], tolerance=10.0).loc["anti"]
+    assert row["log loss skill"] < 0 and row["slope"] < 0
+    assert gate_flags(row, S1_GATES) == {"log loss gate": True, "skill gate": False,
+                                         "slope gate": False, "eligible": False}
+
+
+# stage1_gates: ends and tolerance
+
+def test_stage1_slope_band_low_end_is_included():
+    slope = gates1(["true"])["slope"].iloc[0]
+    assert gates1(["true"], band=(slope, 2.0))["slope gate"].iloc[0]
+    assert not gates1(["true"], band=(np.nextafter(slope, np.inf), 2.0))["slope gate"].iloc[0]
+
+
+def test_stage1_slope_band_high_end_is_included():
+    slope = gates1(["true"])["slope"].iloc[0]
+    assert gates1(["true"], band=(0.5, slope))["slope gate"].iloc[0]
+    assert not gates1(["true"], band=(0.5, np.nextafter(slope, -np.inf)))["slope gate"].iloc[0]
+
+
+def test_stage1_a_setting_tied_with_the_best_passes_any_tolerance():
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [p["true"], p["true"].copy()], base_rate, 1e-12, (0.8, 1.25))
+    assert table["log loss gate"].tolist() == [True, True]
+
+
+def test_stage1_log_loss_tolerance_just_below_and_just_above_the_needed_one():
+    table = gates1(["true", "shift"])
+    needed = table.loc["shift", "log loss"] / table.loc["true", "log loss"] - 1
+    assert not gates1(["true", "shift"], tolerance=needed * 0.999).loc["shift", "log loss gate"]
+    assert gates1(["true", "shift"], tolerance=needed * 1.001).loc["shift", "log loss gate"]
+
+
+def test_stage1_tolerance_is_relative_to_the_grids_best_not_a_running_best():
+    # shift comes first: a running best would let it pass (it is the best "so far").
+    assert not gates1(["shift", "true"], tolerance=0.01).loc["shift", "log loss gate"]
+    # Alone, shift is its grid's best.
+    assert gates1(["shift"], tolerance=0.01).loc["shift", "log loss gate"]
+
+
+def test_stage1_the_order_of_the_settings_does_not_change_any_settings_result():
+    names = ["true", "shift", "under", "over", "anti"]
+    reference = gates1(names, tolerance=0.05).drop(columns="stage1")
+    for order in (names[::-1], ["under", "anti", "true", "over", "shift"]):
+        table = gates1(order, tolerance=0.05)
+        assert table["stage1"].tolist() == list(range(len(order)))
+        pd.testing.assert_frame_equal(table.drop(columns="stage1").loc[names], reference,
+                                      rtol=1e-9)
+
+
+def test_stage1_a_bad_setting_does_not_move_the_others_gates():
+    # anti's huge log loss is not the best, so it cannot loosen or tighten the others' gates.
+    with_anti = gates1(["true", "shift", "anti"], tolerance=0.01)
+    without = gates1(["true", "shift"], tolerance=0.01)
+    pd.testing.assert_frame_equal(with_anti.loc[["true", "shift"], S1_GATES],
+                                  without[S1_GATES])
+
+
+def test_stage1_gates_accepts_a_nullable_boolean_paid_column():
+    # The pipeline passes validation["paid"], a pandas "boolean" column.
+    paid, p, base_rate = stage1_data()
+    plain = stage1_gates(paid, [p["true"], p["shift"]], base_rate, 0.1, (0.8, 1.25))
+    nullable = stage1_gates(paid.astype("boolean"), [p["true"], p["shift"]], base_rate, 0.1,
+                            (0.8, 1.25))
+    pd.testing.assert_frame_equal(plain, nullable)
+
+
+def test_stage1_gates_does_not_change_its_inputs():
+    paid, p, base_rate = stage1_data()
+    copies = paid.copy(), p["true"].copy(), base_rate.copy()
+    stage1_gates(paid, [p["true"]], base_rate, 0.1, (0.8, 1.25))
+    pd.testing.assert_series_equal(paid, copies[0])
+    pd.testing.assert_series_equal(p["true"], copies[1])
+    pd.testing.assert_series_equal(base_rate, copies[2])
+
+
+# stage1_gates: errors
+
+def test_stage1_gates_refuses_an_empty_grid():
+    paid, _, base_rate = stage1_data()
+    with pytest.raises(ValueError, match="^there are no stage-1 settings to check$"):
+        stage1_gates(paid, [], base_rate, 0.1, (0.8, 1.25))
+
+
+def test_stage1_gates_refuses_a_p_with_other_rows():
+    paid, p, base_rate = stage1_data()
+    shifted = p["true"].set_axis(p["true"].index + 1)
+    with pytest.raises(ValueError,
+                       match=r"^actual and p must have the same rows \(the same index\)$"):
+        stage1_gates(paid, [p["true"], shifted], base_rate, 0.1, (0.8, 1.25))
+
+
+def test_stage1_gates_refuses_a_p_with_the_rows_in_another_order():
+    paid, p, base_rate = stage1_data()
+    with pytest.raises(ValueError, match="must have the same rows"):
+        stage1_gates(paid, [p["true"].iloc[::-1]], base_rate, 0.1, (0.8, 1.25))
+
+
+def test_stage1_gates_refuses_a_base_rate_with_other_rows():
+    paid, p, base_rate = stage1_data()
+    with pytest.raises(ValueError, match="must have the same rows"):
+        stage1_gates(paid, [p["true"]], base_rate.iloc[:-1], 0.1, (0.8, 1.25))
+
+
+def test_stage1_gates_refuses_a_single_outcome():
+    paid = pd.Series([True] * 4)
+    p = pd.Series([0.5, 0.6, 0.7, 0.8])
+    with pytest.raises(ValueError,
+                       match=r"^actual must hold both outcomes \(payers and non-payers\)$"):
+        stage1_gates(paid, [p], p.copy(), 0.1, (0.8, 1.25))
+
+
+def test_stage1_gates_refuses_no_rows():
+    empty_paid = pd.Series([], dtype=bool)
+    empty_p = pd.Series([], dtype=float)
+    with pytest.raises(ValueError, match="^there are no rows to measure$"):
+        stage1_gates(empty_paid, [empty_p], empty_p.copy(), 0.1, (0.8, 1.25))
+
+
+# stage1_gates: a bad p (not a finite number in [0, 1]) fails only its own setting. Fixed
+# after the U11.5b test report: a NaN p used to raise scikit-learn's "Input contains NaN."
+# from inside log_loss and stop all of step 15.
+
+S1_SCORES = ["log loss", "log loss skill", "slope"]
+BAD_P_VALUES = [nan, inf, -inf, -1e-9, np.nextafter(0.0, -1.0), 1 + 1e-9,
+                np.nextafter(1.0, 2.0), -1.0, 2.0]
+
+
+def with_bad_p(series, positions, value):
+    broken = series.copy()
+    broken.iloc[list(positions)] = value
+    return broken
+
+
+def test_stage1_a_nan_p_fails_that_setting_instead_of_stopping_the_grid():
+    paid, p, base_rate = stage1_data()
+    broken = p["true"].copy()
+    broken.iloc[0] = nan
+    table = stage1_gates(paid, [p["true"], broken], base_rate, 0.1, (0.8, 1.25))
+    assert table["eligible"].tolist() == [True, False]
+
+
+@pytest.mark.parametrize("bad", BAD_P_VALUES)
+def test_stage1_a_bad_p_has_no_scores_and_fails_every_gate(bad):
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [p["true"], with_bad_p(p["true"], [7], bad)], base_rate, 0.1,
+                         (0.8, 1.25))
+    row = table.loc[1]
+    assert row["bad p"] == 1
+    assert all(np.isnan(row[column]) for column in S1_SCORES)
+    assert gate_flags(row, S1_GATES) == {"log loss gate": False, "skill gate": False,
+                                         "slope gate": False, "eligible": False}
+    assert table.loc[0, "bad p"] == 0
+    assert bool(table.loc[0, "eligible"])
+
+
+@pytest.mark.parametrize("bad", BAD_P_VALUES)
+def test_stage1_a_bad_p_does_not_change_the_other_settings_rows(bad):
+    paid, p, base_rate = stage1_data()
+    good = [p["true"], p["shift"], p["under"]]
+    alone = stage1_gates(paid, good, base_rate, 0.01, (0.8, 1.25))
+    mixed = stage1_gates(paid, [with_bad_p(p["true"], [0], bad)] + good, base_rate, 0.01,
+                         (0.8, 1.25))
+    pd.testing.assert_frame_equal(mixed.iloc[1:].drop(columns="stage1").reset_index(drop=True),
+                                  alone.drop(columns="stage1"))
+
+
+def test_stage1_exact_zero_and_one_are_good_p():
+    paid, p, base_rate = stage1_data()
+    edged = p["true"].copy()
+    payer, non_payer = paid[paid].index[0], paid[~paid].index[0]
+    edged[payer] = 1.0
+    edged[non_payer] = 0.0
+    row = stage1_gates(paid, [edged], base_rate, 0.1, (0.8, 1.25)).loc[0]
+    assert row["bad p"] == 0
+    assert all(np.isfinite(row[column]) for column in S1_SCORES)
+    assert row["log loss"] == pytest.approx(log_loss(paid, edged, labels=[False, True]),
+                                            rel=1e-12)
+    assert bool(row["eligible"])
+
+
+def test_stage1_a_p_of_only_zeros_and_ones_is_good_and_measured():
+    # Five right rows and one confidently wrong row: still a probability, so measured.
+    paid = pd.Series([True, False, True, False, True, False])
+    p = pd.Series([1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+    base_rate = pd.Series(0.5, index=paid.index)
+    row = stage1_gates(paid, [p], base_rate, 0.1, (0.8, 1.25)).loc[0]
+    assert row["bad p"] == 0
+    assert np.isfinite(row["log loss"])
+
+
+def test_stage1_bad_p_counts_every_bad_row_of_every_kind():
+    paid, p, base_rate = stage1_data()
+    broken = p["true"].copy()
+    for position, value in zip([0, 5, 9, 20, 33, 40], [nan, inf, -inf, -0.1, 1.1, nan]):
+        broken.iloc[position] = value
+    broken.iloc[50] = 0.0   # good
+    broken.iloc[51] = 1.0   # good
+    table = stage1_gates(paid, [p["true"], broken], base_rate, 0.1, (0.8, 1.25))
+    assert table["bad p"].tolist() == [0, 6]
+
+
+def test_stage1_bad_p_column_is_an_integer_count():
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [p["true"], with_bad_p(p["true"], [1, 2], nan)], base_rate, 0.1,
+                         (0.8, 1.25))
+    assert pd.api.types.is_integer_dtype(table["bad p"])
+    assert table["bad p"].tolist() == [0, 2]
+
+
+def test_stage1_a_none_in_an_object_p_counts_as_bad():
+    paid, p, base_rate = stage1_data()
+    broken = p["true"].astype(object)
+    broken.iloc[3] = None
+    table = stage1_gates(paid, [p["true"], broken], base_rate, 0.1, (0.8, 1.25))
+    assert table["bad p"].tolist() == [0, 1]
+    assert table["eligible"].tolist() == [True, False]
+
+
+def test_stage1_the_best_log_loss_is_taken_among_good_settings_only():
+    # true is the best p, but with one NaN it is not measured: shift becomes the grid's best,
+    # so a 1% tolerance (which shift fails beside a good true) now passes it.
+    paid, p, base_rate = stage1_data()
+    table = stage1_gates(paid, [with_bad_p(p["true"], [0], nan), p["shift"]], base_rate, 0.01,
+                         (0.8, 1.25))
+    assert table["eligible"].tolist() == [False, True]
+    assert bool(table.loc[1, "log loss gate"])
+
+
+@pytest.mark.parametrize("bad", [nan, inf, -1.0, 2.0])
+def test_stage1_a_bad_p_anywhere_in_the_order_gives_the_same_good_rows(bad):
+    paid, p, base_rate = stage1_data()
+    broken = with_bad_p(p["anti"], [4], bad)
+    first = stage1_gates(paid, [broken, p["true"], p["shift"]], base_rate, 0.05, (0.8, 1.25))
+    middle = stage1_gates(paid, [p["true"], broken, p["shift"]], base_rate, 0.05, (0.8, 1.25))
+    last = stage1_gates(paid, [p["true"], p["shift"], broken], base_rate, 0.05, (0.8, 1.25))
+    rows = [table.drop(columns="stage1").reset_index(drop=True)
+            for table in (first.iloc[[1, 2, 0]], middle.iloc[[0, 2, 1]], last)]
+    pd.testing.assert_frame_equal(rows[0], rows[1])
+    pd.testing.assert_frame_equal(rows[0], rows[2])
+    assert last["eligible"].tolist() == [True, True, False]
+
+
+def test_stage1_every_setting_bad_makes_every_setting_ineligible_without_error():
+    paid, p, base_rate = stage1_data()
+    settings = [with_bad_p(p["true"], [0], nan), with_bad_p(p["shift"], [1], inf),
+                with_bad_p(p["under"], [2], -0.5), with_bad_p(p["over"], [3], 1.5)]
+    table = stage1_gates(paid, settings, base_rate, 0.1, (0.8, 1.25))
+    assert list(table.columns) == STAGE1_GATE_COLUMNS
+    assert table["bad p"].tolist() == [1, 1, 1, 1]
+    assert table[S1_SCORES].isna().all().all()
+    for column in S1_GATES:
+        assert table[column].dtype == bool, column
+        assert not table[column].any(), column
+
+
+def test_stage1_a_p_bad_on_every_row_is_counted_and_fails():
+    paid, p, base_rate = stage1_data()
+    all_nan = pd.Series(nan, index=paid.index)
+    table = stage1_gates(paid, [p["true"], all_nan], base_rate, 0.1, (0.8, 1.25))
+    assert table["bad p"].tolist() == [0, len(paid)]
+    assert table["eligible"].tolist() == [True, False]
+
+
+def test_stage1_a_bad_p_does_not_change_its_input():
+    paid, p, base_rate = stage1_data()
+    broken = with_bad_p(p["true"], [0, 1], nan)
+    broken.iloc[2] = inf
+    copy = broken.copy()
+    stage1_gates(paid, [broken], base_rate, 0.1, (0.8, 1.25))
+    pd.testing.assert_series_equal(broken, copy)
+
+
+def test_stage1_a_bad_p_with_other_rows_still_raises_the_index_error():
+    paid, p, base_rate = stage1_data()
+    broken = with_bad_p(p["true"], [0], nan).set_axis(p["true"].index + 1)
+    with pytest.raises(ValueError, match="must have the same rows"):
+        stage1_gates(paid, [p["true"], broken], base_rate, 0.1, (0.8, 1.25))
+
+
+def test_stage1_a_bad_p_with_a_single_outcome_still_raises():
+    paid = pd.Series([True] * 4)
+    p = pd.Series([0.5, nan, 0.7, 2.0])
+    with pytest.raises(ValueError, match="must hold both outcomes"):
+        stage1_gates(paid, [p], pd.Series(0.5, index=paid.index), 0.1, (0.8, 1.25))
+
+
+# stage2_gates: shape and values
+
+ROWS = pd.Index([3, 5, 8, 13], name="row")  # not 0..n-1, so rows are matched by label
+AMOUNT = pd.Series([10.0, 20.0, 30.0, 40.0], index=ROWS)   # what was paid; sum 100
+REFERENCE = pd.Series(25.0, index=ROWS)                     # the training mean
+
+
+def m_of(*values):
+    return pd.Series([float(v) for v in values], index=ROWS)
+
+
+# The stage-2 settings, measured against AMOUNT and REFERENCE:
+#   name       m                  deviance skill   total ratio
+#   perfect    10, 20, 30, 40     1.0              1.0
+#   high       11, 22, 33, 44     0.956            1.1 (exactly)
+#   low        9, 18, 27, 36      0.950            0.9 (exactly)
+#   too high   12, 24, 36, 48     0.834            1.2
+#   noisy      14, 16, 34, 36     0.854            1.0
+#   noisy2     15, 15, 35, 35     0.773            1.0
+#   flat       25, 25, 25, 25     0.0              1.0 (the reference itself)
+M = {"perfect": m_of(10, 20, 30, 40), "high": m_of(11, 22, 33, 44), "low": m_of(9, 18, 27, 36),
+     "too high": m_of(12, 24, 36, 48), "noisy": m_of(14, 16, 34, 36),
+     "noisy2": m_of(15, 15, 35, 35), "flat": m_of(25, 25, 25, 25)}
+
+
+def gates2(names, tolerance=0.05, band=(0.9, 1.1), m=None, reference=REFERENCE):
+    """stage2_gates on the named settings (from M, or from `m` if named there), by name."""
+    settings = {**M, **(m or {})}
+    table = stage2_gates(AMOUNT, [settings[name] for name in names], reference, tolerance,
+                         band)
+    table.insert(0, "name", list(names))
+    return table.set_index("name")
+
+
+def test_stage2_gates_one_row_per_setting_numbered_in_grid_order():
+    table = stage2_gates(AMOUNT, [M["perfect"], M["noisy"], M["high"]], REFERENCE, 0.05,
+                         (0.9, 1.1))
+    assert list(table.columns) == STAGE2_GATE_COLUMNS
+    assert table["stage2"].tolist() == [0, 1, 2]
+    assert list(table.index) == [0, 1, 2]
+    assert table["bad m"].tolist() == [0, 0, 0]
+    for column in S2_GATES:
+        assert table[column].dtype == bool, column
+
+
+def test_stage2_gates_scores_like_amount_summary():
+    table = gates2(["perfect", "noisy", "too high"])
+    for name in ("perfect", "noisy", "too high"):
+        scores = amount_summary(AMOUNT, M[name], REFERENCE)
+        assert table.loc[name, "deviance skill"] == pytest.approx(scores["deviance skill"],
+                                                                  rel=1e-12)
+        assert table.loc[name, "total ratio"] == pytest.approx(scores["total ratio"], rel=1e-12)
+
+
+def test_stage2_gates_the_right_m_is_eligible():
+    row = gates2(["perfect"]).loc["perfect"]
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": True,
+                                         "ratio gate": True, "eligible": True}
+
+
+# stage2_gates: each gate alone
+
+@pytest.mark.parametrize("bad", [0.0, -5.0, nan, inf, -inf])
+def test_stage2_m_gate_fails_one_bad_m_and_that_setting_has_no_scores(bad):
+    broken = m_of(10, 20, 30, 40)
+    broken.iloc[1] = bad
+    table = gates2(["perfect", "broken"], m={"broken": broken})
+    row = table.loc["broken"]
+    assert row["bad m"] == 1
+    assert np.isnan(row["deviance skill"]) and np.isnan(row["total ratio"])
+    assert gate_flags(row, S2_GATES) == {"m gate": False, "skill gate": False,
+                                         "ratio gate": False, "eligible": False}
+    assert table.loc["perfect", "eligible"]
+
+
+def test_stage2_bad_m_counts_every_bad_row():
+    assert gates2(["broken"], m={"broken": m_of(nan, inf, 0, -1)}).loc["broken", "bad m"] == 4
+    assert gates2(["broken"], m={"broken": m_of(nan, 20, 0, 40)}).loc["broken", "bad m"] == 2
+
+
+def test_stage2_a_tiny_positive_m_passes_the_m_gate():
+    row = gates2(["tiny"], tolerance=10.0, band=(0.01, 10.0),
+                 m={"tiny": m_of(1e-12, 20, 30, 40)}).loc["tiny"]
+    assert row["bad m"] == 0 and row["m gate"]
+
+
+def test_stage2_skill_gate_alone_fails_a_setting_too_far_from_the_best():
+    # noisy: skill 0.854 against the best's 1.0, tolerance 0.05; total ratio exactly 1.
+    row = gates2(["perfect", "noisy"]).loc["noisy"]
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": False,
+                                         "ratio gate": True, "eligible": False}
+
+
+def test_stage2_skill_gate_passes_the_same_setting_with_a_wider_tolerance():
+    row = gates2(["perfect", "noisy"], tolerance=0.2).loc["noisy"]
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": True,
+                                         "ratio gate": True, "eligible": True}
+
+
+def test_stage2_ratio_gate_alone_fails_a_total_ratio_above_the_band():
+    row = gates2(["perfect", "too high"], tolerance=0.5).loc["too high"]
+    assert row["total ratio"] == pytest.approx(1.2)
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": True,
+                                         "ratio gate": False, "eligible": False}
+
+
+def test_stage2_ratio_gate_alone_fails_a_total_ratio_below_the_band():
+    row = gates2(["perfect", "low"], tolerance=0.5, band=(0.95, 1.1)).loc["low"]
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": True,
+                                         "ratio gate": False, "eligible": False}
+
+
+# stage2_gates: ends and tolerance
+
+def test_stage2_ratio_band_ends_are_included():
+    # 110 / 100 and 90 / 100 are exactly the floats 1.1 and 0.9.
+    table = gates2(["perfect", "high", "low"], tolerance=0.5)
+    assert table.loc["high", "total ratio"] == 1.1
+    assert table.loc["low", "total ratio"] == 0.9
+    assert table["ratio gate"].tolist() == [True, True, True]
+
+
+def test_stage2_ratio_just_outside_the_band_fails():
+    table = gates2(["just above", "just below"], tolerance=0.5,
+                   m={"just above": m_of(11, 22, 33, 44.001),
+                      "just below": m_of(9, 18, 27, 35.999)})
+    assert table["ratio gate"].tolist() == [False, False]
+
+
+def test_stage2_a_setting_tied_with_the_best_passes_any_tolerance():
+    table = gates2(["noisy", "noisy copy"], tolerance=1e-12,
+                   m={"noisy copy": M["noisy"].copy()})
+    assert table["skill gate"].tolist() == [True, True]
+
+
+def test_stage2_tolerance_is_relative_to_the_grids_best_not_a_running_best():
+    # noisy comes first: a running best would let it pass.
+    assert not gates2(["noisy", "perfect"]).loc["noisy", "skill gate"]
+    # Alone, noisy is its grid's best; beside the worse noisy2 it is still the best.
+    assert gates2(["noisy"]).loc["noisy", "skill gate"]
+    assert gates2(["noisy2", "noisy"])["skill gate"].tolist() == [False, True]
+
+
+def test_stage2_the_order_of_the_settings_does_not_change_any_settings_result():
+    names = ["perfect", "high", "low", "too high", "noisy", "noisy2", "flat"]
+    reference = gates2(names, tolerance=0.1).drop(columns="stage2")
+    for order in (names[::-1], ["flat", "noisy", "perfect", "low", "noisy2", "too high", "high"]):
+        table = gates2(order, tolerance=0.1)
+        assert table["stage2"].tolist() == list(range(len(order)))
+        pd.testing.assert_frame_equal(table.drop(columns="stage2").loc[names], reference)
+
+
+def test_stage2_the_best_skill_is_taken_among_m_gate_passers_only():
+    # broken would have been perfect but for one m of 0: it cannot set the best, so noisy
+    # (the only usable setting) is the best and passes the skill gate.
+    broken = m_of(10, 20, 30, 40)
+    broken.iloc[0] = 0.0
+    table = gates2(["broken", "noisy"], m={"broken": broken})
+    assert table.loc["noisy", "skill gate"] and table.loc["noisy", "eligible"]
+    assert not table.loc["broken", "eligible"]
+
+
+def test_stage2_no_setting_passes_the_m_gate_then_every_setting_fails_and_nothing_raises():
+    table = gates2(["a", "b"], m={"a": m_of(0, 20, 30, 40), "b": m_of(10, nan, 30, 40)})
+    assert table["m gate"].tolist() == [False, False]
+    assert table["skill gate"].tolist() == [False, False]
+    assert table["eligible"].tolist() == [False, False]
+
+
+def test_stage2_a_reference_exactly_right_gives_nan_skill_and_every_setting_fails():
+    # amount_summary: no deviance left to improve on, so the skill is undefined (NaN); a NaN
+    # skill compares False with the best, so the skill gate fails everywhere.
+    table = gates2(["perfect", "noisy"], reference=AMOUNT.copy())
+    assert table["deviance skill"].isna().all()
+    assert table["m gate"].tolist() == [True, True]
+    assert table["skill gate"].tolist() == [False, False]
+    assert table["eligible"].tolist() == [False, False]
+
+
+def test_stage2_an_m_equal_to_the_reference_has_skill_zero_and_fails_the_skill_gate():
+    row = gates2(["perfect", "flat"]).loc["flat"]
+    assert row["deviance skill"] == pytest.approx(0.0, abs=1e-12)
+    assert gate_flags(row, S2_GATES) == {"m gate": True, "skill gate": False,
+                                         "ratio gate": True, "eligible": False}
+
+
+def test_stage2_gates_does_not_change_its_inputs():
+    amount, m, reference = AMOUNT.copy(), M["noisy"].copy(), REFERENCE.copy()
+    stage2_gates(amount, [m], reference, 0.05, (0.9, 1.1))
+    pd.testing.assert_series_equal(amount, AMOUNT)
+    pd.testing.assert_series_equal(m, M["noisy"])
+    pd.testing.assert_series_equal(reference, REFERENCE)
+
+
+# stage2_gates: errors
+
+def test_stage2_gates_refuses_an_empty_grid():
+    with pytest.raises(ValueError, match="^there are no stage-2 settings to check$"):
+        stage2_gates(AMOUNT, [], REFERENCE, 0.05, (0.9, 1.1))
+
+
+def test_stage2_gates_refuses_an_m_with_other_rows():
+    other = M["noisy"].set_axis([3, 5, 8, 14])
+    with pytest.raises(ValueError,
+                       match=r"^m must have the rows of amount \(the same index\)$"):
+        stage2_gates(AMOUNT, [M["perfect"], other], REFERENCE, 0.05, (0.9, 1.1))
+
+
+def test_stage2_gates_refuses_an_m_with_the_rows_in_another_order():
+    with pytest.raises(ValueError, match="^m must have the rows of amount"):
+        stage2_gates(AMOUNT, [M["noisy"].iloc[::-1]], REFERENCE, 0.05, (0.9, 1.1))
+
+
+def test_stage2_gates_refuses_an_m_with_fewer_rows():
+    with pytest.raises(ValueError, match="^m must have the rows of amount"):
+        stage2_gates(AMOUNT, [M["noisy"].iloc[:-1]], REFERENCE, 0.05, (0.9, 1.1))
+
+
+def test_stage2_gates_refuses_a_reference_with_other_rows():
+    with pytest.raises(ValueError,
+                       match=r"^reference must have the rows of amount \(the same index\)$"):
+        stage2_gates(AMOUNT, [M["noisy"]], REFERENCE.iloc[:-1], 0.05, (0.9, 1.1))
+
+
+@pytest.mark.parametrize("bad", [0.0, -25.0, nan, inf])
+def test_stage2_gates_refuses_a_reference_that_is_not_finite_and_above_zero(bad):
+    reference = REFERENCE.copy()
+    reference.iloc[2] = bad
+    with pytest.raises(ValueError, match="^reference must be finite and above 0 in every row$"):
+        stage2_gates(AMOUNT, [M["noisy"]], reference, 0.05, (0.9, 1.1))
+
+
+@pytest.mark.parametrize("bad, message", [
+    (0.0, r"^amount is 0 or below in 1 rows: stage 2 learns from paid rows only"),
+    (-3.0, r"^amount is 0 or below in 1 rows"),
+    (nan, r"^amount has 1 missing values"),
+    (inf, r"^amount holds an infinite value$"),
+])
+def test_stage2_gates_refuses_an_amount_that_is_not_a_paid_amount(bad, message):
+    amount = AMOUNT.copy()
+    amount.iloc[0] = bad
+    with pytest.raises(ValueError, match=message):
+        stage2_gates(amount, [M["noisy"]], REFERENCE, 0.05, (0.9, 1.1))
+
+
+def test_stage2_gates_refuses_no_paid_rows():
+    empty = pd.Series([], dtype=float)
+    with pytest.raises(ValueError, match="^there are no paid rows to learn the amount from$"):
+        stage2_gates(empty, [empty.copy()], empty.copy(), 0.05, (0.9, 1.1))

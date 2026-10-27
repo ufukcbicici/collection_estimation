@@ -122,6 +122,12 @@ class JointDiagnosticSettings:
     stage2_max_leaf_nodes: tuple[int, ...]
     stage2_scale: tuple[str, ...]             # STAGE2_SCALES to try
     stage2_balance_floor: tuple[str, ...]     # BALANCE_FLOORS to try (under "open balance" only)
+    # The eligibility gates (U11.5b): each stage checked on its own on validation before any
+    # pair is scored. "The best" is the best setting of the same grid.
+    stage1_log_loss_tolerance: float          # log loss at most the best's x (1 + this)
+    stage1_slope_band: tuple[float, float]    # calibration slope inside (low, high)
+    stage2_skill_tolerance: float             # deviance skill at least the best's - this
+    stage2_ratio_band: tuple[float, float]    # total ratio (sum m / sum paid) inside (low, high)
     selection_metric: str                     # one of TOTAL_METRICS: chooses the pair
     bootstrap_samples: int                    # resamples of the paired comparison
     output_folder: Path                       # where the result tables are written as CSV
@@ -221,8 +227,10 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     check_keys(joint, {"run", "stage1_max_iter", "stage1_learning_rate",
                        "stage1_max_leaf_nodes", "stage2_loss", "stage2_max_iter",
                        "stage2_learning_rate", "stage2_max_leaf_nodes", "stage2_scale",
-                       "stage2_balance_floor", "selection_metric", "bootstrap_samples",
-                       "output_folder"}, f"{name} [joint_diagnostic]")
+                       "stage2_balance_floor", "stage1_log_loss_tolerance",
+                       "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band",
+                       "selection_metric", "bootstrap_samples", "output_folder"},
+               f"{name} [joint_diagnostic]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -358,6 +366,11 @@ def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiag
         stage2_scale=grid_setting(table, "stage2_scale", where, one_of(STAGE2_SCALES)),
         stage2_balance_floor=grid_setting(table, "stage2_balance_floor", where,
                                           one_of(BALANCE_FLOORS)),
+        stage1_log_loss_tolerance=positive_number_setting(table, "stage1_log_loss_tolerance",
+                                                          where),
+        stage1_slope_band=band_setting(table, "stage1_slope_band", where),
+        stage2_skill_tolerance=positive_number_setting(table, "stage2_skill_tolerance", where),
+        stage2_ratio_band=band_setting(table, "stage2_ratio_band", where),
         selection_metric=choice_setting(table, "selection_metric", where, TOTAL_METRICS),
         bootstrap_samples=count_setting(table, "bootstrap_samples", where),
         output_folder=path_setting(table, "output_folder", repo_root, where),
@@ -713,6 +726,17 @@ def positive_number_setting(table: dict, key: str, where: str) -> float:
             or value <= 0 or value == float("inf")):
         raise ValueError(f"{where}: {key} is {value!r}, not a number above 0")
     return float(value)
+
+
+def band_setting(table: dict, key: str, where: str) -> tuple[float, float]:
+    """A band [low, high]: two numbers above 0 (finite), low below high, returned as floats."""
+    value = table[key]
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{where}: {key} is {value!r}, not a band [low, high]")
+    low, high = (positive_number_setting({key: item}, key, where) for item in value)
+    if low >= high:
+        raise ValueError(f"{where}: {key} is {value!r}; low must be below high")
+    return low, high
 
 
 # The class weightings a diagnostic grid can try.
