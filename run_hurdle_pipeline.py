@@ -124,7 +124,7 @@ from collection_estimation.hurdle.training_table import (  # noqa: E402
     rows_at_origin,
     rows_known_at,
 )
-from collection_estimation.hurdle.topups import topup_forecasts  # noqa: E402
+from collection_estimation.hurdle.topups import score_topups, topup_actuals, topup_forecasts  # noqa: E402
 from collection_estimation.hurdle.side_tables import (  # noqa: E402
     check_side_tables,
     is_unidentified,
@@ -141,7 +141,7 @@ from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
     load_ledger,
 )
-from collection_estimation.hurdle.prices import deflate, price_weeks, published_levels  # noqa: E402
+from collection_estimation.hurdle.prices import price_weeks, published_levels  # noqa: E402
 from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 from collection_estimation.hurdle.series import (  # noqa: E402
     add_week_index,
@@ -156,8 +156,6 @@ from collection_estimation.hurdle.series import (  # noqa: E402
 # ----------------------------------------------------------------------------------------
 DEFAULT_SETTINGS_FILE = REPO_ROOT / "settings" / "synthetic.toml"
 SETTINGS_FILE = Path(os.environ.get("HURDLE_SETTINGS", DEFAULT_SETTINGS_FILE))
-# The trailing-mean windows the top-ups' printout shows (U12.1); U12.3 compares them.
-TOPUP_MEAN_WINDOW = 8
 
 
 def main():
@@ -368,9 +366,16 @@ def main():
     show_deflated_label(panel, levels)
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
-    # trailing mean and by the ridge (with and without the recent level), beside what came.
+    # trailing mean ([topups] window) and by the ridge (with and without the recent level),
+    # beside what came.
     show_topups(new_cash, refunds, unidentified, levels, calendar, settings.diagnostic.origin,
-                settings.receivables.horizons)
+                settings.receivables.horizons, settings.topups.window)
+
+    # U12.3, the choice of the top-up method ([topups] compare): every candidate forecast at
+    # every origin of the comparison and scored against what came; the method is set by hand.
+    if settings.topups.compare:
+        compare_topups(new_cash, refunds, unidentified, levels, calendar, settings.topups,
+                       settings.receivables.horizons)
 
     # The training table: one row per panel row, with its label and every feature block.
     table = join_features(panel, history, calendar, owed)
@@ -1005,41 +1010,78 @@ def show_deflated_label(panel, levels):
     print((per_week.loc[per_week.index % 16 == 0] / [1e6, 1e6, 1, 1]).round(3).to_string())
 
 
-def show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons):
+def topup_candidates(windows):
+    """The top-up methods to compare: name -> (method, window, with_level); the mean over
+    each of `windows`, and the ridge with and without the recent level (no window)."""
+    candidates = {f"mean {window}": ("mean", window, True) for window in windows}
+    candidates["ridge"] = ("ridge", 1, True)
+    candidates["ridge no level"] = ("ridge", 1, False)
+    return candidates
+
+
+def show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons, window):
     """A short printout of U12.2: the top-up forecasts made at `origin` by the trailing mean of
-    TOPUP_MEAN_WINDOW weeks and by the ridge with and without the recent level, all companies
-    added up (each company forecast on its own series), beside the actual cash (hindsight).
-    A and the top-up (A + R + G), million TRY of week 0."""
-    methods = {f"mean {TOPUP_MEAN_WINDOW}": ("mean", True), "ridge": ("ridge", True),
-               "ridge no level": ("ridge", False)}
+    `window` weeks and by the ridge with and without the recent level, all companies added up
+    (each company forecast on its own series), beside the actual cash (hindsight), both over
+    the companies whose target week has data. A and the top-up (A + R + G), million TRY of
+    week 0."""
+    came = topup_actuals(new_cash, refunds, unidentified, levels, [origin], horizons)
+    # The forecasts are added up over the same (company, h) as the actuals: a company whose
+    # target week has no data is left out of both columns.
+    with_actual = came[["company_code", "origin_week", "h"]]
     lines = {}
-    for name, (method, with_level) in methods.items():
+    for name, (method, window, with_level) in topup_candidates([window]).items():
         found = topup_forecasts(new_cash, refunds, unidentified, levels, calendar, [origin],
-                                horizons, method, TOPUP_MEAN_WINDOW, with_level)
+                                horizons, method, window, with_level)
+        found = found.merge(with_actual, on=["company_code", "origin_week", "h"])
         per_h = found.groupby("h")[["new_customer_cash", "topup", "fallback"]].sum()
         lines[f"A {name}"] = per_h["new_customer_cash"] / 1e6
         lines[f"top-up {name}"] = per_h["topup"] / 1e6
         if method == "ridge":
             lines[f"fallbacks {name}"] = per_h["fallback"]
-    # What came (hindsight), deflated by the week it came: A of this origin per h, and R and G
-    # of each target week.
-    came = new_cash[new_cash["origin_week"] == origin]
-    came = came.assign(deflated=deflate(came["new_customer_cash"], came["target_week"], levels))
-    new_actual = came.groupby("h")["deflated"].sum()
-    other_actual = {}
-    for h in new_actual.index:
-        week = origin + h
-        other_actual[h] = sum(
-            deflate(table.loc[table["week"] == week, column],
-                    table.loc[table["week"] == week, "week"], levels).sum()
-            for table, column in ((refunds, "refunds"), (unidentified, "unidentified_cash")))
-    lines["A actual"] = new_actual / 1e6
-    lines["top-up actual"] = (new_actual + pd.Series(other_actual)) / 1e6
+    came = came.groupby("h")[["new_customer_cash", "topup"]].sum()
+    lines["A actual"] = came["new_customer_cash"] / 1e6
+    lines["top-up actual"] = came["topup"] / 1e6
     print(f"        top-ups at origin {origin}, all companies, million TRY of week 0 (actual = "
           f"what came, hindsight; fallbacks = companies whose ridge fell back to the level):")
     order = [name for prefix in ("A ", "top-up ", "fallbacks ") for name in lines
              if name.startswith(prefix)]
     print(pd.DataFrame(lines)[order].rename_axis("h").round(3).to_string())
+
+
+def compare_topups(new_cash, refunds, unidentified, levels, calendar, topups, horizons):
+    """U12.3: every top-up candidate (`topup_candidates` of [topups] compare_windows) forecast
+    at every origin from compare_first_origin to compare_last_origin, and scored on the
+    consolidated top-up (all companies added up) against what came. Prints, per candidate,
+    the mean absolute error per h and over all h, the bias, and the error of A and R on their
+    own (million TRY of week 0); then the lowest error and the method set in [topups]."""
+    origins = list(range(topups.compare_first_origin, topups.compare_last_origin + 1))
+    actuals = topup_actuals(new_cash, refunds, unidentified, levels, origins, horizons)
+    lines = []
+    for name, (method, window, with_level) in topup_candidates(topups.compare_windows).items():
+        forecasts = topup_forecasts(new_cash, refunds, unidentified, levels, calendar, origins,
+                                    horizons, method, window, with_level)
+        scores = score_topups(forecasts, actuals, by_company=False).set_index(["series", "h"])
+        line = {"candidate": name}
+        for h in range(1, horizons + 1):
+            line[f"h{h}"] = scores.loc[("topup", h), "mean_abs_error"]
+        for series, label in (("topup", "all h"), ("new_customer_cash", "A"),
+                              ("refunds", "R")):
+            line[label] = scores.loc[series, "mean_abs_error"].mean()
+        line["bias"] = scores.loc["topup", "bias"].mean()
+        line["fallbacks"] = int(forecasts["fallback"].sum())
+        lines.append(line)
+    table = pd.DataFrame(lines).set_index("candidate")
+    money = [column for column in table.columns if column != "fallbacks"]
+    table[money] = table[money] / 1e6
+    print(f"        top-up methods compared at origins {origins[0]}-{origins[-1]} "
+          f"({len(origins)} origins), consolidated top-up: mean absolute error per h and over "
+          f"all h, A and R on their own, bias (above 0: too high), million TRY of week 0; "
+          f"fallbacks = forecasts (company, origin, h) whose ridge fell back to the level:")
+    print(table.round(3).to_string())
+    chosen = (f"mean {topups.window}" if topups.method == "mean"
+              else "ridge" if topups.with_level else "ridge no level")
+    print(f"        lowest error over all h: {table['all h'].idxmin()}; set in [topups]: {chosen}")
 
 
 def show_table(table, panel):

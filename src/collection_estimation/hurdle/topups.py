@@ -17,6 +17,9 @@ U12.2, the ridge: the `deflated` benchmark's model (`benchmark.deflated_forecast
 top-up series, refitted at every origin on the target weeks up to it, with one fit per h
 (for R and G too: the same series, but predicting h weeks ahead is a different task).
 `topup_forecasts` gives A, R and G of every company with either method in one table.
+
+U12.3, the choice of method: `topup_actuals` is what really came, in the same shape, and
+`score_topups` the error of a method's forecasts over many origins ([topups] in the settings).
 """
 import numpy as np
 import pandas as pd
@@ -145,3 +148,78 @@ def topup_forecasts(new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified:
     found["topup"] = found["new_customer_cash"] + found["refunds"] + found["unidentified_cash"]
     found = found.sort_values(["company_code", "origin_week", "h"], ignore_index=True)
     return found[TOPUP_COLUMNS]
+
+
+def topup_actuals(new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+                  levels: pd.Series, origins: list[int], horizons: int) -> pd.DataFrame:
+    """What the top-ups really were (hindsight), in the shape of `topup_forecasts`: per
+    company, origin and h, the cash of A, R and G in the target week (origin + h), deflated by
+    that week's price level, and their sum. The side tables and `levels` as for
+    `topup_forecasts`.
+
+    A row is left out when its target week has no data in one of the tables (missing, or
+    after the last week): no data is not 0. Returns the columns of TOPUP_COLUMNS without
+    fallback, sorted by company, origin and h. Raises ValueError if `horizons` is below 1.
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    wanted = new_cash["origin_week"].isin(origins) & (new_cash["h"] <= horizons)
+    found = new_cash.loc[wanted, keys + ["new_customer_cash"]]
+    # R and G do not depend on the origin: each target week's value, joined by company and
+    # week; a target week a table has no row for drops out here.
+    for table, column in ((refunds, "refunds"), (unidentified, "unidentified_cash")):
+        by_week = table[["company_code", "week", column]].rename(columns={"week": "target_week"})
+        found = found.merge(by_week, on=["company_code", "target_week"], how="inner",
+                            validate="many_to_one")
+    for column in ("new_customer_cash", "refunds", "unidentified_cash"):
+        found[column] = deflate(found[column], found["target_week"], levels)
+    found["topup"] = found["new_customer_cash"] + found["refunds"] + found["unidentified_cash"]
+    found = found.sort_values(["company_code", "origin_week", "h"], ignore_index=True)
+    return found[TOPUP_COLUMNS[:-1]]
+
+
+# The series `score_topups` scores, in order: the three top-ups and their sum.
+SCORED_SERIES = ["new_customer_cash", "refunds", "unidentified_cash", "topup"]
+# The columns of the table `score_topups` returns, after company_code (if by company).
+SCORE_COLUMNS = ["h", "series", "mean_abs_error", "bias", "forecasts"]
+
+
+def score_topups(forecasts: pd.DataFrame, actuals: pd.DataFrame,
+                 by_company: bool) -> pd.DataFrame:
+    """How far `forecasts` (from `topup_forecasts`) were from `actuals` (from
+    `topup_actuals`), per h and series (SCORED_SERIES), and per company if `by_company`;
+    otherwise the companies are first added up, so each origin and h is scored on its
+    consolidated top-up.
+
+    Only (company, origin, h) found in both tables are scored; `forecasts` counts them.
+    The scores, in TRY of week 0 like the inputs: mean_abs_error, the mean of |forecast -
+    actual| over the origins, and bias, the mean of forecast - actual (above 0: forecasts too
+    high). Not MAPE: refunds are negative and A is often 0. Returns one row per (company,) h
+    and series, sorted by them. Raises ValueError if a (company, origin, h) appears twice in
+    either table, either holds a NaN or infinite value, or no row is found in both.
+    """
+    keys = ["company_code", "origin_week", "h"]
+    for name, table in (("forecasts", forecasts), ("actuals", actuals)):
+        if table.duplicated(keys).any():
+            raise ValueError(f"{name} holds a (company, origin, h) more than once")
+        if not np.isfinite(table[SCORED_SERIES].astype("float64")).all().all():
+            raise ValueError(f"{name} holds a NaN or infinite value")
+    both = forecasts[keys + SCORED_SERIES].merge(actuals[keys + SCORED_SERIES], on=keys,
+                                                 suffixes=("_forecast", "_actual"))
+    if both.empty:
+        raise ValueError("no (company, origin, h) is in both the forecasts and the actuals")
+    if not by_company:
+        both = both.drop(columns="company_code").groupby(["origin_week", "h"],
+                                                         as_index=False).sum()
+    groups = ["company_code", "h"] if by_company else ["h"]
+    scores = []
+    for group, rows in both.groupby(groups):
+        group = group if isinstance(group, tuple) else (group,)
+        for series in SCORED_SERIES:
+            error = rows[f"{series}_forecast"] - rows[f"{series}_actual"]
+            scores.append({**dict(zip(groups, group)), "series": series,
+                           "mean_abs_error": float(error.abs().mean()),
+                           "bias": float(error.mean()), "forecasts": len(rows)})
+    columns = (["company_code"] if by_company else []) + SCORE_COLUMNS
+    return pd.DataFrame(scores)[columns]

@@ -193,7 +193,12 @@ VALID = {
                          "stage2_ratio_band": "[0.95, 1.05]",
                          "selection_metric": '"wape"', "bootstrap_samples": "500",
                          "output_folder": '"results/joint"'},
-    "debug": {"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
+    # U12.3: the top-ups. Values differ from synthetic.toml's on purpose ("ridge", 8, false,
+    # false, 20..35, [13, 4] unsorted against "mean", 13, true, true, 13..40, [4, 8, 13]).
+    "topups": {"method": '"ridge"', "window": "8", "with_level": "false", "compare": "false",
+               "compare_first_origin": "20", "compare_last_origin": "35",
+               "compare_windows": "[13, 4]"},
+    "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
 
@@ -325,7 +330,8 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
                                        "history", "calendar", "stage1", "stage2",
-                                       "diagnostic", "joint_diagnostic", "debug"])
+                                       "diagnostic", "joint_diagnostic", "topups",
+                                       "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -2213,7 +2219,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2']")
+        f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
 def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
@@ -2721,7 +2727,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2']")
+        f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_diagnostic_typo_has_the_exact_message(tmp_path, repo):
@@ -2767,7 +2773,12 @@ def test_the_other_diagnostic_settings_are_still_checked_when_run_is_false(tmp_p
 
 @pytest.mark.parametrize("good, expected", [("0", 0), ("1", 1), ("49", 49)])
 def test_diagnostic_origin_accepts_week_numbers(tmp_path, repo, good, expected):
-    value = load(tmp_path, repo, changes={("diagnostic", "origin"): good}).diagnostic.origin
+    # Since U12.3 [topups] compare_last_origin may not be after the [diagnostic] origin, so
+    # the comparison's origins are moved to 0 to let any week number through.
+    value = load(tmp_path, repo, changes={("diagnostic", "origin"): good,
+                                          ("topups", "compare_first_origin"): "0",
+                                          ("topups", "compare_last_origin"): "0"}
+                 ).diagnostic.origin
     assert value == expected and type(value) is int
 
 
@@ -2780,7 +2791,8 @@ def test_diagnostic_origin_rejects_with_the_exact_message(tmp_path, repo, bad, s
 
 def test_diagnostic_origin_does_not_borrow_demo_origin(tmp_path, repo):
     settings = load(tmp_path, repo, changes={("diagnostic", "origin"): "33",
-                                             ("debug", "demo_origin"): "12"})
+                                             ("debug", "demo_origin"): "12",
+                                             ("topups", "compare_last_origin"): "33"})
     assert (settings.diagnostic.origin, settings.debug.demo_origin) == (33, 12)
 
 
@@ -3448,7 +3460,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2']")
+        f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_stage2_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4116,7 +4128,7 @@ def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, r
     assert message == (
         f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'stage1', 'stage2']")
+        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_joint_diagnostic_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4608,7 +4620,7 @@ def test_the_calendar_does_not_change_the_other_sections(tmp_path, repo):
     b = load(tmp_path, repo, changes={("calendar", "holiday_encodings"): "[]",
                                       ("calendar", "drain_window"): "9"})
     for name in ("data", "history", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                 "debug"):
+                 "topups", "debug"):
         assert getattr(a, name) == getattr(b, name), name
     assert a.calendar != b.calendar
 
@@ -4618,7 +4630,7 @@ def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'stage1', 'stage2']")
+        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_calendar_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4779,3 +4791,547 @@ def test_the_synthetic_calendar_settings():
     calendar = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).calendar
     assert calendar == CalendarSettings(holiday_encodings=("drain",), drain_window=3,
                                         catch_up_window=5)
+
+
+
+# --- [topups] (U12.3) ------------------------------------------------------------------------
+# A required section: the top-up method that goes into the forecast (method one of
+# TOPUP_METHODS, window a count, with_level a bool) and the comparison that chose it (compare a
+# bool; compare_first_origin <= compare_last_origin, both week numbers, the last at most the
+# [diagnostic] origin; compare_windows a window list, returned sorted). Every setting is
+# checked whatever method and compare say.
+
+from collection_estimation.hurdle import topups as topups_module  # noqa: E402
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    TOPUP_METHODS,
+    TopupSettings,
+    read_topups,
+)
+
+TOPUPS = f"{FILE_NAME} [topups]"
+TOPUP_KEYS = ['compare', 'compare_first_origin', 'compare_last_origin', 'compare_windows',
+              'method', 'window', 'with_level']
+
+
+def test_topup_methods():
+    assert TOPUP_METHODS == ("mean", "ridge")
+
+
+def test_topup_methods_are_the_methods_topups_knows():
+    assert TOPUP_METHODS == topups_module.METHODS
+
+
+def test_topup_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(TopupSettings)] == [
+        "method", "window", "with_level", "compare", "compare_first_origin",
+        "compare_last_origin", "compare_windows"]
+
+
+def test_the_topups_section_is_read(tmp_path, repo):
+    topups = load(tmp_path, repo).topups
+    assert topups == TopupSettings(method="ridge", window=8, with_level=False, compare=False,
+                                   compare_first_origin=20, compare_last_origin=35,
+                                   compare_windows=(4, 13))
+
+
+def test_the_topups_values_have_the_right_python_types(tmp_path, repo):
+    topups = load(tmp_path, repo).topups
+    assert isinstance(topups, TopupSettings)
+    assert type(topups.method) is str
+    assert type(topups.window) is int
+    assert type(topups.with_level) is bool
+    assert type(topups.compare) is bool
+    assert type(topups.compare_first_origin) is int
+    assert type(topups.compare_last_origin) is int
+    assert type(topups.compare_windows) is tuple
+    assert all(type(window) is int for window in topups.compare_windows)
+
+
+def test_topup_settings_is_frozen_and_hashable(tmp_path, repo):
+    topups = load(tmp_path, repo).topups
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        topups.window = 4
+    assert hash(topups) == hash(dataclasses.replace(topups))
+
+
+@pytest.mark.parametrize("attribute", ["method", "window", "with_level", "compare",
+                                       "compare_first_origin", "compare_last_origin",
+                                       "compare_windows"])
+def test_every_topup_setting_is_frozen(tmp_path, repo, attribute):
+    topups = load(tmp_path, repo).topups
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(topups, attribute, None)
+
+
+def test_settings_has_a_topups_field_between_joint_diagnostic_and_debug():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("joint_diagnostic") + 1 == names.index("topups")
+    assert names.index("topups") + 1 == names.index("debug")
+
+
+def test_the_topups_do_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("topups", "method"): '"mean"',
+                                      ("topups", "window"): "13",
+                                      ("topups", "compare"): "true"})
+    for name in ("data", "history", "calendar", "stage1", "stage2", "diagnostic",
+                 "joint_diagnostic", "debug"):
+        assert getattr(a, name) == getattr(b, name), name
+    assert a.topups != b.topups
+
+
+def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="topups")
+    assert message == (
+        f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'collections_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
+
+
+def test_a_topups_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="topups", top="topups = 5")
+    assert message == f"{TOPUPS} is 5, not a section"
+
+
+def test_an_empty_topups_section_names_every_setting(tmp_path, repo):
+    changes = {("topups", key): REMOVE for key in VALID["topups"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == f"{TOPUPS}: missing {TOPUP_KEYS}; expected exactly {TOPUP_KEYS}"
+
+
+def test_the_valid_file_has_exactly_the_topup_keys():
+    assert sorted(VALID["topups"]) == TOPUP_KEYS
+
+
+@pytest.mark.parametrize("key", TOPUP_KEYS)
+def test_each_missing_topups_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("topups", key): REMOVE})
+    assert message == f"{TOPUPS}: missing [{key!r}]; expected exactly {TOPUP_KEYS}"
+
+
+def test_a_topups_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "compare_windows"): REMOVE,
+                                             ("topups", "compare_window"): "[4]"})
+    assert message == (f"{TOPUPS}: missing ['compare_windows']; unknown ['compare_window']; "
+                       f"expected exactly {TOPUP_KEYS}")
+
+
+@pytest.mark.parametrize("key, value", [("windows", "[4]"), ("origin", "40"),
+                                        ("horizons", "5"), ("run", "true")])
+def test_an_unknown_topups_key_is_refused(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("topups", key): value})
+    assert message == f"{TOPUPS}: unknown [{key!r}]; expected exactly {TOPUP_KEYS}"
+
+
+def test_the_topups_keys_are_unknown_in_diagnostic(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "compare_windows"): "[4]"})
+    assert message.startswith(f"{DIAG}: unknown ['compare_windows']; ")
+
+
+# [topups] method
+
+@pytest.mark.parametrize("good", ["mean", "ridge"])
+def test_topups_method_accepts_each_method(tmp_path, repo, good):
+    # Window 4 is one of VALID's compare_windows [13, 4], as "mean" needs.
+    topups = load(tmp_path, repo, changes={("topups", "method"): f'"{good}"',
+                                           ("topups", "window"): "4"}).topups
+    assert topups.method == good and type(topups.method) is str
+
+
+@pytest.mark.parametrize("bad, shown", [('"Mean"', "'Mean'"), ('"RIDGE"', "'RIDGE'"),
+                                        ('"deflated"', "'deflated'"), ('""', "''"),
+                                        ('" mean"', "' mean'"), ("1", "1"), ("true", "True"),
+                                        ('["mean"]', "['mean']")])
+def test_a_bad_topups_method_has_the_exact_message(tmp_path, repo, bad, shown):
+    message = exact_message(tmp_path, repo, {("topups", "method"): bad})
+    assert message == f"{TOPUPS}: method is {shown}, not one of ['mean', 'ridge']"
+
+
+# [topups] window (count_setting)
+
+@pytest.mark.parametrize("text, expected", [("1", 1), ("4", 4), ("13", 13), ("52", 52)])
+def test_topups_window_accepts_a_count(tmp_path, repo, text, expected):
+    topups = load(tmp_path, repo, changes={("topups", "window"): text}).topups
+    assert topups.window == expected and type(topups.window) is int
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("8.0", "8.0"),
+                                         ('"8"', "'8'"), ("true", "True"), ("[8]", "[8]")])
+def test_a_bad_topups_window_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("topups", "window"): text})
+    assert message == f"{TOPUPS}: window is {shown}, not a whole number of 1 or more"
+
+
+def test_the_window_is_checked_under_the_ridge_too(tmp_path, repo):
+    # The ridge ignores the window, but the setting is still checked.
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"ridge"',
+                                             ("topups", "window"): "0"})
+    assert message == f"{TOPUPS}: window is 0, not a whole number of 1 or more"
+
+
+# [topups] with_level and compare (bool_setting)
+
+@pytest.mark.parametrize("key", ["with_level", "compare"])
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_topups_switches_accept_true_and_false(tmp_path, repo, key, text, expected):
+    topups = load(tmp_path, repo, changes={("topups", key): text}).topups
+    assert getattr(topups, key) is expected
+
+
+@pytest.mark.parametrize("key", ["with_level", "compare"])
+@pytest.mark.parametrize("text, shown", [("1", "1"), ("0", "0"), ('"true"', "'true'"),
+                                         ('"yes"', "'yes'"), ("[true]", "[True]")])
+def test_a_bad_topups_switch_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("topups", key): text})
+    assert message == f"{TOPUPS}: {key} is {shown}, not true or false"
+
+
+def test_the_two_switches_are_read_separately(tmp_path, repo):
+    topups = load(tmp_path, repo, changes={("topups", "with_level"): "true",
+                                           ("topups", "compare"): "false"}).topups
+    assert (topups.with_level, topups.compare) == (True, False)
+    topups = load(tmp_path, repo, changes={("topups", "with_level"): "false",
+                                           ("topups", "compare"): "true"}).topups
+    assert (topups.with_level, topups.compare) == (False, True)
+
+
+def test_with_level_is_checked_under_the_mean_too(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): "13",
+                                             ("topups", "with_level"): "1"})
+    assert message == f"{TOPUPS}: with_level is 1, not true or false"
+
+
+def test_the_comparison_settings_are_checked_when_compare_is_false(tmp_path, repo):
+    for key, text, expected in [
+        ("compare_first_origin", "-1",
+         f"{TOPUPS}: compare_first_origin is -1, not a week number (0 or more)"),
+        ("compare_last_origin", '"35"',
+         f"{TOPUPS}: compare_last_origin is '35', not a week number (0 or more)"),
+        ("compare_windows", "[]",
+         f"{TOPUPS}: compare_windows is [], not a non-empty list of window lengths"),
+    ]:
+        message = exact_message(tmp_path, repo, {("topups", "compare"): "false",
+                                                 ("topups", key): text})
+        assert message == expected, key
+
+
+# [topups] compare_first_origin and compare_last_origin (week_setting, and their order)
+
+@pytest.mark.parametrize("key", ["compare_first_origin", "compare_last_origin"])
+@pytest.mark.parametrize("text, shown", [("-1", "-1"), ("20.0", "20.0"), ('"20"', "'20'"),
+                                         ("true", "True"), ("false", "False"), ("[20]", "[20]")])
+def test_a_bad_comparison_origin_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("topups", key): text})
+    assert message == f"{TOPUPS}: {key} is {shown}, not a week number (0 or more)"
+
+
+@pytest.mark.parametrize("first, last", [(0, 0), (0, 40), (13, 40), (20, 21), (35, 35),
+                                         (40, 40)])
+def test_comparison_origins_from_first_to_last_are_accepted(tmp_path, repo, first, last):
+    topups = load(tmp_path, repo, changes={("topups", "compare_first_origin"): str(first),
+                                           ("topups", "compare_last_origin"): str(last)}).topups
+    assert (topups.compare_first_origin, topups.compare_last_origin) == (first, last)
+
+
+@pytest.mark.parametrize("first, last", [(21, 20), (35, 34), (40, 0), (1, 0)])
+def test_a_last_origin_before_the_first_has_the_exact_message(tmp_path, repo, first, last):
+    message = exact_message(tmp_path, repo, {("topups", "compare_first_origin"): str(first),
+                                             ("topups", "compare_last_origin"): str(last)})
+    assert message == (f"{TOPUPS}: compare_last_origin is {last}, before "
+                       f"compare_first_origin {first}")
+
+
+def test_the_first_and_last_origin_are_not_swapped(tmp_path, repo):
+    topups = load(tmp_path, repo, changes={("topups", "compare_first_origin"): "13",
+                                           ("topups", "compare_last_origin"): "30"}).topups
+    assert topups.compare_first_origin == 13
+    assert topups.compare_last_origin == 30
+
+
+@pytest.mark.parametrize("last", [41, 45, 100])
+def test_a_last_origin_after_the_diagnostic_origin_has_the_exact_message(tmp_path, repo, last):
+    # The VALID [diagnostic] origin is 40.
+    message = exact_message(tmp_path, repo, {("topups", "compare_last_origin"): str(last)})
+    assert message == (f"{TOPUPS}: compare_last_origin is {last}, after the [diagnostic] "
+                       f"origin 40: its target weeks would reach the test weeks")
+
+
+def test_a_last_origin_equal_to_the_diagnostic_origin_is_accepted(tmp_path, repo):
+    topups = load(tmp_path, repo, changes={("topups", "compare_last_origin"): "40"}).topups
+    assert topups.compare_last_origin == 40
+
+
+def test_the_limit_is_the_diagnostic_origin_not_the_demo_origin(tmp_path, repo):
+    # [diagnostic] origin 30 and [debug] demo_origin 50: 31 is refused, against 30.
+    changes = {("diagnostic", "origin"): "30", ("debug", "demo_origin"): "50",
+               ("topups", "compare_last_origin"): "31"}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == (f"{TOPUPS}: compare_last_origin is 31, after the [diagnostic] "
+                       f"origin 30: its target weeks would reach the test weeks")
+    changes[("topups", "compare_last_origin")] = "30"
+    assert load(tmp_path, repo, changes=changes).topups.compare_last_origin == 30
+
+
+def test_the_limit_moves_with_the_diagnostic_origin(tmp_path, repo):
+    changes = {("diagnostic", "origin"): "60", ("topups", "compare_last_origin"): "60"}
+    assert load(tmp_path, repo, changes=changes).topups.compare_last_origin == 60
+    changes[("diagnostic", "origin")] = "59"
+    message = exact_message(tmp_path, repo, changes)
+    assert message.startswith(f"{TOPUPS}: compare_last_origin is 60, after the [diagnostic] "
+                              f"origin 59")
+
+
+def test_a_bad_diagnostic_origin_is_reported_by_diagnostic_not_by_topups(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("diagnostic", "origin"): "-1"})
+    assert message == f"{DIAG}: origin is -1, not a week number (0 or more)"
+
+
+def test_the_order_is_checked_before_the_diagnostic_limit(tmp_path, repo):
+    # 50 > 45 > 40: both checks fail; the order is reported.
+    message = exact_message(tmp_path, repo, {("topups", "compare_first_origin"): "50",
+                                             ("topups", "compare_last_origin"): "45"})
+    assert message == f"{TOPUPS}: compare_last_origin is 45, before compare_first_origin 50"
+
+
+def test_the_first_origin_is_checked_before_the_last(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "compare_first_origin"): "-1",
+                                             ("topups", "compare_last_origin"): "-1"})
+    assert message.startswith(f"{TOPUPS}: compare_first_origin is -1")
+
+
+def test_a_first_origin_after_the_diagnostic_origin_is_reported_as_an_order_problem(tmp_path,
+                                                                                     repo):
+    # No separate check on the first origin: with the last at most the [diagnostic] origin,
+    # a first origin past it is always after the last.
+    message = exact_message(tmp_path, repo, {("topups", "compare_first_origin"): "41",
+                                             ("topups", "compare_last_origin"): "40"})
+    assert message == f"{TOPUPS}: compare_last_origin is 40, before compare_first_origin 41"
+
+
+def test_the_origins_are_checked_before_the_method(tmp_path, repo):
+    # As built: read_topups checks the two origins before anything else in the section.
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"x"',
+                                             ("topups", "compare_last_origin"): "41"})
+    assert message.startswith(f"{TOPUPS}: compare_last_origin is 41, after")
+
+
+# [topups] compare_windows (window_list_setting)
+
+@pytest.mark.parametrize("text, expected", [("[4]", (4,)), ("[13, 4]", (4, 13)),
+                                            ("[4, 8, 13]", (4, 8, 13)),
+                                            ("[13, 8, 4, 1]", (1, 4, 8, 13)), ("[52]", (52,))])
+def test_compare_windows_are_returned_sorted(tmp_path, repo, text, expected):
+    topups = load(tmp_path, repo, changes={("topups", "compare_windows"): text}).topups
+    assert topups.compare_windows == expected
+    assert type(topups.compare_windows) is tuple
+
+
+@pytest.mark.parametrize("text, shown", [("[]", "[]"), ("4", "4"), ('"4"', "'4'"),
+                                         ("true", "True"), ("{ a = 4 }", "{'a': 4}")])
+def test_compare_windows_that_is_not_a_non_empty_list_has_the_exact_message(tmp_path, repo,
+                                                                             text, shown):
+    message = exact_message(tmp_path, repo, {("topups", "compare_windows"): text})
+    assert message == (f"{TOPUPS}: compare_windows is {shown}, not a non-empty list of window "
+                       f"lengths")
+
+
+@pytest.mark.parametrize("text, shown", [("[4, 0]", "0"), ("[-4]", "-4"), ("[4, 8.0]", "8.0"),
+                                         ('[4, "8"]', "'8'"), ("[true]", "True"),
+                                         ("[[4]]", "[4]")])
+def test_a_bad_compare_window_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("topups", "compare_windows"): text})
+    assert message == f"{TOPUPS}: compare_windows holds {shown}, not a window length (1 or more)"
+
+
+@pytest.mark.parametrize("text, shown", [("[4, 4]", "[4]"), ("[13, 4, 13, 4, 8]", "[4, 13]")])
+def test_repeated_compare_windows_have_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("topups", "compare_windows"): text})
+    assert message == f"{TOPUPS}: compare_windows lists {shown} more than once"
+
+
+def test_the_window_and_the_compare_windows_are_read_separately(tmp_path, repo):
+    topups = load(tmp_path, repo, changes={("topups", "window"): "6",
+                                           ("topups", "compare_windows"): "[2, 3]"}).topups
+    assert topups.window == 6
+    assert topups.compare_windows == (2, 3)
+
+
+# With method "mean" the window in use must be one of compare_windows, so the comparison
+# shows it; with "ridge" (no window) any window is accepted. Checked after the two origins,
+# method, window and compare_windows are read, before with_level and compare.
+
+def not_compared(window, windows):
+    return (f"{TOPUPS}: window is {window}, not one of compare_windows {windows}: the "
+            f"comparison would not show the mean in use")
+
+
+@pytest.mark.parametrize("window, windows_text, shown", [
+    ("6", "[4, 8]", "[4, 8]"), ("8", "[13, 4]", "[4, 13]"), ("1", "[2]", "[2]"),
+    ("52", "[13, 8, 4]", "[4, 8, 13]"),
+])
+def test_mean_refuses_a_window_not_among_the_compare_windows(tmp_path, repo, window,
+                                                              windows_text, shown):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): window,
+                                             ("topups", "compare_windows"): windows_text})
+    assert message == not_compared(window, shown)
+
+
+@pytest.mark.parametrize("window, windows_text", [("4", "[4, 8]"), ("8", "[8, 4]"),
+                                                  ("13", "[13]"), ("1", "[1, 52]")])
+def test_mean_accepts_a_window_among_the_compare_windows(tmp_path, repo, window,
+                                                         windows_text):
+    topups = load(tmp_path, repo, changes={("topups", "method"): '"mean"',
+                                           ("topups", "window"): window,
+                                           ("topups", "compare_windows"): windows_text}).topups
+    assert topups.window == int(window) and topups.window in topups.compare_windows
+
+
+@pytest.mark.parametrize("window", ["6", "8", "100"])
+def test_ridge_accepts_a_window_not_among_the_compare_windows(tmp_path, repo, window):
+    topups = load(tmp_path, repo, changes={("topups", "method"): '"ridge"',
+                                           ("topups", "window"): window,
+                                           ("topups", "compare_windows"): "[4, 13]"}).topups
+    assert topups.window == int(window) and topups.window not in topups.compare_windows
+
+
+def test_the_membership_check_applies_whatever_compare_says(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "compare"): "false",
+                                             ("topups", "window"): "6"})
+    assert message == not_compared(6, "[4, 13]")
+
+
+def test_a_bad_method_is_reported_before_the_membership_check(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"median"',
+                                             ("topups", "window"): "6"})
+    assert message == f"{TOPUPS}: method is 'median', not one of ['mean', 'ridge']"
+
+
+def test_a_bad_window_is_reported_before_the_membership_check(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): "0"})
+    assert message == f"{TOPUPS}: window is 0, not a whole number of 1 or more"
+
+
+def test_bad_compare_windows_are_reported_before_the_membership_check(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): "6",
+                                             ("topups", "compare_windows"): "[4, 4]"})
+    assert message == f"{TOPUPS}: compare_windows lists [4] more than once"
+
+
+@pytest.mark.parametrize("key", ["with_level", "compare"])
+def test_the_membership_check_comes_before_with_level_and_compare(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): "6",
+                                             ("topups", key): "1"})
+    assert message == not_compared(6, "[4, 13]")
+
+
+def test_the_origins_are_reported_before_the_membership_check(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("topups", "method"): '"mean"',
+                                             ("topups", "window"): "6",
+                                             ("topups", "compare_last_origin"): "41"})
+    assert message.startswith(f"{TOPUPS}: compare_last_origin is 41, after")
+
+
+def test_read_topups_membership_check_by_hand():
+    with pytest.raises(ValueError) as error:
+        read_topups(topups_table(window=6), 40, "here")
+    assert str(error.value) == ("here: window is 6, not one of compare_windows [4, 8, 13]: "
+                                "the comparison would not show the mean in use")
+    assert read_topups(topups_table(method="ridge", window=6), 40, "here").window == 6
+
+
+def test_the_compare_windows_are_not_the_history_windows(tmp_path, repo):
+    # [history] windows are [4, 13, 52]; the top-up comparison may use any window lengths.
+    topups = load(tmp_path, repo, changes={("topups", "compare_windows"): "[3, 5, 7]"}).topups
+    assert topups.compare_windows == (3, 5, 7)
+
+
+# read_topups on its own
+
+def topups_table(**changes):
+    table = {"method": "mean", "window": 13, "with_level": True, "compare": True,
+             "compare_first_origin": 13, "compare_last_origin": 40,
+             "compare_windows": [13, 8, 4]}
+    table.update(changes)
+    return table
+
+
+def test_read_topups_by_hand():
+    assert read_topups(topups_table(), 40, "here") == TopupSettings(
+        method="mean", window=13, with_level=True, compare=True, compare_first_origin=13,
+        compare_last_origin=40, compare_windows=(4, 8, 13))
+
+
+def test_read_topups_uses_where_in_its_messages():
+    for changes, expected in [
+        ({"method": "median"}, "here: method is 'median', not one of ['mean', 'ridge']"),
+        ({"window": 0}, "here: window is 0, not a whole number of 1 or more"),
+        ({"with_level": "yes"}, "here: with_level is 'yes', not true or false"),
+        ({"compare": 1}, "here: compare is 1, not true or false"),
+        ({"compare_first_origin": -1},
+         "here: compare_first_origin is -1, not a week number (0 or more)"),
+        ({"compare_last_origin": 12},
+         "here: compare_last_origin is 12, before compare_first_origin 13"),
+        ({"compare_windows": [4, 4]}, "here: compare_windows lists [4] more than once"),
+    ]:
+        with pytest.raises(ValueError) as error:
+            read_topups(topups_table(**changes), 40, "here")
+        assert str(error.value) == expected, changes
+
+
+@pytest.mark.parametrize("diagnostic_origin, ok", [(39, False), (40, True), (41, True),
+                                                   (100, True)])
+def test_read_topups_compares_the_last_origin_with_the_given_diagnostic_origin(
+        diagnostic_origin, ok):
+    if ok:
+        assert read_topups(topups_table(), diagnostic_origin, "here").compare_last_origin == 40
+    else:
+        with pytest.raises(ValueError) as error:
+            read_topups(topups_table(), diagnostic_origin, "here")
+        assert str(error.value) == ("here: compare_last_origin is 40, after the [diagnostic] "
+                                    "origin 39: its target weeks would reach the test weeks")
+
+
+def test_read_topups_does_not_change_its_table():
+    table = topups_table()
+    read_topups(table, 40, "here")
+    assert table == topups_table()
+    assert table["compare_windows"] == [13, 8, 4]
+
+
+def test_read_topups_result_does_not_follow_later_changes_to_the_list():
+    table = topups_table()
+    found = read_topups(table, 40, "here")
+    table["compare_windows"].append(52)
+    assert found.compare_windows == (4, 8, 13)
+
+
+@pytest.mark.parametrize("key", TOPUP_KEYS)
+def test_read_topups_with_a_key_absent_raises_key_error(key):
+    # Through the file, check_keys reports a missing key first; on its own it is a KeyError.
+    table = topups_table()
+    del table[key]
+    with pytest.raises(KeyError):
+        read_topups(table, 40, "here")
+
+
+# synthetic.toml
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_topups_settings():
+    topups = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).topups
+    assert topups == TopupSettings(method="mean", window=13, with_level=True, compare=True,
+                                   compare_first_origin=13, compare_last_origin=40,
+                                   compare_windows=(4, 8, 13))
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_topups_window_is_among_its_compare_windows():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.topups.window in settings.topups.compare_windows
+    assert settings.topups.compare_last_origin <= settings.diagnostic.origin

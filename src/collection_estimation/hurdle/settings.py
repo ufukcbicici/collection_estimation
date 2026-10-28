@@ -134,6 +134,21 @@ class JointDiagnosticSettings:
 
 
 @dataclass(frozen=True)
+class TopupSettings:
+    """The top-ups (U12): new customers, refunds and unidentified cash, forecast per company
+    (`topups.topup_forecasts`). The method goes into the forecast; the comparison (U12.3)
+    shows how it was chosen."""
+    method: str                       # one of TOPUP_METHODS
+    window: int                       # "mean": the target weeks averaged
+    with_level: bool                  # "ridge": the recent level as an input
+    compare: bool                     # print the comparison of every candidate
+    compare_first_origin: int         # the comparison's origins: first ...
+    compare_last_origin: int          # ... and last, at most [diagnostic] origin
+    compare_windows: tuple[int, ...]  # the windows of the mean it tries (the ridge is tried
+                                      # with and without the level)
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -174,6 +189,7 @@ class Settings:
     stage2: Stage2Settings
     diagnostic: DiagnosticSettings
     joint_diagnostic: JointDiagnosticSettings
+    topups: TopupSettings
     debug: DebugSettings
 
 
@@ -190,7 +206,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
                      "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                     "debug"},
+                     "topups", "debug"},
                name)
 
     data = raw["data"]
@@ -231,6 +247,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                        "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band",
                        "selection_metric", "bootstrap_samples", "output_folder"},
                f"{name} [joint_diagnostic]")
+    topups = raw["topups"]
+    check_keys(topups, {"method", "window", "with_level", "compare", "compare_first_origin",
+                        "compare_last_origin", "compare_windows"}, f"{name} [topups]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -339,6 +358,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         ),
         joint_diagnostic=read_joint_diagnostic(joint, repo_root,
                                                f"{name} [joint_diagnostic]"),
+        topups=read_topups(topups, week_setting(diagnostic, "origin", f"{name} [diagnostic]"),
+                           f"{name} [topups]"),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
@@ -374,6 +395,37 @@ def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiag
         selection_metric=choice_setting(table, "selection_metric", where, TOTAL_METRICS),
         bootstrap_samples=count_setting(table, "bootstrap_samples", where),
         output_folder=path_setting(table, "output_folder", repo_root, where),
+    )
+
+
+def read_topups(table: dict, diagnostic_origin: int, where: str) -> TopupSettings:
+    """The [topups] section, checked. The comparison's last origin may not be after
+    `diagnostic_origin` ([diagnostic] origin): its target weeks would reach the test weeks."""
+    first_origin = week_setting(table, "compare_first_origin", where)
+    last_origin = week_setting(table, "compare_last_origin", where)
+    if last_origin < first_origin:
+        raise ValueError(f"{where}: compare_last_origin is {last_origin}, before "
+                         f"compare_first_origin {first_origin}")
+    if last_origin > diagnostic_origin:
+        raise ValueError(f"{where}: compare_last_origin is {last_origin}, after the "
+                         f"[diagnostic] origin {diagnostic_origin}: its target weeks would "
+                         f"reach the test weeks")
+    method = choice_setting(table, "method", where, TOPUP_METHODS)
+    window = count_setting(table, "window", where)
+    compare_windows = window_list_setting(table, "compare_windows", where)
+    # The mean in use must be one the comparison shows (the ridge has no window).
+    if method == "mean" and window not in compare_windows:
+        raise ValueError(f"{where}: window is {window}, not one of compare_windows "
+                         f"{list(compare_windows)}: the comparison would not show the mean "
+                         f"in use")
+    return TopupSettings(
+        method=method,
+        window=window,
+        with_level=bool_setting(table, "with_level", where),
+        compare=bool_setting(table, "compare", where),
+        compare_first_origin=first_origin,
+        compare_last_origin=last_origin,
+        compare_windows=compare_windows,
     )
 
 
@@ -778,6 +830,11 @@ def choice_setting(table: dict, key: str, where: str, choices: tuple[str, ...]) 
     if value not in choices:
         raise ValueError(f"{where}: {key} is {value!r}, not one of {list(choices)}")
     return value
+
+
+# The methods the top-ups can be forecast by (`topups.METHODS`): the trailing mean or the
+# `deflated` model's ridge.
+TOPUP_METHODS = ("mean", "ridge")
 
 
 # The errors of the weekly cash totals the joint diagnostic can choose a pair by: "mape" (every

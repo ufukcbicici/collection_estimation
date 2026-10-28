@@ -188,6 +188,23 @@ selection_metric = "wape"       # "wape" (weeks by size; chosen 2026-10-27: MAPE
 bootstrap_samples = 2000        # resamples of the paired comparison with `deflated`
 output_folder = "data/interim/hurdle_joint_diagnostic"   # the result tables, as CSV
 
+[topups]
+# The top-ups (U12): each company's cash the panel does not hold (new customers A, refunds R,
+# unidentified cash G), forecast in TRY of week 0. This method goes into the forecast (U13).
+method = "mean"                 # "mean" (the trailing mean) or "ridge" (the `deflated` model);
+                                # chosen 2026-10-28 by the comparison below: mean 13 lowest
+                                # (1.34 M TRY over all h), mean 8 1.35, ridge 1.47
+window = 13                     # "mean": the target weeks averaged
+with_level = true               # "ridge": the recent level as an input
+# U12.3, how the method above is chosen: every candidate (the mean over each of
+# compare_windows, the ridge with and without the level) forecast at every origin from
+# compare_first_origin to compare_last_origin, scored against what came. The last origin is
+# at most the [diagnostic] origin, so no target week reaches the test weeks.
+compare = true                  # print the comparison (about a minute)
+compare_first_origin = 13       # enough weeks for the mean of 13 and the ridge's 12
+compare_last_origin = 40
+compare_windows = [4, 8, 13]
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)

@@ -1,6 +1,8 @@
 """Tests for `hurdle/topups.py`: `trailing_mean_forecasts` (U12.1), the trailing-mean forecast
 of a top-up series (A_h new-customer cash, R refunds, G unidentified cash) per company, and
-`topup_forecasts` (U12.2), A, R and G of every company by the mean or the ridge (second half).
+`topup_forecasts` (U12.2), A, R and G of every company by the mean or the ridge (second half),
+and `topup_actuals` and `score_topups` (U12.3), what came and how far a method was from it
+(last part).
 
 Every series is hand-made; nothing is read from data/. The properties that matter most are
 tested directly: the forecast is the mean of the `window` target weeks ending at the origin,
@@ -1121,3 +1123,752 @@ def test_no_company_and_no_origins_give_the_empty_table(method):
     result = run(no_company_tables(), origins=[], method=method)
     assert len(result) == 0
     assert list(result.columns) == TOPUP_COLUMNS
+
+
+# =============================================================================================
+# U12.3: `topup_actuals`, what the top-ups really were (hindsight), and `score_topups`, how far
+# a method's forecasts were from them.
+#
+# The actuals reuse the hand-built side tables above (`hand_tables`, `side_tables`). The scores
+# are checked on small forecast and actual tables written out by hand, so every mean absolute
+# error and bias can be worked out on paper.
+# =============================================================================================
+
+from collection_estimation.hurdle.topups import (  # noqa: E402
+    SCORE_COLUMNS,
+    SCORED_SERIES,
+    score_topups,
+    topup_actuals,
+)
+
+ACTUAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "new_customer_cash",
+                  "refunds", "unidentified_cash", "topup"]
+KEYS = ["company_code", "origin_week", "h"]
+
+
+def actuals_of(tables=None, levels=None, origins=(30,), horizons=3):
+    new_cash, refunds, unidentified = tables if tables is not None else side_tables()
+    return topup_actuals(new_cash, refunds, unidentified,
+                         price_levels() if levels is None else levels, list(origins), horizons)
+
+
+def keys_of(table):
+    return list(zip(table["company_code"], table["origin_week"], table["h"]))
+
+
+# --- topup_actuals: constants and shape ------------------------------------------------------
+
+def test_actuals_columns_are_the_topup_columns_without_fallback():
+    assert TOPUP_COLUMNS[:-1] == ACTUAL_COLUMNS
+    result = actuals_of(origins=[20, 30])
+    assert list(result.columns) == ACTUAL_COLUMNS
+    assert "fallback" not in result.columns
+
+
+def test_actuals_output_dtypes():
+    result = actuals_of(origins=[20, 30])
+    for column in ("origin_week", "h", "target_week"):
+        assert pd.api.types.is_integer_dtype(result[column]), column
+    for column in ("new_customer_cash", "refunds", "unidentified_cash", "topup"):
+        assert result[column].dtype == "float64", column
+
+
+def test_actuals_one_row_per_company_origin_and_h_sorted():
+    tables = side_tables(companies=("TR05", "TR02", "TR04"))
+    rng = np.random.default_rng(9)
+    shuffled = tuple(t.iloc[rng.permutation(len(t))] for t in tables)
+    result = actuals_of(shuffled, origins=[33, 21, 27], horizons=3)
+    assert keys_of(result) == [(c, o, h) for c in ("TR02", "TR04", "TR05")
+                               for o in (21, 27, 33) for h in (1, 2, 3)]
+    assert (result["target_week"] == result["origin_week"] + result["h"]).all()
+    assert result.index.tolist() == list(range(len(result)))
+    pd.testing.assert_frame_equal(result, actuals_of(tables, origins=[21, 27, 33]))
+
+
+def test_actuals_no_origins_give_an_empty_table_with_the_columns():
+    result = actuals_of(origins=[])
+    assert len(result) == 0
+    assert list(result.columns) == ACTUAL_COLUMNS
+
+
+def test_actuals_an_origin_not_in_the_side_tables_gives_no_row():
+    # Origin 200 is far past the data: no A row, so no actual (not a row of zeros).
+    result = actuals_of(origins=[30, 200])
+    assert set(result["origin_week"]) == {30}
+
+
+def test_actuals_a_repeated_origin_gives_its_rows_once():
+    once = actuals_of(origins=[30])
+    pd.testing.assert_frame_equal(actuals_of(origins=[30, 30]), once)
+
+
+# --- topup_actuals: by hand, with deflation by the target week -------------------------------
+
+def test_actuals_by_hand_with_deflation():
+    # hand_tables: levels 6 -> 2, 7 -> 4, 8 -> 0.5, 9 -> 1.25, 10 -> 2.5.
+    tables, levels = hand_tables()
+    result = actuals_of(tables, levels, origins=[7, 8], horizons=2)
+    expected = pd.DataFrame({
+        "company_code": "TR02",
+        "origin_week": [7, 7, 8, 8], "h": [1, 2, 1, 2], "target_week": [8, 9, 9, 10],
+        # A: origin 7 h 1 -> 1 / 0.5; 7 h 2 -> 2.5 / 1.25; 8 h 1 -> 5 / 1.25; 8 h 2 -> 25 / 2.5.
+        "new_customer_cash": [2.0, 2.0, 4.0, 10.0],
+        # R of the target week: 8 -> -1 / 0.5; 9 -> -5 / 1.25; 10 -> -5 / 2.5.
+        "refunds": [-2.0, -4.0, -4.0, -2.0],
+        # G of the target week: 8 -> 3 / 0.5; 9 -> 0 / 1.25; 10 -> 7.5 / 2.5.
+        "unidentified_cash": [6.0, 0.0, 0.0, 3.0],
+        "topup": [6.0, -2.0, 0.0, 11.0],
+    })
+    pd.testing.assert_frame_equal(result, expected, check_dtype=False)
+
+
+def test_actuals_deflate_by_the_target_week_not_the_origin_week():
+    tables, levels = hand_tables()
+    got = actuals_of(tables, levels, origins=[9], horizons=1).iloc[0]
+    # Target week 10 (level 2.5): A 10 / 2.5 = 4. By origin week 9 (1.25) it would be 8.
+    assert got["target_week"] == 10
+    assert got["new_customer_cash"] == pytest.approx(4.0)
+    assert got["refunds"] == pytest.approx(-2.0)
+    assert got["unidentified_cash"] == pytest.approx(3.0)
+    assert got["topup"] == pytest.approx(5.0)
+
+
+def test_actuals_equal_deflate_of_each_row():
+    tables = side_tables()
+    new_cash, refunds, unidentified = tables
+    levels = price_levels()
+    result = actuals_of(tables, levels, origins=[12, 25, 37], horizons=3)
+    assert len(result) == 2 * 3 * 3
+    for _, got in result.iterrows():
+        company, origin, h, target = (got["company_code"], got["origin_week"], got["h"],
+                                      got["target_week"])
+        a = new_cash[(new_cash["company_code"] == company) & (new_cash["origin_week"] == origin)
+                     & (new_cash["h"] == h)]["new_customer_cash"].item()
+        r = refunds[(refunds["company_code"] == company)
+                    & (refunds["week"] == target)]["refunds"].item()
+        g = unidentified[(unidentified["company_code"] == company)
+                         & (unidentified["week"] == target)]["unidentified_cash"].item()
+        level = levels[target]
+        assert got["new_customer_cash"] == pytest.approx(a / level, rel=1e-14)
+        assert got["refunds"] == pytest.approx(r / level, rel=1e-14)
+        assert got["unidentified_cash"] == pytest.approx(g / level, rel=1e-14)
+        assert got["topup"] == pytest.approx((a + r + g) / level, rel=1e-12)
+
+
+def test_actuals_refunds_stay_negative():
+    result = actuals_of(origins=list(range(5, 38)))
+    assert (result["refunds"] < 0).all()
+
+
+def test_actuals_r_and_g_are_the_target_weeks_whatever_the_origin():
+    # R and G do not depend on the origin: (origin 29, h 2) and (origin 30, h 1) share target
+    # week 31, and so their R and G; their A differ (A_2 and A_1).
+    result = actuals_of(origins=[29, 30], horizons=2)
+    for company in COMPANIES:
+        first, second = row(result, company, 29, 2), row(result, company, 30, 1)
+        assert first["target_week"] == second["target_week"] == 31
+        assert first["refunds"] == second["refunds"]
+        assert first["unidentified_cash"] == second["unidentified_cash"]
+        assert first["new_customer_cash"] != second["new_customer_cash"]
+
+
+def test_actuals_join_r_and_g_by_company_and_week():
+    # TR04's R and G are far larger than TR02's: a join on the week alone would mix them.
+    result = actuals_of(origins=[30], horizons=1)
+    tr02, tr04 = row(result, "TR02", 30, 1), row(result, "TR04", 30, 1)
+    _, refunds, unidentified = side_tables()
+    level = price_levels()[31]
+    for company, got in (("TR02", tr02), ("TR04", tr04)):
+        r = refunds[(refunds["company_code"] == company) & (refunds["week"] == 31)]
+        g = unidentified[(unidentified["company_code"] == company)
+                         & (unidentified["week"] == 31)]
+        assert got["refunds"] == pytest.approx(r["refunds"].item() / level)
+        assert got["unidentified_cash"] == pytest.approx(g["unidentified_cash"].item() / level)
+
+
+def test_actuals_h_above_horizons_is_left_out():
+    result = actuals_of(origins=[30], horizons=2)
+    assert sorted(set(result["h"])) == [1, 2]
+    assert len(actuals_of(origins=[30], horizons=3)) == 2 * 3
+
+
+def test_actuals_horizons_beyond_the_side_tables_give_only_the_h_they_hold():
+    # The side tables hold h 1..3; asking for 5 gives those three (nothing is invented).
+    result = actuals_of(origins=[30], horizons=5)
+    assert sorted(set(result["h"])) == [1, 2, 3]
+
+
+# --- topup_actuals: no data is not 0 ---------------------------------------------------------
+
+def test_actuals_a_target_week_without_refunds_drops_the_row_not_counts_zero():
+    tables, levels = hand_tables()
+    new_cash, refunds, unidentified = tables
+    refunds = refunds[refunds["week"] != 9]
+    result = actuals_of((new_cash, refunds, unidentified), levels, origins=[7, 8], horizons=2)
+    # Target week 9 is (7, 2) and (8, 1): both gone; (7, 1) and (8, 2) are untouched.
+    assert keys_of(result) == [("TR02", 7, 1), ("TR02", 8, 2)]
+    assert result["topup"].tolist() == pytest.approx([6.0, 11.0])
+
+
+def test_actuals_a_target_week_without_unidentified_cash_drops_the_row():
+    tables, levels = hand_tables()
+    new_cash, refunds, unidentified = tables
+    unidentified = unidentified[unidentified["week"] != 10]
+    result = actuals_of((new_cash, refunds, unidentified), levels, origins=[8, 9], horizons=2)
+    assert 10 not in set(result["target_week"])
+    assert keys_of(result) == [("TR02", 8, 1)]
+
+
+def test_actuals_a_target_week_without_new_customer_cash_drops_the_row():
+    tables, levels = hand_tables()
+    new_cash, refunds, unidentified = tables
+    new_cash = new_cash[~((new_cash["origin_week"] == 8) & (new_cash["h"] == 2))]
+    result = actuals_of((new_cash, refunds, unidentified), levels, origins=[8], horizons=2)
+    assert keys_of(result) == [("TR02", 8, 1)]
+
+
+def test_actuals_a_zero_week_is_kept_as_zero():
+    # G of week 9 is 0.0 (no cash that week): the row is kept, with G 0. Missing, it is dropped.
+    tables, levels = hand_tables()
+    result = actuals_of(tables, levels, origins=[8], horizons=1)
+    assert keys_of(result) == [("TR02", 8, 1)]
+    assert result["unidentified_cash"].iloc[0] == 0.0
+    new_cash, refunds, unidentified = tables
+    new_cash = new_cash.assign(new_customer_cash=0.0)
+    zero_a = actuals_of((new_cash, refunds, unidentified), levels, origins=[8], horizons=1)
+    assert zero_a["new_customer_cash"].tolist() == [0.0]
+    assert zero_a["topup"].iloc[0] == pytest.approx(-4.0)
+
+
+def test_actuals_a_week_missing_for_one_company_drops_only_its_rows():
+    new_cash, refunds, unidentified = side_tables()
+    refunds = refunds[~((refunds["company_code"] == "TR04") & (refunds["week"] == 31))]
+    result = actuals_of((new_cash, refunds, unidentified), origins=[30], horizons=2)
+    assert keys_of(result) == [("TR02", 30, 1), ("TR02", 30, 2), ("TR04", 30, 2)]
+
+
+def test_actuals_past_the_last_week_are_dropped():
+    # side_tables' last week is 40: origin 39 has only h 1 (target 40).
+    result = actuals_of(origins=[38, 39], horizons=3)
+    assert set(zip(result["origin_week"], result["h"])) == {(38, 1), (38, 2), (39, 1)}
+
+
+# --- topup_actuals agrees with topup_forecasts' rows -----------------------------------------
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_actuals_have_the_forecasts_keys_when_every_target_week_has_data(method):
+    origins = [15, 22, 30, 37]  # 37 + 3 = 40, the last week
+    forecasts = run(origins=origins, method=method)
+    actuals = actuals_of(origins=origins, horizons=3)
+    assert keys_of(actuals) == keys_of(forecasts)
+    assert actuals["target_week"].tolist() == forecasts["target_week"].tolist()
+    assert list(actuals.columns) == list(forecasts.columns[:-1])
+
+
+def test_actuals_keys_are_a_subset_of_the_forecasts_keys_past_the_last_week():
+    origins = [30, 38, 39, 40]
+    forecasts = run(origins=origins, method="mean")
+    actuals = actuals_of(origins=origins, horizons=3)
+    assert set(keys_of(actuals)) < set(keys_of(forecasts))
+    assert len(forecasts) == 2 * 4 * 3
+    assert len(actuals) == 2 * (3 + 2 + 1)
+
+
+def test_actuals_differ_from_the_forecasts_made_without_them():
+    # A sanity check that the actuals are not the forecasts under another name.
+    forecasts = run(origins=[30], method="mean")
+    actuals = actuals_of(origins=[30])
+    assert not np.allclose(forecasts["topup"], actuals["topup"])
+
+
+# --- topup_actuals: inputs untouched, deterministic, refusals --------------------------------
+
+def test_topup_actuals_does_not_change_its_inputs():
+    tables, levels = side_tables(), price_levels()
+    copies = [t.copy(deep=True) for t in tables]
+    levels_copy = levels.copy(deep=True)
+    origins = [30, 20]
+    topup_actuals(*tables, levels, origins, 3)
+    for table, copy in zip(tables, copies):
+        pd.testing.assert_frame_equal(table, copy)
+    pd.testing.assert_series_equal(levels, levels_copy)
+    assert origins == [30, 20]
+
+
+def test_topup_actuals_is_deterministic():
+    pd.testing.assert_frame_equal(actuals_of(origins=[20, 30]), actuals_of(origins=[20, 30]))
+
+
+@pytest.mark.parametrize("horizons", [0, -1, -5])
+@pytest.mark.parametrize("origins", [(30,), ()])
+def test_actuals_refuse_horizons_below_one_even_without_origins(horizons, origins):
+    with pytest.raises(ValueError) as error:
+        actuals_of(origins=origins, horizons=horizons)
+    assert str(error.value) == f"horizons is {horizons}; horizons start at 1"
+
+
+def test_actuals_refuse_a_target_week_without_a_price_level():
+    levels = price_levels().drop(index=[31])
+    with pytest.raises(ValueError, match=r"no price level for weeks \[31\]"):
+        actuals_of(levels=levels, origins=[30])
+
+
+def test_actuals_do_not_need_price_levels_of_weeks_they_do_not_use():
+    levels = price_levels().drop(index=[5, 17])
+    assert len(actuals_of(levels=levels, origins=[30])) == 2 * 3
+
+
+def test_actuals_refuse_a_refunds_table_with_a_week_twice():
+    new_cash, refunds, unidentified = side_tables()
+    refunds = pd.concat([refunds, refunds.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError):
+        actuals_of((new_cash, refunds, unidentified))
+
+
+def test_actuals_refuse_an_unidentified_table_with_a_week_twice():
+    new_cash, refunds, unidentified = side_tables()
+    unidentified = pd.concat([unidentified, unidentified.iloc[[5]]], ignore_index=True)
+    with pytest.raises(ValueError):
+        actuals_of((new_cash, refunds, unidentified))
+
+
+# --- score_topups: constants ------------------------------------------------------------------
+
+def test_scored_series():
+    assert SCORED_SERIES == ["new_customer_cash", "refunds", "unidentified_cash", "topup"]
+
+
+def test_score_columns():
+    assert SCORE_COLUMNS == ["h", "series", "mean_abs_error", "bias", "forecasts"]
+
+
+# --- score_topups: by hand --------------------------------------------------------------------
+
+def scored_table(rows):
+    """rows: (company, origin, h, A, R, G); the top-up is their sum. Columns as from
+    topup_actuals (target week origin + h)."""
+    table = pd.DataFrame(rows, columns=["company_code", "origin_week", "h",
+                                        "new_customer_cash", "refunds", "unidentified_cash"])
+    table.insert(3, "target_week", table["origin_week"] + table["h"])
+    table["topup"] = table["new_customer_cash"] + table["refunds"] + table["unidentified_cash"]
+    return table
+
+
+# Two companies, origins 10 and 11, h 1. Top-ups: forecast TR02 5, 3 / TR04 1, 4; actual
+# TR02 4, 6 / TR04 3, 1. Errors TR02 +1, -3; TR04 -2, +3; consolidated (6 - 7, 7 - 7) -1, 0.
+HAND_FORECASTS = scored_table([
+    ("TR02", 10, 1, 5.0, -1.0, 1.0), ("TR02", 11, 1, 2.0, -1.0, 2.0),
+    ("TR04", 10, 1, 1.0, -2.0, 2.0), ("TR04", 11, 1, 4.0, -1.0, 1.0),
+])
+HAND_ACTUALS = scored_table([
+    ("TR02", 10, 1, 4.0, -2.0, 2.0), ("TR02", 11, 1, 6.0, -1.0, 1.0),
+    ("TR04", 10, 1, 2.0, -1.0, 2.0), ("TR04", 11, 1, 1.0, -2.0, 2.0),
+])
+
+
+def score_of(scores, series, company=None, h=1):
+    found = scores[(scores["series"] == series) & (scores["h"] == h)]
+    if company is not None:
+        found = found[found["company_code"] == company]
+    assert len(found) == 1
+    return found.iloc[0]
+
+
+def test_hand_topups_are_as_described():
+    assert HAND_FORECASTS["topup"].tolist() == [5.0, 3.0, 1.0, 4.0]
+    assert HAND_ACTUALS["topup"].tolist() == [4.0, 6.0, 3.0, 1.0]
+
+
+def test_score_by_company_by_hand():
+    scores = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True)
+    # TR02: top-up errors +1, -3 -> MAE 2, bias -1. A errors +1, -4 -> MAE 2.5, bias -1.5.
+    # R errors +1, 0 -> 0.5, 0.5. G errors -1, +1 -> MAE 1, bias 0.
+    expected = {("TR02", "topup"): (2.0, -1.0), ("TR02", "new_customer_cash"): (2.5, -1.5),
+                ("TR02", "refunds"): (0.5, 0.5), ("TR02", "unidentified_cash"): (1.0, 0.0),
+                # TR04: top-up -2, +3 -> 2.5, 0.5. A -1, +3 -> 2, 1. R -1, +1 -> 1, 0.
+                # G 0, -1 -> 0.5, -0.5.
+                ("TR04", "topup"): (2.5, 0.5), ("TR04", "new_customer_cash"): (2.0, 1.0),
+                ("TR04", "refunds"): (1.0, 0.0), ("TR04", "unidentified_cash"): (0.5, -0.5)}
+    assert len(scores) == 8
+    for (company, series), (mae, bias) in expected.items():
+        got = score_of(scores, series, company)
+        assert got["mean_abs_error"] == pytest.approx(mae), (company, series)
+        assert got["bias"] == pytest.approx(bias), (company, series)
+        assert got["forecasts"] == 2
+
+
+def test_score_consolidated_by_hand():
+    scores = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=False)
+    # Summed per origin: forecast top-up 6, 7; actual 7, 7 -> errors -1, 0: MAE 0.5, bias -0.5.
+    # A: 6 - 6, 6 - 7 -> 0, -1. R: -3 + 3, -2 + 3 -> 0, +1. G: 3 - 4, 3 - 3 -> -1, 0.
+    expected = {"topup": (0.5, -0.5), "new_customer_cash": (0.5, -0.5),
+                "refunds": (0.5, 0.5), "unidentified_cash": (0.5, -0.5)}
+    assert len(scores) == 4
+    for series, (mae, bias) in expected.items():
+        got = score_of(scores, series)
+        assert got["mean_abs_error"] == pytest.approx(mae), series
+        assert got["bias"] == pytest.approx(bias), series
+        assert got["forecasts"] == 2
+
+
+def test_consolidated_error_is_not_the_mean_or_sum_of_the_company_errors():
+    # Errors of opposite signs in two companies cancel once the companies are added up.
+    by_company = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True)
+    consolidated = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=False)
+    company_mae = by_company.loc[by_company["series"] == "topup", "mean_abs_error"]
+    total_mae = score_of(consolidated, "topup")["mean_abs_error"]
+    assert company_mae.tolist() == pytest.approx([2.0, 2.5])
+    assert total_mae == pytest.approx(0.5)
+    assert total_mae != pytest.approx(company_mae.mean())
+    assert total_mae != pytest.approx(company_mae.sum())
+    assert total_mae < company_mae.min()
+
+
+def test_consolidated_bias_is_the_sum_of_the_company_biases_when_every_row_matches():
+    # The bias is linear: with every (company, origin, h) in both, consolidated = sum.
+    by_company = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True)
+    consolidated = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=False)
+    for series in SCORED_SERIES:
+        company_bias = by_company.loc[by_company["series"] == series, "bias"].sum()
+        assert score_of(consolidated, series)["bias"] == pytest.approx(company_bias), series
+
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_bias_is_above_zero_when_the_forecasts_are_too_high(by_company):
+    high = HAND_ACTUALS.copy()
+    for series in SCORED_SERIES:
+        high[series] = high[series] + 2.5
+    scores = score_topups(high, HAND_ACTUALS, by_company=by_company)
+    expected = 2.5 if by_company else 5.0  # two companies of +2.5 add up
+    assert scores["bias"].tolist() == pytest.approx([expected] * len(scores))
+    assert scores["mean_abs_error"].tolist() == pytest.approx([expected] * len(scores))
+    low = score_topups(HAND_ACTUALS, high, by_company=by_company)
+    assert low["bias"].tolist() == pytest.approx([-expected] * len(low))
+
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_a_perfect_forecast_scores_zero(by_company):
+    scores = score_topups(HAND_ACTUALS, HAND_ACTUALS, by_company=by_company)
+    assert (scores["mean_abs_error"] == 0.0).all()
+    assert (scores["bias"] == 0.0).all()
+
+
+def test_the_mean_abs_error_is_at_least_the_absolute_bias():
+    forecasts = run(origins=[20, 25, 30, 35], method="mean")
+    actuals = actuals_of(origins=[20, 25, 30, 35])
+    for by_company in (True, False):
+        scores = score_topups(forecasts, actuals, by_company=by_company)
+        assert (scores["mean_abs_error"] >= scores["bias"].abs() - 1e-9).all()
+
+
+def test_refund_errors_are_scored_on_the_signed_values():
+    # R forecast -1, actual -3: the forecast is too high (fewer refunds), error +2.
+    forecasts = scored_table([("TR02", 10, 1, 0.0, -1.0, 0.0)])
+    actuals = scored_table([("TR02", 10, 1, 0.0, -3.0, 0.0)])
+    got = score_of(score_topups(forecasts, actuals, by_company=True), "refunds", "TR02")
+    assert got["bias"] == pytest.approx(2.0)
+    assert got["mean_abs_error"] == pytest.approx(2.0)
+
+
+# --- score_topups: which rows are scored -----------------------------------------------------
+
+def test_only_rows_in_both_tables_are_scored_and_counted():
+    forecasts = pd.concat([HAND_FORECASTS, scored_table([("TR02", 12, 1, 99.0, 0.0, 0.0)])],
+                          ignore_index=True)
+    actuals = pd.concat([HAND_ACTUALS, scored_table([("TR04", 13, 1, -99.0, 0.0, 0.0)])],
+                        ignore_index=True)
+    scores = score_topups(forecasts, actuals, by_company=True)
+    pd.testing.assert_frame_equal(scores,
+                                  score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True))
+
+
+def test_forecasts_counts_the_matched_origins_per_company_and_h():
+    # TR02 has two origins matched at h 1, TR04 one (its origin 11 actual is missing).
+    actuals = HAND_ACTUALS[~((HAND_ACTUALS["company_code"] == "TR04")
+                             & (HAND_ACTUALS["origin_week"] == 11))]
+    scores = score_topups(HAND_FORECASTS, actuals, by_company=True)
+    assert set(scores.loc[scores["company_code"] == "TR02", "forecasts"]) == {2}
+    assert set(scores.loc[scores["company_code"] == "TR04", "forecasts"]) == {1}
+    # TR04's one error: top-up 1 - 3 = -2.
+    assert score_of(scores, "topup", "TR04")["mean_abs_error"] == pytest.approx(2.0)
+
+
+def test_consolidated_adds_up_only_the_companies_matched_at_each_origin():
+    # Origin 11 has only TR02 in the actuals: its consolidated forecast and actual are TR02's
+    # alone (3 against 6), not TR02 + TR04's forecast against TR02's actual.
+    actuals = HAND_ACTUALS[~((HAND_ACTUALS["company_code"] == "TR04")
+                             & (HAND_ACTUALS["origin_week"] == 11))]
+    got = score_of(score_topups(HAND_FORECASTS, actuals, by_company=False), "topup")
+    # Origin 10: 6 - 7 = -1; origin 11: 3 - 6 = -3 -> MAE 2, bias -2, 2 origins.
+    assert got["mean_abs_error"] == pytest.approx(2.0)
+    assert got["bias"] == pytest.approx(-2.0)
+    assert got["forecasts"] == 2
+
+
+def test_the_target_week_and_other_columns_are_not_read():
+    forecasts = HAND_FORECASTS.assign(target_week=-1, fallback=True, extra="x")
+    actuals = HAND_ACTUALS.assign(target_week=999)
+    for by_company in (True, False):
+        pd.testing.assert_frame_equal(
+            score_topups(forecasts, actuals, by_company=by_company),
+            score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=by_company))
+
+
+def test_the_row_order_of_the_inputs_does_not_matter():
+    rng = np.random.default_rng(4)
+    forecasts = HAND_FORECASTS.iloc[rng.permutation(len(HAND_FORECASTS))]
+    actuals = HAND_ACTUALS.iloc[rng.permutation(len(HAND_ACTUALS))].reset_index(drop=True)
+    for by_company in (True, False):
+        pd.testing.assert_frame_equal(
+            score_topups(forecasts, actuals, by_company=by_company),
+            score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=by_company))
+
+
+# --- score_topups: shape ---------------------------------------------------------------------
+
+def test_score_columns_by_company_and_consolidated():
+    assert list(score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True).columns) == \
+        ["company_code"] + SCORE_COLUMNS
+    assert list(score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=False).columns) == \
+        SCORE_COLUMNS
+
+
+def test_scores_are_sorted_by_company_h_and_series_in_scored_order():
+    origins = [20, 30]
+    forecasts = run(tables=side_tables(companies=("TR05", "TR02")), origins=origins,
+                    method="mean")
+    actuals = actuals_of(side_tables(companies=("TR05", "TR02")), origins=origins)
+    scores = score_topups(forecasts, actuals, by_company=True)
+    assert list(zip(scores["company_code"], scores["h"], scores["series"])) == [
+        (c, h, s) for c in ("TR02", "TR05") for h in (1, 2, 3) for s in SCORED_SERIES]
+    consolidated = score_topups(forecasts, actuals, by_company=False)
+    assert list(zip(consolidated["h"], consolidated["series"])) == [
+        (h, s) for h in (1, 2, 3) for s in SCORED_SERIES]
+    assert consolidated.index.tolist() == list(range(len(consolidated)))
+
+
+def test_score_dtypes():
+    for by_company in (True, False):
+        scores = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=by_company)
+        assert pd.api.types.is_integer_dtype(scores["h"])
+        assert pd.api.types.is_integer_dtype(scores["forecasts"])
+        assert scores["mean_abs_error"].dtype == "float64"
+        assert scores["bias"].dtype == "float64"
+
+
+def test_one_company_consolidated_equals_by_company_without_the_company_column():
+    forecasts = run(tables=side_tables(companies=("TR02",)), origins=[20, 30], method="mean")
+    actuals = actuals_of(side_tables(companies=("TR02",)), origins=[20, 30])
+    by_company = score_topups(forecasts, actuals, by_company=True)
+    consolidated = score_topups(forecasts, actuals, by_company=False)
+    pd.testing.assert_frame_equal(by_company.drop(columns="company_code"), consolidated)
+
+
+# --- score_topups end to end, on topup_forecasts and topup_actuals ---------------------------
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_scores_equal_a_direct_computation(method):
+    origins = list(range(20, 38))
+    forecasts = run(origins=origins, method=method)
+    actuals = actuals_of(origins=origins)
+    both = forecasts.merge(actuals, on=KEYS, suffixes=("_f", "_a"))
+    scores = score_topups(forecasts, actuals, by_company=True)
+    for (company, h), rows in both.groupby(["company_code", "h"]):
+        for series in SCORED_SERIES:
+            error = rows[f"{series}_f"] - rows[f"{series}_a"]
+            got = score_of(scores, series, company, h)
+            assert got["mean_abs_error"] == pytest.approx(float(np.mean(np.abs(error))),
+                                                          rel=1e-12)
+            assert got["bias"] == pytest.approx(float(np.mean(error)), rel=1e-9, abs=1e-9)
+            assert got["forecasts"] == len(origins)
+    consolidated = score_topups(forecasts, actuals, by_company=False)
+    totals = both.groupby(["origin_week", "h"])[[f"topup_f", f"topup_a"]].sum().reset_index()
+    for h, rows in totals.groupby("h"):
+        error = rows["topup_f"] - rows["topup_a"]
+        got = score_of(consolidated, "topup", h=h)
+        assert got["mean_abs_error"] == pytest.approx(float(np.mean(np.abs(error))), rel=1e-12)
+        assert got["forecasts"] == len(origins)
+
+
+def test_scores_past_the_last_week_count_fewer_origins_at_longer_h():
+    origins = [36, 37, 38, 39]  # targets past 40 have no actual
+    forecasts = run(origins=origins, method="mean")
+    scores = score_topups(forecasts, actuals_of(origins=origins), by_company=False)
+    counts = scores.groupby("h")["forecasts"].first().to_dict()
+    assert counts == {1: 4, 2: 3, 3: 2}
+
+
+def test_score_topups_does_not_change_its_inputs():
+    forecasts, actuals = HAND_FORECASTS.copy(deep=True), HAND_ACTUALS.copy(deep=True)
+    for by_company in (True, False):
+        score_topups(forecasts, actuals, by_company=by_company)
+    pd.testing.assert_frame_equal(forecasts, HAND_FORECASTS)
+    pd.testing.assert_frame_equal(actuals, HAND_ACTUALS)
+
+
+# --- score_topups: refusals ------------------------------------------------------------------
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_a_forecast_row_twice(by_company):
+    forecasts = pd.concat([HAND_FORECASTS, HAND_FORECASTS.iloc[[2]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        score_topups(forecasts, HAND_ACTUALS, by_company=by_company)
+    assert str(error.value) == "forecasts holds a (company, origin, h) more than once"
+
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_an_actual_row_twice(by_company):
+    actuals = pd.concat([HAND_ACTUALS, HAND_ACTUALS.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        score_topups(HAND_FORECASTS, actuals, by_company=by_company)
+    assert str(error.value) == "actuals holds a (company, origin, h) more than once"
+
+
+def test_score_refuses_a_duplicate_key_even_with_different_values():
+    twice = scored_table([("TR02", 10, 1, 1.0, 0.0, 0.0), ("TR02", 10, 1, 2.0, 0.0, 0.0)])
+    with pytest.raises(ValueError, match="forecasts holds"):
+        score_topups(twice, HAND_ACTUALS, by_company=True)
+
+
+def test_score_refuses_a_duplicate_even_if_it_would_not_be_matched():
+    # A duplicate key the other table does not have is still refused.
+    extra = scored_table([("TR09", 50, 1, 1.0, 0.0, 0.0), ("TR09", 50, 1, 1.0, 0.0, 0.0)])
+    actuals = pd.concat([HAND_ACTUALS, extra], ignore_index=True)
+    with pytest.raises(ValueError, match="actuals holds"):
+        score_topups(HAND_FORECASTS, actuals, by_company=True)
+
+
+def test_score_forecast_duplicates_are_reported_before_actual_duplicates():
+    forecasts = pd.concat([HAND_FORECASTS, HAND_FORECASTS.iloc[[0]]], ignore_index=True)
+    actuals = pd.concat([HAND_ACTUALS, HAND_ACTUALS.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        score_topups(forecasts, actuals, by_company=True)
+    assert str(error.value).startswith("forecasts holds")
+
+
+def test_score_the_same_origin_and_h_in_two_companies_is_not_a_duplicate():
+    # Consolidated adds them up; that is not a duplicate key.
+    scores = score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=False)
+    assert len(scores) == 4
+
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_no_overlap(by_company):
+    actuals = HAND_ACTUALS.assign(origin_week=HAND_ACTUALS["origin_week"] + 100)
+    with pytest.raises(ValueError) as error:
+        score_topups(HAND_FORECASTS, actuals, by_company=by_company)
+    assert str(error.value) == "no (company, origin, h) is in both the forecasts and the actuals"
+
+
+def test_score_refuses_no_overlap_when_only_the_companies_differ():
+    actuals = HAND_ACTUALS.assign(
+        company_code=HAND_ACTUALS["company_code"].map({"TR02": "TR98", "TR04": "TR99"}))
+    with pytest.raises(ValueError, match="no \\(company, origin, h\\) is in both"):
+        score_topups(HAND_FORECASTS, actuals, by_company=False)
+
+
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_empty_tables(by_company):
+    with pytest.raises(ValueError, match="no \\(company, origin, h\\) is in both"):
+        score_topups(HAND_FORECASTS.iloc[0:0], HAND_ACTUALS, by_company=by_company)
+    with pytest.raises(ValueError, match="no \\(company, origin, h\\) is in both"):
+        score_topups(run(origins=[]), actuals_of(origins=[]), by_company=by_company)
+
+
+# --- score_topups: NaN and infinite values are refused ----------------------------------------
+# Checked per table right after its duplicate check: forecasts' checks come before actuals'.
+
+def with_value(table, row, series, value):
+    changed = table.copy()
+    changed.loc[changed.index[row], series] = value
+    return changed
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("series", SCORED_SERIES)
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_a_non_finite_forecast(value, series, by_company):
+    forecasts = with_value(HAND_FORECASTS, 1, series, value)
+    with pytest.raises(ValueError) as error:
+        score_topups(forecasts, HAND_ACTUALS, by_company=by_company)
+    assert str(error.value) == "forecasts holds a NaN or infinite value"
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("series", SCORED_SERIES)
+@pytest.mark.parametrize("by_company", [True, False])
+def test_score_refuses_a_non_finite_actual(value, series, by_company):
+    actuals = with_value(HAND_ACTUALS, 2, series, value)
+    with pytest.raises(ValueError) as error:
+        score_topups(HAND_FORECASTS, actuals, by_company=by_company)
+    assert str(error.value) == "actuals holds a NaN or infinite value"
+
+
+@pytest.mark.parametrize("which", ["forecasts", "actuals"])
+def test_score_refuses_a_non_finite_value_in_an_unmatched_row(which):
+    extra = scored_table([("TR09", 50, 1, np.nan, 0.0, 0.0)])
+    forecasts, actuals = HAND_FORECASTS, HAND_ACTUALS
+    if which == "forecasts":
+        forecasts = pd.concat([forecasts, extra], ignore_index=True)
+    else:
+        actuals = pd.concat([actuals, extra], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        score_topups(forecasts, actuals, by_company=True)
+    assert str(error.value) == f"{which} holds a NaN or infinite value"
+
+
+def test_score_non_finite_forecasts_are_reported_before_non_finite_actuals():
+    with pytest.raises(ValueError) as error:
+        score_topups(with_value(HAND_FORECASTS, 0, "topup", np.nan),
+                     with_value(HAND_ACTUALS, 0, "topup", np.inf), by_company=False)
+    assert str(error.value) == "forecasts holds a NaN or infinite value"
+
+
+def test_score_forecast_duplicates_are_reported_before_forecast_non_finite_values():
+    forecasts = pd.concat([HAND_FORECASTS, HAND_FORECASTS.iloc[[0]]], ignore_index=True)
+    forecasts = with_value(forecasts, 1, "refunds", np.nan)
+    with pytest.raises(ValueError) as error:
+        score_topups(forecasts, HAND_ACTUALS, by_company=True)
+    assert str(error.value) == "forecasts holds a (company, origin, h) more than once"
+
+
+def test_score_non_finite_forecasts_are_reported_before_actual_duplicates():
+    # Per table: forecasts' duplicate and value checks, then actuals'.
+    actuals = pd.concat([HAND_ACTUALS, HAND_ACTUALS.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        score_topups(with_value(HAND_FORECASTS, 0, "unidentified_cash", np.inf), actuals,
+                     by_company=True)
+    assert str(error.value) == "forecasts holds a NaN or infinite value"
+
+
+def test_score_actual_duplicates_are_reported_before_actual_non_finite_values():
+    actuals = pd.concat([HAND_ACTUALS, HAND_ACTUALS.iloc[[0]]], ignore_index=True)
+    actuals = with_value(actuals, 1, "topup", np.nan)
+    with pytest.raises(ValueError) as error:
+        score_topups(HAND_FORECASTS, actuals, by_company=True)
+    assert str(error.value) == "actuals holds a (company, origin, h) more than once"
+
+
+def test_score_a_non_finite_value_outside_the_scored_series_is_not_read():
+    # Only SCORED_SERIES are checked: another column may hold anything.
+    forecasts = HAND_FORECASTS.assign(extra=np.nan)
+    actuals = HAND_ACTUALS.assign(extra=np.inf)
+    pd.testing.assert_frame_equal(score_topups(forecasts, actuals, by_company=True),
+                                  score_topups(HAND_FORECASTS, HAND_ACTUALS, by_company=True))
+
+
+def test_score_large_finite_values_are_scored():
+    big = 1e300
+    forecasts = scored_table([("TR02", 10, 1, big, 0.0, 0.0)])
+    actuals = scored_table([("TR02", 10, 1, 0.0, 0.0, 0.0)])
+    got = score_of(score_topups(forecasts, actuals, by_company=True), "new_customer_cash",
+                   "TR02")
+    assert got["mean_abs_error"] == big
+
+
+def test_score_refuses_a_non_finite_value_without_changing_the_inputs():
+    forecasts = with_value(HAND_FORECASTS, 0, "topup", np.nan)
+    copy = forecasts.copy(deep=True)
+    with pytest.raises(ValueError):
+        score_topups(forecasts, HAND_ACTUALS, by_company=True)
+    pd.testing.assert_frame_equal(forecasts, copy)

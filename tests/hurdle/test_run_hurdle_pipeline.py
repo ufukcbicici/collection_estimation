@@ -4646,42 +4646,24 @@ def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday
     assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line
 
 
-# U12.2: the top-ups at the diagnostic origin, by the trailing mean of TOPUP_MEAN_WINDOW weeks
-# and by the ridge with and without the recent level, printed after the deflated label. The
-# wiring is checked on main()'s source; the printout is run on hand-built side tables in a
-# separate process. Two companies, origin 24, horizons 2, price levels that move every week (so
-# deflating by the wrong week shows). TR04's G starts at week 17, too few weeks to fit, so its
-# ridge falls back at every h and the fallbacks column counts it; TR02's G is all zero, forecast
-# 0 and not counted. The trailing means and the actuals are computed in
-# the script by plain loops over dicts, not by the module; the ridge columns come from
-# `topup_forecasts` itself (tested in test_topups.py), summed over the companies.
-TOPUPS = """
-import inspect
+# U12.2: the top-ups at the diagnostic origin, by the trailing mean of [topups] window weeks
+# (passed in as `window`, since U12.3; it was the constant TOPUP_MEAN_WINDOW) and by the ridge
+# with and without the recent level, printed after the deflated label. The wiring is checked on
+# main()'s source; the printout is run on hand-built side tables in a separate process. Two
+# companies, origin 24, horizons 2, window 8, price levels that move every week (so deflating
+# by the wrong week shows). TR04's G starts at week 17, too few weeks to fit, so its ridge
+# falls back at every h and the fallbacks column counts it; TR02's G is all zero, forecast 0
+# and not counted. The trailing means and the actuals are computed in the script by plain
+# loops over dicts, not by the module; the ridge columns come from `topup_forecasts` itself
+# (tested in test_topups.py), summed over the companies. Two more runs follow: window 5 (the
+# argument, not a constant, names and sets the mean) and one with TR04's G of week 26 missing
+# (`topup_actuals` drops TR04's row of h 2, and the forecast columns of h 2 are added up over
+# the same rows: TR02 alone).
+TOPUP_DATA = """
 import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import prices, topups
-
-source = " ".join(inspect.getsource(script.main).split())
-call = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
-        "settings.diagnostic.origin, settings.receivables.horizons)")
-assert call in source, "show_topups is not called as expected"
-assert (source.index("show_deflated_label(panel, levels)") < source.index(call)
-        < source.index("table = join_features(panel, history, calendar, owed)"))
-for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
-              "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
-              "calendar = calendar.merge(positions"):
-    assert source.index(built) < source.index(call), built
-assert "show_trailing_means" not in source
-assert not hasattr(script, "show_trailing_means")
-assert not hasattr(script, "TOPUP_WINDOWS")
-assert script.TOPUP_MEAN_WINDOW == 8
-assert script.deflate is prices.deflate
-assert script.topup_forecasts is topups.topup_forecasts
-inspect.signature(script.show_topups).bind(
-    "new_cash", "refunds", "unidentified", "levels", "calendar", 24, 2)
 
 companies = ["TR02", "TR04"]
-origin, horizons, window = 24, 2, script.TOPUP_MEAN_WINDOW
+origin, horizons = 24, 2
 last = 30
 level_of = {w: 1.0 + 0.1 * w + 0.05 * (w % 3) for w in range(0, last + 1)}  # by hand
 levels = pd.Series(level_of)
@@ -4712,13 +4694,11 @@ for company, scale, first in (("TR02", 0.0, 0), ("TR04", 4e5, 17)):
         g_rows.append({"company_code": company, "week": w,
                        "unidentified_cash": scale * (1 + w % 4)})
 unidentified = pd.DataFrame(g_rows)
-copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified, calendar)]
-levels_copy = levels.copy(deep=True)
 
 
-def mean_by_hand(rows, week_key, value_key, h):
+def mean_by_hand(rows, week_key, value_key, h, origin, window, over=None):
     total = 0.0
-    for company in companies:
+    for company in (companies if over is None else over):
         values = [r[value_key] / level_of[r[week_key]] for r in rows
                   if r["company_code"] == company and (h is None or r["h"] == h)
                   and origin - window < r[week_key] <= origin]
@@ -4726,17 +4706,58 @@ def mean_by_hand(rows, week_key, value_key, h):
     return total
 
 
-def actual(rows, week_key, value_key, h, target):
+def actual(rows, week_key, value_key, h, target, company=None):
     return sum(r[value_key] / level_of[r[week_key]] for r in rows
-               if r[week_key] == target and (h is None or r["h"] == h))
+               if r[week_key] == target and (h is None or r["h"] == h)
+               and (company is None or r["company_code"] == company))
+"""
 
+TOPUPS = TOPUP_DATA + """
+import inspect
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import prices, topups
+
+source = " ".join(inspect.getsource(script.main).split())
+call = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
+        "settings.diagnostic.origin, settings.receivables.horizons, settings.topups.window)")
+assert call in source, "show_topups is not called as expected"
+assert source.count("show_topups(") == 1
+assert (source.index("show_deflated_label(panel, levels)") < source.index(call)
+        < source.index("table = join_features(panel, history, calendar, owed)"))
+for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
+              "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
+              "calendar = calendar.merge(positions"):
+    assert source.index(built) < source.index(call), built
+assert "show_trailing_means" not in source
+assert not hasattr(script, "show_trailing_means")
+assert not hasattr(script, "TOPUP_WINDOWS")
+# U12.3: the window comes from [topups]; the constant is gone.
+assert not hasattr(script, "TOPUP_MEAN_WINDOW")
+assert "TOPUP_MEAN_WINDOW" not in inspect.getsource(script.show_topups)
+assert script.topup_forecasts is topups.topup_forecasts
+assert script.topup_actuals is topups.topup_actuals
+inspect.signature(script.show_topups).bind(
+    "new_cash", "refunds", "unidentified", "levels", "calendar", 24, 2, 8)
+try:
+    inspect.signature(script.show_topups).bind(
+        "new_cash", "refunds", "unidentified", "levels", "calendar", 24, 2)
+except TypeError:
+    pass
+else:
+    raise AssertionError("show_topups still accepts a call without the window")
+# The actual columns come from topup_actuals, not from a loop of the script's own.
+assert "topup_actuals(" in inspect.getsource(script.show_topups)
+
+copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified, calendar)]
+levels_copy = levels.copy(deep=True)
+window = 8
 
 expected = {}
 for h in (1, 2):
     target = origin + h
-    a_mean = mean_by_hand(new_rows, "target_week", "new_customer_cash", h)
-    r_mean = mean_by_hand(refund_rows, "week", "refunds", None)
-    g_mean = mean_by_hand(g_rows, "week", "unidentified_cash", None)
+    a_mean = mean_by_hand(new_rows, "target_week", "new_customer_cash", h, origin, window)
+    r_mean = mean_by_hand(refund_rows, "week", "refunds", None, origin, window)
+    g_mean = mean_by_hand(g_rows, "week", "unidentified_cash", None, origin, window)
     a_actual = actual(new_rows, "target_week", "new_customer_cash", h, target)
     other_actual = (actual(refund_rows, "week", "refunds", None, target)
                     + actual(g_rows, "week", "unidentified_cash", None, target))
@@ -4751,7 +4772,7 @@ for h in (1, 2):
         line["fallbacks " + name] = int(mine["fallback"].sum())
         # TR04's short G falls back; TR02's all-zero G is forecast 0 and not flagged, and
         # every other series keeps its fit: the count is exactly 1.
-        assert mine.set_index("company_code")["fallback"].to_dict() == \
+        assert mine.set_index("company_code")["fallback"].to_dict() == \\
             {"TR02": False, "TR04": True}, (name, h, mine)
         by_company = mine.set_index("company_code")["unidentified_cash"]
         assert by_company["TR02"] == 0.0
@@ -4761,17 +4782,59 @@ for h in (1, 2):
         assert abs(by_company["TR04"] - level) < 1e-6 * level, (by_company["TR04"], level)
     expected[h] = line
 
-script.show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons)
+script.show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons, window)
 for table, copy in zip((new_cash, refunds, unidentified, calendar), copies):
     pd.testing.assert_frame_equal(table, copy)
 pd.testing.assert_series_equal(levels, levels_copy)
 print("EXPECTED " + repr(expected))
+
+# Window 5: the mean's columns are named and computed with the window passed in.
+print("=== WINDOW5 " + repr({h: mean_by_hand(new_rows, "target_week", "new_customer_cash", h,
+                                             origin, 5) / 1e6 for h in (1, 2)}))
+script.show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons, 5)
+
+# TR04's G of week 26 (the target week of h 2) missing: topup_actuals drops TR04's row of h 2.
+missing = unidentified[~((unidentified["company_code"] == "TR04")
+                         & (unidentified["week"] == 26))]
+g_missing = [r for r in g_rows if not (r["company_code"] == "TR04" and r["week"] == 26)]
+missing_expected = {}
+for h in (1, 2):
+    target = origin + h
+    kept = companies if h == 1 else ["TR02"]
+    a = sum(actual(new_rows, "target_week", "new_customer_cash", h, target, c) for c in kept)
+    other = sum(actual(refund_rows, "week", "refunds", None, target, c)
+                + actual(g_missing, "week", "unidentified_cash", None, target, c) for c in kept)
+    line = {"A actual": a / 1e6, "top-up actual": (a + other) / 1e6}
+    # The forecasts (made at origin 24, so week 26 is not read) over the kept companies only.
+    a_mean = mean_by_hand(new_rows, "target_week", "new_customer_cash", h, origin, window, kept)
+    r_mean = mean_by_hand(refund_rows, "week", "refunds", None, origin, window, kept)
+    g_mean = mean_by_hand(g_missing, "week", "unidentified_cash", None, origin, window, kept)
+    line["A mean 8"] = a_mean / 1e6
+    line["top-up mean 8"] = (a_mean + r_mean + g_mean) / 1e6
+    for name, with_level in (("ridge", True), ("ridge no level", False)):
+        found = topups.topup_forecasts(new_cash, refunds, missing, levels, calendar,
+                                       [origin], horizons, "ridge", window, with_level)
+        mine = found[(found["h"] == h) & found["company_code"].isin(kept)]
+        line["A " + name] = float(mine["new_customer_cash"].sum()) / 1e6
+        line["top-up " + name] = float(mine["topup"].sum()) / 1e6
+        line["fallbacks " + name] = int(mine["fallback"].sum())
+    missing_expected[h] = line
+print("=== MISSING " + repr(missing_expected))
+script.show_topups(new_cash, refunds, missing, levels, calendar, origin, horizons, window)
 print("ok")
 """
 
 TOPUP_PRINTOUT_COLUMNS = ["A mean 8", "A ridge", "A ridge no level", "A actual",
                           "top-up mean 8", "top-up ridge", "top-up ridge no level",
                           "top-up actual", "fallbacks ridge", "fallbacks ridge no level"]
+TOPUP_TITLE = ("top-ups at origin 24, all companies, million TRY of week 0 (actual = what came, "
+               "hindsight; fallbacks = companies whose ridge fell back to the level):")
+
+
+def topup_table(lines):
+    """The two rows of a show_topups printout: lines after its title."""
+    return {"header": lines[0], "index_name": lines[1],
+            "rows": [row.split() for row in lines[2:4]]}
 
 
 @pytest.fixture(scope="module")
@@ -4782,19 +4845,22 @@ def topups_run():
     assert result.stdout.strip().endswith("ok")
     lines = [line.strip() for line in result.stdout.splitlines()]
     expected = eval(next(line for line in lines if line.startswith("EXPECTED "))[9:])
-    title = ("top-ups at origin 24, all companies, million TRY of week 0 (actual = what came, "
-             "hindsight; fallbacks = companies whose ridge fell back to the level):")
-    assert title in lines, result.stdout
-    table = lines[lines.index(title) + 1:]
+    assert TOPUP_TITLE in lines, result.stdout
+    table = lines[lines.index(TOPUP_TITLE) + 1:]
     end = next(i for i, line in enumerate(table) if line.startswith("EXPECTED "))
-    return {"header": table[0], "index_name": table[1],
-            "rows": [row.split() for row in table[2:4]], "after": table[4:end],
-            "expected": expected}
+    extra = {}
+    for marker in ("WINDOW5", "MISSING"):
+        start = next(i for i, line in enumerate(lines) if line.startswith(f"=== {marker} "))
+        assert lines[start + 1] == TOPUP_TITLE, lines[start + 1]
+        extra[marker] = {"expected": eval(lines[start][len(marker) + 5:]),
+                         **topup_table(lines[start + 2:])}
+    return {**topup_table(table), "after": table[4:end], "expected": expected,
+            "window5": extra["WINDOW5"], "missing": extra["MISSING"]}
 
 
 def test_topups_are_wired_in_after_the_deflated_label(topups_run):
-    # The source checks (call text, order, imports, TOPUP_MEAN_WINDOW, the old printout gone)
-    # ran in the fixture.
+    # The source checks (call text with [topups] window, order, imports, TOPUP_MEAN_WINDOW
+    # gone, the old printout gone) ran in the fixture.
     assert len(topups_run["rows"]) == 2
 
 
@@ -4841,3 +4907,296 @@ def test_topups_printout_is_in_million_try(topups_run):
     value = float(topups_run["rows"][0][1 + TOPUP_PRINTOUT_COLUMNS.index("A mean 8")])
     assert 0.1 < abs(value) < 100.0
     assert value == pytest.approx(topups_run["expected"][1]["A mean 8"], abs=6e-4)
+
+
+def test_topups_printout_names_and_computes_the_mean_with_the_window_passed_in(topups_run):
+    run5 = topups_run["window5"]
+    columns = [name.replace("mean 8", "mean 5") for name in TOPUP_PRINTOUT_COLUMNS]
+    assert run5["header"].split() == " ".join(columns).split()
+    assert "mean 8" not in run5["header"]
+    for row, h in zip(run5["rows"], (1, 2)):
+        printed = dict(zip(columns, (float(value) for value in row[1:])))
+        assert printed["A mean 5"] == pytest.approx(run5["expected"][h], abs=6e-4)
+        # The window changes the mean only: the ridge and the actual columns are those of 8.
+        for name in ("A ridge", "A ridge no level", "A actual", "top-up actual"):
+            assert printed[name] == pytest.approx(topups_run["expected"][h][name], abs=6e-4)
+    # And the two windows really give different means here.
+    assert run5["expected"][1] != pytest.approx(topups_run["expected"][1]["A mean 8"],
+                                                abs=1e-3)
+
+
+def test_topups_printout_actual_of_an_h_with_a_missing_week_leaves_that_company_out(
+        topups_run):
+    # topup_actuals drops TR04's row of h 2 (its G of week 26 is missing), and show_topups
+    # adds the forecasts up over the same rows: at h 2 every column, forecast and actual,
+    # holds TR02 alone, and TR04's fallback is no longer counted. h 1 is untouched.
+    missing = topups_run["missing"]
+    assert missing["header"] == topups_run["header"]
+    for row, h in zip(missing["rows"], (1, 2)):
+        printed = dict(zip(TOPUP_PRINTOUT_COLUMNS, (float(value) for value in row[1:])))
+        for name in TOPUP_PRINTOUT_COLUMNS:
+            assert printed[name] == pytest.approx(missing["expected"][h][name], abs=6e-4), \
+                (h, name, printed[name], missing["expected"][h][name])
+    # h 1: the full run's numbers; h 2: smaller A in every column, and no fallback.
+    for name in TOPUP_PRINTOUT_COLUMNS:
+        assert missing["expected"][1][name] == pytest.approx(topups_run["expected"][1][name])
+    for name in ("A mean 8", "A ridge", "A ridge no level", "A actual"):
+        assert missing["expected"][2][name] < topups_run["expected"][2][name] - 1e-3, name
+    assert missing["expected"][2]["fallbacks ridge"] == 0
+    assert missing["expected"][2]["fallbacks ridge no level"] == 0
+    printed_h2 = dict(zip(TOPUP_PRINTOUT_COLUMNS, missing["rows"][1][1:]))
+    assert printed_h2["fallbacks ridge"] == printed_h2["fallbacks ridge no level"] == "0"
+
+
+def test_topups_printout_forecast_and_actual_columns_cover_the_same_companies(topups_run):
+    # With every week present the forecast columns add up both companies, as the actuals do.
+    full = topups_run["expected"][2]
+    missing = topups_run["missing"]["expected"][2]
+    assert full["A mean 8"] > missing["A mean 8"] + 1e-3
+    assert full["A actual"] > missing["A actual"] + 1e-3
+
+
+# U12.3: the choice of the top-up method. `topup_candidates` gives the candidates by name;
+# `compare_topups` forecasts every one at every origin of [topups] compare_first_origin ..
+# compare_last_origin, scores the consolidated top-up against what came (score_topups,
+# by_company=False) and prints one line per candidate, then the lowest error and the method
+# set in [topups]. The wiring is checked on main()'s source. The printout is run on the same
+# hand-built side tables as above (origins 20..24, horizons 2, compare windows 2 and 4); the
+# means' errors are worked out in the script by plain loops (each company's own trailing mean,
+# added up, against the cash that came), the ridges' from topup_forecasts consolidated by hand.
+COMPARE_TOPUPS = TOPUP_DATA + """
+import dataclasses
+import inspect
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import topups
+from collection_estimation.hurdle.settings import TopupSettings
+
+source = " ".join(inspect.getsource(script.main).split())
+call = ("compare_topups(new_cash, refunds, unidentified, levels, calendar, settings.topups, "
+        "settings.receivables.horizons)")
+guarded = "if settings.topups.compare: " + call
+assert guarded in source, "compare_topups is not called, guarded by [topups] compare"
+assert source.count("compare_topups(") == 1
+show = "show_topups(new_cash, refunds, unidentified, levels, calendar,"
+assert (source.index(show) < source.index(guarded)
+        < source.index("table = join_features(panel, history, calendar, owed)"))
+assert script.score_topups is topups.score_topups
+assert script.topup_actuals is topups.topup_actuals
+inspect.signature(script.compare_topups).bind(
+    "new_cash", "refunds", "unidentified", "levels", "calendar", "topups", 2)
+inspect.signature(script.topup_candidates).bind((4, 8))
+
+# topup_candidates
+print("CANDIDATES " + repr([list(script.topup_candidates(w).items())
+                            for w in ((4, 8, 13), (13,), (8, 4), ())]))
+
+settings = TopupSettings(method="mean", window=4, with_level=True, compare=True,
+                         compare_first_origin=20, compare_last_origin=24,
+                         compare_windows=(2, 4))
+origins = list(range(20, 25))
+
+
+def consolidated_errors(forecast_of):
+    # forecast_of(company, o, h) -> (A, R, G) forecast; errors of A, R and the top-up per h.
+    errors = {h: {"A": [], "R": [], "topup": []} for h in (1, 2)}
+    for o in origins:
+        for h in (1, 2):
+            target = o + h
+            fa = fr = fg = 0.0
+            for company in companies:
+                a, r, g = forecast_of(company, o, h)
+                fa, fr, fg = fa + a, fr + r, fg + g
+            aa = actual(new_rows, "target_week", "new_customer_cash", h, target)
+            ar = actual(refund_rows, "week", "refunds", None, target)
+            ag = actual(g_rows, "week", "unidentified_cash", None, target)
+            errors[h]["A"].append(fa - aa)
+            errors[h]["R"].append(fr - ar)
+            errors[h]["topup"].append(fa + fr + fg - aa - ar - ag)
+    return errors
+
+
+def mean_abs(values):
+    return sum(abs(v) for v in values) / len(values)
+
+
+def line_of(errors, fallbacks):
+    line = {f"h{h}": mean_abs(errors[h]["topup"]) / 1e6 for h in (1, 2)}
+    line["all h"] = (line["h1"] + line["h2"]) / 2
+    line["A"] = sum(mean_abs(errors[h]["A"]) for h in (1, 2)) / 2 / 1e6
+    line["R"] = sum(mean_abs(errors[h]["R"]) for h in (1, 2)) / 2 / 1e6
+    line["bias"] = sum(sum(errors[h]["topup"]) / len(origins) for h in (1, 2)) / 2 / 1e6
+    line["fallbacks"] = fallbacks
+    return line
+
+
+def one_company_mean(rows, week_key, value_key, company, h, o, window):
+    values = [r[value_key] / level_of[r[week_key]] for r in rows
+              if r["company_code"] == company and (h is None or r["h"] == h)
+              and o - window < r[week_key] <= o]
+    return sum(values) / len(values)
+
+
+expected = {}
+for window in (2, 4):
+    def mean_forecast(company, o, h, window=window):
+        return (one_company_mean(new_rows, "target_week", "new_customer_cash", company, h, o,
+                                 window),
+                one_company_mean(refund_rows, "week", "refunds", company, None, o, window),
+                one_company_mean(g_rows, "week", "unidentified_cash", company, None, o, window))
+    expected[f"mean {window}"] = line_of(consolidated_errors(mean_forecast), 0)
+for name, with_level in (("ridge", True), ("ridge no level", False)):
+    found = topups.topup_forecasts(new_cash, refunds, unidentified, levels, calendar, origins,
+                                   2, "ridge", 1, with_level)
+    by_key = found.set_index(["company_code", "origin_week", "h"])
+
+    def ridge_forecast(company, o, h, by_key=by_key):
+        got = by_key.loc[(company, o, h)]
+        return got["new_customer_cash"], got["refunds"], got["unidentified_cash"]
+    expected[name] = line_of(consolidated_errors(ridge_forecast), int(found["fallback"].sum()))
+print("EXPECTED " + repr(expected))
+
+copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified, calendar)]
+levels_copy = levels.copy(deep=True)
+for label, chosen in (("mean 4", settings),
+                      ("ridge", dataclasses.replace(settings, method="ridge")),
+                      ("ridge no level", dataclasses.replace(settings, method="ridge",
+                                                             with_level=False)),
+                      ("mean 13", dataclasses.replace(settings, window=13))):
+    print("=== RUN " + label)
+    script.compare_topups(new_cash, refunds, unidentified, levels, calendar, chosen, 2)
+for table, copy in zip((new_cash, refunds, unidentified, calendar), copies):
+    pd.testing.assert_frame_equal(table, copy)
+pd.testing.assert_series_equal(levels, levels_copy)
+print("ok")
+"""
+
+COMPARE_TITLE = ("top-up methods compared at origins 20-24 (5 origins), consolidated top-up: "
+                 "mean absolute error per h and over all h, A and R on their own, bias (above "
+                 "0: too high), million TRY of week 0; fallbacks = forecasts (company, origin, "
+                 "h) whose ridge fell back to the level:")
+COMPARE_CANDIDATES = ["mean 2", "mean 4", "ridge", "ridge no level"]
+COMPARE_COLUMNS = ["h1", "h2", "all h", "A", "R", "bias", "fallbacks"]
+
+
+def compare_rows(lines):
+    """The candidate rows of a compare_topups printout: name -> the printed numbers."""
+    rows = {}
+    for line in lines:
+        # The longest name first: "ridge no level" before "ridge".
+        name = next((n for n in sorted(COMPARE_CANDIDATES, key=len, reverse=True)
+                     if line.startswith(n + " ")), None)
+        if name is None:
+            break
+        rows[name] = dict(zip(COMPARE_COLUMNS, line[len(name):].split()))
+    return rows
+
+
+@pytest.fixture(scope="module")
+def compare_topups_run():
+    result = subprocess.run([sys.executable, "-c", COMPARE_TOPUPS], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=300)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    candidates = eval(next(line for line in lines if line.startswith("CANDIDATES "))[11:])
+    expected = eval(next(line for line in lines if line.startswith("EXPECTED "))[9:])
+    runs = {}
+    starts = [i for i, line in enumerate(lines) if line.startswith("=== RUN ")]
+    for start, stop in zip(starts, starts[1:] + [len(lines) - 1]):
+        body = lines[start + 1:stop]
+        runs[lines[start][len("=== RUN "):]] = {
+            "title": body[0], "header": body[1], "index_name": body[2],
+            "rows": compare_rows(body[3:]), "last": body[-1],
+            "after_rows": body[3 + len(COMPARE_CANDIDATES):]}
+    return {"candidates": candidates, "expected": expected, "runs": runs}
+
+
+def test_topup_candidates_names_and_methods(compare_topups_run):
+    first = compare_topups_run["candidates"][0]
+    assert first == [("mean 4", ("mean", 4, True)), ("mean 8", ("mean", 8, True)),
+                     ("mean 13", ("mean", 13, True)), ("ridge", ("ridge", 1, True)),
+                     ("ridge no level", ("ridge", 1, False))]
+
+
+def test_topup_candidates_keep_the_windows_order_and_put_the_ridges_last(compare_topups_run):
+    _, one, unsorted, none = compare_topups_run["candidates"]
+    assert [name for name, _ in one] == ["mean 13", "ridge", "ridge no level"]
+    assert [name for name, _ in unsorted] == ["mean 8", "mean 4", "ridge", "ridge no level"]
+    # No window: only the two ridges.
+    assert none == [("ridge", ("ridge", 1, True)), ("ridge no level", ("ridge", 1, False))]
+
+
+def test_compare_topups_is_wired_in_after_show_topups_guarded_by_compare(compare_topups_run):
+    # The source checks (the guarded call, its order between show_topups and join_features,
+    # the imports and signatures) ran in the fixture.
+    assert set(compare_topups_run["runs"]) == {"mean 4", "ridge", "ridge no level", "mean 13"}
+
+
+def test_compare_topups_printout_title_header_and_one_row_per_candidate(compare_topups_run):
+    for label, run in compare_topups_run["runs"].items():
+        assert run["title"] == COMPARE_TITLE, label
+        assert run["header"].split() == " ".join(COMPARE_COLUMNS).split(), label
+        assert run["index_name"] == "candidate", label
+        assert list(run["rows"]) == COMPARE_CANDIDATES, label
+        assert all(len(row) == len(COMPARE_COLUMNS) for row in run["rows"].values()), label
+
+
+def test_compare_topups_printout_matches_the_errors_worked_out_by_hand(compare_topups_run):
+    expected = compare_topups_run["expected"]
+    rows = compare_topups_run["runs"]["mean 4"]["rows"]
+    for name in COMPARE_CANDIDATES:
+        for column in COMPARE_COLUMNS[:-1]:
+            assert float(rows[name][column]) == pytest.approx(expected[name][column],
+                                                              abs=6e-4), (name, column)
+        assert int(rows[name]["fallbacks"]) == expected[name]["fallbacks"], name
+
+
+def test_compare_topups_all_h_is_the_mean_of_the_h_columns(compare_topups_run):
+    for name, row in compare_topups_run["runs"]["mean 4"]["rows"].items():
+        assert float(row["all h"]) == pytest.approx((float(row["h1"]) + float(row["h2"])) / 2,
+                                                    abs=1.1e-3), name
+
+
+def test_compare_topups_counts_the_ridges_fallbacks_and_none_for_the_means(compare_topups_run):
+    # TR04's G (from week 17) has too few weeks at every origin 20..24 for a fit: one fallback
+    # per origin and h, 5 x 2 = 10, in each ridge. The means never fall back.
+    rows = compare_topups_run["runs"]["mean 4"]["rows"]
+    assert rows["mean 2"]["fallbacks"] == rows["mean 4"]["fallbacks"] == "0"
+    assert rows["ridge"]["fallbacks"] == rows["ridge no level"]["fallbacks"] == "10"
+    assert compare_topups_run["expected"]["ridge"]["fallbacks"] == 10
+
+
+def test_compare_topups_the_means_differ_by_window(compare_topups_run):
+    rows = compare_topups_run["runs"]["mean 4"]["rows"]
+    assert rows["mean 2"]["all h"] != rows["mean 4"]["all h"]
+
+
+def test_compare_topups_last_line_names_the_lowest_error_and_the_chosen_method(
+        compare_topups_run):
+    expected = compare_topups_run["expected"]
+    lowest = min(COMPARE_CANDIDATES, key=lambda name: expected[name]["all h"])
+    for label, run in compare_topups_run["runs"].items():
+        assert run["last"] == f"lowest error over all h: {lowest}; set in [topups]: {label}", \
+            (label, run["last"])
+
+
+def test_compare_topups_the_printed_table_does_not_depend_on_the_chosen_method(
+        compare_topups_run):
+    runs = compare_topups_run["runs"]
+    for label in ("ridge", "ridge no level", "mean 13"):
+        assert runs[label]["rows"] == runs["mean 4"]["rows"], label
+
+
+def test_compare_topups_a_mean_window_outside_the_comparison_is_still_named(compare_topups_run):
+    # read_topups now refuses method "mean" with a window outside compare_windows, so the
+    # settings file cannot produce this. compare_topups itself takes any TopupSettings and
+    # only labels it: window 13 against compare_windows (2, 4) still prints "mean 13", a
+    # method the table above it does not hold. Pinned so the label stays a plain label.
+    run = compare_topups_run["runs"]["mean 13"]
+    assert run["last"].endswith("; set in [topups]: mean 13")
+    assert "mean 13" not in run["rows"]
+
+
+def test_compare_topups_prints_nothing_between_the_rows_and_the_last_line(compare_topups_run):
+    for label, run in compare_topups_run["runs"].items():
+        assert run["after_rows"] == [run["last"]], label
