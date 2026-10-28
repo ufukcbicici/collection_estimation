@@ -4646,39 +4646,48 @@ def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday
     assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line
 
 
-# U12.1: the top-ups' trailing means at the diagnostic origin, printed after the deflated
-# label. The wiring is checked on main()'s source; the printout is run on hand-built side
-# tables in a separate process. Two companies, origin 13, horizons 2, price levels that move
-# every week (so deflating by the wrong week shows). TR04 has no refund row in weeks 11 and 12,
-# so the sum of each company's own mean differs from the mean of the summed series. The
-# expected values are computed in the script by plain loops over dicts, not by the module.
-TRAILING = """
+# U12.2: the top-ups at the diagnostic origin, by the trailing mean of TOPUP_MEAN_WINDOW weeks
+# and by the ridge with and without the recent level, printed after the deflated label. The
+# wiring is checked on main()'s source; the printout is run on hand-built side tables in a
+# separate process. Two companies, origin 24, horizons 2, price levels that move every week (so
+# deflating by the wrong week shows). TR04's G starts at week 17, too few weeks to fit, so its
+# ridge falls back at every h and the fallbacks column counts it; TR02's G is all zero, forecast
+# 0 and not counted. The trailing means and the actuals are computed in
+# the script by plain loops over dicts, not by the module; the ridge columns come from
+# `topup_forecasts` itself (tested in test_topups.py), summed over the companies.
+TOPUPS = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
 from collection_estimation.hurdle import prices, topups
 
 source = " ".join(inspect.getsource(script.main).split())
-call = ("show_trailing_means(new_cash, refunds, unidentified, levels, "
-        "settings.diagnostic.origin, settings.receivables.horizons, companies)")
-assert call in source, "show_trailing_means is not called as expected"
+call = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
+        "settings.diagnostic.origin, settings.receivables.horizons)")
+assert call in source, "show_topups is not called as expected"
 assert (source.index("show_deflated_label(panel, levels)") < source.index(call)
         < source.index("table = join_features(panel, history, calendar, owed)"))
 for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
               "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
-              "companies = list(settings.companies.known)"):
+              "calendar = calendar.merge(positions"):
     assert source.index(built) < source.index(call), built
-assert script.TOPUP_WINDOWS == (4, 8, 13)
+assert "show_trailing_means" not in source
+assert not hasattr(script, "show_trailing_means")
+assert not hasattr(script, "TOPUP_WINDOWS")
+assert script.TOPUP_MEAN_WINDOW == 8
 assert script.deflate is prices.deflate
-assert script.trailing_mean_forecasts is topups.trailing_mean_forecasts
-inspect.signature(script.show_trailing_means).bind(
-    "new_cash", "refunds", "unidentified", "levels", 13, 2, ["TR02"])
+assert script.topup_forecasts is topups.topup_forecasts
+inspect.signature(script.show_topups).bind(
+    "new_cash", "refunds", "unidentified", "levels", "calendar", 24, 2)
 
 companies = ["TR02", "TR04"]
-origin, horizons = 13, 2
-last = 15
-level_of = {w: 1.0 + 0.1 * w for w in range(0, last + 1)}   # plain floats, by hand
+origin, horizons, window = 24, 2, script.TOPUP_MEAN_WINDOW
+last = 30
+level_of = {w: 1.0 + 0.1 * w + 0.05 * (w % 3) for w in range(0, last + 1)}  # by hand
 levels = pd.Series(level_of)
+calendar = pd.DataFrame({"week": range(0, last + 1),
+                         "cycle": [float(w % 4) for w in range(0, last + 1)],
+                         "odd": [float(w % 2) for w in range(0, last + 1)]})
 
 new_rows = []
 for company, scale in (("TR02", 1e6), ("TR04", 2.5e6)):
@@ -4692,121 +4701,143 @@ new_cash = pd.DataFrame(new_rows)
 refund_rows = []
 for company, scale in (("TR02", -1e5), ("TR04", -7e5)):
     for w in range(0, last + 1):
-        if company == "TR04" and w in (11, 12):
-            continue
-        refund_rows.append({"company_code": company, "week": w, "refunds": scale * (w + 1)})
+        refund_rows.append({"company_code": company, "week": w,
+                            "refunds": scale * (2 + w % 3)})
 refunds = pd.DataFrame(refund_rows)
 g_rows = []
-for company, scale in (("TR02", 3e5), ("TR04", 4e5)):
-    for w in range(0, last + 1):
+# TR02: G all zero (forecast 0, not flagged). TR04: G only from week 17, so 8 weeks up to
+# the origin, fewer than MIN_TRAINING_WEEKS: its ridge falls back to the level, flagged.
+for company, scale, first in (("TR02", 0.0, 0), ("TR04", 4e5, 17)):
+    for w in range(first, last + 1):
         g_rows.append({"company_code": company, "week": w,
-                       "unidentified_cash": scale * (w % 4)})
+                       "unidentified_cash": scale * (1 + w % 4)})
 unidentified = pd.DataFrame(g_rows)
-copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified)]
+copies = [t.copy(deep=True) for t in (new_cash, refunds, unidentified, calendar)]
+levels_copy = levels.copy(deep=True)
 
 
-def by_hand(rows, week_key, value_key, window, h):
+def mean_by_hand(rows, week_key, value_key, h):
     total = 0.0
     for company in companies:
         values = [r[value_key] / level_of[r[week_key]] for r in rows
                   if r["company_code"] == company and (h is None or r["h"] == h)
                   and origin - window < r[week_key] <= origin]
         total += sum(values) / len(values)
-    return total / 1e6
+    return total
 
 
 def actual(rows, week_key, value_key, h, target):
     return sum(r[value_key] / level_of[r[week_key]] for r in rows
-               if r[week_key] == target and (h is None or r["h"] == h)) / 1e6
+               if r[week_key] == target and (h is None or r["h"] == h))
 
 
-expected = []
-for h_ in (1, 2):
-    line = [h_, origin + h_]
-    for rows, week_key, value_key, hh in (
-            (new_rows, "target_week", "new_customer_cash", h_),
-            (refund_rows, "week", "refunds", None), (g_rows, "week", "unidentified_cash", None)):
-        for window in (4, 8, 13):
-            line.append(by_hand(rows, week_key, value_key, window, hh))
-        line.append(actual(rows, week_key, value_key, hh, origin + h_))
-    expected.append(line)
+expected = {}
+for h in (1, 2):
+    target = origin + h
+    a_mean = mean_by_hand(new_rows, "target_week", "new_customer_cash", h)
+    r_mean = mean_by_hand(refund_rows, "week", "refunds", None)
+    g_mean = mean_by_hand(g_rows, "week", "unidentified_cash", None)
+    a_actual = actual(new_rows, "target_week", "new_customer_cash", h, target)
+    other_actual = (actual(refund_rows, "week", "refunds", None, target)
+                    + actual(g_rows, "week", "unidentified_cash", None, target))
+    line = {"A mean 8": a_mean / 1e6, "top-up mean 8": (a_mean + r_mean + g_mean) / 1e6,
+            "A actual": a_actual / 1e6, "top-up actual": (a_actual + other_actual) / 1e6}
+    for name, with_level in (("ridge", True), ("ridge no level", False)):
+        found = topups.topup_forecasts(new_cash, refunds, unidentified, levels, calendar,
+                                       [origin], horizons, "ridge", window, with_level)
+        mine = found[found["h"] == h]
+        line["A " + name] = float(mine["new_customer_cash"].sum()) / 1e6
+        line["top-up " + name] = float(mine["topup"].sum()) / 1e6
+        line["fallbacks " + name] = int(mine["fallback"].sum())
+        # TR04's short G falls back; TR02's all-zero G is forecast 0 and not flagged, and
+        # every other series keeps its fit: the count is exactly 1.
+        assert mine.set_index("company_code")["fallback"].to_dict() == \
+            {"TR02": False, "TR04": True}, (name, h, mine)
+        by_company = mine.set_index("company_code")["unidentified_cash"]
+        assert by_company["TR02"] == 0.0
+        # TR04's fallback: the mean of its deflated G over the 4 weeks up to the origin.
+        level = sum(r["unidentified_cash"] / level_of[r["week"]] for r in g_rows
+                    if r["company_code"] == "TR04" and origin - 4 < r["week"] <= origin) / 4
+        assert abs(by_company["TR04"] - level) < 1e-6 * level, (by_company["TR04"], level)
+    expected[h] = line
 
-# The case is discriminating: R's mean of the summed series differs from the sum of means.
-summed = {}
-for r in refund_rows:
-    if origin - 4 < r["week"] <= origin:
-        summed[r["week"]] = summed.get(r["week"], 0.0) + r["refunds"] / level_of[r["week"]]
-mean_of_sum = sum(summed.values()) / len(summed) / 1e6
-assert abs(mean_of_sum - expected[0][6]) > 0.01, (mean_of_sum, expected[0][6])
-
-script.show_trailing_means(new_cash, refunds, unidentified, levels, origin, horizons, companies)
-for table, copy in zip((new_cash, refunds, unidentified), copies):
+script.show_topups(new_cash, refunds, unidentified, levels, calendar, origin, horizons)
+for table, copy in zip((new_cash, refunds, unidentified, calendar), copies):
     pd.testing.assert_frame_equal(table, copy)
+pd.testing.assert_series_equal(levels, levels_copy)
 print("EXPECTED " + repr(expected))
-print("MEANOFSUM " + repr(mean_of_sum))
 print("ok")
 """
 
+TOPUP_PRINTOUT_COLUMNS = ["A mean 8", "A ridge", "A ridge no level", "A actual",
+                          "top-up mean 8", "top-up ridge", "top-up ridge no level",
+                          "top-up actual", "fallbacks ridge", "fallbacks ridge no level"]
+
 
 @pytest.fixture(scope="module")
-def trailing_run():
-    result = subprocess.run([sys.executable, "-c", TRAILING], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+def topups_run():
+    result = subprocess.run([sys.executable, "-c", TOPUPS], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
     lines = [line.strip() for line in result.stdout.splitlines()]
     expected = eval(next(line for line in lines if line.startswith("EXPECTED "))[9:])
-    mean_of_sum = float(next(line for line in lines if line.startswith("MEANOFSUM "))[10:])
-    title = ("top-ups, trailing mean at origin 13, all companies, million TRY of week 0 "
-             "(actual = what came, hindsight):")
+    title = ("top-ups at origin 24, all companies, million TRY of week 0 (actual = what came, "
+             "hindsight; fallbacks = companies whose ridge fell back to the level):")
     assert title in lines, result.stdout
     table = lines[lines.index(title) + 1:]
-    return {"header": table[0], "rows": [row.split() for row in table[1:3]],
-            "expected": expected, "mean_of_sum": mean_of_sum}
+    end = next(i for i, line in enumerate(table) if line.startswith("EXPECTED "))
+    return {"header": table[0], "index_name": table[1],
+            "rows": [row.split() for row in table[2:4]], "after": table[4:end],
+            "expected": expected}
 
 
-def test_trailing_means_are_wired_in_after_the_deflated_label(trailing_run):
-    # The source checks (call text, order, imports, TOPUP_WINDOWS) ran in the fixture.
-    assert len(trailing_run["rows"]) == 2
+def test_topups_are_wired_in_after_the_deflated_label(topups_run):
+    # The source checks (call text, order, imports, TOPUP_MEAN_WINDOW, the old printout gone)
+    # ran in the fixture.
+    assert len(topups_run["rows"]) == 2
 
 
-def test_trailing_means_printout_columns(trailing_run):
-    names = ["h", "target", "week"]
-    for top_up in ("A", "R", "G"):
-        for window in (4, 8, 13):
-            names += [top_up, "mean", str(window)]
-        names += [top_up, "actual"]
-    assert trailing_run["header"].split() == names
+def test_topups_printout_columns_in_order(topups_run):
+    assert topups_run["header"].split() == " ".join(TOPUP_PRINTOUT_COLUMNS).split()
+    assert topups_run["index_name"] == "h"
 
 
-def test_trailing_means_printout_one_row_per_h_with_its_target_week(trailing_run):
-    assert [row[:2] for row in trailing_run["rows"]] == [["1", "14"], ["2", "15"]]
+def test_topups_printout_one_row_per_h(topups_run):
+    assert [row[0] for row in topups_run["rows"]] == ["1", "2"]
+    assert all(len(row) == 1 + len(TOPUP_PRINTOUT_COLUMNS) for row in topups_run["rows"])
+    # Nothing else is printed after the two rows.
+    assert topups_run["after"] == []
 
 
-def test_trailing_means_printout_matches_the_hand_computed_values(trailing_run):
-    # Each company's own trailing mean (A deflated by target week, R and G by week), summed
-    # over the companies, and the actual at origin + h, in million TRY rounded to 3 places.
-    for row, expected in zip(trailing_run["rows"], trailing_run["expected"]):
-        printed = [float(value) for value in row[2:]]
-        assert printed == pytest.approx(expected[2:], abs=6e-4), (printed, expected)
+def test_topups_printout_matches_the_expected_values(topups_run):
+    # The trailing means and actuals by hand (each company's own mean, deflated by the week
+    # the cash came, summed over the companies), the ridge from topup_forecasts; million TRY
+    # rounded to 3 places.
+    for row, h in zip(topups_run["rows"], (1, 2)):
+        printed = dict(zip(TOPUP_PRINTOUT_COLUMNS, (float(value) for value in row[1:])))
+        for name in TOPUP_PRINTOUT_COLUMNS:
+            assert printed[name] == pytest.approx(topups_run["expected"][h][name], abs=6e-4), \
+                (h, name, printed[name], topups_run["expected"][h][name])
 
 
-def test_trailing_means_printout_sums_each_companys_own_mean(trailing_run):
-    # R, window 4: the sum of the per-company means, not the mean of the summed series.
-    printed = float(trailing_run["rows"][0][6])
-    assert printed == pytest.approx(trailing_run["expected"][0][6], abs=6e-4)
-    assert abs(printed - trailing_run["mean_of_sum"]) > 0.01
+def test_topups_printout_counts_the_companies_that_fell_back(topups_run):
+    # TR04's short G falls back in both ridges; TR02's all-zero G is not counted: one per h.
+    for row in topups_run["rows"]:
+        printed = dict(zip(TOPUP_PRINTOUT_COLUMNS, row[1:]))
+        assert printed["fallbacks ridge"] == "1"
+        assert printed["fallbacks ridge no level"] == "1"
 
 
-def test_trailing_means_printout_r_and_g_are_flat_over_h_and_a_is_not(trailing_run):
-    h1, h2 = ([float(value) for value in row[2:]] for row in trailing_run["rows"])
-    # Columns: A 4/8/13/actual (0-3), R 4/8/13/actual (4-7), G 4/8/13/actual (8-11).
-    assert h1[4:7] == h2[4:7] and h1[8:11] == h2[8:11]
-    assert h1[0:3] != h2[0:3]
+def test_topups_printout_top_up_is_below_a_since_refunds_outweigh_g(topups_run):
+    # R (negative) outweighs G here, so every top-up is below its A: the refunds' sign is kept.
+    for row in topups_run["rows"]:
+        printed = dict(zip(TOPUP_PRINTOUT_COLUMNS, (float(value) for value in row[1:])))
+        for name in ("mean 8", "ridge", "ridge no level", "actual"):
+            assert printed["top-up " + name] < printed["A " + name], name
 
 
-def test_trailing_means_printout_is_in_million_try(trailing_run):
-    # TR02 + TR04 G mean over 4 weeks, deflated: about a million, printed as such (not TRY).
-    value = float(trailing_run["rows"][0][10])
-    assert 0.1 < abs(value) < 10.0
-    assert value == pytest.approx(trailing_run["expected"][0][10], abs=6e-4)
+def test_topups_printout_is_in_million_try(topups_run):
+    value = float(topups_run["rows"][0][1 + TOPUP_PRINTOUT_COLUMNS.index("A mean 8")])
+    assert 0.1 < abs(value) < 100.0
+    assert value == pytest.approx(topups_run["expected"][1]["A mean 8"], abs=6e-4)
