@@ -3,8 +3,10 @@
 `inflation.py` works on a table of weeks with `week_start` and `week_end` columns; this module
 builds that table from our week numbers, adds the guard the copied module lacks (it quietly
 falls back to its earliest month for a week whose published month is not in the table), and
-deflates amounts by the price level published in their own week.
+deflates amounts by the price level published in their own week. A forecast is re-inflated
+with `projected_levels`: the same published level, as known at the forecast week.
 """
+import math
 from datetime import date, timedelta
 
 import pandas as pd
@@ -63,6 +65,93 @@ def published_levels(week_zero: date, first_week: int, last_week: int) -> pd.Ser
     levels = pd.Series(inflation.published_price_level(weeks), index=weeks["week"].to_numpy(),
                        name="price_level")
     return levels / levels.loc[0]
+
+
+def published_month(week_start: date,
+                    lag_months: int = inflation.PUBLICATION_LAG_MONTHS) -> tuple[int, int]:
+    """The TÜFE month published as of a week starting `week_start`, as (year, month):
+    `lag_months` before the month of the week's Monday (a week in July has June's)."""
+    months = week_start.year * 12 + (week_start.month - 1) - lag_months
+    return months // 12, months % 12 + 1
+
+
+def _month_number(month: tuple[int, int]) -> int:
+    """(year, month) as a count of months, so two months can be subtracted."""
+    return month[0] * 12 + month[1] - 1
+
+
+def projected_levels(week_zero: date, origin: int, target_weeks: list[int],
+                     window: int = inflation.PROJECTION_WINDOW,
+                     lag_months: int = inflation.PUBLICATION_LAG_MONTHS) -> pd.Series:
+    """The price level a forecast made at the end of week `origin` re-inflates each target
+    week with: the TÜFE that WILL BE published as of the target week, as known at the origin.
+    Indexed by target week, normalised to 1.0 at week 0 like `published_levels`.
+
+    The labels were deflated by the level published as of their own week, so the forecast
+    is re-inflated by the same figure:
+
+      published by the origin   the figure itself, from the table (exact; for a target week
+                                not after the origin this equals `published_levels`)
+      not published yet         the last figure published by the origin, grown at its mean
+                                monthly rate over the last `window` months, for as many
+                                months as the target's figure lies past it
+
+    Reads no TÜFE month published after the origin, except, for an origin before week 0,
+    week 0's own figure, which every level is divided by (a constant scale; the labels are
+    divided by it too). Raises InflationCoverageError if the table lacks the month published
+    by the origin or by week 0, or a month to look up, and ValueError for no target weeks, a
+    `week_zero` that is not a Monday (a week's TÜFE month is its Monday's month, as when the
+    labels were deflated), a window below 1, a negative lag (it would read months not yet
+    published), or a projection with fewer than two months to take the rate from.
+    """
+    if not target_weeks:
+        raise ValueError("no target weeks to project the price level for")
+    if week_zero.weekday() != 0:
+        raise ValueError(f"week_zero {week_zero} is a {week_zero:%A}, not a Monday; weeks run "
+                         f"Monday to Sunday")
+    if window < 1:
+        raise ValueError(f"window is {window}; the rate of inflation needs at least 1 month")
+    if lag_months < 0:
+        raise ValueError(f"lag_months is {lag_months}; a negative lag reads TÜFE months not "
+                         f"yet published")
+
+    def week_start(week: int) -> date:
+        return week_zero + timedelta(days=7 * week)
+
+    known = published_month(week_start(origin), lag_months)
+    base = published_month(week_start(0), lag_months)
+    for week, month in ((origin, known), (0, base)):
+        if month not in inflation.TUFE:
+            raise inflation.InflationCoverageError(
+                f"week {week} (starting {week_start(week)}) needs the TÜFE for "
+                f"{month[0]}-{month[1]:02d}, published by then, which is not in the table; "
+                f"extend `inflation.TUFE`")
+
+    growth = None   # the mean monthly log growth, worked out only if a target needs it
+    levels = []
+    for week in target_weeks:
+        needed = published_month(week_start(week), lag_months)
+        if needed <= known:
+            if needed not in inflation.TUFE:
+                raise inflation.InflationCoverageError(
+                    f"target week {week} needs the TÜFE for {needed[0]}-{needed[1]:02d}, "
+                    f"which is not in the table; extend `inflation.TUFE`")
+            level = inflation.TUFE[needed]
+        else:
+            if growth is None:
+                history = [month for month in sorted(inflation.TUFE)
+                           if month <= known][-(window + 1):]
+                if len(history) < 2:
+                    raise ValueError(f"origin week {origin}: the table has fewer than two "
+                                     f"months up to {known[0]}-{known[1]:02d} to take the "
+                                     f"rate of inflation from")
+                growth = ((math.log(inflation.TUFE[history[-1]])
+                           - math.log(inflation.TUFE[history[0]]))
+                          / (_month_number(history[-1]) - _month_number(history[0])))
+            months_ahead = _month_number(needed) - _month_number(known)
+            level = inflation.TUFE[known] * math.exp(growth * months_ahead)
+        levels.append(level / inflation.TUFE[base])
+    return pd.Series(levels, index=list(target_weeks), name="price_level")
 
 
 def deflate(amounts: pd.Series, weeks: pd.Series, levels: pd.Series) -> pd.Series:

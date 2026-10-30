@@ -141,7 +141,8 @@ from collection_estimation.hurdle.read_ledger import (  # noqa: E402
     check_ledger_against_collections,
     load_ledger,
 )
-from collection_estimation.hurdle.prices import price_weeks, published_levels  # noqa: E402
+from collection_estimation.hurdle.prices import (  # noqa: E402
+    price_weeks, projected_levels, published_levels, published_month)
 from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 from collection_estimation.hurdle.series import (  # noqa: E402
     add_week_index,
@@ -317,6 +318,10 @@ def main():
     projected_level = inflation.projected_price_level(weeks_for_prices)  # P[origin, target]
     levels = published_levels(week_zero, first_price_week, last_week)
     show_prices(weeks_for_prices, actual_level, published_level, projected_level, levels)
+    # U13.1: the levels a forecast re-inflates with, at the demo origin (a past week, so the
+    # published figures can be checked) and at the last week (target weeks after the data).
+    for forecast_week in (settings.debug.demo_origin, last_week):
+        show_projected_levels(week_zero, forecast_week, settings.receivables.horizons)
 
     # Step 11: the features. Built unit by unit; for now, the ledger's payments before the
     # first daily file, used as payment history if [history] use_ledger_before_first_file.
@@ -891,6 +896,30 @@ def show_prices(weeks_for_prices, actual_level, published_level, projected_level
           f"{sum(one_ahead) / len(one_ahead):+.2%}; published_levels() matches: "
           f"{bool((abs(levels.to_numpy() - published_level / at_week_zero) < 1e-12).all())}; "
           f"week 0 = {levels.loc[0]:.3f}, last week = {levels.iloc[-1]:.3f}")
+
+
+def show_projected_levels(week_zero, origin, horizons):
+    """A short printout of the price levels a forecast at `origin` re-inflates with: per
+    target week, the TÜFE month it needs, looked up or projected, and (where the table has
+    that month) the published level in hindsight."""
+    targets = [origin + h for h in range(1, horizons + 1)]
+    projected = projected_levels(week_zero, origin, targets)
+    known = published_month(week_zero + timedelta(days=7 * origin))
+    base = inflation.TUFE[published_month(week_zero)]
+    rows = []
+    for week in targets:
+        needed = published_month(week_zero + timedelta(days=7 * week))
+        hindsight = inflation.TUFE.get(needed)
+        rows.append({"target_week": week,
+                     "starts": f"{week_zero + timedelta(days=7 * week):%Y-%m-%d}",
+                     "TÜFE month": f"{needed[0]}-{needed[1]:02d}",
+                     "how": "looked up" if needed <= known else "projected",
+                     "level": round(projected[week], 4),
+                     "hindsight": round(hindsight / base, 4) if hindsight else None})
+    table = pd.DataFrame(rows).set_index("target_week")
+    print(f"        projected levels for a forecast at week {origin} (TÜFE published by then: "
+          f"{known[0]}-{known[1]:02d})")
+    print(table.to_string())
 
 
 def show_early_receipts(early_receipts, history_start):
