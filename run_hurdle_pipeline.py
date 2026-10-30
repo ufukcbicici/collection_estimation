@@ -65,8 +65,7 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 )
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
-from collection_estimation.hurdle.forecast import (  # noqa: E402
-    CONSOLIDATED, customer_forecasts, forecast_totals)
+from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -546,24 +545,20 @@ def main():
     if settings.joint_diagnostic.run:
         run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar)
 
-    # Step 16: one forecast (U13), at the same forecast week as steps 12 and 14. Built unit by
-    # unit; for now, each customer's p, m and p x m (U13.2), which must equal step 14's.
+    # Step 16: one forecast (U13), at the same forecast week as steps 12 and 14: each
+    # customer's p x m (which must equal step 14's), plus the top-ups, per company and
+    # consolidated, re-inflated with the price levels projected at the origin; then beside the
+    # nominal cash that really came.
     started = time.perf_counter()
-    customers = customer_forecasts(table, origin, settings,
-                                   block_feature_columns(history, calendar, owed), companies)
-    show_customer_forecasts(customers, forecast_rows, time.perf_counter() - started,
+    result = forecast(table, origin, settings,
+                      block_columns=block_feature_columns(history, calendar, owed),
+                      companies=companies, new_cash=new_cash, refunds=refunds,
+                      unidentified=unidentified, levels=levels, calendar=calendar,
+                      week_zero=week_zero)
+    show_customer_forecasts(result.customers, forecast_rows, time.perf_counter() - started,
                             predictions["stage 1 (HGB)"] * m)
-    # U13.3: per company and consolidated, plus the top-ups ([topups] method), re-inflated with
-    # the price levels projected at the origin.
-    horizons = settings.receivables.horizons
-    topups = topup_forecasts(new_cash, refunds, unidentified, levels, calendar, [origin],
-                             horizons, settings.topups.method, settings.topups.window,
-                             settings.topups.with_level)
-    totals = forecast_totals(customers, topups,
-                             projected_levels(week_zero, origin,
-                                              [origin + h for h in range(1, horizons + 1)]),
-                             companies, horizons)
-    show_forecast_totals(totals)
+    show_forecast_totals(result.totals)
+    show_forecast_vs_actual(result.totals, weekly, weeks)
 
     # Later steps follow as each unit is built.
 
@@ -1322,6 +1317,36 @@ def show_forecast_totals(totals):
     first = totals[(totals["h"] == 1)].set_index("company_code")
     print("        per company at h = 1, million TRY:")
     print((first[["customers", "real_total", "total"]] / 1e6).round(2).to_string())
+
+
+def show_forecast_vs_actual(totals, weekly, weeks):
+    """Step 16's forecast beside the nominal cash that really came in each target week (gross
+    receipts + refunds, refunds negative; hindsight, one origin, so an illustration, not a
+    score). A target week that is missing or after the last week has no actual: never 0."""
+    net = weekly.assign(net=weekly["gross_receipts"] + weekly["refunds"])
+    by_company = net.groupby(["company_code", "week"])["net"].sum()
+    consolidated = net.groupby("week")["net"].sum()
+    rows = totals[["company_code", "h", "target_week", "total"]].copy()
+    # A week with data but no line for a company is a real 0 for it.
+    rows["actual"] = [consolidated.get(week, 0.0) if company == CONSOLIDATED
+                      else by_company.get((company, week), 0.0)
+                      for company, week in zip(rows["company_code"], rows["target_week"])]
+    with_data = set(weeks.loc[~weeks["is_missing"], "week"])
+    rows.loc[~rows["target_week"].isin(with_data), "actual"] = float("nan")
+    rows["ratio"] = rows["total"] / rows["actual"]
+
+    origin = int(totals["origin_week"].iloc[0])
+    print(f"        forecast vs actual at week {origin}, nominal (actual = gross receipts + "
+          f"refunds; ratio = forecast / actual; one origin: an illustration, not a score)")
+    print("        consolidated, million TRY:")
+    all_rows = rows[rows["company_code"] == CONSOLIDATED].set_index("h")
+    shown = all_rows[["target_week"]].assign(forecast=all_rows["total"] / 1e6,
+                                             actual=all_rows["actual"] / 1e6,
+                                             ratio=all_rows["ratio"])
+    print(shown.round(2).fillna("no data").to_string())
+    print("        ratio per company and h:")
+    print(rows.pivot(index="company_code", columns="h", values="ratio")
+          .round(2).fillna("no data").to_string())
 
 
 def show_stage2_scores(scores):

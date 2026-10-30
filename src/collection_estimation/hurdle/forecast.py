@@ -10,12 +10,19 @@ origins (U14) and the production forecast (U17) all take the same path.
 U13.3, the totals: per company and h, the customers' p x m added up, plus the top-ups (U12:
 new customers A, unidentified cash G, refunds R, negative), deflated; then times the price
 level projected at T (U13.1), in nominal TRY. Plus the consolidated rows, company "ALL".
+
+U13.4, `forecast`: the steps above in one call, the one path every forecast takes.
 """
+from dataclasses import dataclass
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
+from .prices import projected_levels
 from .stage1 import feature_columns, fit_stage1, predict_paid, stage1_features
 from .stage2 import exposure, fit_stage2, predict_amount
+from .topups import topup_forecasts
 from .training_table import rows_at_origin, rows_known_at
 
 # The columns of the table `customer_forecasts` returns, in order.
@@ -171,3 +178,46 @@ def forecast_totals(customers: pd.DataFrame, topups: pd.DataFrame, levels: pd.Se
         if bad:
             raise ValueError(f"{column} is NaN or infinite in {bad} rows")
     return found
+
+
+@dataclass(frozen=True)
+class Forecast:
+    """One forecast made at one origin: `totals` (`forecast_totals`, per company and h plus
+    the consolidated rows) and `customers` (`customer_forecasts`, the p, m and p x m behind
+    the totals' `customers` column)."""
+    totals: pd.DataFrame
+    customers: pd.DataFrame
+
+
+def forecast(table: pd.DataFrame, origin: int, settings, *,
+             block_columns: dict[str, list[str]], companies: list[str],
+             new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+             levels: pd.Series, calendar: pd.DataFrame, week_zero: date) -> Forecast:
+    """The forecast made at the end of week `origin` (T) for h = 1 to `[receivables]
+    horizons`, per company and consolidated, deflated and nominal.
+
+    The customers (`customer_forecasts` on `table`, `block_columns` and `companies`), the
+    top-ups (`topups.topup_forecasts` on the side tables `new_cash`, `refunds` and
+    `unidentified`, with `levels` the published price levels and `calendar` the calendar
+    features, by the `[topups]` settings), the price levels projected at T
+    (`prices.projected_levels` from `week_zero`), and the totals (`forecast_totals`).
+
+    Raises ValueError if the table's rows at T are not for h = 1 to `[receivables] horizons`
+    (checked before the fits, so the error names the setting); otherwise each step raises
+    ValueError on what it cannot use.
+    """
+    horizons = settings.receivables.horizons
+    found = set(table.loc[table["origin_week"] == origin, "h"])
+    wanted = set(range(1, horizons + 1))
+    # No rows at T is left to customer_forecasts, which says so.
+    if found and found != wanted:
+        raise ValueError(f"the table's rows at origin week {origin} are for h {sorted(found)}, "
+                         f"but [receivables] horizons is {horizons}")
+    customers = customer_forecasts(table, origin, settings, block_columns, companies)
+    topups = topup_forecasts(new_cash, refunds, unidentified, levels, calendar, [origin],
+                             horizons, settings.topups.method, settings.topups.window,
+                             settings.topups.with_level)
+    projected = projected_levels(week_zero, origin,
+                                 [origin + h for h in range(1, horizons + 1)])
+    totals = forecast_totals(customers, topups, projected, companies, horizons)
+    return Forecast(totals=totals, customers=customers)

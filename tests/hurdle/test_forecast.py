@@ -1342,3 +1342,804 @@ def test_with_real_projected_levels():
     company_rows = found[found["company_code"] != CONSOLIDATED]
     np.testing.assert_allclose(all_rows["total"].to_numpy(),
                                company_rows.groupby("h")["total"].sum().to_numpy(), rtol=1e-14)
+
+
+# =============================================================================================
+# U13.4: `Forecast` and `forecast`, the four steps in one call.
+#
+# The customers come from the small training table above (companies TR02 and TR04 only, so
+# the company list here is F_COMPANIES, not COMPANIES, which also holds TR05 with no rows).
+# The side tables, price levels and calendar are hand-built in the shape `side_tables.py`
+# makes them (as in test_topups.py). Settings are a namespace with the four sections read:
+# [stage1], [stage2], [receivables] (horizons) and [topups].
+# =============================================================================================
+
+import inspect  # noqa: E402
+from datetime import date  # noqa: E402
+
+from collection_estimation.hurdle.forecast import Forecast, forecast  # noqa: E402
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    ReceivablesSettings, TopupSettings)
+from collection_estimation.hurdle.topups import topup_forecasts  # noqa: E402
+
+F_COMPANIES = ["TR02", "TR04"]
+WEEK_ZERO = date(2025, 6, 2)   # a Monday
+
+
+def f_side_tables(companies=F_COMPANIES, last=40, horizons=HORIZONS, seed=0):
+    """A (per origin, h, target week), R (per week, negative) and G (per week), nominal TRY."""
+    rng = np.random.default_rng(seed)
+    new_rows, refund_rows, g_rows = [], [], []
+    for number, company in enumerate(companies):
+        scale = 1.0 + number
+        for origin in range(0, last):
+            for h in range(1, horizons + 1):
+                target = origin + h
+                if target <= last:
+                    new_rows.append({"company_code": company, "origin_week": origin, "h": h,
+                                     "target_week": target,
+                                     "new_customer_cash": scale * (1000.0 + 200.0 * (target % 4)
+                                                                   + 50.0 * h
+                                                                   + rng.normal(scale=40.0))})
+        for week in range(0, last + 1):
+            refund_rows.append({"company_code": company, "week": week,
+                                "refunds": -scale * (300.0 + 60.0 * (week % 4)
+                                                     + abs(rng.normal(scale=20.0)))})
+            g_rows.append({"company_code": company, "week": week,
+                           "unidentified_cash": scale * (500.0 + 100.0 * np.cos(week)
+                                                         + rng.normal(scale=20.0))})
+    return pd.DataFrame(new_rows), pd.DataFrame(refund_rows), pd.DataFrame(g_rows)
+
+
+def f_levels(last=60):
+    return pd.Series([1.0 + 0.02 * w + 0.01 * (w % 3) for w in range(0, last + 1)],
+                     index=range(0, last + 1), name="price_level")
+
+
+def f_calendar(last=60):
+    weeks = list(range(0, last + 1))
+    return pd.DataFrame({"week": weeks, "cycle": [float(w % 4) for w in weeks],
+                         "wave": [float(np.cos(w)) for w in weeks]})
+
+
+def f_settings(horizons=HORIZONS, method="mean", window=8, with_level=True, stage1=None,
+               stage2=None):
+    receivables = ReceivablesSettings(min_cleared_for_delay=3, horizons=horizons,
+                                      leak_check_weeks=(), overdue_age_days=(30,))
+    topups = TopupSettings(method=method, window=window, with_level=with_level, compare=False,
+                           compare_first_origin=0, compare_last_origin=0, compare_windows=(4,))
+    return SimpleNamespace(stage1=stage1 or stage1_settings(),
+                           stage2=stage2 or stage2_settings(),
+                           receivables=receivables, topups=topups)
+
+
+def f_inputs(side=None):
+    """Every keyword argument of `forecast` (side tables for h 1..5)."""
+    new_cash, refunds, unidentified = side if side is not None else f_side_tables()
+    return dict(block_columns=BLOCK_COLUMNS, companies=list(F_COMPANIES), new_cash=new_cash,
+                refunds=refunds, unidentified=unidentified, levels=f_levels(),
+                calendar=f_calendar(), week_zero=WEEK_ZERO)
+
+
+def table_with_horizons(table, horizons):
+    """The training table as it would be built with [receivables] horizons = `horizons`."""
+    return table[table["h"] <= horizons]
+
+
+def f_run(table, origin=ORIGIN, settings=None, **overrides):
+    kwargs = f_inputs()
+    kwargs.update(overrides)
+    return forecast(table, origin, settings or f_settings(), **kwargs)
+
+
+def f_side(side):
+    return dict(new_cash=side[0], refunds=side[1], unidentified=side[2])
+
+
+def f_by_hand(table, origin, settings, kwargs):
+    """The four steps called one by one, as the docstring of `forecast` describes them."""
+    horizons = settings.receivables.horizons
+    customers = customer_forecasts(table, origin, settings, kwargs["block_columns"],
+                                   kwargs["companies"])
+    topups = topup_forecasts(kwargs["new_cash"], kwargs["refunds"], kwargs["unidentified"],
+                             kwargs["levels"], kwargs["calendar"], [origin], horizons,
+                             settings.topups.method, settings.topups.window,
+                             settings.topups.with_level)
+    projected = projected_levels(kwargs["week_zero"], origin,
+                                 [origin + h for h in range(1, horizons + 1)])
+    totals_ = forecast_totals(customers, topups, projected, kwargs["companies"], horizons)
+    return customers, topups, projected, totals_
+
+
+@pytest.fixture(scope="module")
+def f_result(table):
+    return f_run(table)
+
+
+# --- the premises ------------------------------------------------------------------------------
+
+def test_f_premise_training_table_holds_only_the_two_companies(table):
+    assert sorted(table["company_code"].unique()) == F_COMPANIES
+    assert WEEK_ZERO.weekday() == 0
+
+
+# --- Forecast ----------------------------------------------------------------------------------
+
+def test_forecast_returns_a_forecast(f_result):
+    assert isinstance(f_result, Forecast)
+    assert isinstance(f_result.totals, pd.DataFrame)
+    assert isinstance(f_result.customers, pd.DataFrame)
+
+
+def test_forecast_dataclass_fields_in_order():
+    assert [field.name for field in dataclasses.fields(Forecast)] == ["totals", "customers"]
+
+
+def test_forecast_is_frozen_assigning_raises(f_result):
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        f_result.totals = pd.DataFrame()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        f_result.customers = pd.DataFrame()
+
+
+def test_forecast_is_frozen_new_attribute_and_delete_raise(f_result):
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        f_result.extra = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        del f_result.totals
+
+
+def test_forecast_can_be_built_by_keyword():
+    a, b = pd.DataFrame({"x": [1]}), pd.DataFrame({"y": [2]})
+    made = Forecast(totals=a, customers=b)
+    assert made.totals is a and made.customers is b
+
+
+# --- the keyword-only arguments ------------------------------------------------------------
+
+def test_signature_everything_after_settings_is_keyword_only():
+    parameters = inspect.signature(forecast).parameters
+    names = list(parameters)
+    assert names[:3] == ["table", "origin", "settings"]
+    assert names[3:] == ["block_columns", "companies", "new_cash", "refunds", "unidentified",
+                         "levels", "calendar", "week_zero"]
+    for name in names[:3]:
+        assert parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
+    for name in names[3:]:
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+
+
+def test_keyword_only_arguments_given_positionally_raise_type_error(table, monkeypatch):
+    called = []
+    monkeypatch.setattr(forecast_module, "customer_forecasts",
+                        lambda *a, **k: called.append(1))
+    kwargs = f_inputs()
+    with pytest.raises(TypeError):
+        forecast(table, ORIGIN, f_settings(), *kwargs.values())
+    with pytest.raises(TypeError):
+        forecast(table, ORIGIN, f_settings(), kwargs["block_columns"],
+                 **{k: v for k, v in kwargs.items() if k != "block_columns"})
+    assert called == []   # refused before any step runs
+
+
+@pytest.mark.parametrize("left_out", ["block_columns", "companies", "new_cash", "refunds",
+                                      "unidentified", "levels", "calendar", "week_zero"])
+def test_each_keyword_argument_is_required(table, left_out):
+    kwargs = f_inputs()
+    del kwargs[left_out]
+    with pytest.raises(TypeError, match=left_out):
+        forecast(table, ORIGIN, f_settings(), **kwargs)
+
+
+# --- equal to the four steps called by hand --------------------------------------------------
+
+@pytest.mark.parametrize("method,window,with_level", [("mean", 8, True), ("mean", 3, False),
+                                                      ("ridge", 8, True), ("ridge", 8, False)])
+def test_totals_and_customers_equal_the_steps_by_hand(table, method, window, with_level):
+    settings = f_settings(method=method, window=window, with_level=with_level)
+    kwargs = f_inputs()
+    found = forecast(table, ORIGIN, settings, **kwargs)
+    customers, _, _, totals_ = f_by_hand(table, ORIGIN, settings, kwargs)
+    pd.testing.assert_frame_equal(found.customers, customers)
+    pd.testing.assert_frame_equal(found.totals, totals_)
+
+
+@pytest.mark.parametrize("origin", [10, 15, 23])
+def test_equal_to_the_steps_by_hand_at_other_origins(table, origin):
+    settings = f_settings()
+    kwargs = f_inputs()
+    found = forecast(table, origin, settings, **kwargs)
+    customers, _, _, totals_ = f_by_hand(table, origin, settings, kwargs)
+    pd.testing.assert_frame_equal(found.customers, customers)
+    pd.testing.assert_frame_equal(found.totals, totals_)
+
+
+def test_customers_equal_customer_forecasts_alone(table, f_result):
+    pd.testing.assert_frame_equal(
+        f_result.customers, customer_forecasts(table, ORIGIN, f_settings(), BLOCK_COLUMNS,
+                                               F_COMPANIES))
+
+
+def test_totals_carry_the_topups_and_the_projected_levels(table, f_result):
+    _, topups, projected, _ = f_by_hand(table, ORIGIN, f_settings(), f_inputs())
+    found = f_result.totals
+    for company in F_COMPANIES:
+        own = found[found["company_code"] == company].set_index("h")
+        theirs = topups[topups["company_code"] == company].set_index("h")
+        for column in ("new_customer_cash", "refunds", "unidentified_cash", "fallback"):
+            assert own[column].tolist() == theirs[column].tolist(), (company, column)
+        assert own["price_level"].tolist() == projected.loc[own["target_week"]].tolist()
+        assert (own["total"] == own["real_total"] * own["price_level"]).all()
+
+
+def test_the_four_steps_are_called_once_each_in_order_with_the_documented_arguments(
+        table, monkeypatch):
+    settings = f_settings(horizons=4, method="ridge", window=6, with_level=False)
+    kwargs = f_inputs()
+    calls = []
+    sentinel = {name: object() for name in ("customers", "topups", "levels", "totals")}
+
+    def fake(name):
+        def step(*args, **kw):
+            calls.append((name, args, kw))
+            return sentinel[name]
+        return step
+
+    monkeypatch.setattr(forecast_module, "customer_forecasts", fake("customers"))
+    monkeypatch.setattr(forecast_module, "topup_forecasts", fake("topups"))
+    monkeypatch.setattr(forecast_module, "projected_levels", fake("levels"))
+    monkeypatch.setattr(forecast_module, "forecast_totals", fake("totals"))
+
+    four = table_with_horizons(table, 4)   # the table must match [receivables] horizons
+    found = forecast(four, ORIGIN, settings, **kwargs)
+    assert [name for name, _, _ in calls] == ["customers", "topups", "levels", "totals"]
+    _, args, kw = calls[0]
+    assert args[0] is four and args[1] == ORIGIN and args[2] is settings
+    assert args[3] is kwargs["block_columns"] and args[4] is kwargs["companies"] and not kw
+    _, args, kw = calls[1]
+    assert args[0] is kwargs["new_cash"] and args[1] is kwargs["refunds"]
+    assert args[2] is kwargs["unidentified"] and args[3] is kwargs["levels"]
+    assert args[4] is kwargs["calendar"]
+    assert list(args[5:]) == [[ORIGIN], 4, "ridge", 6, False] and not kw
+    _, args, kw = calls[2]
+    assert args == (WEEK_ZERO, ORIGIN, [ORIGIN + 1, ORIGIN + 2, ORIGIN + 3, ORIGIN + 4])
+    assert not kw
+    _, args, kw = calls[3]
+    assert args[0] is sentinel["customers"] and args[1] is sentinel["topups"]
+    assert args[2] is sentinel["levels"] and args[3] is kwargs["companies"] and args[4] == 4
+    assert not kw
+    assert found.totals is sentinel["totals"] and found.customers is sentinel["customers"]
+
+
+def test_forecast_is_deterministic(table, f_result):
+    again = f_run(table)
+    pd.testing.assert_frame_equal(again.totals, f_result.totals)
+    pd.testing.assert_frame_equal(again.customers, f_result.customers)
+
+
+# --- settings flow through ----------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [1, 3, 5])
+def test_receivables_horizons_set_the_h_range_of_both_tables(table, horizons):
+    found = forecast(table_with_horizons(table, horizons), ORIGIN,
+                     f_settings(horizons=horizons), **f_inputs())
+    assert sorted(found.customers["h"].unique()) == list(range(1, horizons + 1))
+    assert sorted(found.totals["h"].unique()) == list(range(1, horizons + 1))
+    assert len(found.totals) == (len(F_COMPANIES) + 1) * horizons
+    assert (found.totals["target_week"] == ORIGIN + found.totals["h"]).all()
+
+
+def test_three_horizons_agree_with_five_on_the_topups_and_levels_of_h_1_to_3(table, f_result):
+    three = forecast(table_with_horizons(table, 3), ORIGIN, f_settings(horizons=3),
+                     **f_inputs())
+    five_first = f_result.totals[f_result.totals["h"] <= 3].reset_index(drop=True)
+    for column in ("company_code", "h", "new_customer_cash", "refunds", "unidentified_cash",
+                   "price_level", "target_week"):
+        assert three.totals[column].tolist() == five_first[column].tolist(), column
+
+
+def test_horizons_setting_longer_than_the_table_raises_naming_the_setting(table):
+    # The table holds h 1..3 but [receivables] horizons is 5.
+    with pytest.raises(ValueError) as error:
+        forecast(table_with_horizons(table, 3), ORIGIN, f_settings(horizons=5), **f_inputs())
+    assert str(error.value) == (f"the table's rows at origin week {ORIGIN} are for h "
+                                f"[1, 2, 3], but [receivables] horizons is 5")
+
+
+def test_horizons_setting_shorter_than_the_table_raises_naming_the_setting(table):
+    # The table holds h 1..5 but [receivables] horizons is 3.
+    with pytest.raises(ValueError) as error:
+        forecast(table, ORIGIN, f_settings(horizons=3), **f_inputs())
+    assert str(error.value) == (f"the table's rows at origin week {ORIGIN} are for h "
+                                f"[1, 2, 3, 4, 5], but [receivables] horizons is 3")
+
+
+# --- the horizons check at the top of forecast ------------------------------------------
+
+def horizons_message(found, horizons, origin=ORIGIN):
+    return (f"the table's rows at origin week {origin} are for h {found}, but [receivables] "
+            f"horizons is {horizons}")
+
+
+def spy_on_the_steps(monkeypatch):
+    """Replace every step and fit forecast could reach with one that records its call."""
+    called = []
+
+    def recorder(name):
+        def step(*args, **kwargs):
+            called.append(name)
+            raise AssertionError(f"{name} must not be called")
+        return step
+
+    for name in ("customer_forecasts", "fit_stage1", "fit_stage2", "topup_forecasts",
+                 "projected_levels", "forecast_totals"):
+        monkeypatch.setattr(forecast_module, name, recorder(name))
+    return called
+
+
+@pytest.mark.parametrize("table_h,horizons", [(3, 5), (5, 3), (5, 4), (1, 2)])
+def test_horizons_check_fires_before_any_step_or_fit(table, monkeypatch, table_h, horizons):
+    called = spy_on_the_steps(monkeypatch)
+    with pytest.raises(ValueError) as error:
+        forecast(table_with_horizons(table, table_h), ORIGIN, f_settings(horizons=horizons),
+                 **f_inputs())
+    assert str(error.value) == horizons_message(list(range(1, table_h + 1)), horizons)
+    assert called == []
+
+
+def test_horizons_check_fires_before_the_fits_even_with_other_bad_inputs(table):
+    # A non-Monday week zero and an unknown method would fail later; the check speaks first.
+    with pytest.raises(ValueError) as error:
+        forecast(table, ORIGIN, f_settings(horizons=3, method="median"),
+                 **{**f_inputs(), "week_zero": date(2025, 6, 3)})
+    assert str(error.value) == horizons_message([1, 2, 3, 4, 5], 3)
+
+
+def test_horizons_check_fires_for_a_gap_in_the_h_range(table, monkeypatch):
+    called = spy_on_the_steps(monkeypatch)
+    gappy = table_with_horizons(table, 4)
+    gappy = gappy[~((gappy["origin_week"] == ORIGIN) & (gappy["h"] == 3))]
+    with pytest.raises(ValueError) as error:
+        forecast(gappy, ORIGIN, f_settings(horizons=4), **f_inputs())
+    assert str(error.value) == horizons_message([1, 2, 4], 4)
+    assert called == []
+
+
+def test_horizons_check_fires_for_a_gap_at_h_one(table):
+    gappy = table[~((table["origin_week"] == ORIGIN) & (table["h"] == 1))]
+    with pytest.raises(ValueError) as error:
+        forecast(gappy, ORIGIN, f_settings(horizons=5), **f_inputs())
+    assert str(error.value) == horizons_message([2, 3, 4, 5], 5)
+
+
+def test_horizons_check_is_on_the_set_of_h_not_per_customer(table):
+    # One customer lacking h 3 while the others have it does not trip the check: the SET of
+    # h at the origin is still 1..5, and forecast_totals sums per company and h.
+    one_short = table[~((table["origin_week"] == ORIGIN) & (table["h"] == 3)
+                        & (table["customer_id"] == "C0"))]
+    found = forecast(one_short, ORIGIN, f_settings(), **f_inputs())
+    assert sorted(found.totals["h"].unique()) == list(range(1, HORIZONS + 1))
+    assert not ((found.customers["customer_id"] == "C0") & (found.customers["h"] == 3)).any()
+
+
+def with_extra_h_at_origin(table, h, origin=ORIGIN):
+    """The table plus a copy of its h-1 rows at `origin`, relabelled as horizon `h`."""
+    extra = table[(table["origin_week"] == origin) & (table["h"] == 1)].copy()
+    extra["h"] = h
+    extra["target_week"] = origin + h
+    extra.index = extra.index + 100_000
+    return pd.concat([table, extra])
+
+
+def test_horizons_check_fires_for_h_zero(table, monkeypatch):
+    called = spy_on_the_steps(monkeypatch)
+    with pytest.raises(ValueError) as error:
+        forecast(with_extra_h_at_origin(table, 0), ORIGIN, f_settings(), **f_inputs())
+    assert str(error.value) == horizons_message([0, 1, 2, 3, 4, 5], 5)
+    assert called == []
+
+
+@pytest.mark.parametrize("extra_h", [6, 9])
+def test_horizons_check_fires_for_an_extra_h(table, monkeypatch, extra_h):
+    called = spy_on_the_steps(monkeypatch)
+    with pytest.raises(ValueError) as error:
+        forecast(with_extra_h_at_origin(table, extra_h), ORIGIN, f_settings(), **f_inputs())
+    assert str(error.value) == horizons_message([1, 2, 3, 4, 5, extra_h], 5)
+    assert called == []
+
+
+def test_horizons_check_fires_for_a_negative_h(table):
+    with pytest.raises(ValueError) as error:
+        forecast(with_extra_h_at_origin(table, -1), ORIGIN, f_settings(), **f_inputs())
+    assert str(error.value) == horizons_message([-1, 1, 2, 3, 4, 5], 5)
+
+
+@pytest.mark.parametrize("horizons", [0, -2])
+def test_horizons_setting_below_one_is_caught_by_the_check(table, horizons):
+    with pytest.raises(ValueError) as error:
+        forecast(table, ORIGIN, f_settings(horizons=horizons), **f_inputs())
+    assert str(error.value) == horizons_message([1, 2, 3, 4, 5], horizons)
+
+
+def test_horizons_message_lists_plain_ints(table):
+    # The h column is int64; the message must read [1, 2, 3], not [np.int64(1), ...].
+    with pytest.raises(ValueError) as error:
+        forecast(table_with_horizons(table, 3), ORIGIN, f_settings(horizons=5), **f_inputs())
+    assert "np." not in str(error.value) and "[1, 2, 3]" in str(error.value)
+
+
+@pytest.mark.parametrize("horizons", [1, 3, 5])
+def test_horizons_check_does_not_fire_when_the_table_matches(table, monkeypatch, horizons):
+    called = []
+    real = forecast_module.customer_forecasts
+
+    def spy(*args, **kwargs):
+        called.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(forecast_module, "customer_forecasts", spy)
+    found = forecast(table_with_horizons(table, horizons), ORIGIN,
+                     f_settings(horizons=horizons), **f_inputs())
+    assert called == [1]
+    assert sorted(found.totals["h"].unique()) == list(range(1, horizons + 1))
+
+
+def test_horizons_check_matches_with_shuffled_rows(table, f_result):
+    # The SET of h is compared, so row order does not matter.
+    shuffled = table.sample(frac=1.0, random_state=4)
+    found = forecast(shuffled, ORIGIN, f_settings(), **f_inputs())
+    assert sorted(found.totals["h"].unique()) == list(range(1, HORIZONS + 1))
+
+
+def test_horizons_check_matches_a_float_h_column(table, monkeypatch):
+    # A float h (1.0 .. 5.0) is equal to the int horizons in a set: the check passes.
+    floats = table.astype({"h": "float64"})
+    called = []
+    monkeypatch.setattr(forecast_module, "customer_forecasts",
+                        lambda *a, **k: called.append(1) or (_ for _ in ()).throw(
+                            RuntimeError("reached the steps")))
+    with pytest.raises(RuntimeError, match="reached the steps"):
+        forecast(floats, ORIGIN, f_settings(), **f_inputs())
+    assert called == [1]
+
+
+@pytest.mark.parametrize("origin", [31, 99, -1])
+@pytest.mark.parametrize("horizons", [5, 3])
+def test_no_rows_at_the_origin_still_gives_the_customer_forecasts_message(table, origin,
+                                                                          horizons):
+    # Even with a horizons setting the table could never match.
+    with pytest.raises(ValueError) as error:
+        forecast(table, origin, f_settings(horizons=horizons), **f_inputs())
+    assert str(error.value) == f"the table has no rows at origin week {origin}"
+
+
+def test_only_rows_at_the_origin_are_looked_at(table, monkeypatch):
+    # Rows at other origins with h outside 1..5, and a gap at another origin, do not trip it.
+    other = with_extra_h_at_origin(table, 9, origin=ORIGIN - 3)
+    other = with_extra_h_at_origin(other, 0, origin=ORIGIN + 2)
+    other = other[~((other["origin_week"] == ORIGIN - 1) & (other["h"] == 2))]
+    assert set(other.loc[other["origin_week"] == ORIGIN, "h"]) == set(range(1, 6))
+    called = []
+    monkeypatch.setattr(forecast_module, "customer_forecasts",
+                        lambda *a, **k: called.append(1) or (_ for _ in ()).throw(
+                            RuntimeError("reached the steps")))
+    with pytest.raises(RuntimeError, match="reached the steps"):
+        forecast(other, ORIGIN, f_settings(), **f_inputs())
+    assert called == [1]
+
+
+def test_only_the_rows_at_the_origin_decide_a_mismatch(table):
+    # The table matches horizons 5 at every origin but ORIGIN, where only h 1..3 remain.
+    short_here = table[~((table["origin_week"] == ORIGIN) & (table["h"] > 3))]
+    with pytest.raises(ValueError) as error:
+        forecast(short_here, ORIGIN, f_settings(horizons=5), **f_inputs())
+    assert str(error.value) == horizons_message([1, 2, 3], 5)
+    # At another origin the same table is fine.
+    found = forecast(short_here, ORIGIN - 2, f_settings(horizons=5), **f_inputs())
+    assert set(found.totals["origin_week"]) == {ORIGIN - 2}
+
+
+@pytest.mark.parametrize("method,window,with_level", [("mean", 4, True), ("mean", 13, True),
+                                                      ("ridge", 8, True), ("ridge", 8, False)])
+def test_topup_settings_give_the_topups_topup_forecasts_gives(table, method, window,
+                                                               with_level):
+    settings = f_settings(method=method, window=window, with_level=with_level)
+    kwargs = f_inputs()
+    found = forecast(table, ORIGIN, settings, **kwargs)
+    topups = topup_forecasts(kwargs["new_cash"], kwargs["refunds"], kwargs["unidentified"],
+                             kwargs["levels"], kwargs["calendar"], [ORIGIN], HORIZONS, method,
+                             window, with_level)
+    own = found.totals[found.totals["company_code"] != CONSOLIDATED].reset_index(drop=True)
+    for column in ("company_code", "h", "new_customer_cash", "refunds", "unidentified_cash",
+                   "fallback"):
+        assert own[column].tolist() == topups[column].tolist(), column
+
+
+def test_topup_method_changes_the_topup_columns_not_the_customers(table, f_result):
+    ridge = f_run(table, settings=f_settings(method="ridge"))
+    pd.testing.assert_frame_equal(ridge.customers, f_result.customers)
+    assert not np.allclose(ridge.totals["new_customer_cash"],
+                           f_result.totals["new_customer_cash"])
+    assert (ridge.totals["customers"] == f_result.totals["customers"]).all()
+
+
+def test_topup_window_changes_the_topup_columns(table, f_result):
+    short = f_run(table, settings=f_settings(window=2))
+    assert not np.allclose(short.totals["new_customer_cash"],
+                           f_result.totals["new_customer_cash"])
+    assert not np.allclose(short.totals["unidentified_cash"],
+                           f_result.totals["unidentified_cash"])
+    pd.testing.assert_frame_equal(short.customers, f_result.customers)
+
+
+def test_the_window_has_no_effect_with_the_ridge(table):
+    a = f_run(table, settings=f_settings(method="ridge", window=2))
+    b = f_run(table, settings=f_settings(method="ridge", window=13))
+    pd.testing.assert_frame_equal(a.totals, b.totals)
+
+
+def test_mean_fallback_is_false_everywhere(f_result):
+    assert not f_result.totals["fallback"].any()
+
+
+def test_stage_settings_change_the_customers_and_the_totals_customers(table, f_result):
+    other = f_run(table, settings=f_settings(stage1=stage1_settings(max_iter=3, seed=8)))
+    assert not np.allclose(other.customers["p"], f_result.customers["p"])
+    assert not np.allclose(other.totals["customers"], f_result.totals["customers"])
+
+
+# --- one origin, and totals' customers is the customers added up ----------------------------
+
+def test_customers_and_totals_share_the_one_origin(f_result):
+    assert set(f_result.customers["origin_week"]) == {ORIGIN}
+    assert set(f_result.totals["origin_week"]) == {ORIGIN}
+
+
+def test_totals_customers_column_is_expected_summed_per_company_and_h(f_result):
+    sums = f_result.customers.groupby(["company_code", "h"])["expected"].sum()
+    own = f_result.totals[f_result.totals["company_code"] != CONSOLIDATED]
+    assert len(own) == len(sums)
+    for _, got in own.iterrows():
+        assert got["customers"] == pytest.approx(sums[(got["company_code"], got["h"])],
+                                                 rel=1e-14)
+
+
+def test_consolidated_customers_is_every_expected_summed_per_h(f_result):
+    sums = f_result.customers.groupby("h")["expected"].sum()
+    rows = f_result.totals[f_result.totals["company_code"] == CONSOLIDATED].set_index("h")
+    np.testing.assert_allclose(rows["customers"].to_numpy(), sums.loc[rows.index].to_numpy(),
+                               rtol=1e-13)
+
+
+def test_totals_have_the_total_columns_and_every_company_plus_all(f_result):
+    assert list(f_result.totals.columns) == TOTAL_COLUMNS
+    assert list(f_result.customers.columns) == CUSTOMER_COLUMNS
+    assert f_result.totals["company_code"].unique().tolist() == F_COMPANIES + [CONSOLIDATED]
+
+
+def test_totals_price_level_is_projected_at_the_origin(f_result):
+    projected = projected_levels(WEEK_ZERO, ORIGIN, [ORIGIN + h for h in range(1, HORIZONS + 1)])
+    assert (f_result.totals["price_level"].to_numpy()
+            == projected.loc[f_result.totals["target_week"]].to_numpy()).all()
+
+
+def test_week_zero_moves_the_nominal_total_not_the_real_total(table, f_result):
+    later = f_run(table, week_zero=date(2025, 1, 6))
+    pd.testing.assert_frame_equal(later.customers, f_result.customers)
+    assert (later.totals["real_total"] == f_result.totals["real_total"]).all()
+    assert not np.allclose(later.totals["total"], f_result.totals["total"])
+
+
+# --- errors propagate unchanged ------------------------------------------------------------
+
+@pytest.mark.parametrize("origin", [31, 99])
+def test_no_rows_at_the_origin_propagates_from_customer_forecasts(table, origin):
+    with pytest.raises(ValueError) as error:
+        f_run(table, origin=origin)
+    assert str(error.value) == f"the table has no rows at origin week {origin}"
+
+
+def test_non_monday_week_zero_propagates_from_projected_levels(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, week_zero=date(2025, 6, 3))
+    assert str(error.value) == ("week_zero 2025-06-03 is a Tuesday, not a Monday; weeks run "
+                                "Monday to Sunday")
+
+
+def test_unknown_topup_method_propagates_from_topup_forecasts(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, settings=f_settings(method="median"))
+    assert str(error.value) == "method is 'median'; it must be one of ('mean', 'ridge')"
+
+
+def test_window_below_one_propagates_from_topup_forecasts(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, settings=f_settings(window=0))
+    assert str(error.value) == "window is 0; the trailing mean needs at least 1 week"
+
+
+def test_company_missing_from_the_side_tables_propagates_from_forecast_totals(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, **f_side(f_side_tables(companies=["TR02"])))
+    assert str(error.value) == ("the top-ups have no rows for (company, h) "
+                                "[('TR04', 1), ('TR04', 2), ('TR04', 3), ('TR04', 4), "
+                                "('TR04', 5)]")
+
+
+def test_extra_company_in_the_side_tables_propagates_from_forecast_totals(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, **f_side(f_side_tables(companies=["TR02", "TR04", "TR09"])))
+    assert str(error.value) == ("the top-ups have rows for (company, h) "
+                                "[('TR09', 1), ('TR09', 2), ('TR09', 3), ('TR09', 4), "
+                                "('TR09', 5)], which are not in the company list or the "
+                                "horizons")
+
+
+def test_company_in_the_list_with_no_customers_propagates_from_forecast_totals(table):
+    # TR05 is in the list and in the side tables, but the training table has no customer of it.
+    with pytest.raises(ValueError) as error:
+        f_run(table, companies=["TR02", "TR04", "TR05"],
+              **f_side(f_side_tables(companies=["TR02", "TR04", "TR05"])))
+    assert str(error.value) == ("the customers have no rows for (company, h) "
+                                "[('TR05', 1), ('TR05', 2), ('TR05', 3), ('TR05', 4), "
+                                "('TR05', 5)]")
+
+
+def test_company_missing_from_one_side_table_propagates_from_topup_forecasts(table):
+    new_cash, refunds, unidentified = f_side_tables()
+    new_cash = new_cash[new_cash["company_code"] != "TR04"]
+    with pytest.raises(ValueError, match="no week with data"):
+        f_run(table, new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+
+
+def test_all_in_the_company_list_propagates_from_forecast_totals(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, companies=["TR02", "TR04", "ALL"])
+    assert str(error.value) == ("'ALL' is the code of the consolidated rows; it cannot be a "
+                                "company")
+
+
+def test_customer_error_comes_before_topup_and_price_errors(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, origin=31, settings=f_settings(method="median"),
+              week_zero=date(2025, 6, 3))
+    assert str(error.value) == "the table has no rows at origin week 31"
+
+
+def test_topup_error_comes_before_the_price_error(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, settings=f_settings(method="median"), week_zero=date(2025, 6, 3))
+    assert str(error.value).startswith("method is 'median'")
+
+
+def test_price_error_comes_before_the_totals_error(table):
+    with pytest.raises(ValueError) as error:
+        f_run(table, week_zero=date(2025, 6, 3), **f_side(f_side_tables(companies=["TR02"])))
+    assert str(error.value).startswith("week_zero 2025-06-03 is a Tuesday")
+
+
+def test_inner_exception_object_is_passed_through_not_wrapped(table, monkeypatch):
+    marker = ValueError("from inside")
+
+    def raising(*args, **kwargs):
+        raise marker
+
+    monkeypatch.setattr(forecast_module, "projected_levels", raising)
+    with pytest.raises(ValueError) as error:
+        f_run(table)
+    assert error.value is marker
+
+
+# --- no leakage ---------------------------------------------------------------------------
+
+def scrambled_after(table, origin, seed=5):
+    """Labels and amounts of every row whose target week is after `origin` scrambled (and
+    the "future" rows marked labelled, as if their answers had come)."""
+    rng = np.random.default_rng(seed)
+    changed = table.copy()
+    later = changed["target_week"] > origin
+    n = int(later.sum())
+    paid = rng.random(n) < 0.5
+    changed.loc[later, "paid"] = pd.Series(paid, index=changed.index[later]).astype(object)
+    changed.loc[later, "amount_deflated"] = np.where(paid, rng.lognormal(9, 1, n), 0.0)
+    changed.loc[later, "amount"] = changed.loc[later, "amount_deflated"] * 3.0
+    changed.loc[later, "label_status"] = "labelled"
+    return changed
+
+
+def side_scrambled_after(side, origin, seed=6):
+    rng = np.random.default_rng(seed)
+    new_cash, refunds, unidentified = (frame.copy() for frame in side)
+    later = new_cash["target_week"] > origin
+    new_cash.loc[later, "new_customer_cash"] = rng.normal(1e6, 1e5, int(later.sum()))
+    later = refunds["week"] > origin
+    refunds.loc[later, "refunds"] = -rng.lognormal(12, 1, int(later.sum()))
+    later = unidentified["week"] > origin
+    unidentified.loc[later, "unidentified_cash"] = rng.normal(-5e5, 1e5, int(later.sum()))
+    return new_cash, refunds, unidentified
+
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_labels_after_the_origin_do_not_change_the_forecast(table, method):
+    settings = f_settings(method=method)
+    base = f_run(table, settings=settings)
+    again = f_run(scrambled_after(table, ORIGIN), settings=settings)
+    pd.testing.assert_frame_equal(again.customers, base.customers)
+    pd.testing.assert_frame_equal(again.totals, base.totals)
+
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_side_table_rows_after_the_origin_do_not_change_the_forecast(table, method):
+    settings = f_settings(method=method)
+    side = f_side_tables()
+    base = f_run(table, settings=settings, **f_side(side))
+    again = f_run(table, settings=settings, **f_side(side_scrambled_after(side, ORIGIN)))
+    pd.testing.assert_frame_equal(again.totals, base.totals)
+
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_published_levels_after_the_origin_do_not_change_the_forecast(table, method):
+    settings = f_settings(method=method)
+    base = f_run(table, settings=settings)
+    levels = f_levels()
+    levels[levels.index > ORIGIN] *= 7.0
+    again = f_run(table, settings=settings, levels=levels)
+    pd.testing.assert_frame_equal(again.totals, base.totals)
+
+
+@pytest.mark.parametrize("method", ["mean", "ridge"])
+def test_everything_after_the_origin_at_once_changes_nothing(table, method):
+    settings = f_settings(method=method)
+    side = f_side_tables()
+    base = f_run(table, settings=settings, **f_side(side))
+    levels = f_levels()
+    levels[levels.index > ORIGIN] *= 0.25
+    again = f_run(scrambled_after(table, ORIGIN), settings=settings,
+                  **f_side(side_scrambled_after(side, ORIGIN)), levels=levels)
+    pd.testing.assert_frame_equal(again.customers, base.customers)
+    pd.testing.assert_frame_equal(again.totals, base.totals)
+
+
+def test_dropping_side_table_rows_after_the_origin_changes_nothing(table, f_result):
+    new_cash, refunds, unidentified = f_side_tables()
+    moved = f_run(table, new_cash=new_cash[new_cash["target_week"] <= ORIGIN],
+                  refunds=refunds[refunds["week"] <= ORIGIN],
+                  unidentified=unidentified[unidentified["week"] <= ORIGIN])
+    pd.testing.assert_frame_equal(moved.totals, f_result.totals)
+
+
+def test_leak_checks_have_teeth_labels_up_to_the_origin_move_the_forecast(table, f_result):
+    rng = np.random.default_rng(9)
+    changed = table.copy()
+    known = (changed["target_week"] <= ORIGIN) & (changed["label_status"] == "labelled")
+    flip = known & (rng.random(len(changed)) < 0.5)
+    changed.loc[flip, "paid"] = (~changed.loc[flip, "paid"].astype(bool)).astype(object)
+    now_paid = flip & changed["paid"].fillna(False).astype(bool)
+    changed.loc[now_paid, "amount_deflated"] = 5000.0
+    changed.loc[flip & ~now_paid, "amount_deflated"] = 0.0
+    moved = f_run(changed)
+    assert not np.allclose(moved.totals["customers"], f_result.totals["customers"])
+
+
+def test_leak_checks_have_teeth_side_rows_at_the_origin_move_the_forecast(table, f_result):
+    new_cash, refunds, unidentified = f_side_tables()
+    unidentified.loc[unidentified["week"] == ORIGIN, "unidentified_cash"] += 1e6
+    moved = f_run(table, new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+    assert not np.allclose(moved.totals["unidentified_cash"],
+                           f_result.totals["unidentified_cash"])
+
+
+# --- inputs are not changed --------------------------------------------------------------
+
+def test_forecast_does_not_change_its_inputs(table):
+    kwargs = f_inputs()
+    copies = {name: (value.copy() if hasattr(value, "copy") else value)
+              for name, value in kwargs.items()}
+    table_copy = table.copy()
+    forecast(table, ORIGIN, f_settings(method="ridge"), **kwargs)
+    pd.testing.assert_frame_equal(table, table_copy)
+    for name in ("new_cash", "refunds", "unidentified", "calendar"):
+        pd.testing.assert_frame_equal(kwargs[name], copies[name])
+    pd.testing.assert_series_equal(kwargs["levels"], copies["levels"])
+    assert kwargs["block_columns"] == copies["block_columns"]
+    assert kwargs["companies"] == F_COMPANIES
