@@ -65,6 +65,7 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 )
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
+from collection_estimation.hurdle.forecast import customer_forecasts  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -543,6 +544,14 @@ def main():
     # on validation, tested once beside the default pair and the `deflated` benchmark.
     if settings.joint_diagnostic.run:
         run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar)
+
+    # Step 16: one forecast (U13), at the same forecast week as steps 12 and 14. Built unit by
+    # unit; for now, each customer's p, m and p x m (U13.2), which must equal step 14's.
+    started = time.perf_counter()
+    customers = customer_forecasts(table, origin, settings,
+                                   block_feature_columns(history, calendar, owed), companies)
+    show_customer_forecasts(customers, forecast_rows, time.perf_counter() - started,
+                            predictions["stage 1 (HGB)"] * m)
 
     # Later steps follow as each unit is built.
 
@@ -1265,6 +1274,26 @@ def show_stage2_forecast(forecast_rows, m, p, training_ratio):
     by_h["ratio"] = by_h["p x m"] / by_h["actual cash"]
     print("        per h, the whole model (sum of p x m) against the actual cash, deflated:")
     print(by_h.round({"mean m": 0, "p x m": 0, "actual cash": 0, "ratio": 3}).to_string())
+
+
+def show_customer_forecasts(customers, forecast_rows, seconds, step14_expected):
+    """Step 16's customer forecasts (U13.2): their size and fit time, per h the sum of p and
+    of p x m against the deflated cash that came (labelled rows only; a missing week is not a
+    zero), and whether p x m equals step 14's, row for row."""
+    origin = int(customers["origin_week"].iloc[0])
+    print(f"Step 16: one forecast at week {origin}: {len(customers):,} customer rows "
+          f"({customers['key'].nunique():,} customers x {customers['h'].nunique()} h), both "
+          f"stages fitted in {seconds:.1f} s")
+    step14 = step14_expected.loc[customers.index].rename("expected")
+    print(f"        p x m equals step 14's, row for row: {customers['expected'].equals(step14)} "
+          f"(largest difference {(customers['expected'] - step14).abs().max():.3g})")
+    labelled = forecast_rows.loc[customers.index, "label_status"] == "labelled"
+    rows = customers.assign(actual=forecast_rows["amount_deflated"])[labelled]
+    by_h = rows.groupby("h").agg(customers=("key", "size"), sum_p=("p", "sum"),
+                                 p_x_m=("expected", "sum"), actual=("actual", "sum"))
+    by_h["ratio"] = by_h["p_x_m"] / by_h["actual"]
+    print("        per h, labelled rows, deflated (TRY of week 0):")
+    print(by_h.round({"sum_p": 1, "p_x_m": 0, "actual": 0, "ratio": 3}).to_string())
 
 
 def show_stage2_scores(scores):
