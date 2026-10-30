@@ -1,0 +1,17 @@
+# Kept out of the image. The data is mounted at run time, never built in.
+data/
+.git/
+.idea/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+models/
+outputs/
+*.joblib
+*.pkl
+Dockerfile_old
+
+# Private keys must never reach the build context. authorized_keys (public keys) is needed.
+id_rsa*
+id_ed25519*
+*.pem

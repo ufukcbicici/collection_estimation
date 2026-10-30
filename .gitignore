@@ -27,3 +27,8 @@ venv/
 # lists internal hostnames, usernames and SSH ports that have no business being pushed.
 .idea/deployment.xml
 .idea/other.xml
+
+# Docker: the SSH public keys copied into the image, and any private key, stay local.
+authorized_keys
+id_rsa*
+id_ed25519*
