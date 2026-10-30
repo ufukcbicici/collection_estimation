@@ -65,7 +65,8 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 )
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
-from collection_estimation.hurdle.forecast import customer_forecasts  # noqa: E402
+from collection_estimation.hurdle.forecast import (  # noqa: E402
+    CONSOLIDATED, customer_forecasts, forecast_totals)
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -552,6 +553,17 @@ def main():
                                    block_feature_columns(history, calendar, owed), companies)
     show_customer_forecasts(customers, forecast_rows, time.perf_counter() - started,
                             predictions["stage 1 (HGB)"] * m)
+    # U13.3: per company and consolidated, plus the top-ups ([topups] method), re-inflated with
+    # the price levels projected at the origin.
+    horizons = settings.receivables.horizons
+    topups = topup_forecasts(new_cash, refunds, unidentified, levels, calendar, [origin],
+                             horizons, settings.topups.method, settings.topups.window,
+                             settings.topups.with_level)
+    totals = forecast_totals(customers, topups,
+                             projected_levels(week_zero, origin,
+                                              [origin + h for h in range(1, horizons + 1)]),
+                             companies, horizons)
+    show_forecast_totals(totals)
 
     # Later steps follow as each unit is built.
 
@@ -1294,6 +1306,22 @@ def show_customer_forecasts(customers, forecast_rows, seconds, step14_expected):
     by_h["ratio"] = by_h["p_x_m"] / by_h["actual"]
     print("        per h, labelled rows, deflated (TRY of week 0):")
     print(by_h.round({"sum_p": 1, "p_x_m": 0, "actual": 0, "ratio": 3}).to_string())
+
+
+def show_forecast_totals(totals):
+    """Step 16's totals (U13.3): the consolidated forecast per h, million TRY (deflated parts,
+    then the price level and the nominal total), and every company at h = 1."""
+    columns = ["customers", "new_customer_cash", "unidentified_cash", "refunds",
+               "real_total", "total"]
+    consolidated = totals[totals["company_code"] == CONSOLIDATED].set_index("h")
+    table = consolidated[columns] / 1e6
+    table.insert(5, "price_level", consolidated["price_level"])
+    print(f"        consolidated forecast at week {int(totals['origin_week'].iloc[0])}, million "
+          f"TRY (all deflated, TRY of week 0, except total, nominal = real_total x price_level):")
+    print(table.round({**{column: 2 for column in columns}, "price_level": 4}).to_string())
+    first = totals[(totals["h"] == 1)].set_index("company_code")
+    print("        per company at h = 1, million TRY:")
+    print((first[["customers", "real_total", "total"]] / 1e6).round(2).to_string())
 
 
 def show_stage2_scores(scores):

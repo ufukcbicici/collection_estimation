@@ -7,8 +7,11 @@ columns CUSTOMER_COLUMNS with the table's index and expected = p x m, and raises
 for no rows at the origin, a NaN / infinite p, m or expected, an m below 0, and as the fits do.
 
 A small hand-made training table (8 customers in two companies, origins 0..30, h 1..5; target
-weeks after 23 unlabelled) and
-few trees, so every forecast takes well under a second. Nothing reads the corpus.
+weeks after 23 unlabelled) and few trees, so every forecast takes well under a second.
+Nothing reads the corpus.
+
+U13.3, at the end: `forecast_totals` (with `_check_pairs`, `TOTAL_COLUMNS`, `CONSOLIDATED`),
+pure bookkeeping, tested on small hand-made customers / top-ups / levels tables.
 """
 import dataclasses
 from types import SimpleNamespace
@@ -18,7 +21,11 @@ import pandas as pd
 import pytest
 
 from collection_estimation.hurdle import forecast as forecast_module
-from collection_estimation.hurdle.forecast import CUSTOMER_COLUMNS, customer_forecasts
+from collection_estimation.hurdle.forecast import (
+    CONSOLIDATED, CUSTOMER_COLUMNS, TOTAL_COLUMNS, _check_pairs, customer_forecasts,
+    forecast_totals)
+from collection_estimation.hurdle.prices import projected_levels
+from collection_estimation.hurdle.topups import TOPUP_COLUMNS
 from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings, Stage2Settings
 from collection_estimation.hurdle.stage1 import (
     feature_columns, fit_stage1, predict_paid, stage1_features)
@@ -620,3 +627,718 @@ def test_settings_are_frozen_dataclasses_and_left_alone():
     assert dataclasses.is_dataclass(s1)
     with pytest.raises(dataclasses.FrozenInstanceError):
         s1.max_iter = 99
+
+
+# =========================================================================================
+# U13.3: forecast_totals
+#
+# A hand-made example whose answer is known: companies TR02 and TR04 (passed unsorted),
+# horizons 3, origin 40, so target weeks 41-43, price levels 2.0, 4.0 and 0.5 (exact in
+# binary, so every total is exact).
+#
+#   customers (expected per customer)     top-ups (new, refunds, unidentified, fallback)
+#   TR02 h1: 100 + 50 = 150               TR02: (1, -4, 8, F) (2, -5, 16, T) (3, -6, 32, F)
+#   TR02 h2: 10                           TR04: (10, -1, 0, F) (20, -1, 0, F) (30, -1, 0, F)
+#   TR02 h3: 1 + 2 + 3 = 6
+#   TR04 h1: 7    h2: 20 + 30 = 50    h3: 0
+# =========================================================================================
+
+T_ORIGIN = 40
+T_COMPANIES = ["TR04", "TR02"]
+T_HORIZONS = 3
+
+CUSTOMER_EXPECTED = {("TR02", 1): [100.0, 50.0], ("TR02", 2): [10.0],
+                     ("TR02", 3): [1.0, 2.0, 3.0], ("TR04", 1): [7.0],
+                     ("TR04", 2): [20.0, 30.0], ("TR04", 3): [0.0]}
+TOPUP_VALUES = {"TR02": [(1.0, -4.0, 8.0, False), (2.0, -5.0, 16.0, True),
+                         (3.0, -6.0, 32.0, False)],
+                "TR04": [(10.0, -1.0, 0.0, False), (20.0, -1.0, 0.0, False),
+                         (30.0, -1.0, 0.0, False)]}
+T_LEVELS = pd.Series({41: 2.0, 42: 4.0, 43: 0.5}, name="price_level")
+
+# (company, h) -> customers, real_total, total
+EXPECTED_TOTALS = {
+    ("TR02", 1): (150.0, 155.0, 310.0), ("TR02", 2): (10.0, 23.0, 92.0),
+    ("TR02", 3): (6.0, 35.0, 17.5), ("TR04", 1): (7.0, 16.0, 32.0),
+    ("TR04", 2): (50.0, 69.0, 276.0), ("TR04", 3): (0.0, 29.0, 14.5),
+    ("ALL", 1): (157.0, 171.0, 342.0), ("ALL", 2): (60.0, 92.0, 368.0),
+    ("ALL", 3): (6.0, 64.0, 32.0),
+}
+
+
+def hand_customers(expected=CUSTOMER_EXPECTED, origin=T_ORIGIN, index_offset=700):
+    """A customers table shaped like `customer_forecasts`' output (CUSTOMER_COLUMNS)."""
+    rows = []
+    for (company, h), values in expected.items():
+        for i, value in enumerate(values):
+            rows.append({"key": f"{company}|K{i}", "company_code": company,
+                         "customer_id": f"K{i}", "origin_week": origin, "h": h,
+                         "target_week": origin + h, "p": 0.5, "m": 2 * value,
+                         "expected": value})
+    frame = pd.DataFrame(rows, columns=CUSTOMER_COLUMNS)
+    frame.index = pd.RangeIndex(index_offset, index_offset + len(frame))
+    return frame
+
+
+def hand_topups(values=TOPUP_VALUES, origin=T_ORIGIN):
+    """A top-ups table shaped like `topups.topup_forecasts`' output (TOPUP_COLUMNS)."""
+    rows = []
+    for company, per_h in values.items():
+        for h, (new, refunds, unidentified, fallback) in enumerate(per_h, start=1):
+            rows.append({"company_code": company, "origin_week": origin, "h": h,
+                         "target_week": origin + h, "new_customer_cash": new,
+                         "refunds": refunds, "unidentified_cash": unidentified,
+                         "topup": new + refunds + unidentified, "fallback": fallback})
+    return pd.DataFrame(rows, columns=TOPUP_COLUMNS)
+
+
+def totals(customers=None, topups=None, levels=None, companies=None, horizons=T_HORIZONS):
+    return forecast_totals(hand_customers() if customers is None else customers,
+                           hand_topups() if topups is None else topups,
+                           T_LEVELS if levels is None else levels,
+                           T_COMPANIES if companies is None else companies, horizons)
+
+
+def totals_error(**kwargs):
+    with pytest.raises(ValueError) as error:
+        totals(**kwargs)
+    assert type(error.value) is ValueError
+    return str(error.value)
+
+
+@pytest.fixture
+def hand_totals():
+    return totals()
+
+
+def row(frame, company, h):
+    found = frame[(frame["company_code"] == company) & (frame["h"] == h)]
+    assert len(found) == 1
+    return found.iloc[0]
+
+
+# --- constants ---------------------------------------------------------------------------
+
+def test_total_columns_are_the_documented_list():
+    assert TOTAL_COLUMNS == ["company_code", "origin_week", "h", "target_week", "customers",
+                             "new_customer_cash", "unidentified_cash", "refunds",
+                             "real_total", "price_level", "total", "fallback"]
+
+
+def test_consolidated_code_is_all():
+    assert CONSOLIDATED == "ALL"
+
+
+# --- _check_pairs -----------------------------------------------------------------------
+
+def test_check_pairs_equal_sets_pass():
+    _check_pairs("things", {("A", 1), ("B", 2)}, {("B", 2), ("A", 1)})
+
+
+def test_check_pairs_missing_exact_message_sorted():
+    with pytest.raises(ValueError) as error:
+        _check_pairs("things", {("A", 1)}, {("A", 1), ("B", 2), ("A", 2)})
+    assert str(error.value) == "the things have no rows for (company, h) [('A', 2), ('B', 2)]"
+
+
+def test_check_pairs_extra_exact_message():
+    with pytest.raises(ValueError) as error:
+        _check_pairs("things", {("A", 1), ("Z", 9)}, {("A", 1)})
+    assert str(error.value) == ("the things have rows for (company, h) [('Z', 9)], which are "
+                                "not in the company list or the horizons")
+
+
+def test_check_pairs_missing_is_reported_before_extra():
+    with pytest.raises(ValueError, match="have no rows for"):
+        _check_pairs("things", {("Z", 9)}, {("A", 1)})
+
+
+def test_check_pairs_lists_at_most_ten():
+    wanted = {("A", h) for h in range(1, 16)}
+    with pytest.raises(ValueError) as error:
+        _check_pairs("things", set(), wanted)
+    assert str(error.value).count("('A',") == 10
+
+
+def test_check_pairs_extra_with_mixed_types_does_not_crash_sorting():
+    # sorted(..., key=str): a None company beside text must not raise TypeError.
+    with pytest.raises(ValueError, match="which are not in"):
+        _check_pairs("things", {("A", 1), (None, 1), ("B", 1.5)}, {("A", 1)})
+
+
+# --- arithmetic ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pair", list(EXPECTED_TOTALS))
+def test_totals_by_hand(hand_totals, pair):
+    customers, real_total, total = EXPECTED_TOTALS[pair]
+    found = row(hand_totals, *pair)
+    assert found["customers"] == customers
+    assert found["real_total"] == real_total
+    assert found["total"] == total
+
+
+def test_real_total_is_the_sum_of_the_four_parts(hand_totals):
+    parts = (hand_totals["customers"] + hand_totals["new_customer_cash"]
+             + hand_totals["unidentified_cash"] + hand_totals["refunds"])
+    np.testing.assert_array_equal(hand_totals["real_total"].to_numpy(), parts.to_numpy())
+
+
+def test_refunds_are_added_negative_not_subtracted(hand_totals):
+    found = row(hand_totals, "TR04", 3)
+    assert found["refunds"] == -1.0
+    assert found["real_total"] == 0.0 + 30.0 + 0.0 - 1.0
+
+
+def test_total_is_real_total_times_the_price_level(hand_totals):
+    np.testing.assert_array_equal(hand_totals["total"].to_numpy(),
+                                  (hand_totals["real_total"]
+                                   * hand_totals["price_level"]).to_numpy())
+
+
+def test_price_level_is_the_level_of_the_target_week(hand_totals):
+    np.testing.assert_array_equal(hand_totals["price_level"].to_numpy(),
+                                  hand_totals["target_week"].map(T_LEVELS).to_numpy())
+
+
+def test_top_up_amounts_are_carried_unchanged(hand_totals):
+    for company, per_h in TOPUP_VALUES.items():
+        for h, (new, refunds, unidentified, fallback) in enumerate(per_h, start=1):
+            found = row(hand_totals, company, h)
+            assert (found["new_customer_cash"], found["refunds"],
+                    found["unidentified_cash"]) == (new, refunds, unidentified)
+            assert bool(found["fallback"]) is fallback
+
+
+def test_customers_column_ignores_p_and_m(hand_totals):
+    customers = hand_customers()
+    customers["p"], customers["m"] = 0.99, 1e9
+    pd.testing.assert_frame_equal(totals(customers=customers), hand_totals)
+
+
+def test_levels_may_hold_more_weeks_than_needed(hand_totals):
+    levels = pd.concat([pd.Series({30: 9.0, 99: 9.0}), T_LEVELS])
+    pd.testing.assert_frame_equal(totals(levels=levels), hand_totals)
+
+
+def test_negative_real_total_is_kept(hand_totals):
+    # Large refunds can make a week negative: kept, not clipped.
+    values = {**TOPUP_VALUES, "TR04": [(0.0, -500.0, 0.0, False)] + TOPUP_VALUES["TR04"][1:]}
+    found = row(totals(topups=hand_topups(values)), "TR04", 1)
+    assert found["real_total"] == 7.0 - 500.0
+    assert found["total"] == (7.0 - 500.0) * 2.0
+
+
+def test_float_customers_are_summed(hand_totals):
+    # To rounding only: a groupby sum and Series.sum may add in a different order.
+    expected = {**CUSTOMER_EXPECTED, ("TR02", 1): [0.1, 0.2, 0.3]}
+    found = row(totals(customers=hand_customers(expected)), "TR02", 1)
+    assert found["customers"] == pytest.approx(0.6, rel=1e-15)
+
+
+# --- consolidated rows ------------------------------------------------------------------------
+
+def test_consolidated_rows_one_per_h(hand_totals):
+    consolidated = hand_totals[hand_totals["company_code"] == CONSOLIDATED]
+    assert list(consolidated["h"]) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("column", ["customers", "new_customer_cash", "unidentified_cash",
+                                    "refunds", "real_total", "total"])
+def test_consolidated_amounts_are_the_sum_over_companies(hand_totals, column):
+    companies = hand_totals[hand_totals["company_code"] != CONSOLIDATED]
+    for h in range(1, T_HORIZONS + 1):
+        assert row(hand_totals, CONSOLIDATED, h)[column] == (
+            companies.loc[companies["h"] == h, column].sum())
+
+
+def test_consolidated_price_level_and_weeks_are_the_companies(hand_totals):
+    for h in range(1, T_HORIZONS + 1):
+        found = row(hand_totals, CONSOLIDATED, h)
+        assert found["price_level"] == T_LEVELS[T_ORIGIN + h]
+        assert found["target_week"] == T_ORIGIN + h
+        assert found["origin_week"] == T_ORIGIN
+
+
+def test_consolidated_total_is_also_its_real_total_times_the_level(hand_totals):
+    consolidated = hand_totals[hand_totals["company_code"] == CONSOLIDATED]
+    np.testing.assert_allclose(consolidated["total"],
+                               consolidated["real_total"] * consolidated["price_level"],
+                               rtol=1e-15)
+
+
+def test_consolidated_fallback_is_any_company(hand_totals):
+    assert [bool(row(hand_totals, CONSOLIDATED, h)["fallback"]) for h in (1, 2, 3)] == [
+        False, True, False]
+
+
+def test_consolidated_fallback_true_when_every_company_falls_back():
+    values = {company: [(n, r, u, True) for n, r, u, _ in per_h]
+              for company, per_h in TOPUP_VALUES.items()}
+    found = totals(topups=hand_topups(values))
+    assert found["fallback"].astype(bool).all()
+
+
+def test_one_company_consolidated_equals_it():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[0] == "TR02"})
+    topups = hand_topups({"TR02": TOPUP_VALUES["TR02"]})
+    found = totals(customers=customers, topups=topups, companies=["TR02"])
+    company = found[found["company_code"] == "TR02"].drop(columns="company_code")
+    consolidated = found[found["company_code"] == CONSOLIDATED].drop(columns="company_code")
+    pd.testing.assert_frame_equal(company.reset_index(drop=True),
+                                  consolidated.reset_index(drop=True), check_dtype=False)
+
+
+# --- shape and order ----------------------------------------------------------------------------
+
+def test_columns_are_total_columns(hand_totals):
+    assert list(hand_totals.columns) == TOTAL_COLUMNS
+
+
+def test_topup_column_is_not_in_the_output(hand_totals):
+    assert "topup" not in hand_totals.columns
+
+
+def test_rows_companies_sorted_then_all_h_ascending(hand_totals):
+    assert list(zip(hand_totals["company_code"], hand_totals["h"])) == [
+        ("TR02", 1), ("TR02", 2), ("TR02", 3), ("TR04", 1), ("TR04", 2), ("TR04", 3),
+        ("ALL", 1), ("ALL", 2), ("ALL", 3)]
+
+
+def test_row_count_is_companies_plus_one_times_horizons(hand_totals):
+    assert len(hand_totals) == (len(T_COMPANIES) + 1) * T_HORIZONS
+
+
+def test_index_is_a_fresh_range(hand_totals):
+    assert list(hand_totals.index) == list(range(len(hand_totals)))
+
+
+def test_all_is_last_even_when_a_company_sorts_after_it():
+    # "AAA" sorts before "ALL", "ZZZ" after; ALL still comes last.
+    rename = {"TR02": "ZZZ", "TR04": "AAA"}
+    customers = hand_customers().replace({"company_code": rename})
+    topups = hand_topups().replace({"company_code": rename})
+    found = totals(customers=customers, topups=topups, companies=["ZZZ", "AAA"])
+    assert list(found["company_code"]) == ["AAA"] * 3 + ["ZZZ"] * 3 + ["ALL"] * 3
+
+
+def test_origin_and_target_weeks_carried_from_the_top_ups(hand_totals):
+    assert (hand_totals["origin_week"] == T_ORIGIN).all()
+    assert (hand_totals["target_week"] == T_ORIGIN + hand_totals["h"]).all()
+
+
+def test_company_list_order_does_not_matter(hand_totals):
+    pd.testing.assert_frame_equal(totals(companies=["TR02", "TR04"]), hand_totals)
+
+
+def test_input_row_order_does_not_matter(hand_totals):
+    customers = hand_customers().sample(frac=1.0, random_state=3)
+    topups = hand_topups().sample(frac=1.0, random_state=4)
+    pd.testing.assert_frame_equal(totals(customers=customers, topups=topups), hand_totals)
+
+
+def test_horizons_one_gives_one_row_per_company_and_all():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[1] == 1})
+    topups = hand_topups({c: v[:1] for c, v in TOPUP_VALUES.items()})
+    found = totals(customers=customers, topups=topups, horizons=1)
+    assert list(found["company_code"]) == ["TR02", "TR04", "ALL"]
+    assert row(found, "ALL", 1)["total"] == 342.0
+
+
+def test_amount_columns_are_float(hand_totals):
+    for column in ("customers", "new_customer_cash", "unidentified_cash", "refunds",
+                   "real_total", "price_level", "total"):
+        assert hand_totals[column].dtype == np.float64
+
+
+def test_inputs_are_not_changed():
+    customers, topups, levels = hand_customers(), hand_topups(), T_LEVELS.copy()
+    companies = list(T_COMPANIES)
+    before = customers.copy(), topups.copy(), levels.copy()
+    forecast_totals(customers, topups, levels, companies, T_HORIZONS)
+    pd.testing.assert_frame_equal(customers, before[0])
+    pd.testing.assert_frame_equal(topups, before[1])
+    pd.testing.assert_series_equal(levels, before[2])
+    assert companies == T_COMPANIES
+
+
+# --- errors ----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [0, -1])
+def test_horizons_below_one_exact_message(horizons):
+    assert totals_error(horizons=horizons) == f"horizons is {horizons}; horizons start at 1"
+
+
+def test_all_in_companies_exact_message():
+    assert totals_error(companies=["TR02", "ALL"]) == (
+        "'ALL' is the code of the consolidated rows; it cannot be a company")
+
+
+def test_two_origins_across_customers_and_topups_exact_message():
+    message = totals_error(customers=hand_customers(origin=41))
+    assert message == ("the customers and top-ups must be for one origin week; they hold "
+                       "[40, 41]")
+
+
+def test_two_origins_within_the_customers():
+    customers = hand_customers()
+    customers.loc[customers.index[0], "origin_week"] = 39
+    assert "they hold [39, 40]" in totals_error(customers=customers)
+
+
+def test_two_origins_within_the_topups():
+    topups = hand_topups()
+    topups.loc[0, "origin_week"] = 41
+    assert "they hold [40, 41]" in totals_error(topups=topups)
+
+
+def test_topup_pair_twice_exact_message():
+    topups = pd.concat([hand_topups(), hand_topups().iloc[[0]]], ignore_index=True)
+    assert totals_error(topups=topups) == "the top-ups hold a company and h more than once"
+
+
+def test_topups_missing_a_company():
+    topups = hand_topups({"TR02": TOPUP_VALUES["TR02"]})
+    message = totals_error(topups=topups)
+    assert message.startswith("the top-ups have no rows for (company, h) [('TR04', 1)")
+
+
+def test_topups_missing_an_h():
+    topups = hand_topups({c: v[:2] for c, v in TOPUP_VALUES.items()})
+    assert totals_error(topups=topups) == (
+        "the top-ups have no rows for (company, h) [('TR02', 3), ('TR04', 3)]")
+
+
+def test_topups_extra_company():
+    topups = pd.concat([hand_topups(), hand_topups({"TR99": TOPUP_VALUES["TR02"]})],
+                       ignore_index=True)
+    message = totals_error(topups=topups)
+    assert "the top-ups have rows for (company, h) [('TR99', 1)" in message
+    assert "not in the company list or the horizons" in message
+
+
+@pytest.mark.parametrize("bad_h", [0, 4])
+def test_topups_extra_h_outside_the_horizons(bad_h):
+    extra = hand_topups({"TR02": [(1.0, -1.0, 1.0, False)]})
+    extra["h"], extra["target_week"] = bad_h, T_ORIGIN + bad_h
+    topups = pd.concat([hand_topups(), extra], ignore_index=True)
+    assert f"[('TR02', {bad_h})]" in totals_error(topups=topups)
+
+
+def test_customers_missing_a_whole_company_raises_not_zero():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[0] == "TR02"})
+    message = totals_error(customers=customers)
+    assert message == ("the customers have no rows for (company, h) "
+                       "[('TR04', 1), ('TR04', 2), ('TR04', 3)]")
+
+
+def test_customers_missing_one_h():
+    expected = {k: v for k, v in CUSTOMER_EXPECTED.items() if k != ("TR04", 2)}
+    assert totals_error(customers=hand_customers(expected)) == (
+        "the customers have no rows for (company, h) [('TR04', 2)]")
+
+
+def test_customers_with_no_rows_at_all():
+    customers = hand_customers().iloc[0:0]
+    # No customer rows: the origins come from the top-ups alone, then every pair is missing.
+    assert totals_error(customers=customers).startswith("the customers have no rows for")
+
+
+def test_customers_extra_company():
+    expected = {**CUSTOMER_EXPECTED, ("TR99", 1): [5.0]}
+    assert "the customers have rows for (company, h) [('TR99', 1)]" in totals_error(
+        customers=hand_customers(expected))
+
+
+def test_customers_extra_h():
+    expected = {**CUSTOMER_EXPECTED, ("TR02", 4): [5.0]}
+    assert "[('TR02', 4)]" in totals_error(customers=hand_customers(expected))
+
+
+def test_a_target_week_missing_from_levels_exact_message():
+    assert totals_error(levels=T_LEVELS.drop(42)) == "no price level for target weeks [42]"
+
+
+def test_nan_level_reads_as_missing():
+    levels = T_LEVELS.copy()
+    levels[43] = nan
+    assert totals_error(levels=levels) == "no price level for target weeks [43]"
+
+
+def test_infinite_level_is_reported():
+    levels = T_LEVELS.copy()
+    levels[41] = inf
+    # total is checked before price_level, and holds the company rows and ALL.
+    assert totals_error(levels=levels) == "total is NaN or infinite in 3 rows"
+
+
+@pytest.mark.parametrize("column", ["new_customer_cash", "refunds", "unidentified_cash"])
+@pytest.mark.parametrize("bad", [nan, inf])
+def test_nan_or_infinite_top_up_is_reported(column, bad):
+    topups = hand_topups()
+    topups.loc[0, column] = bad
+    message = totals_error(topups=topups)
+    assert "is NaN or infinite in" in message
+
+
+def test_nan_top_up_names_its_column_first():
+    topups = hand_topups()
+    topups.loc[0, "new_customer_cash"] = nan
+    # The company row is NaN; the ALL row's sum skips the NaN, so it counts 1 row.
+    assert totals_error(topups=topups) == "new_customer_cash is NaN or infinite in 1 rows"
+
+
+def test_infinite_top_up_counts_the_company_and_all_rows():
+    topups = hand_topups()
+    topups.loc[0, "unidentified_cash"] = inf
+    assert totals_error(topups=topups) == "unidentified_cash is NaN or infinite in 2 rows"
+
+
+def test_infinite_customer_expected_is_reported():
+    customers = hand_customers()
+    customers.loc[customers.index[0], "expected"] = inf
+    assert totals_error(customers=customers) == "customers is NaN or infinite in 2 rows"
+
+
+def test_nan_customer_expected_is_reported():
+    # groupby's sum would skip it (TR02 h1 would read 50, not 150): refused up front.
+    customers = hand_customers()
+    customers.loc[customers.index[0], "expected"] = nan
+    assert totals_error(customers=customers) == "the customers have no expected in 1 rows"
+
+
+def test_customer_row_with_a_missing_company_is_not_dropped_silently():
+    # groupby would leave the row out: refused up front.
+    customers = hand_customers()
+    customers.loc[customers.index[0], "company_code"] = None
+    assert totals_error(customers=customers) == "the customers have no company_code in 1 rows"
+
+
+def test_customer_row_with_a_nan_company_is_refused_too():
+    customers = hand_customers()
+    customers.loc[customers.index[[0, 3]], "company_code"] = nan
+    assert totals_error(customers=customers) == "the customers have no company_code in 2 rows"
+
+
+def test_customer_row_with_a_missing_h_is_not_dropped_silently():
+    customers = hand_customers()
+    customers["h"] = customers["h"].astype("float64")
+    customers.loc[customers.index[0], "h"] = nan
+    assert totals_error(customers=customers) == "the customers have no h in 1 rows"
+
+
+def test_customer_missing_values_count_every_row():
+    customers = hand_customers()
+    customers.loc[customers.index[:4], "expected"] = nan
+    assert totals_error(customers=customers) == "the customers have no expected in 4 rows"
+
+
+def test_customer_missing_values_checked_company_then_h_then_expected():
+    customers = hand_customers()
+    customers["h"] = customers["h"].astype("float64")
+    customers.loc[customers.index[0], "expected"] = nan
+    customers.loc[customers.index[1], "h"] = nan
+    assert totals_error(customers=customers) == "the customers have no h in 1 rows"
+    customers.loc[customers.index[2], "company_code"] = None
+    assert totals_error(customers=customers) == "the customers have no company_code in 1 rows"
+
+
+def test_customer_missing_h_is_reported_as_missing_not_as_a_wrong_target_week():
+    # A NaN h also makes target_week != origin + h; the missing-value check comes first.
+    customers = hand_customers()
+    customers["h"] = customers["h"].astype("float64")
+    customers.loc[customers.index[0], "h"] = nan
+    assert "target week" not in totals_error(customers=customers)
+
+
+def test_a_customer_with_an_infinite_expected_is_not_a_missing_value():
+    customers = hand_customers()
+    customers.loc[customers.index[0], "expected"] = inf
+    assert totals_error(customers=customers) == "customers is NaN or infinite in 2 rows"
+
+
+# --- target weeks: origin + h in both tables ----------------------------------------------
+
+def test_topup_target_week_other_than_origin_plus_h_exact_message():
+    # The probe: TR02 h1 at week 42 used to give week 42's level and two "ALL" rows for h 1.
+    topups = hand_topups()
+    topups.loc[0, "target_week"] = 42
+    assert totals_error(topups=topups) == (
+        "the top-ups have a target week other than origin 40 + h in 1 rows")
+
+
+def test_topup_target_weeks_counted():
+    topups = hand_topups()
+    topups["target_week"] = topups["target_week"] + 1
+    assert totals_error(topups=topups) == (
+        "the top-ups have a target week other than origin 40 + h in 6 rows")
+
+
+def test_customer_target_week_other_than_origin_plus_h_exact_message():
+    customers = hand_customers()
+    customers.loc[customers.index[[0, 1]], "target_week"] = 99
+    assert totals_error(customers=customers) == (
+        "the customers have a target week other than origin 40 + h in 2 rows")
+
+
+def test_customer_target_weeks_checked_before_topup_target_weeks():
+    customers, topups = hand_customers(), hand_topups()
+    customers.loc[customers.index[0], "target_week"] = 99
+    topups.loc[0, "target_week"] = 99
+    assert totals_error(customers=customers, topups=topups).startswith(
+        "the customers have a target week")
+
+
+def test_missing_target_week_is_a_wrong_target_week():
+    topups = hand_topups()
+    topups["target_week"] = topups["target_week"].astype("float64")
+    topups.loc[0, "target_week"] = nan
+    assert totals_error(topups=topups) == (
+        "the top-ups have a target week other than origin 40 + h in 1 rows")
+
+
+def test_topup_with_a_nan_h_trips_the_target_week_check():
+    # Pinned: a NaN h in the top-ups is caught by the target-week check, before the pairs.
+    topups = hand_topups()
+    topups["h"] = topups["h"].astype("float64")
+    topups.loc[0, "h"] = nan
+    assert totals_error(topups=topups) == (
+        "the top-ups have a target week other than origin 40 + h in 1 rows")
+
+
+def test_topup_with_a_missing_company_is_reported_by_the_pair_check():
+    # Top-ups have no missing-value check: a None company leaves (TR02, 1) missing.
+    topups = hand_topups()
+    topups.loc[0, "company_code"] = None
+    assert totals_error(topups=topups) == (
+        "the top-ups have no rows for (company, h) [('TR02', 1)]")
+
+
+def test_no_duplicate_consolidated_row_can_appear():
+    # Every target week is origin + h, so the consolidated rows are exactly one per h.
+    found = totals()
+    consolidated = found[found["company_code"] == CONSOLIDATED]
+    assert list(consolidated["h"]) == [1, 2, 3]
+    assert not found.duplicated(["company_code", "h"]).any()
+    assert (found["target_week"] == found["origin_week"] + found["h"]).all()
+
+
+def test_float_h_with_matching_target_weeks_passes():
+    customers = hand_customers()
+    customers["h"] = customers["h"].astype("float64")
+    assert row(totals(customers=customers), "ALL", 1)["total"] == 342.0
+
+
+# --- order of the checks ------------------------------------------------------------------------
+
+def test_order_horizons_before_all():
+    assert totals_error(horizons=0, companies=["ALL"]).startswith("horizons is 0")
+
+
+def test_order_all_before_origins():
+    assert totals_error(companies=["ALL"], customers=hand_customers(origin=41)).startswith(
+        "'ALL'")
+
+
+def test_order_origins_before_topup_duplicates():
+    topups = pd.concat([hand_topups(), hand_topups().iloc[[0]]], ignore_index=True)
+    message = totals_error(topups=topups, customers=hand_customers(origin=41))
+    assert message.startswith("the customers and top-ups must be for one origin week")
+
+
+def test_order_topup_duplicates_before_topup_pairs():
+    topups = hand_topups({"TR02": TOPUP_VALUES["TR02"]})
+    topups = pd.concat([topups, topups.iloc[[0]]], ignore_index=True)
+    assert totals_error(topups=topups) == "the top-ups hold a company and h more than once"
+
+
+def test_order_topup_pairs_before_customer_pairs():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[0] == "TR02"})
+    topups = hand_topups({"TR02": TOPUP_VALUES["TR02"]})
+    assert totals_error(customers=customers, topups=topups).startswith("the top-ups")
+
+
+def test_order_customer_pairs_before_levels():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[0] == "TR02"})
+    assert totals_error(customers=customers, levels=T_LEVELS.drop(42)).startswith(
+        "the customers")
+
+
+def test_order_levels_before_finite():
+    topups = hand_topups()
+    topups.loc[0, "refunds"] = inf
+    assert totals_error(topups=topups, levels=T_LEVELS.drop(43)) == (
+        "no price level for target weeks [43]")
+
+
+# The full order: horizons -> ALL -> origins -> customer missing values -> target weeks
+# (customers, then top-ups) -> top-up duplicates -> top-up pairs -> customer pairs ->
+# levels -> finite.
+
+def nan_expected_customers(origin=T_ORIGIN):
+    customers = hand_customers(origin=origin)
+    customers.loc[customers.index[0], "expected"] = nan
+    return customers
+
+
+def test_order_all_before_customer_missing_values():
+    assert totals_error(customers=nan_expected_customers(),
+                        companies=["TR02", "ALL"]).startswith("'ALL'")
+
+
+def test_order_origins_before_customer_missing_values():
+    assert totals_error(customers=nan_expected_customers(origin=41)).startswith(
+        "the customers and top-ups must be for one origin week")
+
+
+def test_order_customer_missing_values_before_target_weeks():
+    customers = nan_expected_customers()
+    customers.loc[customers.index[1], "target_week"] = 99
+    topups = hand_topups()
+    topups.loc[0, "target_week"] = 99
+    assert totals_error(customers=customers, topups=topups) == (
+        "the customers have no expected in 1 rows")
+
+
+def test_order_topup_target_weeks_before_topup_duplicates():
+    topups = pd.concat([hand_topups(), hand_topups().iloc[[0]]], ignore_index=True)
+    topups.loc[1, "target_week"] = 99
+    assert totals_error(topups=topups).startswith("the top-ups have a target week")
+
+
+def test_order_target_weeks_before_pairs():
+    topups = hand_topups({"TR02": TOPUP_VALUES["TR02"]})       # TR04 missing
+    topups.loc[0, "target_week"] = 99
+    assert totals_error(topups=topups).startswith("the top-ups have a target week")
+
+
+def test_order_customer_missing_values_before_customer_pairs():
+    customers = hand_customers({k: v for k, v in CUSTOMER_EXPECTED.items() if k[0] == "TR02"})
+    customers.loc[customers.index[0], "expected"] = nan
+    assert totals_error(customers=customers) == "the customers have no expected in 1 rows"
+
+
+def test_order_customer_missing_values_before_levels_and_finite():
+    topups = hand_topups()
+    topups.loc[0, "refunds"] = inf
+    assert totals_error(customers=nan_expected_customers(), topups=topups,
+                        levels=T_LEVELS.drop(43)) == "the customers have no expected in 1 rows"
+
+
+# --- end to end with the real projected_levels ---------------------------------------------
+
+def test_with_real_projected_levels():
+    # Week zero Monday 2025-06-02, origin 40: the levels a real forecast would use.
+    from datetime import date
+    levels = projected_levels(date(2025, 6, 2), T_ORIGIN, [T_ORIGIN + h for h in (1, 2, 3)])
+    found = totals(levels=levels)
+    for company, h in EXPECTED_TOTALS:
+        got = row(found, company, h)
+        assert got["price_level"] == levels[T_ORIGIN + h]
+        # Company rows: exactly real_total x level. ALL: the sum of the company totals, so
+        # equal to its real_total x level to rounding only.
+        assert got["total"] == pytest.approx(got["real_total"] * levels[T_ORIGIN + h],
+                                             rel=0 if company != CONSOLIDATED else 1e-14)
+    all_rows = found[found["company_code"] == CONSOLIDATED]
+    company_rows = found[found["company_code"] != CONSOLIDATED]
+    np.testing.assert_allclose(all_rows["total"].to_numpy(),
+                               company_rows.groupby("h")["total"].sum().to_numpy(), rtol=1e-14)

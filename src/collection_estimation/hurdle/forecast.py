@@ -6,6 +6,10 @@ every customer known at T and every h, p (stage 1, "will it pay?"), m (stage 2, 
 if it pays?") and the expected cash p x m, deflated (TRY of week 0). The same steps as
 pipeline steps 12 and 14, in one call, so that one forecast, the evaluation over many
 origins (U14) and the production forecast (U17) all take the same path.
+
+U13.3, the totals: per company and h, the customers' p x m added up, plus the top-ups (U12:
+new customers A, unidentified cash G, refunds R, negative), deflated; then times the price
+level projected at T (U13.1), in nominal TRY. Plus the consolidated rows, company "ALL".
 """
 import numpy as np
 import pandas as pd
@@ -17,6 +21,14 @@ from .training_table import rows_at_origin, rows_known_at
 # The columns of the table `customer_forecasts` returns, in order.
 CUSTOMER_COLUMNS = ["key", "company_code", "customer_id", "origin_week", "h", "target_week",
                     "p", "m", "expected"]
+
+# The columns of the table `forecast_totals` returns, in order. All amounts are deflated (TRY
+# of week 0) except `total`, which is nominal TRY: real_total x price_level.
+TOTAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "customers",
+                 "new_customer_cash", "unidentified_cash", "refunds", "real_total",
+                 "price_level", "total", "fallback"]
+# The company code of the consolidated rows: all companies added up.
+CONSOLIDATED = "ALL"
 
 
 def customer_forecasts(table: pd.DataFrame, origin: int, settings,
@@ -73,3 +85,89 @@ def customer_forecasts(table: pd.DataFrame, origin: int, settings,
                          f"cannot pay a negative amount ([stage2] loss {stage2.loss!r}; "
                          f"'poisson' and 'gamma' never predict one)")
     return forecasts
+
+
+def _check_pairs(what: str, found: set, wanted: set) -> None:
+    """Raise ValueError unless `found` (company, h) pairs are exactly the `wanted` ones."""
+    missing, extra = sorted(wanted - found), sorted(found - wanted, key=str)
+    if missing:
+        raise ValueError(f"the {what} have no rows for (company, h) {missing[:10]}")
+    if extra:
+        raise ValueError(f"the {what} have rows for (company, h) {extra[:10]}, which are not in "
+                         f"the company list or the horizons")
+
+
+def forecast_totals(customers: pd.DataFrame, topups: pd.DataFrame, levels: pd.Series,
+                    companies: list[str], horizons: int) -> pd.DataFrame:
+    """The forecast per company and h, and consolidated: `customers` (from
+    `customer_forecasts`) added up per company and h, plus `topups` (from
+    `topups.topup_forecasts`, made at the same origin), real_total = customers +
+    new_customer_cash + unidentified_cash + refunds (refunds are negative), deflated; and
+    total = real_total x price_level, nominal TRY, with the level of each target week from
+    `levels` (`prices.projected_levels` at the origin).
+
+    One row per company in `companies` and h = 1 to `horizons`, then the consolidated rows
+    (company "ALL": every amount added up over the companies, the same price level, fallback
+    True if any company's is), with the columns `TOTAL_COLUMNS`.
+
+    Raises ValueError if `horizons` is below 1, the company list holds "ALL", the customers
+    and top-ups are not for one single origin week, a customer row lacks its company, h or
+    expected (adding up would drop it without a word), a target week is not origin + h, the
+    top-ups hold a company and h twice, either table lacks a (company, h) of the list or holds
+    one outside it (a missing company is an error, never a zero), `levels` lacks a target
+    week, or a value is NaN or infinite.
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    if CONSOLIDATED in companies:
+        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
+                         f"a company")
+    origins = set(customers["origin_week"]) | set(topups["origin_week"])
+    if len(origins) != 1:
+        raise ValueError(f"the customers and top-ups must be for one origin week; they hold "
+                         f"{sorted(origins)}")
+    origin = origins.pop()
+    # groupby would leave out a row with no company or h, and sum() would skip a NaN amount:
+    # cash lost without an error. So they are refused here, before adding up.
+    for column in ("company_code", "h", "expected"):
+        missing = int(customers[column].isna().sum())
+        if missing:
+            raise ValueError(f"the customers have no {column} in {missing} rows")
+    for what, table in (("customers", customers), ("top-ups", topups)):
+        wrong = int((table["target_week"] != origin + table["h"]).sum())
+        if wrong:
+            raise ValueError(f"the {what} have a target week other than origin {origin} + h in "
+                             f"{wrong} rows")
+
+    wanted = {(company, h) for company in companies for h in range(1, horizons + 1)}
+    topup_pairs = list(zip(topups["company_code"], topups["h"]))
+    if len(topup_pairs) != len(set(topup_pairs)):
+        raise ValueError("the top-ups hold a company and h more than once")
+    _check_pairs("top-ups", set(topup_pairs), wanted)
+    customer_sums = (customers.groupby(["company_code", "h"])["expected"].sum()
+                     .rename("customers").reset_index())
+    _check_pairs("customers", set(zip(customer_sums["company_code"], customer_sums["h"])),
+                 wanted)
+
+    totals = topups.merge(customer_sums, on=["company_code", "h"], validate="one_to_one")
+    totals["price_level"] = totals["target_week"].map(levels)
+    if totals["price_level"].isna().any():
+        missing = sorted(set(totals.loc[totals["price_level"].isna(), "target_week"]))
+        raise ValueError(f"no price level for target weeks {missing}")
+    totals["real_total"] = (totals["customers"] + totals["new_customer_cash"]
+                            + totals["unidentified_cash"] + totals["refunds"])
+    totals["total"] = totals["real_total"] * totals["price_level"]
+    totals = totals.sort_values(["company_code", "h"], ignore_index=True)
+
+    amounts = ["customers", "new_customer_cash", "unidentified_cash", "refunds",
+               "real_total", "total"]
+    consolidated = totals.groupby(["origin_week", "h", "target_week"], as_index=False).agg(
+        {**{column: "sum" for column in amounts}, "price_level": "first", "fallback": "any"})
+    consolidated["company_code"] = CONSOLIDATED
+
+    found = pd.concat([totals[TOTAL_COLUMNS], consolidated[TOTAL_COLUMNS]], ignore_index=True)
+    for column in amounts + ["price_level"]:
+        bad = int((~np.isfinite(found[column].astype("float64"))).sum())
+        if bad:
+            raise ValueError(f"{column} is NaN or infinite in {bad} rows")
+    return found
