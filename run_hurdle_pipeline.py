@@ -66,6 +66,7 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
+from collection_estimation.hurdle.evaluate import actual_totals  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -558,7 +559,11 @@ def main():
     show_customer_forecasts(result.customers, forecast_rows, time.perf_counter() - started,
                             predictions["stage 1 (HGB)"] * m)
     show_forecast_totals(result.totals)
-    show_forecast_vs_actual(result.totals, weekly, weeks)
+    # U14.1: the cash that really came, per company and consolidated (hindsight).
+    actual = actual_totals(weekly, weeks, levels, companies, [origin],
+                           settings.receivables.horizons)
+    show_actual_totals(actual, weekly, weeks)
+    show_forecast_vs_actual(result.totals, actual)
 
     # Later steps follow as each unit is built.
 
@@ -1319,20 +1324,26 @@ def show_forecast_totals(totals):
     print((first[["customers", "real_total", "total"]] / 1e6).round(2).to_string())
 
 
-def show_forecast_vs_actual(totals, weekly, weeks):
-    """Step 16's forecast beside the nominal cash that really came in each target week (gross
-    receipts + refunds, refunds negative; hindsight, one origin, so an illustration, not a
-    score). A target week that is missing or after the last week has no actual: never 0."""
-    net = weekly.assign(net=weekly["gross_receipts"] + weekly["refunds"])
-    by_company = net.groupby(["company_code", "week"])["net"].sum()
-    consolidated = net.groupby("week")["net"].sum()
-    rows = totals[["company_code", "h", "target_week", "total"]].copy()
-    # A week with data but no line for a company is a real 0 for it.
-    rows["actual"] = [consolidated.get(week, 0.0) if company == CONSOLIDATED
-                      else by_company.get((company, week), 0.0)
-                      for company, week in zip(rows["company_code"], rows["target_week"])]
-    with_data = set(weeks.loc[~weeks["is_missing"], "week"])
-    rows.loc[~rows["target_week"].isin(with_data), "actual"] = float("nan")
+def show_actual_totals(actual, weekly, weeks):
+    """Step 16's actual cash (U14.1): its size, and a tie-out of the consolidated rows to the
+    weekly amounts of their target weeks."""
+    consolidated = actual[actual["company_code"] == CONSOLIDATED]
+    in_weekly = weekly[weekly["week"].isin(consolidated["target_week"])]
+    expected = (in_weekly["gross_receipts"] + in_weekly["refunds"]).sum()
+    missing = int(weeks["is_missing"].sum())
+    print(f"        actual cash (U14.1): {len(actual)} rows ({actual['company_code'].nunique()} "
+          f"companies with ALL); consolidated {consolidated['actual'].sum():,.2f} TRY vs the "
+          f"weekly amounts of its target weeks {expected:,.2f} TRY; {missing} missing weeks "
+          f"in the calendar (no rows)")
+
+
+def show_forecast_vs_actual(totals, actual):
+    """Step 16's forecast beside the nominal cash that really came in each target week
+    (`actual_totals`: gross receipts + refunds, refunds negative; hindsight, one origin, so an
+    illustration, not a score). A target week without data has no actual: never 0."""
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    rows = totals[keys + ["total"]].merge(actual[keys + ["actual"]], on=keys, how="left",
+                                          validate="one_to_one")
     rows["ratio"] = rows["total"] / rows["actual"]
 
     origin = int(totals["origin_week"].iloc[0])
