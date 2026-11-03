@@ -1617,3 +1617,1330 @@ def test_reference_empty_weekly_gives_zero_forecasts_that_fall_back():
     assert len(found) == 6
     assert (found["real_forecast"] == 0.0).all() and (found["forecast"] == 0.0).all()
     assert found["fallback"].all()
+
+
+
+# =============================================================================================
+# U14.4: the financial-rule reference: `invoice_delays`, `rule_invoices`, `rule_totals`,
+# `RuleReference` and `rule_reference`.
+#
+# Hand-made AR ledgers in the shape `open_invoices_at` and `payment_delays_at` read (as in
+# test_receivables_at.py). Week zero is test_forecast's Monday 2025-06-02, so the origin T = 20
+# ends on Sunday 2025-10-26 (CUT below). [receivables] horizons 5, min_cleared 3 and
+# [evaluation] rule_doubtful_days 90 unless a test says otherwise.
+#
+# The running example at T = 20 (CUT = Sunday 2025-10-26), delays by hand:
+#   TR02 customer A: three cleared invoices 4, 6, 8 days late -> its own usual delay 6.
+#   TR02 customer C: three cleared invoices 0, 2, 2 days late -> 2 (no open invoice).
+#   TR02 customer B: ONE cleared invoice, 10 days late -> too few (NaN) -> TR02's median over
+#        its customers WITH a usual delay, median(6, 2) = 4. (An invoice-level median over
+#        0, 2, 2, 4, 6, 8 would be 3; counting B's 10 would give median(6, 2, 10) = 6.)
+#   TR04 customer E: ONE cleared invoice -> NaN; TR04 has no usual delay at all, so its
+#        customer D gets 0 days ("none"). TR02's median does not leak into TR04.
+# The open invoices at T (status, h, outstanding TRY):
+#   A1  100 TRY due CUT-6   -> expected CUT (the cutoff Sunday)        LATE, h 1
+#   A2 1000 TRY due CUT-5, 300 paid before T -> expected CUT+1 (Monday) EXPECTED h 1, 700
+#   A3   50 TRY due CUT+29  -> expected CUT+35 = Sunday of week 25      EXPECTED h 5 (= horizons)
+#        (a 50 TRY payment for it is posted only after T, in the leak tests)
+#   A4   20 TRY due CUT+30  -> expected CUT+36 = Monday of week 26      AFTER_HORIZON, h 6
+#   A5   30 TRY due CUT-90  -> 90 days past due (not > 90), expected CUT-84   LATE, h 1
+#   A6  999 TRY due CUT-91  -> 91 days past due                          DOUBTFUL
+#   B1  100 EUR due CUT+3, rate known at T 36 (35 before, 99 the day after) -> 3600 TRY,
+#        expected CUT+7 (Sunday of week 21)                            EXPECTED h 1, company
+#   B2  200 TRY due CUT+10, cleared only on CUT+2 (still open at T) -> expected CUT+14
+#        (Sunday of week 22)                                            EXPECTED h 2, company
+#   D1  400 TRY (TR04) due CUT+8 (Monday of week 22), 0 days           EXPECTED h 2, none
+#   D2 5000 TRY (TR04) due CUT-100                                       DOUBTFUL, none
+# =============================================================================================
+
+from types import SimpleNamespace  # noqa: E402
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    AFTER_HORIZON, DOUBTFUL, EXPECTED, FROM_COMPANY, FROM_CUSTOMER, FROM_NOTHING, LATE,
+    RULE_COLUMNS, RULE_INVOICE_COLUMNS, RuleReference, invoice_delays, rule_invoices,
+    rule_reference, rule_totals)
+from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
+    end_of_week, ledger_as_known_at, open_invoices_at)
+from collection_estimation.hurdle.topups import topup_forecasts  # noqa: E402
+from tests.hurdle.test_forecast import f_calendar, f_levels  # noqa: E402
+
+RULE_ORIGIN = 20
+CUT = end_of_week(WEEK_ZERO, RULE_ORIGIN)          # Sunday 2025-10-26
+RULE_HORIZONS = 5
+RULE_MIN_CLEARED = 3
+RULE_DOUBTFUL = 90
+RULE_COMPANIES = ["TR02", "TR04"]
+RULE_LEDGER_COLUMNS = ["key", "company_code", "customer_id", "document_no", "document_role",
+                       "invoice_reference", "posting_date", "net_due_date", "clearing_date",
+                       "clearing_document", "amount_document", "document_currency",
+                       "source_row"]
+
+
+def days(n):
+    return timedelta(days=n)
+
+
+def rl(role, document_no, amount, posted, due, *, customer, company="TR02", reference=None,
+       cleared=None, clearing_document=None, currency="TRY"):
+    """One ledger line; `amount` as in the ledger (payments negative)."""
+    def ts(day):
+        return pd.Timestamp(day) if day is not None else pd.NaT
+    return {"key": f"{company}-{customer}", "company_code": company, "customer_id": customer,
+            "document_no": document_no, "document_role": role, "invoice_reference": reference,
+            "posting_date": ts(posted), "net_due_date": ts(due), "clearing_date": ts(cleared),
+            "clearing_document": clearing_document, "amount_document": float(amount),
+            "document_currency": currency}
+
+
+def rl_ledger(lines):
+    """A ledger table with ledger-like dtypes; source_row counts from 2."""
+    if not lines:
+        table = pd.DataFrame({c: pd.Series(dtype=object) for c in RULE_LEDGER_COLUMNS})
+    else:
+        table = pd.DataFrame(lines, columns=RULE_LEDGER_COLUMNS[:-1])
+        table["source_row"] = range(2, 2 + len(table))
+    for column in ["posting_date", "net_due_date", "clearing_date"]:
+        table[column] = pd.to_datetime(table[column])
+    table["amount_document"] = table["amount_document"].astype("float64")
+    for column in ["invoice_reference", "clearing_document"]:
+        table[column] = table[column].astype(object)
+    table["source_row"] = table["source_row"].astype("int64")
+    return table
+
+
+def history(customer, delays_late, company="TR02", back=120):
+    """Cleared invoices of `customer`, each paid `delays_late[i]` days after its due date,
+    every one cleared (on the payment day) well before CUT."""
+    lines = []
+    for i, late in enumerate(delays_late):
+        due = CUT - days(back + 7 * i)
+        paid = due + days(late)
+        assert paid <= CUT
+        document, clearing = f"H-{company}-{customer}-{i}", f"CL-{company}-{customer}-{i}"
+        lines.append(rl("invoice", document, 10.0, due - days(30), due, customer=customer,
+                        company=company, cleared=paid, clearing_document=clearing))
+        lines.append(rl("payment", f"P-{company}-{customer}-{i}", -10.0, paid, paid,
+                        customer=customer, company=company, reference=document, cleared=paid,
+                        clearing_document=clearing))
+    return lines
+
+
+def rule_rates(extra=()):
+    rows = [(CUT - days(10), "EUR", 35.0), (CUT, "EUR", 36.0), (CUT + days(1), "EUR", 99.0)]
+    rows += list(extra)
+    return pd.DataFrame({"day": pd.Series([r[0] for r in rows], dtype=object),
+                         "currency": pd.Series([r[1] for r in rows], dtype=object),
+                         "rate": pd.Series([r[2] for r in rows], dtype="float64")})
+
+
+def running_lines():
+    """The running example's lines, as known at and before T (see the header)."""
+    return (history("A", [4, 6, 8]) + history("C", [0, 2, 2]) + history("B", [10])
+            + history("E", [5], company="TR04") + [
+                rl("invoice", "A1", 100, CUT - days(40), CUT - days(6), customer="A"),
+                rl("invoice", "A2", 1000, CUT - days(40), CUT - days(5), customer="A"),
+                rl("payment", "PA2", -300, CUT - days(1), CUT - days(1), customer="A",
+                   reference="A2"),
+                rl("invoice", "A3", 50, CUT - days(10), CUT + days(29), customer="A"),
+                rl("invoice", "A4", 20, CUT - days(10), CUT + days(30), customer="A"),
+                rl("invoice", "A5", 30, CUT - days(120), CUT - days(90), customer="A"),
+                rl("invoice", "A6", 999, CUT - days(120), CUT - days(91), customer="A"),
+                rl("invoice", "B1", 100, CUT - days(5), CUT + days(3), customer="B",
+                   currency="EUR"),
+                rl("invoice", "B2", 200, CUT - days(5), CUT + days(10), customer="B",
+                   cleared=CUT + days(2), clearing_document="CL-B2"),
+                rl("payment", "PB2", -200, CUT + days(2), CUT + days(2), customer="B",
+                   reference="B2", cleared=CUT + days(2), clearing_document="CL-B2"),
+                rl("invoice", "D1", 400, CUT - days(5), CUT + days(8), customer="D",
+                   company="TR04"),
+                rl("invoice", "D2", 5000, CUT - days(130), CUT - days(100), customer="D",
+                   company="TR04"),
+            ])
+
+
+def running_ledger():
+    return rl_ledger(running_lines())
+
+
+def later_lines():
+    """Lines posted after T, and clearings made after T: none may change the rows at T."""
+    return [
+        # A1 paid and cleared the day after T (its own line gets a clearing date in run_full).
+        rl("payment", "PA1", -100, CUT + days(1), CUT + days(1), customer="A", reference="A1",
+           cleared=CUT + days(1), clearing_document="CL-A1"),
+        # A payment for A3 posted after T: A3 stays 50 outstanding at T.
+        rl("payment", "PA3", -50, CUT + days(3), CUT + days(3), customer="A", reference="A3"),
+        # A new invoice posted the Monday after T.
+        rl("invoice", "N1", 777, CUT + days(1), CUT + days(5), customer="A"),
+        # D's first cleared invoices, all after T: D still has no usual delay at T.
+        *[line for i in range(3) for line in (
+            rl("invoice", f"HD{i}", 10, CUT + days(1), CUT + days(2), customer="D",
+               company="TR04", cleared=CUT + days(3 + i), clearing_document=f"CL-D{i}"),
+            rl("payment", f"PD{i}", -10, CUT + days(3 + i), CUT + days(3 + i), customer="D",
+               company="TR04", reference=f"HD{i}", cleared=CUT + days(3 + i),
+               clearing_document=f"CL-D{i}"))],
+    ]
+
+
+def full_ledger():
+    """The running ledger as extracted later: the later lines, and A1 cleared after T."""
+    lines = running_lines()
+    for line in lines:
+        if line["document_no"] == "A1":
+            line["clearing_date"] = pd.Timestamp(CUT + days(1))
+            line["clearing_document"] = "CL-A1"
+    return rl_ledger(lines + later_lines())
+
+
+def run_rule_invoices(ledger=None, rates=None, origin=RULE_ORIGIN, horizons=RULE_HORIZONS,
+                      min_cleared=RULE_MIN_CLEARED, doubtful_days=RULE_DOUBTFUL):
+    return rule_invoices(running_ledger() if ledger is None else ledger,
+                         rule_rates() if rates is None else rates, WEEK_ZERO, origin, horizons,
+                         min_cleared, doubtful_days)
+
+
+def by_document(invoices):
+    assert not invoices["document_no"].duplicated().any()
+    return invoices.set_index("document_no")
+
+
+@pytest.fixture(scope="module")
+def running():
+    return run_rule_invoices()
+
+
+# (status, h or None if not asserted, outstanding_try, delay_days, delay_from, days_past_due,
+#  expected_date)
+RUNNING = {
+    "A1": (LATE, 1, 100.0, 6, FROM_CUSTOMER, 6, CUT),
+    "A2": (EXPECTED, 1, 700.0, 6, FROM_CUSTOMER, 5, CUT + days(1)),
+    "A3": (EXPECTED, 5, 50.0, 6, FROM_CUSTOMER, -29, CUT + days(35)),
+    "A4": (AFTER_HORIZON, 6, 20.0, 6, FROM_CUSTOMER, -30, CUT + days(36)),
+    "A5": (LATE, 1, 30.0, 6, FROM_CUSTOMER, 90, CUT - days(84)),
+    "A6": (DOUBTFUL, None, 999.0, 6, FROM_CUSTOMER, 91, CUT - days(85)),
+    "B1": (EXPECTED, 1, 3600.0, 4, FROM_COMPANY, -3, CUT + days(7)),
+    "B2": (EXPECTED, 2, 200.0, 4, FROM_COMPANY, -10, CUT + days(14)),
+    "D1": (EXPECTED, 2, 400.0, 0, FROM_NOTHING, -8, CUT + days(8)),
+    "D2": (DOUBTFUL, None, 5000.0, 0, FROM_NOTHING, 100, CUT - days(100)),
+}
+
+
+# --- constants -----------------------------------------------------------------------------
+
+def test_rule_status_constants():
+    assert (DOUBTFUL, LATE, EXPECTED, AFTER_HORIZON) == ("doubtful", "late", "expected",
+                                                         "after horizon")
+    assert len({DOUBTFUL, LATE, EXPECTED, AFTER_HORIZON}) == 4
+
+
+def test_rule_delay_source_constants():
+    assert (FROM_CUSTOMER, FROM_COMPANY, FROM_NOTHING) == ("customer", "company", "none")
+
+
+def test_rule_invoice_columns():
+    assert RULE_INVOICE_COLUMNS == ["key", "company_code", "document_no", "origin_week",
+                                    "net_due_date", "outstanding_try", "days_past_due",
+                                    "delay_days", "delay_from", "expected_date", "status", "h"]
+
+
+def test_rule_columns():
+    assert RULE_COLUMNS == ["company_code", "origin_week", "h", "target_week", "invoice_cash",
+                            "late_cash", "fallback_delay_cash", "topup_cash", "price_level",
+                            "forecast"]
+
+
+def test_rule_premise_the_cutoff_is_the_sunday_ending_week_20():
+    assert CUT == date(2025, 10, 26)
+    assert CUT.weekday() == 6
+
+
+# --- rule_invoices: the running example by hand ----------------------------------------------
+
+def test_rule_invoices_has_exactly_the_columns(running):
+    assert list(running.columns) == RULE_INVOICE_COLUMNS
+
+
+def test_rule_invoices_one_row_per_open_invoice(running):
+    # History invoices are cleared before T; B2 (cleared after T) is still open.
+    assert sorted(running["document_no"]) == sorted(RUNNING)
+
+
+@pytest.mark.parametrize("document", sorted(RUNNING))
+def test_rule_invoices_each_invoice_by_hand(running, document):
+    status, h, outstanding, delay, source, past_due, expected = RUNNING[document]
+    found = by_document(running).loc[document]
+    assert found["status"] == status
+    if h is not None:
+        assert found["h"] == h
+    assert found["outstanding_try"] == pytest.approx(outstanding, rel=1e-12)
+    assert found["delay_days"] == delay
+    assert found["delay_from"] == source
+    assert found["days_past_due"] == past_due
+    assert found["expected_date"] == pd.Timestamp(expected)
+    assert found["origin_week"] == RULE_ORIGIN
+
+
+def test_rule_invoices_keys_and_companies(running):
+    table = by_document(running)
+    for document in RUNNING:
+        company = "TR04" if document.startswith("D") else "TR02"
+        assert table.loc[document, "company_code"] == company
+        assert table.loc[document, "key"] == f"{company}-{document[0]}"
+
+
+def test_rule_invoices_expected_date_is_due_date_plus_delay(running):
+    assert (running["expected_date"]
+            == running["net_due_date"] + pd.to_timedelta(running["delay_days"], unit="D")).all()
+
+
+def test_rule_invoices_days_past_due_is_cutoff_minus_due_date(running):
+    assert ((pd.Timestamp(CUT) - running["net_due_date"]).dt.days
+            == running["days_past_due"]).all()
+
+
+def test_rule_invoices_h_of_counted_rows_is_the_week_of_the_expected_date(running):
+    not_late = running[running["status"].isin([EXPECTED, AFTER_HORIZON])]
+    weeks = week_numbers_of(not_late["expected_date"])
+    assert (not_late["h"] == weeks - RULE_ORIGIN).all()
+
+
+def week_numbers_of(dates):
+    from collection_estimation.hurdle.series import week_numbers
+    return week_numbers(dates, WEEK_ZERO)
+
+
+def test_rule_invoices_every_late_row_has_h_1(running):
+    late = running[running["status"] == LATE]
+    assert len(late) == 2
+    assert (late["h"] == 1).all()
+
+
+def test_rule_invoices_expected_rows_lie_in_the_horizon(running):
+    expected = running[running["status"] == EXPECTED]
+    assert expected["h"].between(1, RULE_HORIZONS).all()
+    assert (expected["expected_date"] > pd.Timestamp(CUT)).all()
+
+
+def test_rule_invoices_after_horizon_rows_lie_after_it(running):
+    after = running[running["status"] == AFTER_HORIZON]
+    assert (after["h"] > RULE_HORIZONS).all()
+
+
+def test_rule_invoices_statuses_are_only_the_four(running):
+    assert set(running["status"]) <= {DOUBTFUL, LATE, EXPECTED, AFTER_HORIZON}
+    assert set(running["delay_from"]) <= {FROM_CUSTOMER, FROM_COMPANY, FROM_NOTHING}
+
+
+def test_rule_invoices_dtypes(running):
+    assert running["origin_week"].dtype == "int64"
+    assert running["h"].dtype == "int64"
+    assert running["days_past_due"].dtype == "int64"
+    assert running["delay_days"].dtype == "int64"
+    assert running["outstanding_try"].dtype == "float64"
+    # The unit (s or ns) is the ledger's; both dates are datetimes of the same unit.
+    assert pd.api.types.is_datetime64_dtype(running["net_due_date"])
+    assert running["expected_date"].dtype == running["net_due_date"].dtype
+    # Text columns: object or pandas' str dtype (the ledger's; pandas 3 infers str).
+    for column in ("key", "company_code", "document_no", "delay_from", "status"):
+        assert (pd.api.types.is_object_dtype(running[column])
+                or pd.api.types.is_string_dtype(running[column])), column
+
+
+# --- rule_invoices: the boundaries -------------------------------------------------------------
+
+def test_expected_date_on_the_cutoff_sunday_is_late_and_monday_after_is_h_1_expected(running):
+    table = by_document(running)
+    assert table.loc["A1", "expected_date"] == pd.Timestamp(CUT)
+    assert table.loc["A1", "status"] == LATE
+    assert table.loc["A2", "expected_date"] == pd.Timestamp(CUT + days(1))
+    assert table.loc["A2", "status"] == EXPECTED and table.loc["A2", "h"] == 1
+
+
+def test_h_equal_to_horizons_is_expected_and_one_more_is_after_horizon(running):
+    table = by_document(running)
+    assert (table.loc["A3", "status"], table.loc["A3", "h"]) == (EXPECTED, RULE_HORIZONS)
+    assert (table.loc["A4", "status"], table.loc["A4", "h"]) == (AFTER_HORIZON,
+                                                                 RULE_HORIZONS + 1)
+
+
+def test_more_horizons_makes_the_after_horizon_invoice_expected():
+    table = by_document(run_rule_invoices(horizons=6))
+    assert (table.loc["A4", "status"], table.loc["A4", "h"]) == (EXPECTED, 6)
+
+
+def test_fewer_horizons_makes_the_last_week_invoice_after_horizon():
+    table = by_document(run_rule_invoices(horizons=4))
+    assert (table.loc["A3", "status"], table.loc["A3", "h"]) == (AFTER_HORIZON, 5)
+    assert table.loc["A2", "status"] == EXPECTED   # h 1 unchanged
+
+
+def test_days_past_due_equal_to_doubtful_days_is_not_doubtful_one_more_is(running):
+    table = by_document(running)
+    assert (table.loc["A5", "days_past_due"], table.loc["A5", "status"]) == (90, LATE)
+    assert (table.loc["A6", "days_past_due"], table.loc["A6", "status"]) == (91, DOUBTFUL)
+
+
+@pytest.mark.parametrize("doubtful_days, a5, a6", [(89, DOUBTFUL, DOUBTFUL),
+                                                  (90, LATE, DOUBTFUL),
+                                                  (91, LATE, LATE)])
+def test_the_doubtful_threshold_moves_with_doubtful_days(doubtful_days, a5, a6):
+    table = by_document(run_rule_invoices(doubtful_days=doubtful_days))
+    assert (table.loc["A5", "status"], table.loc["A6", "status"]) == (a5, a6)
+
+
+def test_doubtful_beats_late(running):
+    # A6 and D2 are past their expected date too; doubtful wins.
+    table = by_document(running)
+    for document in ("A6", "D2"):
+        assert table.loc[document, "expected_date"] <= pd.Timestamp(CUT)
+        assert table.loc[document, "status"] == DOUBTFUL
+
+
+def test_doubtful_days_is_counted_on_the_due_date_not_the_expected_date():
+    # Customer F pays 200 days late: F1 is 91 days past due but expected 109 days after T;
+    # it is still doubtful (priority over AFTER_HORIZON). F2 is 50 days past due, expected
+    # 150 days after T: AFTER_HORIZON, though overdue.
+    ledger = rl_ledger(history("F", [200, 200, 200], back=320) + [
+        rl("invoice", "F1", 10, CUT - days(120), CUT - days(91), customer="F"),
+        rl("invoice", "F2", 20, CUT - days(80), CUT - days(50), customer="F")])
+    table = by_document(run_rule_invoices(ledger))
+    assert table.loc["F1", "delay_days"] == 200
+    assert table.loc["F1", "expected_date"] == pd.Timestamp(CUT + days(109))
+    assert table.loc["F1", "status"] == DOUBTFUL
+    assert table.loc["F2", "expected_date"] == pd.Timestamp(CUT + days(150))
+    assert table.loc["F2", "status"] == AFTER_HORIZON
+    assert table.loc["F2", "h"] == week_numbers_of(pd.Series([pd.Timestamp(CUT + days(150))]))[0] - 20
+
+
+def test_a_negative_usual_delay_moves_the_expected_date_before_the_due_date():
+    # G pays 3 days early: an invoice due Tuesday CUT + 2 is expected Saturday CUT - 1, LATE.
+    ledger = rl_ledger(history("G", [-3, -3, -3]) + [
+        rl("invoice", "G1", 10, CUT - days(10), CUT + days(2), customer="G"),
+        rl("invoice", "G2", 10, CUT - days(10), CUT + days(4), customer="G")])
+    table = by_document(run_rule_invoices(ledger))
+    assert table.loc["G1", "delay_days"] == -3
+    assert table.loc["G1", "expected_date"] == pd.Timestamp(CUT - days(1))
+    assert (table.loc["G1", "status"], table.loc["G1", "h"]) == (LATE, 1)
+    # Due Thursday CUT + 4, expected Monday CUT + 1: h 1, expected.
+    assert (table.loc["G2", "status"], table.loc["G2", "h"]) == (EXPECTED, 1)
+    assert table.loc["G1", "days_past_due"] == -2
+
+
+# --- the three delay sources -------------------------------------------------------------------
+
+def test_delay_from_the_customer_is_its_median(running):
+    assert by_document(running).loc["A1", "delay_days"] == 6
+
+
+def test_delay_from_the_company_is_the_median_over_its_customers_with_a_usual_delay(running):
+    # median(6, 2) = 4: not B's own single 10, not the invoice-level median 3, not 6.
+    table = by_document(running)
+    assert table.loc["B1", "delay_from"] == FROM_COMPANY
+    assert table.loc["B1", "delay_days"] == 4
+
+
+def test_delay_from_nothing_is_zero_and_the_other_companys_median_does_not_leak(running):
+    table = by_document(running)
+    assert table.loc["D1", "delay_from"] == FROM_NOTHING
+    assert table.loc["D1", "delay_days"] == 0
+    assert table.loc["D1", "expected_date"] == table.loc["D1", "net_due_date"]
+
+
+def test_min_cleared_1_makes_every_customer_with_one_cleared_invoice_its_own_source():
+    table = by_document(run_rule_invoices(min_cleared=1))
+    assert (table.loc["B1", "delay_from"], table.loc["B1", "delay_days"]) == (FROM_CUSTOMER, 10)
+    # E's own invoice gives TR04 a usual delay (5); D still has none of its own.
+    assert (table.loc["D1", "delay_from"], table.loc["D1", "delay_days"]) == (FROM_COMPANY, 5)
+
+
+def test_min_cleared_above_everyones_count_falls_back_to_none_everywhere():
+    table = run_rule_invoices(min_cleared=4)
+    assert set(table["delay_from"]) == {FROM_NOTHING}
+    assert (table["delay_days"] == 0).all()
+
+
+def test_a_customers_half_day_median_is_rounded_half_to_even():
+    # A half goes to the even number, as invoice_delays' docstring states (approved by Ufuk,
+    # 2026-11-03): 2.5 -> 2, 3.5 -> 4, -2.5 -> -2.
+    ledger = rl_ledger(history("X", [2, 3]) + history("Y", [3, 4]) + history("W", [-3, -2])
+                       + [rl("invoice", f"{c}1", 10, CUT - days(5), CUT + days(20), customer=c)
+                          for c in ("X", "Y", "W")])
+    table = by_document(run_rule_invoices(ledger, min_cleared=2))
+    assert table.loc["X1", "delay_days"] == 2
+    assert table.loc["Y1", "delay_days"] == 4
+    assert table.loc["W1", "delay_days"] == -2
+    assert set(table["delay_from"]) == {FROM_CUSTOMER}
+
+
+def test_a_companys_half_day_median_is_rounded_half_to_even():
+    # TR04: customers P (1) and Q (2) -> 1.5 -> 2. TR05: customers S (2) and U (3) -> 2.5 -> 2.
+    ledger = rl_ledger(history("P", [1], company="TR04") + history("Q", [2], company="TR04")
+                       + history("S", [2], company="TR05") + history("U", [3], company="TR05")
+                       + [rl("invoice", "R4", 10, CUT - days(5), CUT + days(20), customer="R",
+                             company="TR04"),
+                          rl("invoice", "R5", 10, CUT - days(5), CUT + days(20), customer="R",
+                             company="TR05")])
+    table = by_document(run_rule_invoices(ledger, min_cleared=1))
+    assert (table.loc["R4", "delay_from"], table.loc["R4", "delay_days"]) == (FROM_COMPANY, 2)
+    assert (table.loc["R5", "delay_from"], table.loc["R5", "delay_days"]) == (FROM_COMPANY, 2)
+
+
+def test_invoice_delays_directly_adds_the_two_columns_and_keeps_the_rest():
+    ledger = running_ledger()
+    invoices = open_invoices_at(ledger, CUT)
+    before = invoices.copy()
+    found = invoice_delays(invoices, ledger, CUT, RULE_MIN_CLEARED)
+    pd.testing.assert_frame_equal(invoices, before)               # not changed in place
+    assert list(found.columns) == list(invoices.columns) + ["delay_from", "delay_days"]
+    pd.testing.assert_frame_equal(found[list(invoices.columns)], invoices)
+    assert found["delay_days"].dtype == "int64"
+    table = found.set_index("document_no")
+    assert table.loc["A1", "delay_days"] == 6 and table.loc["B1", "delay_days"] == 4
+    assert table.loc["D1", "delay_days"] == 0
+
+
+def test_invoice_delays_on_no_invoices_is_empty():
+    ledger = running_ledger()
+    invoices = open_invoices_at(ledger, CUT).iloc[0:0]
+    found = invoice_delays(invoices, ledger, CUT, RULE_MIN_CLEARED)
+    assert found.empty
+    assert {"delay_from", "delay_days"} <= set(found.columns)
+
+
+# --- amounts: partial payments, foreign currency, cleared after T -----------------------------
+
+def test_a_partial_payment_before_t_reduces_the_outstanding(running):
+    assert by_document(running).loc["A2", "outstanding_try"] == pytest.approx(700.0)
+
+
+def test_two_partial_payments_both_count():
+    ledger = rl_ledger(running_lines() + [
+        rl("payment", "PA2b", -150, CUT, CUT, customer="A", reference="A2")])   # on T itself
+    assert by_document(run_rule_invoices(ledger)).loc["A2", "outstanding_try"] == pytest.approx(
+        550.0)
+
+
+def test_a_foreign_currency_invoice_uses_the_rate_known_at_t(running):
+    # 100 EUR x 36 (the rate on the cutoff day itself), not 35 (before) or 99 (after).
+    assert by_document(running).loc["B1", "outstanding_try"] == pytest.approx(3600.0)
+
+
+def test_a_foreign_currency_invoice_at_an_older_rate_when_none_on_t():
+    rates = rule_rates()
+    rates = rates[rates["day"] != CUT]
+    assert by_document(run_rule_invoices(rates=rates)).loc["B1", "outstanding_try"] == (
+        pytest.approx(3500.0))
+
+
+def test_a_lower_case_currency_is_converted_too():
+    lines = running_lines()
+    for line in lines:
+        if line["document_no"] == "B1":
+            line["document_currency"] = " eur "
+    table = by_document(run_rule_invoices(rl_ledger(lines)))
+    assert table.loc["B1", "outstanding_try"] == pytest.approx(3600.0)
+
+
+def test_an_invoice_cleared_after_t_is_still_open_at_t(running):
+    table = by_document(running)
+    assert "B2" in table.index
+    assert table.loc["B2", "outstanding_try"] == pytest.approx(200.0)   # paid only after T
+
+
+def test_an_invoice_cleared_on_t_itself_is_not_open():
+    lines = running_lines()
+    for line in lines:
+        if line["document_no"] == "B2":
+            line["clearing_date"] = pd.Timestamp(CUT)
+    assert "B2" not in set(run_rule_invoices(rl_ledger(lines))["document_no"])
+
+
+def test_an_invoice_posted_on_t_is_in_and_one_posted_the_day_after_is_not():
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "ON", 5, CUT, CUT + days(20), customer="A"),
+        rl("invoice", "AFTER", 5, CUT + days(1), CUT + days(20), customer="A")])
+    found = set(run_rule_invoices(ledger)["document_no"])
+    assert "ON" in found and "AFTER" not in found
+
+
+def test_a_fully_paid_open_invoice_is_left_out():
+    ledger = rl_ledger(running_lines() + [
+        rl("payment", "PA4", -20, CUT - days(1), CUT - days(1), customer="A", reference="A4")])
+    assert "A4" not in set(run_rule_invoices(ledger)["document_no"])
+
+
+# --- no leak ---------------------------------------------------------------------------------
+
+def test_no_leak_lines_posted_or_cleared_after_t_do_not_change_the_rows_at_t(running):
+    pd.testing.assert_frame_equal(run_rule_invoices(full_ledger()), running)
+
+
+def test_no_leak_premise_the_later_lines_do_change_a_later_origin():
+    # Teeth: at T + 1 the later lines are known, and the rows differ.
+    later = run_rule_invoices(full_ledger(), origin=RULE_ORIGIN + 1)
+    without = run_rule_invoices(running_ledger(), origin=RULE_ORIGIN + 1)
+    assert not later.reset_index(drop=True).equals(without.reset_index(drop=True))
+    assert "N1" in set(later["document_no"])
+    assert "A1" not in set(later["document_no"])
+
+
+def test_no_leak_equals_the_ledger_cut_at_t_and_the_rates_cut_at_t(running):
+    rates = rule_rates()
+    cut = run_rule_invoices(ledger_as_known_at(full_ledger(), CUT),
+                            rates[rates["day"] <= CUT])
+    pd.testing.assert_frame_equal(cut, running)
+
+
+def test_no_leak_a_rate_after_t_is_never_used():
+    rates = rule_rates(extra=[(CUT + days(1), "USD", 30.0)])
+    lines = running_lines() + [rl("invoice", "U1", 10, CUT - days(5), CUT + days(20),
+                                  customer="A", currency="USD")]
+    with pytest.raises(ValueError) as error:
+        run_rule_invoices(rl_ledger(lines), rates)
+    assert str(error.value) == f"no exchange rate known on or before {CUT} for ['USD']"
+
+
+def test_no_leak_customer_delays_cleared_after_t_are_not_used(running):
+    # D's three cleared invoices after T would give it its own delay; at T it has none.
+    found = by_document(run_rule_invoices(full_ledger()))
+    assert (found.loc["D1", "delay_from"], found.loc["D1", "delay_days"]) == (FROM_NOTHING, 0)
+    later = by_document(run_rule_invoices(full_ledger(), origin=RULE_ORIGIN + 1))
+    assert later.loc["D1", "delay_from"] == FROM_CUSTOMER
+
+
+# --- rule_invoices: refusals and empty -------------------------------------------------------
+
+def test_an_open_invoice_without_a_due_date_raises_with_the_exact_message():
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "NODUE", 10, CUT - days(5), None, customer="A")])
+    with pytest.raises(ValueError) as error:
+        run_rule_invoices(ledger)
+    assert str(error.value) == (f"at {CUT}, 1 open invoices have no net due date "
+                                f"(first: ['NODUE'])")
+
+
+def test_an_invoice_without_a_due_date_posted_after_t_does_not_raise(running):
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "NODUE", 10, CUT + days(1), None, customer="A")])
+    pd.testing.assert_frame_equal(run_rule_invoices(ledger), running)
+
+
+def test_a_currency_with_no_rate_at_all_raises():
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "G1", 10, CUT - days(5), CUT + days(20), customer="A", currency="GBP")])
+    with pytest.raises(ValueError) as error:
+        run_rule_invoices(ledger)
+    assert str(error.value) == f"no exchange rate known on or before {CUT} for ['GBP']"
+
+
+def test_no_line_known_at_t_gives_an_empty_table_with_the_columns():
+    found = run_rule_invoices(origin=-30)     # before every line of the running ledger
+    assert found.empty
+    assert list(found.columns) == RULE_INVOICE_COLUMNS
+
+
+def test_an_empty_ledger_gives_an_empty_table_with_the_columns():
+    found = run_rule_invoices(rl_ledger([]))
+    assert found.empty
+    assert list(found.columns) == RULE_INVOICE_COLUMNS
+
+
+def test_rule_invoices_does_not_change_its_inputs():
+    ledger, rates = running_ledger(), rule_rates()
+    ledger_before, rates_before = ledger.copy(), rates.copy()
+    run_rule_invoices(ledger, rates)
+    pd.testing.assert_frame_equal(ledger, ledger_before)
+    pd.testing.assert_frame_equal(rates, rates_before)
+
+
+def test_rule_invoices_is_deterministic(running):
+    pd.testing.assert_frame_equal(run_rule_invoices(), running)
+
+
+def test_rule_invoices_does_not_depend_on_the_ledger_row_order(running):
+    shuffled = running_ledger().sample(frac=1.0, random_state=7).reset_index(drop=True)
+    found = run_rule_invoices(shuffled)
+    key = ["document_no"]
+    pd.testing.assert_frame_equal(found.sort_values(key, ignore_index=True),
+                                  running.sort_values(key, ignore_index=True))
+
+
+# --- rule_totals ------------------------------------------------------------------------------
+
+TOTALS_COMPANIES = ["TR02", "TR04", "TR05"]     # TR05 has no invoice at all
+TOPUP_OFFSET = {"TR02": 0.0, "TR04": 1000.0, "TR05": 2000.0}
+
+
+def level_at(week):
+    return 1.0 + (week - RULE_ORIGIN) / 10.0      # 1.1 at T + 1 ... 1.5 at T + 5
+
+
+def rule_topups(companies=TOTALS_COMPANIES, horizons=RULE_HORIZONS):
+    """topup = 10 h + an offset per company, deflated."""
+    return pd.DataFrame([{"company_code": c, "origin_week": RULE_ORIGIN, "h": h,
+                          "target_week": RULE_ORIGIN + h, "topup": 10.0 * h + TOPUP_OFFSET[c]}
+                         for c in companies for h in range(1, horizons + 1)])
+
+
+def rule_projected(horizons=RULE_HORIZONS):
+    weeks = [RULE_ORIGIN + h for h in range(1, horizons + 1)]
+    return pd.Series([level_at(w) for w in weeks], index=weeks)
+
+
+# (company, h) -> (invoice_cash, late_cash, fallback_delay_cash), by hand from the header.
+RUNNING_TOTALS = {
+    ("TR02", 1): (100.0 + 700.0 + 30.0 + 3600.0, 100.0 + 30.0, 3600.0),
+    ("TR02", 2): (200.0, 0.0, 200.0),
+    ("TR02", 5): (50.0, 0.0, 0.0),
+    ("TR04", 2): (400.0, 0.0, 400.0),
+}
+
+
+def expected_part(company, h):
+    return RUNNING_TOTALS.get((company, h), (0.0, 0.0, 0.0))
+
+
+@pytest.fixture(scope="module")
+def running_totals(running):
+    return rule_totals(running, rule_topups(), rule_projected(), TOTALS_COMPANIES, RULE_ORIGIN,
+                       RULE_HORIZONS)
+
+
+def total_row(totals, company, h, origin=RULE_ORIGIN):
+    found = totals[(totals["company_code"] == company) & (totals["h"] == h)
+                   & (totals["origin_week"] == origin)]
+    assert len(found) == 1, (company, h, origin, len(found))
+    return found.iloc[0]
+
+
+def test_rule_totals_has_exactly_the_columns(running_totals):
+    assert list(running_totals.columns) == RULE_COLUMNS
+
+
+def test_rule_totals_row_count_and_order(running_totals):
+    assert list(zip(running_totals["company_code"], running_totals["h"])) == [
+        (c, h) for c in TOTALS_COMPANIES + [CONSOLIDATED] for h in range(1, RULE_HORIZONS + 1)]
+
+
+@pytest.mark.parametrize("company", TOTALS_COMPANIES)
+@pytest.mark.parametrize("h", range(1, RULE_HORIZONS + 1))
+def test_rule_totals_each_company_and_h_by_hand(running_totals, company, h):
+    found = total_row(running_totals, company, h)
+    invoice, late, fallback = expected_part(company, h)
+    topup = (10.0 * h + TOPUP_OFFSET[company]) * level_at(RULE_ORIGIN + h)
+    assert found["target_week"] == RULE_ORIGIN + h
+    assert found["invoice_cash"] == pytest.approx(invoice, rel=1e-12)
+    assert found["late_cash"] == pytest.approx(late, rel=1e-12)
+    assert found["fallback_delay_cash"] == pytest.approx(fallback, rel=1e-12)
+    assert found["price_level"] == pytest.approx(level_at(RULE_ORIGIN + h), rel=1e-15)
+    assert found["topup_cash"] == pytest.approx(topup, rel=1e-12)
+    assert found["forecast"] == pytest.approx(invoice + topup, rel=1e-12)
+
+
+@pytest.mark.parametrize("h", range(1, RULE_HORIZONS + 1))
+def test_rule_totals_all_rows_by_hand(running_totals, h):
+    found = total_row(running_totals, CONSOLIDATED, h)
+    parts = [expected_part(c, h) for c in TOTALS_COMPANIES]
+    topup = sum(10.0 * h + TOPUP_OFFSET[c] for c in TOTALS_COMPANIES) * level_at(RULE_ORIGIN + h)
+    invoice = sum(p[0] for p in parts)
+    assert found["invoice_cash"] == pytest.approx(invoice, rel=1e-12)
+    assert found["late_cash"] == pytest.approx(sum(p[1] for p in parts), rel=1e-12)
+    assert found["fallback_delay_cash"] == pytest.approx(sum(p[2] for p in parts), rel=1e-12)
+    assert found["topup_cash"] == pytest.approx(topup, rel=1e-12)
+    assert found["forecast"] == pytest.approx(invoice + topup, rel=1e-12)
+    assert found["price_level"] == pytest.approx(level_at(RULE_ORIGIN + h), rel=1e-15)
+    assert found["target_week"] == RULE_ORIGIN + h
+
+
+def test_rule_totals_h1_all_by_hand_numbers(running_totals):
+    # 4430 (TR02) + 0 + 0; top-ups (10 + 1010 + 2010) x 1.1 = 3333; forecast 7763.
+    found = total_row(running_totals, CONSOLIDATED, 1)
+    assert found["invoice_cash"] == pytest.approx(4430.0)
+    assert found["late_cash"] == pytest.approx(130.0)
+    assert found["fallback_delay_cash"] == pytest.approx(3600.0)
+    assert found["topup_cash"] == pytest.approx(3333.0)
+    assert found["forecast"] == pytest.approx(7763.0)
+
+
+def test_rule_totals_all_is_the_sum_of_the_companies_for_every_amount(running_totals):
+    amounts = ["invoice_cash", "late_cash", "fallback_delay_cash", "topup_cash", "forecast"]
+    companies = running_totals[running_totals["company_code"] != CONSOLIDATED]
+    consolidated = running_totals[running_totals["company_code"] == CONSOLIDATED]
+    summed = companies.groupby("h")[amounts].sum()
+    np.testing.assert_allclose(consolidated.set_index("h")[amounts].to_numpy(),
+                               summed.to_numpy(), rtol=1e-14)
+
+
+def test_rule_totals_a_company_with_no_invoice_gets_zero_invoice_rows(running_totals):
+    rows = running_totals[running_totals["company_code"] == "TR05"]
+    assert len(rows) == RULE_HORIZONS
+    for column in ("invoice_cash", "late_cash", "fallback_delay_cash"):
+        assert (rows[column] == 0.0).all(), column
+    assert (rows["forecast"] == rows["topup_cash"]).all()
+
+
+def test_rule_totals_doubtful_and_after_horizon_invoices_count_nowhere(running_totals):
+    # 999 + 5000 doubtful and 20 after the horizon: the invoice cash over everything is the
+    # outstanding of the EXPECTED and LATE rows only.
+    all_rows = running_totals[running_totals["company_code"] == CONSOLIDATED]
+    assert all_rows["invoice_cash"].sum() == pytest.approx(4430.0 + 200.0 + 50.0 + 400.0)
+
+
+def test_rule_totals_late_cash_only_in_h_1(running_totals):
+    assert (running_totals.loc[running_totals["h"] > 1, "late_cash"] == 0.0).all()
+
+
+def test_rule_totals_parts_never_exceed_the_invoice_cash(running_totals):
+    assert (running_totals["late_cash"] <= running_totals["invoice_cash"] + 1e-9).all()
+    assert (running_totals["fallback_delay_cash"]
+            <= running_totals["invoice_cash"] + 1e-9).all()
+
+
+def test_rule_totals_dtypes(running_totals):
+    assert running_totals["company_code"].dtype == object
+    for column in ("origin_week", "h", "target_week"):
+        assert running_totals[column].dtype == "int64", column
+    for column in ("invoice_cash", "late_cash", "fallback_delay_cash", "topup_cash",
+                   "price_level", "forecast"):
+        assert running_totals[column].dtype == "float64", column
+
+
+def test_rule_totals_index_is_a_fresh_range(running_totals):
+    assert list(running_totals.index) == list(range(len(running_totals)))
+
+
+def test_rule_totals_on_no_invoices_are_the_top_ups_alone(running):
+    found = rule_totals(running.iloc[0:0], rule_topups(), rule_projected(), TOTALS_COMPANIES,
+                        RULE_ORIGIN, RULE_HORIZONS)
+    assert len(found) == (len(TOTALS_COMPANIES) + 1) * RULE_HORIZONS
+    assert (found["invoice_cash"] == 0.0).all()
+    np.testing.assert_allclose(found["forecast"], found["topup_cash"], rtol=0)
+
+
+def test_rule_totals_on_an_empty_rule_invoices_result(running):
+    empty = run_rule_invoices(origin=-30)
+    found = rule_totals(empty, rule_topups(), rule_projected(), TOTALS_COMPANIES, RULE_ORIGIN,
+                        RULE_HORIZONS)
+    assert (found["invoice_cash"] == 0.0).all()
+    assert list(found.columns) == RULE_COLUMNS
+
+
+def test_rule_totals_unsorted_and_repeated_companies_collapse(running, running_totals):
+    found = rule_totals(running, rule_topups(), rule_projected(), ["TR05", "TR02", "TR04", "TR02"],
+                        RULE_ORIGIN, RULE_HORIZONS)
+    pd.testing.assert_frame_equal(found, running_totals)
+
+
+def test_rule_totals_a_negative_top_up_lowers_the_forecast(running):
+    topups = rule_topups()
+    topups["topup"] = -topups["topup"]
+    found = rule_totals(running, topups, rule_projected(), TOTALS_COMPANIES, RULE_ORIGIN,
+                        RULE_HORIZONS)
+    row = total_row(found, "TR02", 1)
+    assert row["forecast"] == pytest.approx(4430.0 - 10.0 * 1.1)
+
+
+def test_rule_totals_an_invoice_of_a_company_outside_the_list_raises(running):
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, rule_topups(), rule_projected(), ["TR02"], RULE_ORIGIN,
+                    RULE_HORIZONS)
+    assert str(error.value) == ("the open invoices at origin week 20 have companies not in the "
+                                "list: ['TR04']")
+
+
+def test_rule_totals_a_doubtful_invoice_outside_the_list_still_raises(running):
+    # Only TR04's doubtful D2 is left: it counts in no total, but its company is still checked.
+    only_d2 = running[running["document_no"].isin(["A1", "D2"])]
+    with pytest.raises(ValueError, match=r"not in the list: \['TR04'\]"):
+        rule_totals(only_d2, rule_topups(["TR02"]), rule_projected(), ["TR02"], RULE_ORIGIN,
+                    RULE_HORIZONS)
+
+
+def test_rule_totals_a_missing_top_up_row_raises_with_the_exact_message(running):
+    topups = rule_topups()
+    topups = topups[~((topups["company_code"] == "TR04") & (topups["h"] == 3))]
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, topups, rule_projected(), TOTALS_COMPANIES, RULE_ORIGIN,
+                    RULE_HORIZONS)
+    assert str(error.value) == ("the top-ups have 0 rows for company 'TR04', h 3 at origin "
+                                "week 20; expected 1")
+
+
+def test_rule_totals_a_repeated_top_up_row_raises_with_the_exact_message(running):
+    topups = rule_topups()
+    topups = pd.concat([topups, topups[(topups["company_code"] == "TR02")
+                                       & (topups["h"] == 5)]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, topups, rule_projected(), TOTALS_COMPANIES, RULE_ORIGIN,
+                    RULE_HORIZONS)
+    assert str(error.value) == ("the top-ups have 2 rows for company 'TR02', h 5 at origin "
+                                "week 20; expected 1")
+
+
+def test_rule_totals_top_ups_of_a_company_with_no_invoices_must_be_there(running):
+    with pytest.raises(ValueError, match="0 rows for company 'TR05', h 1"):
+        rule_totals(running, rule_topups(["TR02", "TR04"]), rule_projected(), TOTALS_COMPANIES,
+                    RULE_ORIGIN, RULE_HORIZONS)
+
+
+def test_rule_totals_does_not_change_its_inputs(running):
+    invoices, topups, projected = running.copy(), rule_topups(), rule_projected()
+    before = (invoices.copy(), topups.copy(), projected.copy())
+    rule_totals(invoices, topups, projected, TOTALS_COMPANIES, RULE_ORIGIN, RULE_HORIZONS)
+    pd.testing.assert_frame_equal(invoices, before[0])
+    pd.testing.assert_frame_equal(topups, before[1])
+    pd.testing.assert_series_equal(projected, before[2])
+
+
+# --- RuleReference ----------------------------------------------------------------------------
+
+def test_rule_reference_dataclass_fields_and_frozen():
+    import dataclasses
+    assert [f.name for f in dataclasses.fields(RuleReference)] == ["totals", "invoices"]
+    made = RuleReference(totals=pd.DataFrame(), invoices=pd.DataFrame())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        made.totals = None
+
+
+# --- rule_reference over many origins -----------------------------------------------------------
+#
+# The running ledger at origins 18, 20 and 22, with test_forecast's side tables (companies TR02
+# and TR04), price levels and calendar, the mean top-up over 8 weeks.
+
+RR_ORIGINS = [18, 20, 22]
+
+
+def rr_settings(horizons=RULE_HORIZONS, min_cleared=RULE_MIN_CLEARED,
+                doubtful_days=RULE_DOUBTFUL):
+    settings = f_settings(horizons=horizons)
+    receivables = SimpleNamespace(horizons=horizons, min_cleared_for_delay=min_cleared)
+    return SimpleNamespace(receivables=receivables, topups=settings.topups,
+                           evaluation=SimpleNamespace(rule_doubtful_days=doubtful_days))
+
+
+def rr_inputs(**overrides):
+    new_cash, refunds, unidentified = f_side_tables(companies=RULE_COMPANIES)
+    kwargs = dict(companies=list(RULE_COMPANIES), new_cash=new_cash, refunds=refunds,
+                  unidentified=unidentified, levels=f_levels(), calendar=f_calendar(),
+                  week_zero=WEEK_ZERO)
+    kwargs.update(overrides)
+    return kwargs
+
+
+def rr_run(ledger=None, rates=None, origins=RR_ORIGINS, settings=None, **overrides):
+    return rule_reference(running_ledger() if ledger is None else ledger,
+                          rule_rates() if rates is None else rates, origins,
+                          settings or rr_settings(), **rr_inputs(**overrides))
+
+
+def rr_by_hand(origins, settings=None, ledger=None, rates=None, **overrides):
+    """Every step called by hand at each origin, then sorted as the docstring says."""
+    settings = settings or rr_settings()
+    kwargs = rr_inputs(**overrides)
+    ledger = running_ledger() if ledger is None else ledger
+    rates = rule_rates() if rates is None else rates
+    horizons = settings.receivables.horizons
+    totals, invoices = [], []
+    for origin in origins:
+        made = rule_invoices(ledger, rates, WEEK_ZERO, origin, horizons,
+                             settings.receivables.min_cleared_for_delay,
+                             settings.evaluation.rule_doubtful_days)
+        topups = topup_forecasts(kwargs["new_cash"], kwargs["refunds"], kwargs["unidentified"],
+                                 kwargs["levels"], kwargs["calendar"], [origin], horizons,
+                                 settings.topups.method, settings.topups.window,
+                                 settings.topups.with_level)
+        projected = projected_levels(WEEK_ZERO, origin,
+                                     [origin + h for h in range(1, horizons + 1)])
+        totals.append(rule_totals(made, topups, projected, kwargs["companies"], origin,
+                                  horizons))
+        invoices.append(made)
+    stacked = pd.concat(totals, ignore_index=True)
+    order = sorted(set(kwargs["companies"])) + [CONSOLIDATED]
+    parts = [stacked[stacked["company_code"] == c].sort_values(["origin_week", "h"])
+             for c in order]
+    return (pd.concat(parts, ignore_index=True), pd.concat(invoices, ignore_index=True))
+
+
+@pytest.fixture(scope="module")
+def rr_result():
+    return rr_run()
+
+
+def test_rule_reference_returns_a_rule_reference(rr_result):
+    assert isinstance(rr_result, RuleReference)
+    assert list(rr_result.totals.columns) == RULE_COLUMNS
+    assert list(rr_result.invoices.columns) == RULE_INVOICE_COLUMNS
+
+
+def test_rule_reference_equals_the_steps_by_hand(rr_result):
+    totals, invoices = rr_by_hand(RR_ORIGINS)
+    pd.testing.assert_frame_equal(rr_result.totals, totals)
+    pd.testing.assert_frame_equal(rr_result.invoices, invoices)
+
+
+def test_rule_reference_totals_sorted_companies_then_all_then_origin_and_h(rr_result):
+    expected = [(c, o, h) for c in ["TR02", "TR04", CONSOLIDATED] for o in RR_ORIGINS
+                for h in range(1, RULE_HORIZONS + 1)]
+    found = list(zip(rr_result.totals["company_code"], rr_result.totals["origin_week"],
+                     rr_result.totals["h"]))
+    assert found == expected
+    assert list(rr_result.totals.index) == list(range(len(expected)))
+
+
+def test_rule_reference_all_comes_last_even_when_a_company_sorts_after_it():
+    lines = running_lines()
+    for line in lines:
+        if line["company_code"] == "TR04":
+            line["company_code"] = "ZZ"
+            line["key"] = line["key"].replace("TR04", "ZZ")
+    new_cash, refunds, unidentified = f_side_tables(companies=["AA", "ZZ"])
+    # TR02's lines are renamed AA (sorts before ALL), TR04's ZZ (sorts after it).
+    for line in lines:
+        if line["company_code"] == "TR02":
+            line["company_code"] = "AA"
+            line["key"] = line["key"].replace("TR02", "AA")
+    found = rule_reference(rl_ledger(lines), rule_rates(), [20], rr_settings(),
+                           **rr_inputs(companies=["ZZ", "AA"], new_cash=new_cash,
+                                       refunds=refunds, unidentified=unidentified)).totals
+    assert list(dict.fromkeys(found["company_code"])) == ["AA", "ZZ", CONSOLIDATED]
+
+
+def test_rule_reference_invoices_are_stacked_in_origin_order(rr_result):
+    origins = list(rr_result.invoices["origin_week"])
+    assert origins == sorted(origins)
+    assert set(origins) == set(RR_ORIGINS)
+    assert list(rr_result.invoices.index) == list(range(len(rr_result.invoices)))
+
+
+@pytest.mark.parametrize("origin", RR_ORIGINS)
+def test_rule_reference_each_origins_invoices_equal_rule_invoices_alone(rr_result, origin):
+    found = rr_result.invoices[rr_result.invoices["origin_week"] == origin]
+    alone = run_rule_invoices(origin=origin)
+    pd.testing.assert_frame_equal(found.reset_index(drop=True), alone)
+
+
+def test_rule_reference_at_t_holds_the_running_example(rr_result):
+    at_t = rr_result.invoices[rr_result.invoices["origin_week"] == RULE_ORIGIN]
+    table = by_document(at_t)
+    for document, (status, h, outstanding, delay, source, *_rest) in RUNNING.items():
+        assert table.loc[document, "status"] == status, document
+        assert table.loc[document, "outstanding_try"] == pytest.approx(outstanding), document
+    totals = rr_result.totals
+    for (company, h), (invoice, late, fallback) in RUNNING_TOTALS.items():
+        row = total_row(totals, company, h)
+        assert row["invoice_cash"] == pytest.approx(invoice)
+        assert row["late_cash"] == pytest.approx(late)
+        assert row["fallback_delay_cash"] == pytest.approx(fallback)
+
+
+def test_rule_reference_invoice_cash_is_the_expected_and_late_outstanding(rr_result):
+    counted = rr_result.invoices[rr_result.invoices["status"].isin([EXPECTED, LATE])]
+    sums = counted.groupby(["company_code", "origin_week", "h"])["outstanding_try"].sum()
+    companies = rr_result.totals[rr_result.totals["company_code"] != CONSOLIDATED]
+    for _, row in companies.iterrows():
+        expected = sums.get((row["company_code"], row["origin_week"], row["h"]), 0.0)
+        assert row["invoice_cash"] == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+
+def test_rule_reference_topup_cash_is_the_topup_times_the_level_projected_at_the_origin(
+        rr_result):
+    kwargs = rr_inputs()
+    settings = rr_settings()
+    for origin in RR_ORIGINS:
+        topups = topup_forecasts(kwargs["new_cash"], kwargs["refunds"], kwargs["unidentified"],
+                                 kwargs["levels"], kwargs["calendar"], [origin], RULE_HORIZONS,
+                                 settings.topups.method, settings.topups.window,
+                                 settings.topups.with_level)
+        projected = projected_levels(WEEK_ZERO, origin,
+                                     [origin + h for h in range(1, RULE_HORIZONS + 1)])
+        for company in RULE_COMPANIES:
+            for h in range(1, RULE_HORIZONS + 1):
+                topup = topups[(topups["company_code"] == company) & (topups["h"] == h)]
+                row = total_row(rr_result.totals, company, h, origin)
+                level_now = float(projected.loc[origin + h])
+                assert row["price_level"] == pytest.approx(level_now, rel=1e-15)
+                assert row["topup_cash"] == pytest.approx(
+                    float(topup["topup"].iloc[0]) * level_now, rel=1e-12)
+                assert row["forecast"] == pytest.approx(row["invoice_cash"] + row["topup_cash"],
+                                                        rel=1e-12)
+
+
+def test_rule_reference_all_rows_are_the_sums_with_the_same_price_level(rr_result):
+    amounts = ["invoice_cash", "late_cash", "fallback_delay_cash", "topup_cash", "forecast"]
+    totals = rr_result.totals
+    companies = totals[totals["company_code"] != CONSOLIDATED]
+    consolidated = totals[totals["company_code"] == CONSOLIDATED].set_index(["origin_week", "h"])
+    summed = companies.groupby(["origin_week", "h"])[amounts].sum()
+    np.testing.assert_allclose(consolidated.loc[summed.index, amounts].to_numpy(),
+                               summed.to_numpy(), rtol=1e-14)
+    levels = companies.groupby(["origin_week", "h"])["price_level"].agg(["min", "max"])
+    assert (levels["min"] == levels["max"]).all()
+    np.testing.assert_array_equal(consolidated.loc[levels.index, "price_level"].to_numpy(),
+                                  levels["min"].to_numpy())
+
+
+def test_rule_reference_target_week_is_origin_plus_h(rr_result):
+    totals = rr_result.totals
+    assert (totals["target_week"] == totals["origin_week"] + totals["h"]).all()
+
+
+def test_rule_reference_dtypes(rr_result):
+    totals = rr_result.totals
+    assert totals["company_code"].dtype == object
+    for column in ("origin_week", "h", "target_week"):
+        assert totals[column].dtype == "int64", column
+    for column in ("invoice_cash", "late_cash", "fallback_delay_cash", "topup_cash",
+                   "price_level", "forecast"):
+        assert totals[column].dtype == "float64", column
+    assert rr_result.invoices["h"].dtype == "int64"
+    assert rr_result.invoices["origin_week"].dtype == "int64"
+
+
+def test_rule_reference_values_are_finite(rr_result):
+    numbers = rr_result.totals.select_dtypes("number")
+    assert np.isfinite(numbers.to_numpy()).all()
+
+
+@pytest.mark.parametrize("given", [[22, 18, 20], [20, 22, 18, 20, 22]])
+def test_rule_reference_unsorted_and_repeated_origins_equal_sorted_unique(rr_result, given):
+    found = rr_run(origins=given)
+    pd.testing.assert_frame_equal(found.totals, rr_result.totals)
+    pd.testing.assert_frame_equal(found.invoices, rr_result.invoices)
+
+
+def test_rule_reference_unsorted_and_repeated_companies_equal_sorted(rr_result):
+    found = rr_run(companies=["TR04", "TR02", "TR04"])
+    pd.testing.assert_frame_equal(found.totals, rr_result.totals)
+
+
+def test_rule_reference_a_single_origin_equals_its_slice(rr_result):
+    alone = rr_run(origins=[RULE_ORIGIN])
+    sliced = rr_result.totals[rr_result.totals["origin_week"] == RULE_ORIGIN]
+    pd.testing.assert_frame_equal(alone.totals, sliced.reset_index(drop=True))
+
+
+def test_rule_reference_uses_the_doubtful_days_setting():
+    found = rr_run(origins=[RULE_ORIGIN], settings=rr_settings(doubtful_days=89))
+    table = by_document(found.invoices)
+    assert table.loc["A5", "status"] == DOUBTFUL
+    # A5's 30 TRY leaves TR02's h 1 invoice cash and late cash.
+    row = total_row(found.totals, "TR02", 1)
+    assert row["invoice_cash"] == pytest.approx(4430.0 - 30.0)
+    assert row["late_cash"] == pytest.approx(100.0)
+
+
+def test_rule_reference_uses_the_min_cleared_setting():
+    found = rr_run(origins=[RULE_ORIGIN], settings=rr_settings(min_cleared=1))
+    assert by_document(found.invoices).loc["B1", "delay_from"] == FROM_CUSTOMER
+    assert total_row(found.totals, "TR02", 1)["fallback_delay_cash"] == pytest.approx(0.0)
+
+
+def test_rule_reference_uses_the_horizons_setting():
+    new_cash, refunds, unidentified = f_side_tables(companies=RULE_COMPANIES, horizons=6)
+    found = rr_run(origins=[RULE_ORIGIN], settings=rr_settings(horizons=6), new_cash=new_cash,
+                   refunds=refunds, unidentified=unidentified)
+    assert set(found.totals["h"]) == set(range(1, 7))
+    assert total_row(found.totals, "TR02", 6)["invoice_cash"] == pytest.approx(20.0)   # A4
+
+
+def test_rule_reference_no_leak_from_the_ledger_after_each_origin(rr_result):
+    found = rr_run(ledger=full_ledger(), origins=[RULE_ORIGIN])
+    sliced_totals = rr_result.totals[rr_result.totals["origin_week"] == RULE_ORIGIN]
+    sliced_invoices = rr_result.invoices[rr_result.invoices["origin_week"] == RULE_ORIGIN]
+    pd.testing.assert_frame_equal(found.totals, sliced_totals.reset_index(drop=True))
+    pd.testing.assert_frame_equal(found.invoices, sliced_invoices.reset_index(drop=True))
+
+
+def test_rule_reference_is_deterministic(rr_result):
+    again = rr_run()
+    pd.testing.assert_frame_equal(again.totals, rr_result.totals)
+    pd.testing.assert_frame_equal(again.invoices, rr_result.invoices)
+
+
+def test_rule_reference_does_not_change_its_inputs():
+    ledger, rates = running_ledger(), rule_rates()
+    kwargs = rr_inputs()
+    copies = {name: value.copy() for name, value in kwargs.items()
+              if isinstance(value, (pd.DataFrame, pd.Series))}
+    companies = list(kwargs["companies"])
+    ledger_before, rates_before = ledger.copy(), rates.copy()
+    origins = [22, 18, 20]
+    rule_reference(ledger, rates, origins, rr_settings(), **kwargs)
+    pd.testing.assert_frame_equal(ledger, ledger_before)
+    pd.testing.assert_frame_equal(rates, rates_before)
+    for name, copy in copies.items():
+        if isinstance(copy, pd.DataFrame):
+            pd.testing.assert_frame_equal(kwargs[name], copy)
+        else:
+            pd.testing.assert_series_equal(kwargs[name], copy)
+    assert kwargs["companies"] == companies
+    assert origins == [22, 18, 20]
+
+
+# --- rule_reference: refusals ---------------------------------------------------------------
+
+@pytest.mark.parametrize("origins", [[], ()])
+def test_rule_reference_no_origins_exact_message(origins):
+    with pytest.raises(ValueError) as error:
+        rr_run(origins=origins)
+    assert str(error.value) == "there are no origins to forecast at"
+
+
+def test_rule_reference_all_in_companies_exact_message():
+    with pytest.raises(ValueError) as error:
+        rr_run(companies=["TR02", CONSOLIDATED, "TR04"])
+    assert str(error.value) == ("'ALL' is the code of the consolidated rows; it cannot be a "
+                                "company")
+
+
+def test_rule_reference_no_origins_is_checked_before_all():
+    with pytest.raises(ValueError, match="no origins"):
+        rr_run(origins=[], companies=[CONSOLIDATED])
+
+
+def test_rule_reference_an_invoice_of_a_company_outside_the_list_raises():
+    new_cash, refunds, unidentified = f_side_tables(companies=["TR02"])
+    with pytest.raises(ValueError) as error:
+        rr_run(origins=[RULE_ORIGIN], companies=["TR02"], new_cash=new_cash, refunds=refunds,
+               unidentified=unidentified)
+    assert str(error.value) == ("the open invoices at origin week 20 have companies not in the "
+                                "list: ['TR04']")
+
+
+def test_rule_reference_an_open_invoice_without_a_due_date_raises():
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "NODUE", 10, CUT - days(5), None, customer="A")])
+    with pytest.raises(ValueError, match=r"open invoices have no net due date"):
+        rr_run(ledger=ledger, origins=[RULE_ORIGIN])
+
+
+def test_rule_reference_a_top_up_row_missing_for_a_company_raises():
+    # Side tables of TR02 only, but TR04 in the list: its top-ups have no row.
+    new_cash, refunds, unidentified = f_side_tables(companies=["TR02"])
+    with pytest.raises(ValueError, match="0 rows for company 'TR04', h 1 at origin week 18"):
+        rr_run(new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+
+
+def test_rule_reference_week_zero_not_a_monday_raises():
+    with pytest.raises(ValueError):
+        rr_run(week_zero=WEEK_ZERO + timedelta(days=1))
+
+
+
+# --- 2026-11-03 follow-up: the two new refusals --------------------------------------------
+# rule_reference refuses an empty company list (after empty origins, before "ALL");
+# rule_totals refuses top-ups of a company outside the list (after the invoices' check, before
+# the per-(company, h) row count).
+
+def test_rule_reference_empty_company_list_exact_message():
+    with pytest.raises(ValueError) as error:
+        rr_run(companies=[])
+    assert str(error.value) == "the company list is empty"
+
+
+def test_rule_reference_empty_company_list_with_no_invoices_is_refused_too():
+    # Before the fix this returned 0 total rows and no error.
+    with pytest.raises(ValueError) as error:
+        rr_run(ledger=rl_ledger([]), origins=[RULE_ORIGIN], companies=[])
+    assert str(error.value) == "the company list is empty"
+
+
+def test_rule_reference_empty_origins_is_checked_before_the_empty_company_list():
+    with pytest.raises(ValueError) as error:
+        rr_run(origins=[], companies=[])
+    assert str(error.value) == "there are no origins to forecast at"
+
+
+def test_rule_reference_empty_company_list_is_checked_before_any_step():
+    # A ledger that rule_invoices would refuse: the company list is found empty first.
+    ledger = rl_ledger(running_lines() + [
+        rl("invoice", "NODUE", 10, CUT - days(5), None, customer="A")])
+    with pytest.raises(ValueError) as error:
+        rr_run(ledger=ledger, companies=[])
+    assert str(error.value) == "the company list is empty"
+
+
+def test_rule_reference_all_check_still_follows_the_empty_list_check():
+    with pytest.raises(ValueError) as error:
+        rr_run(companies=[CONSOLIDATED])
+    assert str(error.value) == ("'ALL' is the code of the consolidated rows; it cannot be a "
+                                "company")
+
+
+def test_rule_totals_top_ups_of_a_company_outside_the_list_exact_message(running):
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, rule_topups(["TR02", "TR04", "TR05"]), rule_projected(),
+                    ["TR02", "TR04"], RULE_ORIGIN, RULE_HORIZONS)
+    assert str(error.value) == ("the top-ups at origin week 20 have companies not in the "
+                                "list: ['TR05']")
+
+
+def test_rule_totals_top_ups_outside_the_list_are_listed_sorted(running):
+    topups = pd.concat([rule_topups(["TR02", "TR04"]),
+                        rule_topups(["TR05"]).assign(company_code="ZZ"),
+                        rule_topups(["TR05"]).assign(company_code="AB")], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, topups, rule_projected(), ["TR02", "TR04"], RULE_ORIGIN,
+                    RULE_HORIZONS)
+    assert str(error.value) == ("the top-ups at origin week 20 have companies not in the "
+                                "list: ['AB', 'ZZ']")
+
+
+def test_rule_totals_a_single_outside_top_up_row_is_refused(running):
+    extra = pd.DataFrame([{"company_code": "TR05", "origin_week": RULE_ORIGIN, "h": 3,
+                           "target_week": RULE_ORIGIN + 3, "topup": 0.0}])
+    topups = pd.concat([rule_topups(["TR02", "TR04"]), extra], ignore_index=True)
+    with pytest.raises(ValueError, match=r"top-ups at origin week 20 have companies not in "
+                                         r"the list: \['TR05'\]"):
+        rule_totals(running, topups, rule_projected(), ["TR02", "TR04"], RULE_ORIGIN,
+                    RULE_HORIZONS)
+
+
+def test_rule_totals_the_invoices_check_comes_before_the_top_ups_check(running):
+    # Both outside: TR04's invoices (list [TR02]) and TR05's top-ups.
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, rule_topups(["TR02", "TR05"]), rule_projected(), ["TR02"],
+                    RULE_ORIGIN, RULE_HORIZONS)
+    assert str(error.value) == ("the open invoices at origin week 20 have companies not in the "
+                                "list: ['TR04']")
+
+
+def test_rule_totals_the_top_ups_check_comes_before_the_row_count(running):
+    # TR05 outside, and TR02 h 3 missing: the outside company is reported.
+    topups = rule_topups(["TR02", "TR04", "TR05"])
+    topups = topups[~((topups["company_code"] == "TR02") & (topups["h"] == 3))]
+    with pytest.raises(ValueError) as error:
+        rule_totals(running, topups, rule_projected(), ["TR02", "TR04"], RULE_ORIGIN,
+                    RULE_HORIZONS)
+    assert str(error.value) == ("the top-ups at origin week 20 have companies not in the "
+                                "list: ['TR05']")
+
+
+def test_rule_totals_top_ups_of_exactly_the_listed_companies_pass(running, running_totals):
+    found = rule_totals(running, rule_topups(), rule_projected(), TOTALS_COMPANIES,
+                        RULE_ORIGIN, RULE_HORIZONS)
+    pd.testing.assert_frame_equal(found, running_totals)
+
+
+def test_rule_totals_no_invoices_and_outside_top_ups_is_still_refused(running):
+    with pytest.raises(ValueError, match=r"top-ups at origin week 20 .*\['TR05'\]"):
+        rule_totals(running.iloc[0:0], rule_topups(["TR02", "TR05"]), rule_projected(),
+                    ["TR02"], RULE_ORIGIN, RULE_HORIZONS)
+
+
+def test_rule_reference_side_tables_of_a_company_outside_the_list_are_refused():
+    # Side tables of TR02, TR04 and TR05; the list (and the invoices) only TR02 and TR04.
+    new_cash, refunds, unidentified = f_side_tables(companies=["TR02", "TR04", "TR05"])
+    with pytest.raises(ValueError) as error:
+        rr_run(new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+    assert str(error.value) == ("the top-ups at origin week 18 have companies not in the "
+                                "list: ['TR05']")
+
+
+def test_rule_reference_invoices_outside_are_reported_before_top_ups_outside():
+    new_cash, refunds, unidentified = f_side_tables(companies=["TR02", "TR05"])
+    with pytest.raises(ValueError) as error:
+        rr_run(origins=[RULE_ORIGIN], companies=["TR02"], new_cash=new_cash, refunds=refunds,
+               unidentified=unidentified)
+    assert str(error.value) == ("the open invoices at origin week 20 have companies not in the "
+                                "list: ['TR04']")

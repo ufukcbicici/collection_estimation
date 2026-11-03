@@ -5332,7 +5332,7 @@ def test_step_16_and_17_imports():
     # U14.3 added REFERENCES and deflated_reference to the one import of evaluate.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
         ("REFERENCES", None), ("actual_totals", None), ("deflated_reference", None),
-        ("rolling_forecasts", None)]
+        ("rolling_forecasts", None), ("rule_reference", None)]
 
 
 STEP_16_17_NAMES = """
@@ -5365,6 +5365,12 @@ assert script.REFERENCES is evaluate.REFERENCES
 inspect.signature(script.deflated_reference).bind("weekly", "weeks", "levels", "calendar", [],
                                                   [0], 5, None)
 inspect.signature(script.show_deflated_reference).bind("reference", "rolled", "actual")
+# U14.4.
+assert script.rule_reference is evaluate.rule_reference
+inspect.signature(script.rule_reference).bind(
+    "ledger", "rates", [0], "settings", companies=[], new_cash=None, refunds=None,
+    unidentified=None, levels=None, calendar=None, week_zero=None)
+inspect.signature(script.show_rule_reference).bind("rule", "actual")
 print("ok")
 """
 
@@ -5396,24 +5402,26 @@ def test_step_17_uses_the_validation_origins_only():
 
 
 def test_step_17_calls_rolling_forecasts_once_with_a_progress_callback():
+    # Since with_model (2026-11-03) the call and its callback sit in the with_model branch.
     assert len(calls_to(main_tree(), "rolling_forecasts")) == 1
-    block = step_17_block()
-    calls = calls_to(block, "rolling_forecasts")
+    branch = with_model_if()
+    calls = calls_to(branch, "rolling_forecasts")
     assert len(calls) == 1
     call = calls[0]
     assert [ast.unparse(a) for a in call.args] == ["table", "origins", "settings"]
     assert keywords_of(call) == {**FORECAST_KEYWORDS, "on_origin_done": "progress"}
-    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+    assigned = [node for node in branch.body if isinstance(node, ast.Assign)
                 and node.value is call]
     assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["rolled"]
-    # progress is defined inside the block, before the call, with rolling_forecasts' four
+    # progress is defined inside the branch, before the call, with rolling_forecasts' four
     # callback arguments (done, total, origin, seconds).
-    defs = [(i, node) for i, node in enumerate(block.body)
+    defs = [(i, node) for i, node in enumerate(branch.body)
             if isinstance(node, ast.FunctionDef) and node.name == "progress"]
     assert len(defs) == 1
     index, progress = defs[0]
     assert [a.arg for a in progress.args.args] == ["done", "total", "at", "seconds"]
-    assert index < block.body.index(assigned[0])
+    assert index < branch.body.index(assigned[0])
+    assert all(calls_to(node, "rolling_forecasts") == [] for node in branch.orelse)
 
 
 def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
@@ -5427,10 +5435,12 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
     statements = [ast.unparse(node) for node in block.body]
-    # U14.3's two statements follow these two (see the deflated reference tests below).
-    assert statements[-4] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
-                              "origins, settings.receivables.horizons)")
-    assert statements[-3] == "show_rolling_forecasts(rolled, rolled_actual)"
+    # Since with_model: the actual cash comes first (right after the header), then
+    # rolled = None, then the with_model branch, whose last statement is the printout.
+    assert statements[2] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
+                             "origins, settings.receivables.horizons)")
+    assert statements[3] == "rolled = None"
+    assert ast.unparse(with_model_if().body[-1]) == "show_rolling_forecasts(rolled, rolled_actual)"
 
 
 def row_cells(lines, first):
@@ -5645,11 +5655,13 @@ def test_step_17_deflated_reference_is_a_direct_statement_of_the_evaluation_bloc
 
 
 def test_step_17_deflated_reference_comes_after_show_rolling_forecasts():
-    statements = [ast.unparse(node) for node in step_17_block().body]
-    shown = statements.index("show_rolling_forecasts(rolled, rolled_actual)")
-    made = statements.index("reference = deflated_reference(weekly, weeks, levels, calendar, "
-                            "companies, origins, settings.receivables.horizons, week_zero)")
-    assert made == shown + 1
+    # Right after the with_model branch (which ends with show_rolling_forecasts).
+    block = step_17_block()
+    body = block.body
+    branch = body.index(with_model_if(block))
+    assert ast.unparse(body[branch + 1]) == (
+        "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
+        "settings.receivables.horizons, week_zero)")
 
 
 def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and_actual():
@@ -5661,11 +5673,9 @@ def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and
 
 
 def test_step_17_ends_with_the_deflated_reference_and_its_printout():
+    # U14.4 appended the financial rule's two statements after the reference's two.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-4:] == [
-        "rolled_actual = actual_totals(weekly, weeks, levels, companies, origins, "
-        "settings.receivables.horizons)",
-        "show_rolling_forecasts(rolled, rolled_actual)",
+    assert statements[-4:-2] == [
         "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
         "settings.receivables.horizons, week_zero)",
         "show_deflated_reference(reference, rolled, rolled_actual)"]
@@ -5686,8 +5696,9 @@ def test_step_17_is_still_the_last_step_after_the_deflated_reference():
     body = main_body()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
-    last = body[-1].body[-1]
-    assert ast.unparse(last) == "show_deflated_reference(reference, rolled, rolled_actual)"
+    # Since U14.4 the deflated reference's printout is third from last, before the rule's two.
+    assert ast.unparse(body[-1].body[-3]) == (
+        "show_deflated_reference(reference, rolled, rolled_actual)")
 
 
 def test_show_deflated_reference_is_a_module_level_function_with_three_parameters():
@@ -5790,3 +5801,544 @@ def test_show_deflated_reference_lines_follow_the_references_order(reference_lin
 
 def test_show_deflated_reference_the_hurdle_line_has_no_fallback_count(reference_lines):
     assert "fell back" not in reference_lines[1]
+
+
+
+# Step 17, U14.4: the financial-rule reference at the validation origins, right after the
+# deflated reference's printout, and its printout. Wiring on main()'s syntax tree, as above.
+
+RULE_REFERENCE_KEYWORDS = {
+    "companies": "companies", "new_cash": "new_cash", "refunds": "refunds",
+    "unidentified": "unidentified", "levels": "levels", "calendar": "calendar",
+    "week_zero": "week_zero"}
+RULE_STATEMENT = ("rule = rule_reference(ledger, rates, origins, settings, companies=companies, "
+                  "new_cash=new_cash, refunds=refunds, unidentified=unidentified, "
+                  "levels=levels, calendar=calendar, week_zero=week_zero)")
+SHOW_RULE_STATEMENT = "show_rule_reference(rule, rolled_actual)"
+
+
+def test_step_17_calls_rule_reference_once_with_its_arguments():
+    assert len(calls_to(main_tree(), "rule_reference")) == 1
+    block = step_17_block()
+    calls = calls_to(block, "rule_reference")
+    assert len(calls) == 1
+    call = calls[0]
+    assert [ast.unparse(a) for a in call.args] == ["ledger", "rates", "origins", "settings"]
+    assert keywords_of(call) == RULE_REFERENCE_KEYWORDS
+    # The keywords in the order written.
+    assert [k.arg for k in call.keywords] == list(RULE_REFERENCE_KEYWORDS)
+    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+                and node.value is call]
+    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["rule"]
+
+
+def test_step_17_rule_reference_is_a_direct_statement_of_the_evaluation_block():
+    block = step_17_block()
+    direct = [node for node in block.body if isinstance(node, ast.Assign)
+              and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+              and node.value.func.id == "rule_reference"]
+    assert len(direct) == 1
+    shown = [node for node in block.body if isinstance(node, ast.Expr)
+             and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+             and node.value.func.id == "show_rule_reference"]
+    assert len(shown) == 1
+    assert block.orelse == []
+
+
+def test_step_17_rule_reference_comes_right_after_show_deflated_reference():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    shown = statements.index("show_deflated_reference(reference, rolled, rolled_actual)")
+    assert statements.index(RULE_STATEMENT) == shown + 1
+    assert statements.index(SHOW_RULE_STATEMENT) == shown + 2
+
+
+def test_step_17_shows_the_rule_reference_once_with_the_rule_and_the_actual():
+    assert len(calls_to(main_tree(), "show_rule_reference")) == 1
+    calls = calls_to(step_17_block(), "show_rule_reference")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["rule", "rolled_actual"]
+    assert calls[0].keywords == []
+
+
+def test_step_17_ends_with_the_rule_reference_and_its_printout():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    assert statements[-2:] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
+
+
+def test_step_17_is_still_the_last_step_after_the_rule_reference():
+    body = main_body()
+    assert isinstance(body[-1], ast.If)
+    assert ast.unparse(body[-1].test) == "settings.evaluation.run"
+    assert body[-1].orelse == []
+    assert ast.unparse(body[-1].body[-1]) == SHOW_RULE_STATEMENT
+
+
+def test_step_17_rule_reference_uses_the_same_origins_as_the_rolling_forecasts():
+    block = step_17_block()
+    rolled = calls_to(block, "rolling_forecasts")[0]
+    rule = calls_to(block, "rule_reference")[0]
+    assert ast.unparse(rolled.args[1]) == "origins" == ast.unparse(rule.args[2])
+    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+                and "origins" in [ast.unparse(t) for t in node.targets]]
+    assert len(assigned) == 1
+    rule_statement = [node for node in block.body if isinstance(node, ast.Assign)
+                      and [ast.unparse(t) for t in node.targets] == ["rule"]]
+    assert block.body.index(assigned[0]) < block.body.index(rule_statement[0])
+
+
+def test_step_17_rule_reference_is_shown_against_the_rolled_actual_made_before_it():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    made = [i for i, s in enumerate(statements) if s.startswith("rolled_actual = ")]
+    assert len(made) == 1
+    assert made[0] < statements.index(SHOW_RULE_STATEMENT)
+
+
+def test_rule_reference_inputs_are_assigned_in_main_before_step_17():
+    # ledger and rates, the two inputs only the rule needs, exist before the evaluation block.
+    body = main_body()
+    step_17 = index_of_if(body, "settings.evaluation.run")
+    for name in ("ledger", "rates"):
+        assigned = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                    and name in [ast.unparse(t) for t in node.targets]]
+        assert assigned and max(assigned) < step_17, name
+
+
+def test_rule_reference_is_imported_once_from_evaluate():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [(node.module, a.name, a.asname) for node in ast.walk(module)
+             if isinstance(node, ast.ImportFrom) for a in node.names
+             if a.name == "rule_reference"]
+    assert found == [("collection_estimation.hurdle.evaluate", "rule_reference", None)]
+
+
+def test_show_rule_reference_is_a_module_level_function_with_two_parameters():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_rule_reference"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["rule", "actual"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == []
+
+
+# show_rule_reference at origins 10 and 11, h = 1, 2, companies TR02 and ALL.
+# Consolidated actual: (10, 1) wk 11 1,000,000; (10, 2) wk 12 2,000,000; (11, 1) wk 12
+# 2,000,000; (11, 2) wk 13 has no row. Rule (ALL) forecast 1.5 + 1.0 + 3.0 = 5.5 M (wk 13's 9e9
+# left out) vs actual 5.0 M: ratio 1.100.
+#   per h: h1 forecast 1.5 + 3.0 = 4.5, actual 1.0 + 2.0 = 3.0, ratio 1.5, late share
+#          (0.25 + 1.0) / (1.0 + 2.0) = 0.41667 -> 0.417;
+#          h2 forecast 1.0, actual 2.0, ratio 0.5, late share 0 / 0.8 = 0.000.
+# TR02 (9e9 everywhere) enters no sum. The invoices (both origins, summed): expected 2 rows
+# 1.0 + 2.0 = 3.0 M; late 1 row 0.5 M; after horizon 1 row 0.3 M; doubtful 1 row 3.0 M. Delay
+# sources of the open TRY (6.8 M): customer 1.0 + 0.5 + 0.3 = 1.8 -> 26.5%; company 2.0 ->
+# 29.4%; none 3.0 -> 44.1%.
+SHOW_RULE = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import RuleReference
+
+keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
+def block(company, forecast, invoice, late):
+    return pd.DataFrame({"company_code": [company] * 4, **keys, "invoice_cash": invoice,
+                         "late_cash": late, "fallback_delay_cash": [0.0] * 4,
+                         "topup_cash": [f - i for f, i in zip(forecast, invoice)],
+                         "price_level": [1.0] * 4, "forecast": forecast})
+totals = pd.concat([
+    block("TR02", [9e9] * 4, [9e9] * 4, [9e9] * 4),
+    block("ALL", [1.5e6, 1.0e6, 3.0e6, 9e9], [1.0e6, 0.8e6, 2.0e6, 9e9],
+          [0.25e6, 0.0, 1.0e6, 9e9])], ignore_index=True)
+three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
+actual = pd.concat([
+    pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
+    pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
+    ignore_index=True)
+actual["actual_real"] = 0.0
+invoices = pd.DataFrame({
+    "origin_week": [10, 10, 10, 11, 11],
+    "status": __STATUS__,
+    "delay_from": __DELAY_FROM__,
+    "outstanding_try": [1e6, 0.5e6, 0.3e6, 2e6, 3e6]})
+rule = RuleReference(totals=totals, invoices=invoices)
+before = (totals.copy(), invoices.copy(), actual.copy())
+script.show_rule_reference(rule, actual)
+pd.testing.assert_frame_equal(totals, before[0])
+pd.testing.assert_frame_equal(invoices, before[1])
+pd.testing.assert_frame_equal(actual, before[2])
+print("ok")
+"""
+RULE_STATUS = '["expected", "late", "after horizon", "expected", "doubtful"]'
+RULE_DELAY_FROM = '["customer", "customer", "customer", "company", "none"]'
+
+
+def run_show_rule(status=RULE_STATUS, delay_from=RULE_DELAY_FROM):
+    code = SHOW_RULE.replace("__STATUS__", status).replace("__DELAY_FROM__", delay_from)
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+@pytest.fixture(scope="module")
+def rule_lines():
+    return run_show_rule()
+
+
+RULE_PER_H_TITLE = "          the rule per h, consolidated, million TRY:"
+RULE_DECIDED_TITLE = ("          the open invoices at the origins, by what the rule decided "
+                      "(summed over the origins):")
+
+
+def test_show_rule_reference_prints_fourteen_lines(rule_lines):
+    assert len(rule_lines) == 14, rule_lines
+
+
+def test_show_rule_reference_first_line_forecast_vs_actual_and_ratio(rule_lines):
+    assert rule_lines[0] == ("          financial rule" + " " * 11
+                             + "5.5 vs actual 5.0 (ratio 1.100)")
+
+
+def test_show_rule_reference_first_line_has_the_deflated_reference_layout(rule_lines):
+    # The layout of show_deflated_reference's lines: the name in 17, the amount in 10.
+    assert rule_lines[0] == (f"          {'financial rule':<17} {5.5:>10,.1f} vs actual 5.0 "
+                             f"(ratio 1.100)")
+
+
+def test_show_rule_reference_titles(rule_lines):
+    assert rule_lines[1] == RULE_PER_H_TITLE
+    assert rule_lines[6] == RULE_DECIDED_TITLE
+    assert rule_lines.count(RULE_PER_H_TITLE) == 1
+    assert rule_lines.count(RULE_DECIDED_TITLE) == 1
+
+
+def test_show_rule_reference_per_h_table_by_hand(rule_lines):
+    table = rule_lines[2:6]
+    assert table[0].split() == ["forecast", "actual", "ratio", "late", "share"]
+    assert table[1].split() == ["h"]
+    assert [float(v) for v in row_cells(table, "1")[1:]] == [4.5, 3.0, 1.5, 0.417]
+    assert [float(v) for v in row_cells(table, "2")[1:]] == [1.0, 2.0, 0.5, 0.0]
+
+
+def test_show_rule_reference_leaves_out_the_target_week_without_actual(rule_lines):
+    # (11, 2)'s 9e9, and TR02's, would show as 9,000 million or more if a sum kept them.
+    assert not any("9000" in line or "9e" in line or "9,000" in line for line in rule_lines)
+
+
+def test_show_rule_reference_decided_table_by_hand(rule_lines):
+    table = rule_lines[7:13]
+    assert table[0].split() == ["invoices", "million", "TRY"]
+    assert table[1].split() == ["status"]
+    rows = [line.split() for line in table[2:]]
+    # Sorted by status (groupby), counts and million TRY summed over both origins.
+    assert rows == [["after", "horizon", "1", "0.3"], ["doubtful", "1", "3.0"],
+                    ["expected", "2", "3.0"], ["late", "1", "0.5"]]
+
+
+def test_show_rule_reference_delay_source_shares_by_hand(rule_lines):
+    assert rule_lines[13] == (
+        "          the delay came from the customer for 26.5% of the open TRY, its company's "
+        "median for 29.4%, none (0 days) for 44.1%")
+
+
+def test_show_rule_reference_a_delay_source_with_no_invoice_shows_zero():
+    lines = run_show_rule(delay_from='["customer"] * 5')
+    assert lines[-1] == (
+        "          the delay came from the customer for 100.0% of the open TRY, its company's "
+        "median for 0.0%, none (0 days) for 0.0%")
+
+
+def test_show_rule_reference_a_status_with_no_invoice_has_no_row():
+    lines = run_show_rule(status='["expected"] * 5')
+    decided = lines[lines.index(RULE_DECIDED_TITLE) + 1:-1]
+    assert [line.split() for line in decided[2:]] == [["expected", "5", "6.8"]]
+    assert len(lines) == 11
+
+
+def test_show_rule_reference_does_not_change_its_inputs(rule_lines):
+    # SHOW_RULE compares the three tables with copies taken before the call; "ok" means equal.
+    assert rule_lines
+
+
+from types import SimpleNamespace as SimpleNamespace  # noqa: E402
+
+
+# Step 17, [evaluation] with_model (2026-11-03): the hurdle model's forecasts run only if
+# with_model is true; the references and the rule always run. Wiring on main()'s syntax tree;
+# then both branches run for real by executing step 17's block with recording fakes.
+
+SKIP_LINE = "        the hurdle model's forecasts are skipped ([evaluation] with_model = false)"
+
+
+def with_model_if(block=None):
+    """The `if settings.evaluation.with_model:` statement directly in step 17's block (of
+    `block`, if given: main_tree() parses afresh each time, so nodes compare by identity only
+    within one parse)."""
+    block = block if block is not None else step_17_block()
+    found = [node for node in block.body if isinstance(node, ast.If)
+             and ast.unparse(node.test) == "settings.evaluation.with_model"]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_step_17_has_one_with_model_branch_and_no_other_if():
+    ifs = [node for node in step_17_block().body if isinstance(node, ast.If)]
+    assert len(ifs) == 1
+    assert ast.unparse(ifs[0].test) == "settings.evaluation.with_model"
+    assert "with_model" in ast.unparse(step_17_block())
+    assert ast.unparse(main_tree()).count("settings.evaluation.with_model") == 1
+
+
+def test_step_17_statement_order_with_the_with_model_branch():
+    block = step_17_block()
+    body = block.body
+    shapes = [type(node).__name__ for node in body]
+    assert shapes == ["Assign", "Expr", "Assign", "Assign", "If", "Assign", "Expr", "Assign",
+                      "Expr"]
+    assert ast.unparse(body[0]) == "origins = list(settings.evaluation.validation_origins)"
+    assert ast.unparse(body[2]).startswith("rolled_actual = actual_totals(")
+    assert ast.unparse(body[3]) == "rolled = None"
+    assert body[4] is with_model_if(block)
+    assert ast.unparse(body[5]).startswith("reference = deflated_reference(")
+    assert ast.unparse(body[6]) == "show_deflated_reference(reference, rolled, rolled_actual)"
+    assert ast.unparse(body[7]).startswith("rule = rule_reference(")
+    assert ast.unparse(body[8]) == "show_rule_reference(rule, rolled_actual)"
+
+
+def test_step_17_with_model_branch_body_in_order():
+    branch = with_model_if().body
+    assert [type(node).__name__ for node in branch] == ["Assign", "FunctionDef", "Assign",
+                                                        "Expr"]
+    assert ast.unparse(branch[0]) == "started = time.perf_counter()"
+    assert branch[1].name == "progress"
+    assert ast.unparse(branch[2]).startswith("rolled = rolling_forecasts(")
+    assert ast.unparse(branch[3]) == "show_rolling_forecasts(rolled, rolled_actual)"
+
+
+def test_step_17_the_else_branch_prints_the_skip_line_only():
+    orelse = with_model_if().orelse
+    assert len(orelse) == 1
+    call = orelse[0].value
+    assert isinstance(orelse[0], ast.Expr) and ast.unparse(call.func) == "print"
+    assert len(call.args) == 1 and call.keywords == []
+    assert ast.literal_eval(call.args[0]) == SKIP_LINE
+
+
+def test_step_17_the_skip_line_and_rolled_none_are_outside_nothing_else():
+    # Nothing of the model (rolling_forecasts, show_rolling_forecasts, progress, started) is
+    # outside the with_model branch.
+    block = step_17_block()
+    branch = with_model_if(block)
+    outside = [node for node in block.body if node is not branch]
+    for name in ("rolling_forecasts", "show_rolling_forecasts"):
+        assert calls_in(outside, name) == [], name
+    text = "\n".join(ast.unparse(node) for node in outside)
+    assert "progress" not in text and "started" not in text
+
+
+def test_step_17_header_no_longer_says_two_fits_each():
+    header = step_17_block().body[1]
+    assert ast.unparse(header.value.func) == "print"
+    text = ast.unparse(header)
+    assert "two fits" not in text
+    assert text.endswith("({len(origins)} origins)')")
+
+
+def test_step_17_rolled_none_is_assigned_once_right_before_the_branch():
+    block = step_17_block()
+    body = block.body
+    rolled = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+              and [ast.unparse(t) for t in node.targets] == ["rolled"]]
+    assert rolled == [body.index(with_model_if(block)) - 1]
+    assert ast.unparse(body[rolled[0]].value) == "None"
+
+
+def test_step_17_the_references_get_rolled_whatever_the_branch():
+    calls = calls_to(step_17_block(), "show_deflated_reference")
+    assert [ast.unparse(a) for a in calls[0].args] == ["reference", "rolled", "rolled_actual"]
+    # The rule never sees the model.
+    calls = calls_to(step_17_block(), "show_rule_reference")
+    assert [ast.unparse(a) for a in calls[0].args] == ["rule", "rolled_actual"]
+
+
+# Running step 17's block (both branches) with fakes: every name it reads is a recorder.
+
+STEP_17_NAMES = ["weekly", "weeks", "levels", "companies", "table", "history", "calendar",
+                 "owed", "new_cash", "refunds", "unidentified", "week_zero", "ledger", "rates"]
+
+
+def run_step_17(with_model):
+    """Execute step 17's `if` with fake inputs and functions; return (calls, printed)."""
+    calls, printed = [], []
+
+    def recorder(name, result):
+        def call(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return result
+        return call
+
+    rolled_result, actual_result = object(), object()
+    namespace = {name: f"<{name}>" for name in STEP_17_NAMES}
+    settings = SimpleNamespace(
+        evaluation=SimpleNamespace(run=True, with_model=with_model,
+                                   validation_origins=(33, 34, 35)),
+        receivables=SimpleNamespace(horizons=5))
+    namespace.update(
+        settings=settings, time=SimpleNamespace(perf_counter=lambda: 0.0),
+        print=lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        actual_totals=recorder("actual_totals", actual_result),
+        rolling_forecasts=recorder("rolling_forecasts", rolled_result),
+        block_feature_columns=recorder("block_feature_columns", "<blocks>"),
+        show_rolling_forecasts=recorder("show_rolling_forecasts", None),
+        deflated_reference=recorder("deflated_reference", "<reference>"),
+        show_deflated_reference=recorder("show_deflated_reference", None),
+        rule_reference=recorder("rule_reference", "<rule>"),
+        show_rule_reference=recorder("show_rule_reference", None))
+    module = ast.Module(body=[step_17_block()], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
+    return calls, printed, rolled_result, actual_result
+
+
+def names_called(calls):
+    return [name for name, _, _ in calls if name != "block_feature_columns"]
+
+
+def test_step_17_with_model_true_calls_everything_in_order():
+    calls, printed, _, _ = run_step_17(True)
+    assert names_called(calls) == ["actual_totals", "rolling_forecasts",
+                                   "show_rolling_forecasts", "deflated_reference",
+                                   "show_deflated_reference", "rule_reference",
+                                   "show_rule_reference"]
+    assert SKIP_LINE not in printed
+
+
+def test_step_17_with_model_false_does_not_call_rolling_forecasts():
+    calls, printed, _, _ = run_step_17(False)
+    assert names_called(calls) == ["actual_totals", "deflated_reference",
+                                   "show_deflated_reference", "rule_reference",
+                                   "show_rule_reference"]
+    assert "block_feature_columns" not in [name for name, _, _ in calls]
+
+
+def test_step_17_with_model_false_prints_the_skip_line_once_after_the_header():
+    _, printed, _, _ = run_step_17(False)
+    assert printed == ["Step 17: evaluation over the validation origins 33-35 (3 origins)",
+                       SKIP_LINE]
+
+
+def test_step_17_with_model_true_prints_only_the_header():
+    _, printed, _, _ = run_step_17(True)
+    assert printed == ["Step 17: evaluation over the validation origins 33-35 (3 origins)"]
+
+
+def test_step_17_with_model_false_passes_none_as_rolled():
+    calls, _, _, actual = run_step_17(False)
+    shown = [args for name, args, _ in calls if name == "show_deflated_reference"]
+    assert len(shown) == 1
+    assert shown[0][0] == "<reference>"
+    assert shown[0][1] is None
+    assert shown[0][2] is actual
+
+
+def test_step_17_with_model_true_passes_the_rolled_forecasts_on():
+    calls, _, rolled, actual = run_step_17(True)
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert by_name["show_rolling_forecasts"][0] == (rolled, actual)
+    assert by_name["show_deflated_reference"][0][1] is rolled
+    args, kwargs = by_name["rolling_forecasts"]
+    assert args[0] == "<table>" and list(args[1]) == [33, 34, 35]
+    assert kwargs["block_columns"] == "<blocks>"
+    assert callable(kwargs["on_origin_done"])
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_the_rule_and_the_references_run_alike_in_both_branches(with_model):
+    calls, _, _, actual = run_step_17(with_model)
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert by_name["actual_totals"][0] == ("<weekly>", "<weeks>", "<levels>", "<companies>",
+                                           [33, 34, 35], 5)
+    assert by_name["deflated_reference"][0] == ("<weekly>", "<weeks>", "<levels>",
+                                                "<calendar>", "<companies>", [33, 34, 35], 5,
+                                                "<week_zero>")
+    args, kwargs = by_name["rule_reference"]
+    assert args[:3] == ("<ledger>", "<rates>", [33, 34, 35])
+    assert kwargs == {"companies": "<companies>", "new_cash": "<new_cash>",
+                      "refunds": "<refunds>", "unidentified": "<unidentified>",
+                      "levels": "<levels>", "calendar": "<calendar>",
+                      "week_zero": "<week_zero>"}
+    assert by_name["show_rule_reference"][0] == ("<rule>", actual)
+
+
+def test_step_17_the_progress_callback_prints_one_line():
+    calls, printed, _, _ = run_step_17(True)
+    progress = [kwargs for name, _, kwargs in calls if name == "rolling_forecasts"][0]
+    progress["on_origin_done"](1, 3, 33, 95.0)
+    assert printed[-1] == "  ... origin 33: 1 of 3 done (95 s), about 0 min left"
+
+
+# show_deflated_reference with rolled=None: the same data as SHOW_REFERENCE above; the
+# "hurdle model" line is left out, the other three lines are the same as with rolled.
+
+SHOW_REFERENCE_NO_MODEL = SHOW_REFERENCE.replace(
+    "script.show_deflated_reference(reference, Forecast(totals=totals, customers=customers), "
+    "actual)", "script.show_deflated_reference(reference, None, actual)")
+
+
+def test_show_reference_no_model_script_premise():
+    assert SHOW_REFERENCE_NO_MODEL != SHOW_REFERENCE
+    assert "show_deflated_reference(reference, None, actual)" in SHOW_REFERENCE_NO_MODEL
+
+
+@pytest.fixture(scope="module")
+def no_model_reference_lines():
+    result = run_code(SHOW_REFERENCE_NO_MODEL)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_deflated_reference_without_the_model_prints_three_lines(no_model_reference_lines):
+    assert len(no_model_reference_lines) == 3
+    assert not any("hurdle" in line for line in no_model_reference_lines)
+
+
+def test_show_deflated_reference_without_the_model_header_is_the_same(no_model_reference_lines,
+                                                                      reference_lines):
+    assert no_model_reference_lines[0] == reference_lines[0]
+    assert no_model_reference_lines[0] == (
+        "        the deflated reference (U14.3): 16 rows; over the 3 consolidated (origin, h) "
+        "with data, nominal, million TRY:")
+
+
+def test_show_deflated_reference_without_the_model_reference_lines_by_hand(
+        no_model_reference_lines):
+    assert no_model_reference_lines[1] == ("          deflated" + " " * 17 + "5.0 vs actual 5.0 "
+                                           "(ratio 1.000), fell back to the recent level in 1 "
+                                           "of 3")
+    assert no_model_reference_lines[2] == ("          deflated_nolevel" + " " * 9 + "2.5 vs "
+                                           "actual 5.0 (ratio 0.500), fell back to the recent "
+                                           "level in 0 of 3")
+
+
+def test_show_deflated_reference_with_and_without_the_model_differ_only_by_its_line(
+        no_model_reference_lines, reference_lines):
+    assert [reference_lines[0]] + reference_lines[2:] == no_model_reference_lines
+    assert reference_lines[1].startswith("          hurdle model")
+
+
+# A consolidated (origin, h) with an actual but no model total: with the model, the inner
+# merge drops it (2 pairs); without the model it stays (3 pairs).
+SHOW_REFERENCE_MODEL_SHORT = SHOW_REFERENCE.replace(
+    'pd.DataFrame({"company_code": ["ALL"] * 4, **keys, "total": [2e6, 1.5e6, 3e6, 1e6]})',
+    'pd.DataFrame({"company_code": ["ALL"] * 4, **keys, '
+    '"total": [2e6, 1.5e6, 3e6, 1e6]}).iloc[1:]')
+
+
+def test_show_deflated_reference_with_the_model_counts_only_pairs_the_model_has():
+    assert SHOW_REFERENCE_MODEL_SHORT != SHOW_REFERENCE
+    result = run_code(SHOW_REFERENCE_MODEL_SHORT)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()[:-1]
+    assert "over the 2 consolidated (origin, h)" in lines[0]
+    # Without (10, 1): hurdle 1.5 + 3.0 = 4.5 vs actual 2.0 + 2.0 = 4.0 -> 1.125.
+    assert lines[1] == "          hurdle model" + " " * 13 + "4.5 vs actual 4.0 (ratio 1.125)"

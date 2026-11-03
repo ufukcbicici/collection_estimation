@@ -152,9 +152,13 @@ class TopupSettings:
 class EvaluationSettings:
     """The evaluation over many origins (U14, `evaluate.py`). Validation is scored now; the
     test origins are scored once, in U16 (the v1 test)."""
-    run: bool                              # run pipeline step 17 (slow: one fit per origin)
+    run: bool                              # run pipeline step 17
+    with_model: bool                       # the hurdle model's forecasts in step 17 (slow:
+                                           # two fits per origin); false = references only
     validation_origins: tuple[int, ...]    # sorted; scored in U14
     test_origins: tuple[int, ...]          # sorted; every target week after validation's
+    rule_doubtful_days: int                # the financial rule leaves out invoices more than
+                                           # this many days past due (doubtful)
 
 
 @dataclass(frozen=True)
@@ -261,8 +265,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     check_keys(topups, {"method", "window", "with_level", "compare", "compare_first_origin",
                         "compare_last_origin", "compare_windows"}, f"{name} [topups]")
     evaluation = raw["evaluation"]
-    check_keys(evaluation, {"run", "validation_origins", "test_origins"},
-               f"{name} [evaluation]")
+    check_keys(evaluation, {"run", "with_model", "validation_origins", "test_origins",
+                            "rule_doubtful_days"}, f"{name} [evaluation]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -459,7 +463,10 @@ def read_evaluation(table: dict, horizons: int, where: str) -> EvaluationSetting
                          f"week {validation[-1] + horizons}, which is not before the first test "
                          f"target week {test[0] + 1} (first test origin {test[0]} + 1)")
     return EvaluationSettings(run=bool_setting(table, "run", where),
-                              validation_origins=validation, test_origins=test)
+                              with_model=bool_setting(table, "with_model", where),
+                              validation_origins=validation, test_origins=test,
+                              rule_doubtful_days=count_setting(table, "rule_doubtful_days",
+                                                               where))
 
 
 def read_collections_layout(table: dict, where: str) -> CollectionsLayout:

@@ -212,9 +212,14 @@ compare_windows = [4, 8, 13]
 # must come before the first test target week. The data's last week is 64, so the last
 # origin with all five target weeks is 59. Validation starts at 33 (2026-11-02, Ufuk), so it
 # is about as large as the test: 12 origins and 16 target weeks against 11 and 15.
-run = true                       # slow: two fits per origin, about 95 s each
+run = true
+with_model = true                # the hurdle model's forecasts (slow: two fits per origin,
+                                 # about 95 s each); false = the references only
 validation_origins = [33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
 test_origins = [49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+rule_doubtful_days = 90          # the financial rule (U14.4) leaves out invoices more than
+                                 # this many days past due: a finance person would not count
+                                 # on that cash
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

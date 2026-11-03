@@ -200,8 +200,10 @@ VALID = {
                "compare_windows": "[13, 4]"},
     # U14.2: the evaluation over many origins. Values differ from synthetic.toml's on purpose
     # (unsorted lists, run true); 44 + 13 = 57 keeps every horizons value the tests use legal.
+    # U14.4: rule_doubtful_days 60 (synthetic.toml has 90).
     "evaluation": {"run": "true", "validation_origins": "[44, 37, 40]",
-                   "test_origins": "[60, 57]"},
+                   "test_origins": "[60, 57]", "rule_doubtful_days": "60",
+                   "with_model": "true"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -5354,11 +5356,13 @@ from collection_estimation.hurdle.settings import (  # noqa: E402
     EvaluationSettings, read_evaluation)
 
 EVALUATION = f"{FILE_NAME} [evaluation]"
-EVALUATION_KEYS = ["run", "test_origins", "validation_origins"]
+EVALUATION_KEYS = ["rule_doubtful_days", "run", "test_origins", "validation_origins",
+                   "with_model"]
 
 
 def evaluation_table(**changes):
-    table = {"run": True, "validation_origins": [44, 37, 40], "test_origins": [60, 49]}
+    table = {"run": True, "validation_origins": [44, 37, 40], "test_origins": [60, 49],
+             "rule_doubtful_days": 60, "with_model": True}
     table.update(changes)
     return table
 
@@ -5373,7 +5377,7 @@ def evaluation_error(horizons=5, **changes):
 
 def test_evaluation_settings_fields_in_order():
     assert [field.name for field in dataclasses.fields(EvaluationSettings)] == [
-        "run", "validation_origins", "test_origins"]
+        "run", "with_model", "validation_origins", "test_origins", "rule_doubtful_days"]
 
 
 def test_settings_has_an_evaluation_field_between_topups_and_debug():
@@ -5384,7 +5388,8 @@ def test_settings_has_an_evaluation_field_between_topups_and_debug():
 
 def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
     evaluation = load(tmp_path, repo).evaluation
-    for attribute in ("run", "validation_origins", "test_origins"):
+    for attribute in ("run", "with_model", "validation_origins", "test_origins",
+                      "rule_doubtful_days"):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(evaluation, attribute, None)
     assert hash(evaluation) == hash(dataclasses.replace(evaluation))
@@ -5401,8 +5406,9 @@ def test_settings_evaluation_attribute_is_frozen(tmp_path, repo):
 def test_the_evaluation_section_is_read(tmp_path, repo):
     evaluation = load(tmp_path, repo).evaluation
     assert isinstance(evaluation, EvaluationSettings)
-    assert evaluation == EvaluationSettings(run=True, validation_origins=(37, 40, 44),
-                                            test_origins=(57, 60))
+    assert evaluation == EvaluationSettings(run=True, with_model=True,
+                                            validation_origins=(37, 40, 44),
+                                            test_origins=(57, 60), rule_doubtful_days=60)
 
 
 def test_the_origin_lists_are_tuples_of_ints(tmp_path, repo):
@@ -5502,7 +5508,8 @@ def test_the_overlap_check_does_not_use_the_diagnostic_origin(tmp_path, repo):
 
 def test_read_evaluation_by_hand():
     assert read_evaluation(evaluation_table(), 5, "here") == EvaluationSettings(
-        run=True, validation_origins=(37, 40, 44), test_origins=(49, 60))
+        run=True, with_model=True, validation_origins=(37, 40, 44), test_origins=(49, 60),
+        rule_doubtful_days=60)
 
 
 @pytest.mark.parametrize("validation, test, expected_validation, expected_test", [
@@ -5647,7 +5654,7 @@ def test_read_evaluation_with_a_key_absent_raises_key_error(key):
 
 
 def test_read_evaluation_ignores_an_unknown_key_on_its_own():
-    # Unknown keys are check_keys' job (load_settings); read_evaluation reads only its three.
+    # Unknown keys are check_keys' job (load_settings); read_evaluation reads only its five.
     found = read_evaluation(evaluation_table(extra=1), 5, "here")
     assert found == read_evaluation(evaluation_table(), 5, "here")
 
@@ -5683,6 +5690,8 @@ def test_the_synthetic_evaluation_settings():
     # Validation starts at 33 since 2026-11-02 (Ufuk), about as large as the test.
     assert evaluation.validation_origins == tuple(range(33, 45))
     assert evaluation.test_origins == tuple(range(49, 60))
+    # U14.4 (2026-11-03): a finance person would not count on cash more than 90 days past due.
+    assert evaluation.rule_doubtful_days == 90
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -5691,3 +5700,203 @@ def test_the_synthetic_validation_cannot_see_the_test():
     evaluation = settings.evaluation
     horizons = settings.receivables.horizons
     assert evaluation.validation_origins[-1] + horizons <= evaluation.test_origins[0]
+
+
+# =============================================================================================
+# U14.4: [evaluation] rule_doubtful_days, the financial rule's doubtful threshold (days past
+# due). A required count (a whole number, 1 or more), read with `count_setting`. VALID holds 60.
+# =============================================================================================
+
+def test_rule_doubtful_days_is_read_through_the_file(tmp_path, repo):
+    assert load(tmp_path, repo).evaluation.rule_doubtful_days == 60
+
+
+@pytest.mark.parametrize("text, expected", [("1", 1), ("90", 90), ("365", 365),
+                                            ("100000", 100000)])
+def test_rule_doubtful_days_good_values_through_the_file(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo,
+                 changes={("evaluation", "rule_doubtful_days"): text}).evaluation
+    assert found.rule_doubtful_days == expected
+    assert type(found.rule_doubtful_days) is int
+
+
+def test_rule_doubtful_days_missing_through_the_file_has_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "rule_doubtful_days"): REMOVE})
+    assert message == (f"{EVALUATION}: missing ['rule_doubtful_days']; expected exactly "
+                       f"{EVALUATION_KEYS}")
+
+
+def test_rule_doubtful_days_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={
+        ("evaluation", "rule_doubtful_days"): REMOVE, ("evaluation", "rule_doubtful_day"): "90"})
+    assert message == (f"{EVALUATION}: missing ['rule_doubtful_days']; unknown "
+                       f"['rule_doubtful_day']; expected exactly {EVALUATION_KEYS}")
+
+
+def test_rule_doubtful_days_in_another_section_is_unknown_there(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("receivables", "rule_doubtful_days"): "90"})
+    assert "[receivables]" in message
+    assert "unknown ['rule_doubtful_days']" in message
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("-90", "-90"),
+                                         ("true", "True"), ("false", "False"),
+                                         ("1.5", "1.5"), ("90.0", "90.0"), ('"90"', "'90'"),
+                                         ("[90]", "[90]")],
+                         ids=["zero", "negative", "very-negative", "true", "false", "fraction",
+                              "whole-float", "text", "list"])
+def test_rule_doubtful_days_bad_through_the_file_has_the_exact_message(tmp_path, repo, text,
+                                                                        shown):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "rule_doubtful_days"): text})
+    assert message == (f"{EVALUATION}: rule_doubtful_days is {shown}, not a whole number of 1 "
+                       f"or more")
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 1.5, 90.0, "90", None, [90]],
+                         ids=["zero", "negative", "true", "false", "fraction", "whole-float",
+                              "text", "none", "list"])
+def test_read_evaluation_bad_rule_doubtful_days_has_the_exact_message(bad):
+    assert (evaluation_error(rule_doubtful_days=bad)
+            == f"here: rule_doubtful_days is {bad!r}, not a whole number of 1 or more")
+
+
+@pytest.mark.parametrize("good", [1, 2, 30, 90, 10**6])
+def test_read_evaluation_good_rule_doubtful_days_is_kept_as_given(good):
+    found = read_evaluation(evaluation_table(rule_doubtful_days=good), 5, "here")
+    assert found.rule_doubtful_days == good
+    assert type(found.rule_doubtful_days) is int
+
+
+def test_rule_doubtful_days_does_not_change_the_other_evaluation_fields():
+    a = read_evaluation(evaluation_table(rule_doubtful_days=1), 5, "here")
+    b = read_evaluation(evaluation_table(rule_doubtful_days=365), 5, "here")
+    assert (a.run, a.validation_origins, a.test_origins) == (b.run, b.validation_origins,
+                                                             b.test_origins)
+    assert a != b
+
+
+def test_rule_doubtful_days_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("evaluation", "rule_doubtful_days"): "7"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "evaluation":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+
+
+def test_rule_doubtful_days_is_checked_after_the_origin_lists_and_the_overlap():
+    assert (evaluation_error(rule_doubtful_days=0, validation_origins=[])
+            == "here: validation_origins is empty")
+    message = evaluation_error(rule_doubtful_days=0, validation_origins=[40], test_origins=[41])
+    assert message.startswith("here: the last validation origin 40")
+
+
+def test_rule_doubtful_days_is_checked_after_run():
+    assert evaluation_error(run="yes", rule_doubtful_days=0) == (
+        "here: run is 'yes', not true or false")
+
+
+def test_read_evaluation_without_rule_doubtful_days_raises_key_error():
+    table = evaluation_table()
+    del table["rule_doubtful_days"]
+    with pytest.raises(KeyError):
+        read_evaluation(table, 5, "here")
+
+
+
+# =============================================================================================
+# [evaluation] with_model (2026-11-03): run the hurdle model's forecasts in step 17 or not. A
+# required bool, read with `bool_setting` right after `run`. VALID holds true. The
+# synthetic-settings test does not pin it: the committed file says true, Ufuk's local one false.
+# =============================================================================================
+
+def test_with_model_is_read_through_the_file(tmp_path, repo):
+    assert load(tmp_path, repo).evaluation.with_model is True
+
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_with_model_is_read_as_a_bool(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo, changes={("evaluation", "with_model"): text}).evaluation
+    assert found.with_model is expected
+
+
+def test_with_model_is_independent_of_run(tmp_path, repo):
+    found = load(tmp_path, repo, changes={("evaluation", "run"): "false",
+                                          ("evaluation", "with_model"): "true"}).evaluation
+    assert (found.run, found.with_model) == (False, True)
+    found = load(tmp_path, repo, changes={("evaluation", "run"): "true",
+                                          ("evaluation", "with_model"): "false"}).evaluation
+    assert (found.run, found.with_model) == (True, False)
+
+
+def test_with_model_missing_through_the_file_has_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "with_model"): REMOVE})
+    assert message == (f"{EVALUATION}: missing ['with_model']; expected exactly "
+                       f"['rule_doubtful_days', 'run', 'test_origins', 'validation_origins', "
+                       f"'with_model']")
+
+
+def test_with_model_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={
+        ("evaluation", "with_model"): REMOVE, ("evaluation", "with_models"): "true"})
+    assert message == (f"{EVALUATION}: missing ['with_model']; unknown ['with_models']; "
+                       f"expected exactly {EVALUATION_KEYS}")
+
+
+def test_with_model_not_a_bool_through_the_file(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "with_model"): '"no"'})
+    assert message == f"{EVALUATION}: with_model is 'no', not true or false"
+
+
+@pytest.mark.parametrize("bad, shown", [(1, "1"), (0, "0"), ("true", "'true'"),
+                                        (None, "None"), ([True], "[True]"), (1.0, "1.0")])
+def test_with_model_that_is_not_a_bool_has_the_exact_message(bad, shown):
+    assert evaluation_error(with_model=bad) == f"here: with_model is {shown}, not true or false"
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_read_evaluation_with_model_is_kept_as_given(value):
+    found = read_evaluation(evaluation_table(with_model=value), 5, "here")
+    assert found.with_model is value
+
+
+def test_with_model_does_not_change_the_other_evaluation_fields():
+    a = read_evaluation(evaluation_table(with_model=True), 5, "here")
+    b = read_evaluation(evaluation_table(with_model=False), 5, "here")
+    assert dataclasses.replace(a, with_model=False) == b
+
+
+def test_with_model_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("evaluation", "with_model"): "false"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "evaluation":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+
+
+def test_with_model_is_checked_after_run():
+    assert evaluation_error(run="yes", with_model="no") == "here: run is 'yes', not true or false"
+
+
+def test_with_model_is_checked_before_rule_doubtful_days():
+    assert (evaluation_error(with_model="no", rule_doubtful_days=0)
+            == "here: with_model is 'no', not true or false")
+
+
+def test_with_model_is_checked_after_the_origin_lists():
+    assert (evaluation_error(with_model="no", validation_origins=[])
+            == "here: validation_origins is empty")
+
+
+def test_read_evaluation_without_with_model_raises_key_error():
+    table = evaluation_table()
+    del table["with_model"]
+    with pytest.raises(KeyError):
+        read_evaluation(table, 5, "here")
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_with_model_is_a_bool_whatever_its_value():
+    assert isinstance(load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).evaluation.with_model, bool)

@@ -71,6 +71,7 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
     actual_totals,
     deflated_reference,
     rolling_forecasts,
+    rule_reference,
 )
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
@@ -576,26 +577,40 @@ def main():
     if settings.evaluation.run:
         origins = list(settings.evaluation.validation_origins)
         print(f"Step 17: evaluation over the validation origins {origins[0]}-{origins[-1]} "
-              f"({len(origins)} origins, two fits each)")
-        started = time.perf_counter()
-
-        def progress(done, total, at, seconds):
-            left = (time.perf_counter() - started) / done * (total - done)
-            print(f"  ... origin {at}: {done} of {total} done ({seconds:.0f} s), about "
-                  f"{left / 60:.0f} min left")
-
-        rolled = rolling_forecasts(table, origins, settings,
-                                   block_columns=block_feature_columns(history, calendar, owed),
-                                   companies=companies, new_cash=new_cash, refunds=refunds,
-                                   unidentified=unidentified, levels=levels, calendar=calendar,
-                                   week_zero=week_zero, on_origin_done=progress)
+              f"({len(origins)} origins)")
         rolled_actual = actual_totals(weekly, weeks, levels, companies, origins,
                                       settings.receivables.horizons)
-        show_rolling_forecasts(rolled, rolled_actual)
+
+        # The hurdle model at every origin (slow: two fits each). [evaluation] with_model =
+        # false skips it, to look at the references alone; then rolled is None.
+        rolled = None
+        if settings.evaluation.with_model:
+            started = time.perf_counter()
+
+            def progress(done, total, at, seconds):
+                left = (time.perf_counter() - started) / done * (total - done)
+                print(f"  ... origin {at}: {done} of {total} done ({seconds:.0f} s), about "
+                      f"{left / 60:.0f} min left")
+
+            rolled = rolling_forecasts(
+                table, origins, settings,
+                block_columns=block_feature_columns(history, calendar, owed),
+                companies=companies, new_cash=new_cash, refunds=refunds,
+                unidentified=unidentified, levels=levels, calendar=calendar,
+                week_zero=week_zero, on_origin_done=progress)
+            show_rolling_forecasts(rolled, rolled_actual)
+        else:
+            print("        the hurdle model's forecasts are skipped ([evaluation] with_model = "
+                  "false)")
         # U14.3: the `deflated` reference at the same origins, refitted at each.
         reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins,
                                        settings.receivables.horizons, week_zero)
         show_deflated_reference(reference, rolled, rolled_actual)
+        # U14.4: the financial rule at the same origins (open invoices, due date + usual delay).
+        rule = rule_reference(ledger, rates, origins, settings, companies=companies,
+                              new_cash=new_cash, refunds=refunds, unidentified=unidentified,
+                              levels=levels, calendar=calendar, week_zero=week_zero)
+        show_rule_reference(rule, rolled_actual)
 
     # Later steps follow as each unit is built.
 
@@ -1378,26 +1393,72 @@ def show_rolling_forecasts(rolled, actual):
 
 def show_deflated_reference(reference, rolled, actual):
     """Step 17's `deflated` reference (U14.3): over all consolidated (origin, h) with data,
-    the model's forecast and each reference's against the actual cash (nominal), and how
-    often each fell back to the recent level there. Scores come with U14.5."""
+    the model's forecast (if `rolled` is not None) and each reference's against the actual
+    cash (nominal), and how often each fell back to the recent level there. Scores come with
+    U14.5."""
     keys = ["company_code", "origin_week", "h", "target_week"]
-    consolidated = actual[actual["company_code"] == CONSOLIDATED][keys + ["actual"]]
-    wide = reference.pivot(index=keys, columns="reference", values="forecast").reset_index()
-    fallbacks = reference.pivot(index=keys, columns="reference", values="fallback").add_suffix(
-        " fallback").reset_index()
-    rows = (consolidated.merge(rolled.totals[keys + ["total"]], on=keys, validate="one_to_one")
-            .merge(wide, on=keys, validate="one_to_one")
-            .merge(fallbacks, on=keys, validate="one_to_one"))
+    rows = actual[actual["company_code"] == CONSOLIDATED][keys + ["actual"]]
+
+    # One column per reference: its forecast, and whether it fell back.
+    for name in REFERENCES:
+        mine = reference[reference["reference"] == name]
+        mine = mine[keys + ["forecast", "fallback"]].rename(
+            columns={"forecast": name, "fallback": name + " fallback"})
+        rows = rows.merge(mine, on=keys, validate="one_to_one")
+    lines = list(REFERENCES)
+    if rolled is not None:
+        rows = rows.merge(rolled.totals[keys + ["total"]], on=keys, validate="one_to_one")
+        lines = ["total"] + lines
+
     print(f"        the deflated reference (U14.3): {len(reference)} rows; over the "
           f"{len(rows)} consolidated (origin, h) with data, nominal, million TRY:")
-    for name, column in (("hurdle model", "total"), *((r, r) for r in REFERENCES)):
+    came = rows["actual"].sum()
+    for column in lines:
+        name = "hurdle model" if column == "total" else column
         fell_back = ""
         if column in REFERENCES:
             fell_back = (f", fell back to the recent level in "
                          f"{int(rows[column + ' fallback'].sum())} of {len(rows)}")
         print(f"          {name:<17} {rows[column].sum() / 1e6:>10,.1f} vs actual "
-              f"{rows['actual'].sum() / 1e6:,.1f} (ratio "
-              f"{rows[column].sum() / rows['actual'].sum():.3f}){fell_back}")
+              f"{came / 1e6:,.1f} (ratio {rows[column].sum() / came:.3f}){fell_back}")
+
+
+def show_rule_reference(rule, actual):
+    """Step 17's financial-rule reference (U14.4): over the consolidated (origin, h) with
+    data, the rule's forecast against the actual cash, in total and per h (late invoices all
+    land in h = 1); and what the rule decided for the open invoices, summed over the origins.
+    Scores come with U14.5."""
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    consolidated = actual[actual["company_code"] == CONSOLIDATED]
+    rows = consolidated[keys + ["actual"]].merge(rule.totals, on=keys, validate="one_to_one")
+
+    forecast, came = rows["forecast"].sum(), rows["actual"].sum()
+    print(f"          {'financial rule':<17} {forecast / 1e6:>10,.1f} vs actual "
+          f"{came / 1e6:,.1f} (ratio {forecast / came:.3f})")
+
+    # Per h: the forecast / actual, and how much of the invoice cash is late invoices.
+    by_h = rows.groupby("h")[["forecast", "actual", "invoice_cash", "late_cash"]].sum()
+    by_h["ratio"] = by_h["forecast"] / by_h["actual"]
+    by_h["late share"] = by_h["late_cash"] / by_h["invoice_cash"]
+    print("          the rule per h, consolidated, million TRY:")
+    shown = by_h[["forecast", "actual"]] / 1e6
+    shown["ratio"] = by_h["ratio"]
+    shown["late share"] = by_h["late share"]
+    print(shown.round(3).to_string())
+
+    # What the rule decided for each open invoice, added up over every origin.
+    decided = rule.invoices.groupby("status")["outstanding_try"].agg(["size", "sum"])
+    decided["sum"] = decided["sum"] / 1e6
+    decided.columns = ["invoices", "million TRY"]
+    print("          the open invoices at the origins, by what the rule decided "
+          "(summed over the origins):")
+    print(decided.round(1).to_string())
+    # Where the delays came from, as a share of the open TRY.
+    by_source = rule.invoices.groupby("delay_from")["outstanding_try"].sum()
+    share = by_source / by_source.sum()
+    print(f"          the delay came from the customer for {share.get('customer', 0.0):.1%} "
+          f"of the open TRY, its company's median for {share.get('company', 0.0):.1%}, "
+          f"none (0 days) for {share.get('none', 0.0):.1%}")
 
 
 def show_actual_totals(actual, weekly, weeks):
