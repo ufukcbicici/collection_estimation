@@ -67,12 +67,18 @@ from collection_estimation.hurdle.holidays import load_holidays, public_holidays
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
 from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    HORIZON_TOTAL,
+    POOLED,
     REFERENCES,
     actual_totals,
     deflated_reference,
+    evaluation_scores,
+    rolling_fingerprint,
     rolling_forecasts,
     rule_reference,
+    stack_forecasts,
 )
+from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -592,12 +598,24 @@ def main():
                 print(f"  ... origin {at}: {done} of {total} done ({seconds:.0f} s), about "
                       f"{left / 60:.0f} min left")
 
-            rolled = rolling_forecasts(
-                table, origins, settings,
-                block_columns=block_feature_columns(history, calendar, owed),
+            block_columns = block_feature_columns(history, calendar, owed)
+
+            def fit_every_origin():
+                return rolling_forecasts(
+                    table, origins, settings, block_columns=block_columns,
+                    companies=companies, new_cash=new_cash, refunds=refunds,
+                    unidentified=unidentified, levels=levels, calendar=calendar,
+                    week_zero=week_zero, on_origin_done=progress)
+
+            # Read from the cache if nothing the forecasts are made from has changed (the
+            # fingerprint: same arguments); else fitted, and the cache written.
+            fingerprint = rolling_fingerprint(
+                table, origins, settings, block_columns=block_columns,
                 companies=companies, new_cash=new_cash, refunds=refunds,
                 unidentified=unidentified, levels=levels, calendar=calendar,
-                week_zero=week_zero, on_origin_done=progress)
+                week_zero=week_zero)
+            rolled = load_with_cache("hurdle_rolling_forecasts", fingerprint, fit_every_origin,
+                                     settings.data.cache_folder)
             show_rolling_forecasts(rolled, rolled_actual)
         else:
             print("        the hurdle model's forecasts are skipped ([evaluation] with_model = "
@@ -611,6 +629,9 @@ def main():
                               new_cash=new_cash, refunds=refunds, unidentified=unidentified,
                               levels=levels, calendar=calendar, week_zero=week_zero)
         show_rule_reference(rule, rolled_actual)
+        forecasts = stack_forecasts(rolled, reference, rule)
+        scores = evaluation_scores(forecasts, rolled_actual, settings.receivables.horizons)
+        show_evaluation_scores(scores, settings.receivables.horizons)
 
     # Later steps follow as each unit is built.
 
@@ -1459,6 +1480,40 @@ def show_rule_reference(rule, actual):
     print(f"          the delay came from the customer for {share.get('customer', 0.0):.1%} "
           f"of the open TRY, its company's median for {share.get('company', 0.0):.1%}, "
           f"none (0 days) for {share.get('none', 0.0):.1%}")
+
+
+def show_evaluation_scores(scores, horizons):
+    """Step 17's scores (U14.5): consolidated, one line per method (WAPE, bias and MAPE over
+    all (origin, h), WAPE per h and of the per-origin total); then the pooled WAPE per method
+    and company."""
+    total_name = f"{horizons}-week total WAPE"
+
+    # 1. Consolidated, one line per method.
+    consolidated = scores[scores["company_code"] == CONSOLIDATED]
+    lines = []
+    for method, mine in consolidated.groupby("method", sort=False):
+        by_horizon = mine.set_index("horizon")
+        line = {"method": method,
+                "WAPE": by_horizon.loc[POOLED, "wape"],
+                "bias": by_horizon.loc[POOLED, "bias"],
+                "MAPE": by_horizon.loc[POOLED, "mape"]}
+        for h in range(1, horizons + 1):
+            line[f"h{h}"] = by_horizon["wape"].get(str(h), float("nan"))
+        line[total_name] = by_horizon["wape"].get(HORIZON_TOTAL, float("nan"))
+        lines.append(line)
+    pooled_rows = int(consolidated["rows"][consolidated["horizon"] == POOLED].iloc[0])
+    print(f"        scores (U14.5), consolidated, over {pooled_rows} (origin, h) with data "
+          f"(h1 ... h{horizons}: WAPE per h):")
+    print(pd.DataFrame(lines).set_index("method").round(3).to_string())
+
+    # 2. Per company, the pooled WAPE.
+    pooled = scores[scores["horizon"] == POOLED]
+    methods = list(dict.fromkeys(pooled["method"]))
+    companies = list(dict.fromkeys(pooled["company_code"]))
+    per_company = pooled.pivot(index="method", columns="company_code", values="wape")
+    per_company = per_company.reindex(index=methods, columns=companies)
+    print("        pooled WAPE per company:")
+    print(per_company.round(3).to_string())
 
 
 def show_actual_totals(actual, weekly, weeks):

@@ -18,21 +18,35 @@ U14.4, the financial-rule reference: what a finance person would forecast from t
 invoices, with no model. Each invoice open at the origin is expected on its due date plus the
 customer's usual delay; a date already passed means "late, expected next week"; an invoice
 long past due is doubtful and left out. Plus the same top-ups as the model.
+
+U14.5, the scores: every method's forecasts in one long table (`stack_forecasts`), then per
+method and company the error against the actual cash (`evaluation_scores`): WAPE, bias, the
+mean absolute error in TRY, and MAPE for the consolidated rows; per h, pooled over all h, and
+for the total of the h weeks of each origin.
 """
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
+from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 from .benchmark import deflated_forecasts
+from .cache import source_fingerprint, table_fingerprint
 from .forecast import CONSOLIDATED, Forecast, forecast
 from .prices import deflate, projected_levels
 from .receivables_asof import (end_of_week, open_invoices_at, payment_delays_at,
                                rates_known_at, to_try)
 from .series import week_numbers
 from .topups import topup_forecasts
+
+# The code a forecast at one origin runs (beside this file), for `rolling_fingerprint`. Not
+# evaluate.py itself: it changes often, and `rolling_forecasts` only loops over the origins
+# (after a change to that loop, delete the cache by hand).
+MODEL_CODE = ("forecast.py", "stage1.py", "stage2.py", "topups.py", "benchmark.py", "prices.py",
+              "inflation.py", "training_table.py")
 
 # The columns of the table `actual_totals` returns, in order.
 ACTUAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "actual", "actual_real"]
@@ -63,6 +77,20 @@ RULE_INVOICE_COLUMNS = ["key", "company_code", "document_no", "origin_week", "ne
 # The columns of the `totals` of `rule_reference`, in order. All amounts nominal TRY.
 RULE_COLUMNS = ["company_code", "origin_week", "h", "target_week", "invoice_cash", "late_cash",
                 "fallback_delay_cash", "topup_cash", "price_level", "forecast"]
+
+# The method names of the stacked forecasts; the references are named as in `REFERENCES`.
+HURDLE = "hurdle"
+RULE = "rule"
+# The columns of the table `stack_forecasts` returns, in order. forecast is nominal TRY.
+STACK_COLUMNS = ["method", "company_code", "origin_week", "h", "target_week", "forecast"]
+# The `horizon` of a score row: "1" ... "5" for one h, or one of these two.
+POOLED = "pooled"                    # every (origin, h) together
+HORIZON_TOTAL = "total"              # per origin the sum over its h weeks, then scored
+# The columns of the table `evaluation_scores` returns, in order. rows is the number of
+# (origin, h) scored (of origins, for HORIZON_TOTAL); forecast, actual and abs_error are sums,
+# nominal TRY.
+SCORE_COLUMNS = ["method", "company_code", "horizon", "rows", "forecast", "actual", "abs_error",
+                 "wape", "bias", "mean_abs_error", "mape"]
 
 
 def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
@@ -182,6 +210,45 @@ def rolling_forecasts(table: pd.DataFrame, origins: list[int], settings, *,
             on_origin_done(done, len(origins), origin, time.perf_counter() - started)
     return Forecast(totals=pd.concat([r.totals for r in results], ignore_index=True),
                     customers=pd.concat([r.customers for r in results]))
+
+
+def rolling_fingerprint(table: pd.DataFrame, origins: list[int], settings, *,
+                        block_columns: dict[str, list[str]], companies: list[str],
+                        new_cash: pd.DataFrame, refunds: pd.DataFrame,
+                        unidentified: pd.DataFrame, levels: pd.Series, calendar: pd.DataFrame,
+                        week_zero: date) -> list:
+    """Everything `rolling_forecasts` makes its result from, with its arguments, as a
+    fingerprint for `cache.load_with_cache`: if any of it changes, the cached forecasts are
+    made again. The fits are seeded, so a cached result equals a new one.
+
+    The origins; the settings the fits read (`[receivables]`, `[stage1]`, `[stage2]`, and the
+    method of `[topups]`; not e.g. `[diagnostic]`, which does not change a forecast); the
+    feature lists, companies and week 0; a hash of every input table; and a hash of the
+    model's code (`MODEL_CODE`).
+    """
+    topups = settings.topups
+    here = Path(__file__).parent
+    return [
+        sorted(set(origins)),
+        # 1. The settings the fits read.
+        asdict(settings.receivables),
+        asdict(settings.stage1),
+        asdict(settings.stage2),
+        [topups.method, topups.window, topups.with_level],
+        # 2. The other arguments.
+        block_columns,
+        sorted(companies),
+        week_zero.isoformat(),
+        # 3. The input tables.
+        table_fingerprint(table),
+        table_fingerprint(new_cash),
+        table_fingerprint(refunds),
+        table_fingerprint(unidentified),
+        table_fingerprint(levels),
+        table_fingerprint(calendar),
+        # 4. The model's code.
+        source_fingerprint(*(here / name for name in MODEL_CODE)),
+    ]
 
 
 def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
@@ -459,3 +526,158 @@ def rule_reference(ledger: pd.DataFrame, rates: pd.DataFrame, origins: list[int]
     totals = totals.sort_values(["order", "origin_week", "h"], ignore_index=True)
     totals = totals.drop(columns="order")
     return RuleReference(totals=totals, invoices=pd.concat(all_invoices, ignore_index=True))
+
+
+def stack_forecasts(rolled: Forecast | None, reference: pd.DataFrame,
+                    rule: RuleReference) -> pd.DataFrame:
+    """Every method's forecasts in one long table, one row per method, company, origin and h,
+    nominal TRY: the hurdle model's `total` (from `rolling_forecasts`; left out if `rolled`
+    is None, i.e. step 17 ran without the model), each variant of the `deflated` reference
+    (from `deflated_reference`, named as in `REFERENCES`) and the financial rule (from
+    `rule_reference`).
+
+    Columns `STACK_COLUMNS`, the methods in that order (hurdle, the references, rule), each
+    method's rows in the order they came. Raises ValueError if the reference table lacks one
+    of the variants.
+    """
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    parts = []
+
+    # 1. The hurdle model, if it ran.
+    if rolled is not None:
+        hurdle = rolled.totals[keys + ["total"]].rename(columns={"total": "forecast"})
+        hurdle.insert(0, "method", HURDLE)
+        parts.append(hurdle)
+
+    # 2. The `deflated` references, one variant after the other.
+    for name in REFERENCES:
+        mine = reference.loc[reference["reference"] == name, keys + ["forecast"]].copy()
+        if mine.empty:
+            raise ValueError(f"the reference table has no {name!r} rows")
+        mine.insert(0, "method", name)
+        parts.append(mine)
+
+    # 3. The financial rule.
+    by_rule = rule.totals[keys + ["forecast"]].copy()
+    by_rule.insert(0, "method", RULE)
+    parts.append(by_rule)
+
+    stacked = pd.concat(parts, ignore_index=True)
+    stacked["method"] = stacked["method"].astype(object)
+    stacked["company_code"] = stacked["company_code"].astype(object)
+    return stacked[STACK_COLUMNS]
+
+
+def score_row(method: str, company: str, horizon: str, forecast: pd.Series, actual: pd.Series,
+              with_mape: bool) -> dict:
+    """One row of `evaluation_scores`: the forecasts against the actual cash, both nominal
+    TRY, one value per (origin, h) (or per origin, for a total).
+
+    WAPE = sum |forecast - actual| / sum actual; bias = sum forecast / sum actual - 1; both
+    NaN if the actual cash adds up to 0 or less (a share of nothing). mean_abs_error is the
+    mean |forecast - actual| in TRY. MAPE = mean of |forecast - actual| / actual, only if
+    `with_mape` and every actual is above 0, else NaN.
+    """
+    errors = (forecast - actual).abs()
+    came = float(actual.sum())
+    made = float(forecast.sum())
+
+    wape = float("nan")
+    bias = float("nan")
+    if came > 0:
+        wape = float(errors.sum()) / came
+        bias = made / came - 1
+
+    mape = float("nan")
+    if with_mape and (actual > 0).all():
+        mape = float((errors / actual).mean())
+
+    return {"method": method, "company_code": company, "horizon": horizon,
+            "rows": len(actual), "forecast": made, "actual": came,
+            "abs_error": float(errors.sum()), "wape": wape, "bias": bias,
+            "mean_abs_error": float(errors.mean()), "mape": mape}
+
+
+def evaluation_scores(forecasts: pd.DataFrame, actual: pd.DataFrame,
+                      horizons: int) -> pd.DataFrame:
+    """The scores of every method (`forecasts`, from `stack_forecasts`) against the actual cash
+    (`actual`, from `actual_totals`), per method and company (the companies and "ALL"),
+    nominal TRY. Only the (company, origin, h) with actual cash are scored.
+
+    For each method and company, rows with `horizon`:
+      - "1" ... str(`horizons`): the (origin, h) of that h;
+      - POOLED: every (origin, h) together (a target week counts once per h aiming at it);
+      - HORIZON_TOTAL: per origin, the forecasts and the actual cash added up over its h
+        weeks, then scored as one value per origin. Only origins with actual cash in all
+        `horizons` target weeks; no row if there is none.
+    The numbers are `score_row`'s; MAPE only for "ALL". "ALL" is scored on its own rows, not
+    as the sum of the companies (the `deflated` references fit it on its own).
+
+    Columns `SCORE_COLUMNS`; the methods and companies in the order they come in `forecasts`,
+    per company the h, then POOLED, then HORIZON_TOTAL.
+
+    Raises ValueError if `horizons` is below 1, a forecast's h is not 1 to `horizons`, a
+    method has two forecasts for one (company, origin, h), a forecast is NaN or infinite, or
+    a method has no forecast for a row with actual cash (the methods would be scored on
+    different weeks).
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    keys = ["company_code", "origin_week", "h", "target_week"]
+
+    # 1. Each forecast is for h 1 to horizons, and each method has each row once.
+    outside = sorted(set(forecasts["h"]) - set(range(1, horizons + 1)))
+    if outside:
+        raise ValueError(f"forecasts for h {outside}; horizons is {horizons}")
+    repeated = forecasts.duplicated(["method"] + keys)
+    if repeated.any():
+        first = forecasts.loc[repeated, ["method"] + keys].iloc[0].to_dict()
+        raise ValueError(f"{int(repeated.sum())} forecasts are there twice (first: {first})")
+    # A forecast with no value: the sums would skip it and score that week as perfect.
+    no_value = ~np.isfinite(forecasts["forecast"].astype("float64"))
+    if no_value.any():
+        first = forecasts.loc[no_value, ["method"] + keys].iloc[0].to_dict()
+        raise ValueError(f"{int(no_value.sum())} forecasts are NaN or infinite (first: {first})")
+
+    # 2. Every method has a forecast for every row with actual cash.
+    wanted = actual[keys]
+    methods = list(dict.fromkeys(forecasts["method"]))
+    for method in methods:
+        mine = forecasts.loc[forecasts["method"] == method, keys]
+        found = wanted.merge(mine, on=keys, how="left", indicator=True)
+        missing = found[found["_merge"] == "left_only"]
+        if not missing.empty:
+            first = missing[keys].iloc[0].to_dict()
+            raise ValueError(f"{method!r} has no forecast for {len(missing)} rows with actual "
+                             f"cash (first: {first})")
+
+    # 3. The rows scored: the forecasts beside the actual cash of their week.
+    rows = forecasts.merge(actual[keys + ["actual"]], on=keys, how="inner",
+                           validate="many_to_one")
+
+    # 4. The scores, method by method and company by company.
+    scores = []
+    for (method, company), mine in rows.groupby(["method", "company_code"], sort=False):
+        with_mape = company == CONSOLIDATED
+
+        # Per h.
+        for h in range(1, horizons + 1):
+            at_h = mine[mine["h"] == h]
+            if not at_h.empty:
+                scores.append(score_row(method, company, str(h), at_h["forecast"],
+                                        at_h["actual"], with_mape))
+
+        # Every (origin, h) together.
+        scores.append(score_row(method, company, POOLED, mine["forecast"], mine["actual"],
+                                with_mape))
+
+        # Per origin the sum over its h weeks; only origins with all of them.
+        per_origin = mine.groupby("origin_week").agg(weeks=("h", "size"),
+                                                     forecast=("forecast", "sum"),
+                                                     actual=("actual", "sum"))
+        complete = per_origin[per_origin["weeks"] == horizons]
+        if not complete.empty:
+            scores.append(score_row(method, company, HORIZON_TOTAL, complete["forecast"],
+                                    complete["actual"], with_mape))
+
+    return pd.DataFrame(scores, columns=SCORE_COLUMNS)

@@ -9,6 +9,9 @@ a company with no line in a week with data gets a real 0.0; "ALL" is the sum of 
 U14.2, at the end: `rolling_forecasts`, `forecast.forecast` at every origin, stacked, on the
 small training table and side tables of test_forecast.py. Every cheap check must fire before
 the first fit, which the tests prove by replacing the fits with spies that fail if called.
+
+U14.5, at the very end: `stack_forecasts`, `score_row` and `evaluation_scores`, on hand-made
+tables whose every score is worked out by hand in the comments.
 """
 import numpy as np
 import pandas as pd
@@ -2990,3 +2993,1338 @@ def test_rule_reference_invoices_outside_are_reported_before_top_ups_outside():
                unidentified=unidentified)
     assert str(error.value) == ("the open invoices at origin week 20 have companies not in the "
                                 "list: ['TR04']")
+
+
+
+# =============================================================================================
+# U14.5a, `stack_forecasts`: every method's forecasts in one long table (the hurdle model's
+# `total`, if it ran; each variant of the `deflated` reference; the financial rule).
+# U14.5b, `score_row` and `evaluation_scores`: WAPE, bias, mean absolute error and (for "ALL"
+# only) MAPE, per h, pooled over every (origin, h), and for each origin's h-week total.
+#
+# Every table is hand-made and every expected number is worked out by hand in the comments.
+# =============================================================================================
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    HORIZON_TOTAL, HURDLE, POOLED, RULE, SCORE_COLUMNS, STACK_COLUMNS, RuleReference,
+    evaluation_scores, score_row, stack_forecasts)
+
+S_KEYS = ["company_code", "origin_week", "h", "target_week"]
+NAN = float("nan")
+
+
+# --- builders --------------------------------------------------------------------------------
+
+def s_forecasts(rows):
+    """rows: (method, company_code, origin_week, h, target_week, forecast)."""
+    frame = pd.DataFrame(rows, columns=STACK_COLUMNS)
+    for column in ("origin_week", "h", "target_week"):
+        frame[column] = frame[column].astype("int64")
+    frame["forecast"] = frame["forecast"].astype("float64")
+    return frame
+
+
+def s_actual(rows):
+    """rows: (company_code, origin_week, h, target_week, actual); actual_real is a decoy."""
+    frame = pd.DataFrame(rows, columns=S_KEYS + ["actual"])
+    for column in ("origin_week", "h", "target_week"):
+        frame[column] = frame[column].astype("int64")
+    frame["actual"] = frame["actual"].astype("float64")
+    frame["actual_real"] = -1.0          # never scored: scoring it would make every WAPE NaN
+    return frame
+
+
+# Origins 10 and 11, h = 1, 2, so target weeks 11, 12 (origin 10) and 12, 13 (origin 11).
+S_PAIRS = [(10, 1, 11), (10, 2, 12), (11, 1, 12), (11, 2, 13)]
+
+
+def s_rolled(total_by_company, real_total=-5.0):
+    """A Forecast whose totals have `total` (company -> 4 values in S_PAIRS order) and a
+    `real_total` that is deliberately different (-5.0 everywhere)."""
+    rows = []
+    for company, totals in total_by_company.items():
+        for (origin, h, target), total in zip(S_PAIRS, totals):
+            rows.append({"company_code": company, "origin_week": origin, "h": h,
+                         "target_week": target, "customers": 0.0, "new_customer_cash": 0.0,
+                         "unidentified_cash": 0.0, "refunds": 0.0, "real_total": real_total,
+                         "price_level": 2.0, "total": total, "fallback": False})
+    return Forecast(totals=pd.DataFrame(rows), customers=pd.DataFrame({"key": ["K0"]}))
+
+
+def s_reference(value_by_variant, companies=("TR02", "ALL")):
+    """A deflated_reference-shaped table: per variant, per company, the four S_PAIRS rows;
+    forecast = base + 10 x pair index (real_forecast is half of it, a decoy)."""
+    rows = []
+    for name, base in value_by_variant.items():
+        for company in companies:
+            for i, (origin, h, target) in enumerate(S_PAIRS):
+                forecast = base + 10.0 * i
+                rows.append({"company_code": company, "origin_week": origin, "h": h,
+                             "target_week": target, "reference": name,
+                             "real_forecast": forecast / 2.0, "price_level": 2.0,
+                             "forecast": forecast, "fallback": False})
+    return pd.DataFrame(rows)
+
+
+def s_rule(forecast_by_company):
+    """A RuleReference whose totals have `forecast` (company -> 4 values in S_PAIRS order)."""
+    rows = []
+    for company, forecasts in forecast_by_company.items():
+        for (origin, h, target), forecast in zip(S_PAIRS, forecasts):
+            rows.append({"company_code": company, "origin_week": origin, "h": h,
+                         "target_week": target, "invoice_cash": forecast / 2,
+                         "late_cash": 0.0, "fallback_delay_cash": 0.0,
+                         "topup_cash": forecast / 2, "price_level": 1.0,
+                         "forecast": forecast})
+    return RuleReference(totals=pd.DataFrame(rows), invoices=pd.DataFrame({"key": ["K0"]}))
+
+
+ALL_THREE = {"deflated": 1000.0, "deflated_nolevel": 2000.0, "deflated_trend": 3000.0}
+
+
+@pytest.fixture
+def stack_inputs():
+    rolled = s_rolled({"TR02": [1.0, 2.0, 3.0, 4.0], "ALL": [5.0, 6.0, 7.0, 8.0]})
+    reference = s_reference(ALL_THREE)
+    rule = s_rule({"TR02": [11.0, 12.0, 13.0, 14.0], "ALL": [15.0, 16.0, 17.0, 18.0]})
+    return rolled, reference, rule
+
+
+def score_of(scores, method, company, horizon):
+    found = scores[(scores["method"] == method) & (scores["company_code"] == company)
+                   & (scores["horizon"] == horizon)]
+    assert len(found) == 1, f"expected one row for {method}, {company}, {horizon}: {len(found)}"
+    return found.iloc[0]
+
+
+# --- constants -------------------------------------------------------------------------------
+
+def test_stack_and_score_constants():
+    assert HURDLE == "hurdle"
+    assert RULE == "rule"
+    assert POOLED == "pooled"
+    assert HORIZON_TOTAL == "total"
+    assert STACK_COLUMNS == ["method", "company_code", "origin_week", "h", "target_week",
+                             "forecast"]
+    assert SCORE_COLUMNS == ["method", "company_code", "horizon", "rows", "forecast", "actual",
+                             "abs_error", "wape", "bias", "mean_abs_error", "mape"]
+
+
+def test_method_names_do_not_clash_with_the_reference_names():
+    # A clash would merge two methods' rows into one group in evaluation_scores.
+    assert HURDLE not in REFERENCES and RULE not in REFERENCES and HURDLE != RULE
+
+
+# --- stack_forecasts ---------------------------------------------------------------------------
+
+def test_stack_has_exactly_the_stack_columns_and_a_fresh_index(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    assert list(stacked.columns) == STACK_COLUMNS
+    assert list(stacked.index) == list(range(len(stacked)))
+
+
+def test_stack_with_the_hurdle_methods_in_order_and_row_counts(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    # 8 rows per method: 2 companies x 4 (origin, h); the methods one block after the other.
+    expected_order = [HURDLE, "deflated", "deflated_nolevel", "deflated_trend", RULE]
+    assert list(stacked["method"]) == [m for m in expected_order for _ in range(8)]
+
+
+def test_stack_without_the_hurdle_has_no_hurdle_rows(stack_inputs):
+    _, reference, rule = stack_inputs
+    stacked = stack_forecasts(None, reference, rule)
+    expected_order = ["deflated", "deflated_nolevel", "deflated_trend", RULE]
+    assert list(stacked["method"]) == [m for m in expected_order for _ in range(8)]
+    assert list(stacked.columns) == STACK_COLUMNS
+    assert list(stacked.index) == list(range(32))
+
+
+def test_stack_the_hurdle_forecast_is_its_total_not_its_real_total(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    hurdle = stacked[stacked["method"] == HURDLE]
+    # real_total is -5.0 everywhere in s_rolled; total runs 1 ... 8.
+    assert list(hurdle["forecast"]) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    assert -5.0 not in set(stacked["forecast"])
+
+
+def test_stack_the_hurdle_keys_come_from_its_totals(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    hurdle = stacked[stacked["method"] == HURDLE].reset_index(drop=True)
+    expected = stack_inputs[0].totals[S_KEYS].reset_index(drop=True)
+    pd.testing.assert_frame_equal(hurdle[S_KEYS], expected, check_dtype=False)
+
+
+def test_stack_each_reference_variant_takes_its_own_forecast_column(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    for name, base in ALL_THREE.items():
+        mine = stacked[stacked["method"] == name]
+        # TR02 then ALL, each base + 0, 10, 20, 30 (never real_forecast, half of it).
+        steps = [base + 10.0 * i for i in range(4)]
+        assert list(mine["forecast"]) == steps + steps, name
+
+
+def test_stack_the_rule_forecast_is_its_forecast_column(stack_inputs):
+    stacked = stack_forecasts(*stack_inputs)
+    rule = stacked[stacked["method"] == RULE]
+    assert list(rule["forecast"]) == [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0]
+    assert list(rule["company_code"]) == ["TR02"] * 4 + ["ALL"] * 4
+
+
+def test_stack_each_methods_rows_keep_their_input_order():
+    # 1. The reference's 24 rows in a scrambled, interleaved order.
+    reference = s_reference(ALL_THREE)
+    scrambled = reference.iloc[[23, 0, 13, 5, 2, 17, 8, 11, 1, 19, 4, 22, 6, 15, 3, 9, 12,
+                                21, 7, 14, 18, 10, 20, 16]].reset_index(drop=True)
+    # 2. The hurdle's totals reversed, so its forecasts read 1, 2, 3, 4.
+    rolled = s_rolled({"ALL": [4.0, 3.0, 2.0, 1.0]})
+    rolled = Forecast(totals=rolled.totals.iloc[::-1].reset_index(drop=True),
+                      customers=rolled.customers)
+    # 3. The rule's totals in the order 2, 0, 3, 1.
+    rule = s_rule({"ALL": [1.0, 2.0, 3.0, 4.0]})
+    rule = RuleReference(totals=rule.totals.iloc[[2, 0, 3, 1]].reset_index(drop=True),
+                         invoices=rule.invoices)
+    stacked = stack_forecasts(rolled, scrambled, rule)
+    # 4. Each method's rows as they came: nothing is re-sorted.
+    assert list(stacked.loc[stacked["method"] == HURDLE, "forecast"]) == [1.0, 2.0, 3.0, 4.0]
+    for name in REFERENCES:
+        expected = scrambled.loc[scrambled["reference"] == name, "forecast"]
+        found = stacked.loc[stacked["method"] == name, "forecast"]
+        assert list(found) == list(expected), name
+    assert list(stacked.loc[stacked["method"] == RULE, "forecast"]) == [3.0, 1.0, 4.0, 2.0]
+
+
+def test_stack_values_carry_over_row_by_row(stack_inputs):
+    # Each stacked row is the input row it came from: the stack rebuilt by hand.
+    rolled, reference, rule = stack_inputs
+    stacked = stack_forecasts(rolled, reference, rule)
+    by_hand = [rolled.totals[S_KEYS + ["total"]].rename(columns={"total": "forecast"})
+               .assign(method=HURDLE)]
+    for name in REFERENCES:
+        by_hand.append(reference.loc[reference["reference"] == name, S_KEYS + ["forecast"]]
+                       .assign(method=name))
+    by_hand.append(rule.totals[S_KEYS + ["forecast"]].assign(method=RULE))
+    expected = pd.concat(by_hand, ignore_index=True)[STACK_COLUMNS]
+    pd.testing.assert_frame_equal(stacked, expected, check_dtype=False)
+
+
+def test_stack_method_and_company_code_are_object_dtype(stack_inputs):
+    rolled, reference, rule = stack_inputs
+    # Even if the inputs hold the company code as a category or a pandas string.
+    reference = reference.assign(company_code=reference["company_code"].astype("category"))
+    rule = RuleReference(totals=rule.totals.assign(
+        company_code=rule.totals["company_code"].astype("string")), invoices=rule.invoices)
+    stacked = stack_forecasts(rolled, reference, rule)
+    assert stacked["method"].dtype == object
+    assert stacked["company_code"].dtype == object
+    assert set(stacked["company_code"]) == {"TR02", "ALL"}
+
+
+def test_stack_ignores_a_reference_variant_not_in_references(stack_inputs):
+    rolled, reference, rule = stack_inputs
+    extra = s_reference({"deflated_other": 7.0})
+    stacked = stack_forecasts(rolled, pd.concat([reference, extra], ignore_index=True), rule)
+    assert "deflated_other" not in set(stacked["method"])
+    assert len(stacked) == 5 * 8
+
+
+@pytest.mark.parametrize("missing", list(REFERENCES))
+def test_stack_a_reference_variant_with_no_rows_raises_exact_message(stack_inputs, missing):
+    rolled, reference, rule = stack_inputs
+    without = reference[reference["reference"] != missing]
+    with pytest.raises(ValueError) as error:
+        stack_forecasts(rolled, without, rule)
+    assert str(error.value) == f"the reference table has no {missing!r} rows"
+
+
+def test_stack_an_empty_reference_names_the_first_variant(stack_inputs):
+    _, reference, rule = stack_inputs
+    with pytest.raises(ValueError) as error:
+        stack_forecasts(None, reference.iloc[0:0], rule)
+    assert str(error.value) == "the reference table has no 'deflated' rows"
+
+
+def test_stack_does_not_change_its_inputs(stack_inputs):
+    rolled, reference, rule = stack_inputs
+    before = (rolled.totals.copy(), reference.copy(), rule.totals.copy())
+    stack_forecasts(rolled, reference, rule)
+    pd.testing.assert_frame_equal(rolled.totals, before[0])
+    pd.testing.assert_frame_equal(reference, before[1])
+    pd.testing.assert_frame_equal(rule.totals, before[2])
+
+
+def test_stack_is_deterministic(stack_inputs):
+    pd.testing.assert_frame_equal(stack_forecasts(*stack_inputs), stack_forecasts(*stack_inputs))
+
+
+# --- score_row ---------------------------------------------------------------------------------
+
+def test_score_row_by_hand_with_mape():
+    # forecast 110, 150, 140 against actual 100, 200, 200: errors 10, 50, 60 (sum 120).
+    forecast = pd.Series([110.0, 150.0, 140.0])
+    actual = pd.Series([100.0, 200.0, 200.0])
+    found = score_row("m", "ALL", "pooled", forecast, actual, True)
+    assert found["rows"] == 3
+    assert found["forecast"] == pytest.approx(400.0)
+    assert found["actual"] == pytest.approx(500.0)
+    assert found["abs_error"] == pytest.approx(120.0)
+    assert found["wape"] == pytest.approx(120.0 / 500.0)                 # 0.24
+    assert found["bias"] == pytest.approx(400.0 / 500.0 - 1)             # -0.2
+    assert found["mean_abs_error"] == pytest.approx(40.0)
+    assert found["mape"] == pytest.approx((0.1 + 0.25 + 0.3) / 3)        # 0.216667
+
+
+def test_score_row_keys_are_the_score_columns_in_order():
+    found = score_row("m", "TR02", "1", pd.Series([1.0]), pd.Series([2.0]), False)
+    assert list(found) == SCORE_COLUMNS
+    assert (found["method"], found["company_code"], found["horizon"]) == ("m", "TR02", "1")
+
+
+def test_score_row_mape_is_nan_without_with_mape():
+    found = score_row("m", "TR02", "1", pd.Series([110.0]), pd.Series([100.0]), False)
+    assert np.isnan(found["mape"])
+    assert found["wape"] == pytest.approx(0.1)
+
+
+def test_score_row_mape_is_nan_if_any_actual_is_zero():
+    # Sum of actual 100 > 0: WAPE and bias are defined; MAPE is not (a share of 0).
+    found = score_row("m", "ALL", "1", pd.Series([5.0, 110.0]), pd.Series([0.0, 100.0]), True)
+    assert np.isnan(found["mape"])
+    assert found["wape"] == pytest.approx(15.0 / 100.0)
+    assert found["bias"] == pytest.approx(115.0 / 100.0 - 1)
+
+
+def test_score_row_mape_is_nan_if_any_actual_is_negative():
+    # Errors 6 and 10 over actual -1 + 100 = 99.
+    found = score_row("m", "ALL", "1", pd.Series([5.0, 110.0]), pd.Series([-1.0, 100.0]), True)
+    assert np.isnan(found["mape"])
+    assert found["wape"] == pytest.approx(16.0 / 99.0)
+
+
+@pytest.mark.parametrize("actual", [[0.0, 0.0], [-10.0, 10.0], [-5.0, 1.0]])
+def test_score_row_wape_and_bias_are_nan_if_actual_sums_to_zero_or_less(actual):
+    found = score_row("m", "ALL", "1", pd.Series([3.0, 4.0]), pd.Series(actual), True)
+    assert np.isnan(found["wape"]) and np.isnan(found["bias"]) and np.isnan(found["mape"])
+    # The TRY numbers are still there.
+    errors = [abs(3.0 - actual[0]), abs(4.0 - actual[1])]
+    assert found["abs_error"] == pytest.approx(sum(errors))
+    assert found["mean_abs_error"] == pytest.approx(sum(errors) / 2)
+    assert found["actual"] == pytest.approx(sum(actual))
+
+
+def test_score_row_a_perfect_forecast_scores_zero():
+    found = score_row("m", "ALL", "1", pd.Series([7.0, 9.0]), pd.Series([7.0, 9.0]), True)
+    assert found["wape"] == 0.0 and found["bias"] == 0.0 and found["mape"] == 0.0
+    assert found["mean_abs_error"] == 0.0
+
+
+def test_score_row_errors_cancel_in_bias_but_not_in_wape():
+    # +50 and -50: bias 0, WAPE 100 / 200.
+    found = score_row("m", "ALL", "1", pd.Series([150.0, 50.0]), pd.Series([100.0, 100.0]), True)
+    assert found["bias"] == pytest.approx(0.0)
+    assert found["wape"] == pytest.approx(0.5)
+    assert found["mape"] == pytest.approx(0.5)
+
+
+def test_score_row_numbers_are_python_floats_and_rows_an_int():
+    found = score_row("m", "ALL", "1", pd.Series([1.0, 2.0]), pd.Series([2.0, 2.0]), True)
+    for name in ("forecast", "actual", "abs_error", "wape", "bias", "mean_abs_error", "mape"):
+        assert type(found[name]) is float, name
+    assert found["rows"] == 2 and isinstance(found["rows"], int)
+
+
+# --- evaluation_scores: the running example ----------------------------------------------------
+# Companies TR02 and ALL, origins 10 and 11, h = 1, 2 (horizons 2). Actual: (11, 2) -> week 13
+# has no data (no row).
+#   ALL  actual: (10,1) 100  (10,2) 200  (11,1) 200
+#   TR02 actual: (10,1)  40  (10,2)  80  (11,1)  80
+# Method "hurdle":
+#   ALL  forecast: (10,1) 110  (10,2) 150  (11,1) 140  (11,2) 999 (no actual: never scored)
+#   TR02 forecast: (10,1)  50  (10,2)  60  (11,1)  80  (11,2) 999
+# By hand, ALL:
+#   h1: f 110+140 = 250, a 100+200 = 300, |e| 10+60 = 70: WAPE 70/300, bias 250/300-1 = -1/6,
+#       mean |e| 35, MAPE (0.1 + 0.3)/2 = 0.2
+#   h2: f 150, a 200, |e| 50: WAPE 0.25, bias -0.25, mean |e| 50, MAPE 0.25
+#   pooled: f 400, a 500, |e| 120: WAPE 0.24, bias -0.2, mean |e| 40, MAPE 0.65/3
+#   total: only origin 10 has both weeks: f 260, a 300, |e| 40: WAPE 40/300, bias -40/300,
+#       mean |e| 40, MAPE 40/300; rows = 1 (one origin)
+# By hand, TR02 (no MAPE):
+#   h1: f 130, a 120, |e| 10: WAPE 1/12, bias 1/12, mean |e| 5
+#   h2: f 60, a 80, |e| 20: WAPE 0.25, bias -0.25, mean |e| 20
+#   pooled: f 190, a 200, |e| 30: WAPE 0.15, bias -0.05, mean |e| 10
+#   total: origin 10, f 110, a 120, |e| 10: WAPE 1/12, bias -1/12, mean |e| 10
+# Method "rule": the actual itself wherever there is one (every error 0), 999 at (11, 2).
+
+E_HORIZONS = 2
+
+
+def e_actual():
+    return s_actual([
+        ("TR02", 10, 1, 11, 40.0), ("TR02", 10, 2, 12, 80.0), ("TR02", 11, 1, 12, 80.0),
+        ("ALL", 10, 1, 11, 100.0), ("ALL", 10, 2, 12, 200.0), ("ALL", 11, 1, 12, 200.0)])
+
+
+def e_forecasts(unscored=999.0):
+    hurdle = {"TR02": [50.0, 60.0, 80.0, unscored], "ALL": [110.0, 150.0, 140.0, unscored]}
+    rule = {"TR02": [40.0, 80.0, 80.0, unscored], "ALL": [100.0, 200.0, 200.0, unscored]}
+    rows = []
+    for method, by_company in ((HURDLE, hurdle), (RULE, rule)):
+        for company, values in by_company.items():
+            for (origin, h, target), value in zip(S_PAIRS, values):
+                rows.append((method, company, origin, h, target, value))
+    return s_forecasts(rows)
+
+
+@pytest.fixture
+def e_scores():
+    return evaluation_scores(e_forecasts(), e_actual(), E_HORIZONS)
+
+
+def assert_score(row, rows, forecast, actual, abs_error, wape, bias, mean_abs_error, mape):
+    """mape None means: must be NaN."""
+    assert row["rows"] == rows
+    assert row["forecast"] == pytest.approx(forecast)
+    assert row["actual"] == pytest.approx(actual)
+    assert row["abs_error"] == pytest.approx(abs_error)
+    assert row["wape"] == pytest.approx(wape)
+    assert row["bias"] == pytest.approx(bias)
+    assert row["mean_abs_error"] == pytest.approx(mean_abs_error)
+    if mape is None:
+        assert np.isnan(row["mape"])
+    else:
+        assert row["mape"] == pytest.approx(mape)
+
+
+def test_scores_have_exactly_the_score_columns(e_scores):
+    assert list(e_scores.columns) == SCORE_COLUMNS
+    assert list(e_scores.index) == list(range(len(e_scores)))
+
+
+def test_scores_row_order_methods_companies_then_h_pooled_total(e_scores):
+    # Per (method, company) in order of first appearance: "1", "2", pooled, total.
+    found = list(zip(e_scores["method"], e_scores["company_code"], e_scores["horizon"]))
+    expected = [(method, company, horizon)
+                for method in (HURDLE, RULE) for company in ("TR02", "ALL")
+                for horizon in ("1", "2", POOLED, HORIZON_TOTAL)]
+    assert found == expected
+
+
+def test_scores_consolidated_h1_by_hand(e_scores):
+    row = score_of(e_scores, HURDLE, CONSOLIDATED, "1")
+    assert_score(row, 2, 250.0, 300.0, 70.0, 70.0 / 300.0, -1.0 / 6.0, 35.0, 0.2)
+
+
+def test_scores_consolidated_h2_by_hand(e_scores):
+    row = score_of(e_scores, HURDLE, CONSOLIDATED, "2")
+    assert_score(row, 1, 150.0, 200.0, 50.0, 0.25, -0.25, 50.0, 0.25)
+
+
+def test_scores_consolidated_pooled_by_hand(e_scores):
+    row = score_of(e_scores, HURDLE, CONSOLIDATED, POOLED)
+    assert_score(row, 3, 400.0, 500.0, 120.0, 0.24, -0.2, 40.0, 0.65 / 3)
+
+
+def test_scores_consolidated_total_by_hand_only_the_complete_origin(e_scores):
+    # Origin 11 has data only for h1, so its total is left out: one origin scored.
+    row = score_of(e_scores, HURDLE, CONSOLIDATED, HORIZON_TOTAL)
+    assert_score(row, 1, 260.0, 300.0, 40.0, 40.0 / 300.0, -40.0 / 300.0, 40.0, 40.0 / 300.0)
+
+
+def test_scores_company_rows_by_hand_and_without_mape(e_scores):
+    assert_score(score_of(e_scores, HURDLE, "TR02", "1"), 2, 130.0, 120.0, 10.0, 1 / 12, 1 / 12,
+                 5.0, None)
+    assert_score(score_of(e_scores, HURDLE, "TR02", "2"), 1, 60.0, 80.0, 20.0, 0.25, -0.25,
+                 20.0, None)
+    assert_score(score_of(e_scores, HURDLE, "TR02", POOLED), 3, 190.0, 200.0, 30.0, 0.15, -0.05,
+                 10.0, None)
+    assert_score(score_of(e_scores, HURDLE, "TR02", HORIZON_TOTAL), 1, 110.0, 120.0, 10.0,
+                 1 / 12, -1 / 12, 10.0, None)
+
+
+def test_scores_mape_only_for_the_consolidated_rows(e_scores):
+    consolidated = e_scores[e_scores["company_code"] == CONSOLIDATED]
+    companies = e_scores[e_scores["company_code"] != CONSOLIDATED]
+    assert consolidated["mape"].notna().all()
+    assert companies["mape"].isna().all()
+
+
+def test_scores_a_perfect_method_scores_zero_everywhere(e_scores):
+    rule = e_scores[e_scores["method"] == RULE]
+    assert (rule["wape"] == 0.0).all() and (rule["bias"] == 0.0).all()
+    assert (rule["abs_error"] == 0.0).all() and (rule["mean_abs_error"] == 0.0).all()
+    assert (rule[rule["company_code"] == CONSOLIDATED]["mape"] == 0.0).all()
+
+
+def test_scores_a_target_week_without_actual_is_left_out_everywhere():
+    # (11, 2) -> week 13 has no actual: its forecast, whatever it is, changes no score.
+    small = evaluation_scores(e_forecasts(unscored=999.0), e_actual(), E_HORIZONS)
+    huge = evaluation_scores(e_forecasts(unscored=1e12), e_actual(), E_HORIZONS)
+    pd.testing.assert_frame_equal(small, huge)
+    assert not (small["forecast"] >= 999.0).any()
+
+
+def test_scores_the_pooled_rows_count_only_the_rows_with_actual(e_scores):
+    # 4 forecasts per method and company, 3 with an actual.
+    assert set(e_scores.loc[e_scores["horizon"] == POOLED, "rows"]) == {3}
+
+
+def test_scores_use_the_actual_column_not_actual_real(e_scores):
+    # actual_real is -1.0 everywhere in s_actual; were it scored, every WAPE would be NaN.
+    assert e_scores["wape"].notna().all()
+    assert score_of(e_scores, HURDLE, CONSOLIDATED, POOLED)["actual"] == pytest.approx(500.0)
+
+
+def test_scores_consolidated_is_scored_on_its_own_rows_not_the_sum_of_companies(e_scores):
+    # 1. ALL's pooled forecast is ALL's own 110 + 150 + 140, not TR02's 190 plus anything.
+    assert score_of(e_scores, HURDLE, CONSOLIDATED, POOLED)["forecast"] == pytest.approx(400.0)
+    # 2. Changing TR02's forecasts leaves ALL's scores as they are.
+    forecasts = e_forecasts()
+    tr02 = (forecasts["method"] == HURDLE) & (forecasts["company_code"] == "TR02")
+    forecasts.loc[tr02, "forecast"] = 1e6
+    changed = evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    consolidated_after = changed[changed["company_code"] == CONSOLIDATED].reset_index(drop=True)
+    consolidated_before = e_scores[e_scores["company_code"] == CONSOLIDATED].reset_index(
+        drop=True)
+    pd.testing.assert_frame_equal(consolidated_after, consolidated_before)
+
+
+def test_scores_pooled_equals_score_row_on_the_rows_with_actual(e_scores):
+    # The pooled row is score_row on the three (origin, h) with data, nothing else.
+    expected = score_row(HURDLE, CONSOLIDATED, POOLED, pd.Series([110.0, 150.0, 140.0]),
+                         pd.Series([100.0, 200.0, 200.0]), True)
+    found = score_of(e_scores, HURDLE, CONSOLIDATED, POOLED)
+    for name, value in expected.items():
+        if isinstance(value, float):
+            assert found[name] == pytest.approx(value), name
+        else:
+            assert found[name] == value, name
+
+
+def test_scores_horizon_labels_are_strings(e_scores):
+    assert set(e_scores["horizon"]) == {"1", "2", POOLED, HORIZON_TOTAL}
+    assert all(isinstance(h, str) for h in e_scores["horizon"])
+
+
+def test_scores_order_of_first_appearance_not_sorted():
+    # Methods "z" then "a"; companies ALL then TR02 for "z", TR02 then ALL for "a".
+    actual = s_actual([("TR02", 10, 1, 11, 1.0), ("ALL", 10, 1, 11, 2.0)])
+    forecasts = s_forecasts([
+        ("z", "ALL", 10, 1, 11, 2.0), ("z", "TR02", 10, 1, 11, 1.0),
+        ("a", "TR02", 10, 1, 11, 1.0), ("a", "ALL", 10, 1, 11, 2.0)])
+    scores = evaluation_scores(forecasts, actual, 1)
+    pairs_found = list(dict.fromkeys(zip(scores["method"], scores["company_code"])))
+    assert pairs_found == [("z", "ALL"), ("z", "TR02"), ("a", "TR02"), ("a", "ALL")]
+
+
+def test_scores_an_h_with_no_actual_has_no_row():
+    # Horizons 2, but actual only at h = 1: no "2" row, and no origin is complete, so no
+    # total row either.
+    actual = s_actual([("ALL", 10, 1, 11, 100.0), ("ALL", 11, 1, 12, 100.0)])
+    forecasts = s_forecasts([("m", "ALL", o, h, o + h, 90.0) for o in (10, 11) for h in (1, 2)])
+    scores = evaluation_scores(forecasts, actual, 2)
+    assert list(scores["horizon"]) == ["1", POOLED]
+    assert score_of(scores, "m", "ALL", POOLED)["rows"] == 2
+
+
+def test_scores_no_complete_origin_means_no_total_row():
+    # Each origin misses one of its two target weeks.
+    actual = s_actual([("ALL", 10, 1, 11, 100.0), ("ALL", 11, 2, 13, 100.0)])
+    forecasts = s_forecasts([("m", "ALL", o, h, o + h, 90.0) for o in (10, 11) for h in (1, 2)])
+    scores = evaluation_scores(forecasts, actual, 2)
+    assert list(scores["horizon"]) == ["1", "2", POOLED]
+
+
+def test_scores_total_sums_each_origin_before_scoring():
+    # Origin 10: f 150 + 50 = 200 vs a 100 + 100 = 200: the errors (+50, -50) cancel in the
+    # origin's total, so the total WAPE is 0 while the pooled WAPE is 100 / 200.
+    actual = s_actual([("ALL", 10, 1, 11, 100.0), ("ALL", 10, 2, 12, 100.0)])
+    forecasts = s_forecasts([("m", "ALL", 10, 1, 11, 150.0), ("m", "ALL", 10, 2, 12, 50.0)])
+    scores = evaluation_scores(forecasts, actual, 2)
+    assert score_of(scores, "m", "ALL", HORIZON_TOTAL)["wape"] == pytest.approx(0.0)
+    assert score_of(scores, "m", "ALL", POOLED)["wape"] == pytest.approx(0.5)
+
+
+def test_scores_total_rows_count_the_origins():
+    # Three complete origins (10, 11, 12) and one incomplete (13 misses h = 2).
+    actual = s_actual([("ALL", o, h, o + h, 10.0) for o in (10, 11, 12) for h in (1, 2)]
+                      + [("ALL", 13, 1, 14, 10.0)])
+    forecasts = s_forecasts([("m", "ALL", o, h, o + h, 12.0) for o in (10, 11, 12, 13)
+                             for h in (1, 2)])
+    scores = evaluation_scores(forecasts, actual, 2)
+    # Each complete origin: f 24 vs a 20, |e| 4. Three of them: f 72, a 60, |e| 12.
+    total = score_of(scores, "m", "ALL", HORIZON_TOTAL)
+    assert_score(total, 3, 72.0, 60.0, 12.0, 0.2, 0.2, 4.0, 0.2)
+    # Pooled: all 7 (origin, h) with data, origin 13's included.
+    assert score_of(scores, "m", "ALL", POOLED)["rows"] == 7
+
+
+def test_scores_with_one_horizon_pooled_and_total_equal_h1():
+    actual = s_actual([("ALL", 10, 1, 11, 100.0), ("ALL", 11, 1, 12, 50.0)])
+    forecasts = s_forecasts([("m", "ALL", 10, 1, 11, 80.0), ("m", "ALL", 11, 1, 12, 70.0)])
+    scores = evaluation_scores(forecasts, actual, 1)
+    assert list(scores["horizon"]) == ["1", POOLED, HORIZON_TOTAL]
+    numbers = ["rows", "forecast", "actual", "abs_error", "wape", "bias", "mean_abs_error",
+               "mape"]
+    h1 = score_of(scores, "m", "ALL", "1")[numbers].astype(float)
+    for horizon in (POOLED, HORIZON_TOTAL):
+        found = score_of(scores, "m", "ALL", horizon)[numbers].astype(float)
+        pd.testing.assert_series_equal(found, h1, check_names=False)
+
+
+def test_scores_a_company_whose_actual_sums_to_zero_has_nan_wape_and_bias():
+    actual = s_actual([("TR02", 10, 1, 11, 0.0), ("ALL", 10, 1, 11, 100.0)])
+    forecasts = s_forecasts([("m", "TR02", 10, 1, 11, 5.0), ("m", "ALL", 10, 1, 11, 105.0)])
+    scores = evaluation_scores(forecasts, actual, 1)
+    tr02 = score_of(scores, "m", "TR02", POOLED)
+    assert np.isnan(tr02["wape"]) and np.isnan(tr02["bias"])
+    assert tr02["mean_abs_error"] == pytest.approx(5.0)
+    assert score_of(scores, "m", "ALL", POOLED)["wape"] == pytest.approx(0.05)
+
+
+def test_scores_a_consolidated_zero_actual_week_gives_nan_mape_but_a_wape():
+    actual = s_actual([("ALL", 10, 1, 11, 0.0), ("ALL", 10, 2, 12, 100.0)])
+    forecasts = s_forecasts([("m", "ALL", 10, 1, 11, 10.0), ("m", "ALL", 10, 2, 12, 110.0)])
+    scores = evaluation_scores(forecasts, actual, 2)
+    # 1. Pooled: an actual of 0 among the rows, so no MAPE; WAPE (10 + 10) / 100.
+    pooled = score_of(scores, "m", "ALL", POOLED)
+    assert np.isnan(pooled["mape"])
+    assert pooled["wape"] == pytest.approx(0.2)
+    # 2. h1 alone: actual sums to 0, so WAPE, bias and MAPE are all NaN.
+    h1 = score_of(scores, "m", "ALL", "1")
+    assert np.isnan(h1["wape"]) and np.isnan(h1["bias"]) and np.isnan(h1["mape"])
+    # 3. The origin's total has actual 100 > 0, so its MAPE is defined: |120 - 100| / 100.
+    assert score_of(scores, "m", "ALL", HORIZON_TOTAL)["mape"] == pytest.approx(0.2)
+
+
+def test_scores_a_forecast_company_without_any_actual_has_no_rows():
+    # TR09 is forecast, but the actual has no row for it: nothing to score, no refusal.
+    actual = s_actual([("ALL", 10, 1, 11, 100.0)])
+    forecasts = s_forecasts([("m", "ALL", 10, 1, 11, 90.0), ("m", "TR09", 10, 1, 11, 5.0)])
+    scores = evaluation_scores(forecasts, actual, 1)
+    assert set(scores["company_code"]) == {"ALL"}
+
+
+def test_scores_with_and_without_the_hurdle_agree_on_the_other_methods(stack_inputs):
+    # The pipeline's two branches: the references' and the rule's scores do not depend on
+    # whether the hurdle model ran.
+    rolled, reference, rule = stack_inputs
+    actual = s_actual([(c, o, h, t, 1000.0) for c in ("TR02", "ALL")
+                       for o, h, t in S_PAIRS[:3]])
+    with_model = evaluation_scores(stack_forecasts(rolled, reference, rule), actual, 2)
+    without = evaluation_scores(stack_forecasts(None, reference, rule), actual, 2)
+    assert list(dict.fromkeys(with_model["method"])) == [HURDLE, *REFERENCES, RULE]
+    assert list(dict.fromkeys(without["method"])) == [*REFERENCES, RULE]
+    others = with_model[with_model["method"] != HURDLE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(others, without)
+
+
+def test_scores_end_to_end_the_hurdle_is_scored_on_its_total(stack_inputs):
+    # The hurdle's ALL totals at the three pairs with data are 5, 6, 7 (real_total -5 unused)
+    # against an actual of 2 each: f 18, a 6, |e| 3 + 4 + 5 = 12: WAPE 2.0, bias 2.0,
+    # mean |e| 4, MAPE (1.5 + 2.0 + 2.5) / 3 = 2.0.
+    rolled, reference, rule = stack_inputs
+    actual = s_actual([(c, o, h, t, 2.0) for c in ("TR02", "ALL") for o, h, t in S_PAIRS[:3]])
+    scores = evaluation_scores(stack_forecasts(rolled, reference, rule), actual, 2)
+    row = score_of(scores, HURDLE, CONSOLIDATED, POOLED)
+    assert_score(row, 3, 18.0, 6.0, 12.0, 2.0, 2.0, 4.0, 2.0)
+
+
+def test_scores_do_not_change_their_inputs():
+    forecasts, actual = e_forecasts(), e_actual()
+    before = (forecasts.copy(), actual.copy())
+    evaluation_scores(forecasts, actual, E_HORIZONS)
+    pd.testing.assert_frame_equal(forecasts, before[0])
+    pd.testing.assert_frame_equal(actual, before[1])
+
+
+def test_scores_are_deterministic():
+    first = evaluation_scores(e_forecasts(), e_actual(), E_HORIZONS)
+    second = evaluation_scores(e_forecasts(), e_actual(), E_HORIZONS)
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_scores_a_nan_forecast_is_never_scored_as_a_perfect_one():
+    # A NaN forecast would vanish from the sums and score its week as perfect: refused, with
+    # the method and keys of the first such row named.
+    actual = s_actual([("ALL", 10, 1, 11, 2.0), ("ALL", 10, 2, 12, 4.0)])
+    forecasts = s_forecasts([("m", "ALL", 10, 1, 11, 1.0), ("m", "ALL", 10, 2, 12, NAN)])
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, actual, 2)
+    assert str(error.value) == (
+        "1 forecasts are NaN or infinite (first: {'method': 'm', 'company_code': 'ALL', "
+        "'origin_week': 10, 'h': 2, 'target_week': 12})")
+
+
+# --- evaluation_scores: NaN or infinite forecasts (refused before the join) ---------------------
+
+NONFINITE = [NAN, float("inf"), float("-inf")]
+NONFINITE_IDS = ["nan", "inf", "-inf"]
+
+
+def nonfinite_forecasts(value, method=RULE, company="ALL", origin=10, h=2):
+    """The running example's forecasts with one row's forecast set to `value`."""
+    forecasts = e_forecasts()
+    forecasts.loc[is_row(forecasts, method, company, origin, h), "forecast"] = value
+    return forecasts
+
+
+@pytest.mark.parametrize("bad", NONFINITE, ids=NONFINITE_IDS)
+def test_scores_a_nonfinite_forecast_exact_message(bad):
+    # rule's ALL (10, 2) forecast is NaN, inf or -inf: refused, the row named.
+    forecasts = nonfinite_forecasts(bad)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "1 forecasts are NaN or infinite (first: {'method': 'rule', 'company_code': 'ALL', "
+        "'origin_week': 10, 'h': 2, 'target_week': 12})")
+
+
+@pytest.mark.parametrize("bad", NONFINITE, ids=NONFINITE_IDS)
+def test_scores_a_nonfinite_forecast_in_a_week_without_actual_is_refused_too(bad):
+    # (11, 2) aims at week 13, which has no actual cash: still refused (the check runs on
+    # every forecast, before the join). Four such rows; hurdle's TR02 row comes first.
+    forecasts = e_forecasts(unscored=bad)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "4 forecasts are NaN or infinite (first: {'method': 'hurdle', 'company_code': 'TR02', "
+        "'origin_week': 11, 'h': 2, 'target_week': 13})")
+
+
+def test_scores_nonfinite_forecasts_are_counted_across_kinds_and_methods():
+    # One NaN, one inf, one -inf in different methods: counted together, the first in the
+    # table's order named (hurdle's rows come before rule's).
+    forecasts = e_forecasts()
+    forecasts.loc[is_row(forecasts, RULE, "TR02", 11, 1), "forecast"] = NAN
+    forecasts.loc[is_row(forecasts, HURDLE, "ALL", 10, 1), "forecast"] = float("inf")
+    forecasts.loc[is_row(forecasts, RULE, "ALL", 10, 2), "forecast"] = float("-inf")
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "3 forecasts are NaN or infinite (first: {'method': 'hurdle', 'company_code': 'ALL', "
+        "'origin_week': 10, 'h': 1, 'target_week': 11})")
+
+
+def test_scores_a_very_large_finite_forecast_is_scored_not_refused():
+    # The edge just inside: 1e300 is finite, so it is scored (a huge WAPE, not a refusal).
+    forecasts = nonfinite_forecasts(1e300, method=HURDLE)
+    scores = evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    h2 = score_of(scores, HURDLE, "ALL", "2")
+    assert np.isfinite(h2["wape"]) and h2["wape"] > 1e290
+
+
+def test_scores_a_nonfinite_forecast_does_not_change_the_inputs():
+    # The refusal leaves the caller's tables as they were.
+    forecasts, actual = nonfinite_forecasts(NAN), e_actual()
+    before = (forecasts.copy(), actual.copy())
+    with pytest.raises(ValueError):
+        evaluation_scores(forecasts, actual, E_HORIZONS)
+    pd.testing.assert_frame_equal(forecasts, before[0])
+    pd.testing.assert_frame_equal(actual, before[1])
+
+
+def test_scores_the_horizons_check_comes_before_the_nonfinite_check():
+    with pytest.raises(ValueError, match=r"^horizons is 0; horizons start at 1$"):
+        evaluation_scores(nonfinite_forecasts(NAN), e_actual(), 0)
+
+
+def test_scores_the_h_check_comes_before_the_nonfinite_check():
+    # An h outside 1 ... horizons whose forecast is also NaN: the h message.
+    extra = s_forecasts([(HURDLE, "ALL", 12, 4, 16, NAN)])
+    forecasts = pd.concat([e_forecasts(), extra], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^forecasts for h \[4\]; horizons is 2$"):
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+
+
+def test_scores_the_repeat_check_comes_before_the_nonfinite_check():
+    # A repeated row and, elsewhere, a NaN forecast: the repeat message.
+    forecasts = nonfinite_forecasts(NAN)
+    repeated = pd.concat([forecasts, forecasts.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        evaluation_scores(repeated, e_actual(), E_HORIZONS)
+
+
+def test_scores_a_repeated_nan_row_is_reported_as_a_repeat():
+    # The same NaN row twice: the repeat check runs first.
+    forecasts = nonfinite_forecasts(NAN)
+    repeated = pd.concat([forecasts, forecasts[forecasts["forecast"].isna()]],
+                         ignore_index=True)
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        evaluation_scores(repeated, e_actual(), E_HORIZONS)
+
+
+def test_scores_the_nonfinite_check_comes_before_the_missing_check():
+    # rule misses ALL (10, 1) and hurdle's ALL (10, 2) is inf: the NaN-or-infinite message.
+    forecasts = nonfinite_forecasts(float("inf"), method=HURDLE)
+    missing_one = forecasts[~is_row(forecasts, RULE, "ALL", 10, 1)]
+    with pytest.raises(ValueError, match=r"^1 forecasts are NaN or infinite"):
+        evaluation_scores(missing_one, e_actual(), E_HORIZONS)
+
+
+# --- evaluation_scores: refusals ---------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [0, -1])
+def test_scores_horizons_below_one_exact_message(horizons):
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(e_forecasts(), e_actual(), horizons)
+    assert str(error.value) == f"horizons is {horizons}; horizons start at 1"
+
+
+def test_scores_horizons_check_comes_first():
+    # Even with a repeated forecast, the horizons message comes first.
+    forecasts = e_forecasts()
+    forecasts = pd.concat([forecasts, forecasts.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^horizons is 0; horizons start at 1$"):
+        evaluation_scores(forecasts, e_actual(), 0)
+
+
+@pytest.mark.parametrize("bad_h", [0, 3, 7])
+def test_scores_a_forecast_h_outside_one_to_horizons_exact_message(bad_h):
+    extra = s_forecasts([(HURDLE, "ALL", 12, bad_h, 12 + bad_h, 1.0)])
+    forecasts = pd.concat([e_forecasts(), extra], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    assert str(error.value) == f"forecasts for h [{bad_h}]; horizons is 2"
+
+
+def test_scores_several_h_outside_are_listed_sorted():
+    extra = s_forecasts([(HURDLE, "ALL", 12, 5, 17, 1.0), (HURDLE, "ALL", 12, 0, 12, 1.0),
+                         (RULE, "ALL", 12, 4, 16, 1.0)])
+    forecasts = pd.concat([e_forecasts(), extra], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+    assert str(error.value) == "forecasts for h [0, 4, 5]; horizons is 2"
+
+
+def test_scores_an_h_outside_is_refused_even_without_actual_for_it():
+    # The forecast at h = 3 aims at a week with no actual: still refused.
+    extra = s_forecasts([(RULE, "ALL", 50, 3, 53, 1.0)])
+    forecasts = pd.concat([e_forecasts(), extra], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^forecasts for h \[3\]; horizons is 2$"):
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+
+
+def test_scores_a_repeated_forecast_exact_message():
+    forecasts = e_forecasts()
+    repeated = pd.concat([forecasts, forecasts.iloc[[5]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(repeated, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "1 forecasts are there twice (first: {'method': 'hurdle', 'company_code': 'ALL', "
+        "'origin_week': 10, 'h': 2, 'target_week': 12})")
+
+
+def test_scores_a_repeat_with_a_different_value_is_still_refused():
+    forecasts = e_forecasts()
+    again = forecasts.iloc[[0]].assign(forecast=-1.0)
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        evaluation_scores(pd.concat([forecasts, again], ignore_index=True), e_actual(),
+                          E_HORIZONS)
+
+
+def test_scores_repeats_are_counted_and_the_first_named():
+    forecasts = e_forecasts()
+    repeated = pd.concat([forecasts, forecasts.iloc[[0, 1, 9]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(repeated, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "3 forecasts are there twice (first: {'method': 'hurdle', 'company_code': 'TR02', "
+        "'origin_week': 10, 'h': 1, 'target_week': 11})")
+
+
+def test_scores_the_same_row_in_two_methods_is_not_a_repeat(e_scores):
+    # Every hurdle row has a twin in rule with the same keys: allowed, 2 x 2 x 4 score rows.
+    assert len(e_scores) == 16
+
+
+def test_scores_a_repeat_in_a_week_without_actual_is_still_refused():
+    forecasts = e_forecasts()
+    unscored = forecasts[(forecasts["origin_week"] == 11) & (forecasts["h"] == 2)].iloc[[0]]
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        evaluation_scores(pd.concat([forecasts, unscored], ignore_index=True), e_actual(),
+                          E_HORIZONS)
+
+
+def test_scores_the_h_check_comes_before_the_repeat_check():
+    bad = s_forecasts([(HURDLE, "ALL", 12, 9, 21, 1.0)] * 2)
+    forecasts = pd.concat([e_forecasts(), bad], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^forecasts for h \[9\]; horizons is 2$"):
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+
+
+def is_row(forecasts, method, company, origin, h):
+    return ((forecasts["method"] == method) & (forecasts["company_code"] == company)
+            & (forecasts["origin_week"] == origin) & (forecasts["h"] == h))
+
+
+def test_scores_a_method_missing_a_forecast_for_a_row_with_actual_exact_message():
+    # Drop rule's ALL (10, 2) forecast: week 12 has actual cash for ALL.
+    forecasts = e_forecasts()
+    dropped = forecasts[~is_row(forecasts, RULE, "ALL", 10, 2)]
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(dropped, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "'rule' has no forecast for 1 rows with actual cash (first: {'company_code': 'ALL', "
+        "'origin_week': 10, 'h': 2, 'target_week': 12})")
+
+
+def test_scores_a_method_missing_a_whole_company_is_refused_with_the_count():
+    forecasts = e_forecasts()
+    dropped = forecasts[~((forecasts["method"] == HURDLE) & (forecasts["company_code"] == "TR02"))]
+    with pytest.raises(ValueError) as error:
+        evaluation_scores(dropped, e_actual(), E_HORIZONS)
+    assert str(error.value) == (
+        "'hurdle' has no forecast for 3 rows with actual cash (first: {'company_code': 'TR02', "
+        "'origin_week': 10, 'h': 1, 'target_week': 11})")
+
+
+def test_scores_a_forecast_for_the_wrong_target_week_counts_as_missing():
+    # rule's ALL (10, 1) aims at week 99 instead of 11: the row with actual has no forecast.
+    forecasts = e_forecasts()
+    forecasts.loc[is_row(forecasts, RULE, "ALL", 10, 1), "target_week"] = 99
+    with pytest.raises(ValueError, match=r"^'rule' has no forecast for 1 rows"):
+        evaluation_scores(forecasts, e_actual(), E_HORIZONS)
+
+
+def test_scores_a_missing_forecast_in_a_week_without_actual_is_fine(e_scores):
+    # Dropping every forecast at (11, 2) (week 13, no actual) is not refused, same scores.
+    forecasts = e_forecasts()
+    kept = forecasts[~((forecasts["origin_week"] == 11) & (forecasts["h"] == 2))]
+    pd.testing.assert_frame_equal(evaluation_scores(kept, e_actual(), E_HORIZONS), e_scores)
+
+
+def test_scores_the_first_method_missing_a_row_is_named():
+    # Both methods miss ALL (11, 1): hurdle comes first in the forecasts.
+    forecasts = e_forecasts()
+    gone = ((forecasts["company_code"] == "ALL") & (forecasts["origin_week"] == 11)
+            & (forecasts["h"] == 1))
+    with pytest.raises(ValueError, match=r"^'hurdle' has no forecast"):
+        evaluation_scores(forecasts[~gone], e_actual(), E_HORIZONS)
+
+
+def test_scores_the_repeat_check_comes_before_the_missing_check():
+    # rule misses a row and hurdle has a repeat: the repeat is reported.
+    forecasts = e_forecasts()
+    missing_one = forecasts[~is_row(forecasts, RULE, "ALL", 10, 1)]
+    broken = pd.concat([missing_one, forecasts.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        evaluation_scores(broken, e_actual(), E_HORIZONS)
+
+
+def test_scores_a_repeated_actual_row_is_refused():
+    # Not one of the documented refusals, but a repeated actual row must not count a week
+    # twice: the many-to-one merge refuses it (pandas' MergeError is a ValueError).
+    actual = e_actual()
+    repeated = pd.concat([actual, actual.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError):
+        evaluation_scores(e_forecasts(), repeated, E_HORIZONS)
+
+
+# =============================================================================================
+# The cache of step 17: `rolling_fingerprint` (everything `rolling_forecasts` makes its result
+# from, as a fingerprint for `cache.load_with_cache`) and `MODEL_CODE` (the source files whose
+# hash it carries). Run with the real Settings of settings/synthetic.toml, changed one field
+# at a time with dataclasses.replace; the tables are small hand-made ones (only their hash
+# goes in, so their content does not need to make sense to the model).
+# =============================================================================================
+
+import ast as fp_ast  # noqa: E402
+import inspect as fp_inspect  # noqa: E402
+import json as fp_json  # noqa: E402
+import shutil as fp_shutil  # noqa: E402
+from dataclasses import asdict as fp_asdict, replace as fp_replace  # noqa: E402
+from pathlib import Path as FpPath  # noqa: E402
+
+from collection_estimation.hurdle.cache import (  # noqa: E402
+    load_with_cache, source_fingerprint, table_fingerprint)
+from collection_estimation.hurdle.evaluate import MODEL_CODE, rolling_fingerprint  # noqa: E402
+from collection_estimation.hurdle.settings import load_settings  # noqa: E402
+
+FP_REPO_ROOT = FpPath(__file__).resolve().parents[2]
+FP_SETTINGS_FILE = FP_REPO_ROOT / "settings" / "synthetic.toml"
+FP_HURDLE_FOLDER = FpPath(evaluate_module.__file__).parent
+FP_TABLE_NAMES = ["table", "new_cash", "refunds", "unidentified", "levels", "calendar"]
+
+
+@pytest.fixture(scope="module")
+def fp_settings():
+    if not FP_SETTINGS_FILE.exists():
+        pytest.skip("settings/synthetic.toml not present")
+    return load_settings(FP_SETTINGS_FILE, FP_REPO_ROOT)
+
+
+def fp_table():
+    """A tiny stand-in training table: two customers, origins 20 and 21, h 1 and 2."""
+    rows = [{"key": f"K{c}", "company_code": "TR02", "origin_week": origin, "h": h,
+             "target_week": origin + h, "paid": float((c + h) % 2), "amount": 10.0 * c + h}
+            for c in (1, 2) for origin in (20, 21) for h in (1, 2)]
+    return pd.DataFrame(rows)
+
+
+def fp_arguments(settings):
+    """Every argument of rolling_fingerprint, fresh each call: (table, origins, settings,
+    the keyword arguments)."""
+    new_cash, refunds, unidentified = f_side_tables(last=30)
+    keywords = dict(block_columns={"history": ["mean_receipts_4"], "calendar": ["cycle"]},
+                    companies=["TR02", "TR04"], new_cash=new_cash, refunds=refunds,
+                    unidentified=unidentified, levels=f_levels(), calendar=f_calendar(),
+                    week_zero=WEEK_ZERO)
+    return fp_table(), [20, 21], settings, keywords
+
+
+def fp_of(table, origins, settings, keywords):
+    return rolling_fingerprint(table, origins, settings, **keywords)
+
+
+def fp_with(settings, section, **changes):
+    """`settings` with one section's fields changed (Settings and its sections are frozen)."""
+    changed_section = fp_replace(getattr(settings, section), **changes)
+    return fp_replace(settings, **{section: changed_section})
+
+
+# --- shape and encoding ----------------------------------------------------------------------
+
+def test_fingerprint_is_json_serialisable_with_the_real_settings(fp_settings):
+    # load_with_cache encodes it as JSON before anything else: it must encode, and come back
+    # equal (after the JSON round trip, tuples become lists).
+    fingerprint = fp_of(*fp_arguments(fp_settings))
+    text = fp_json.dumps(fingerprint, indent=1)
+    assert fp_json.loads(text) == fp_json.loads(fp_json.dumps(fingerprint))
+    assert isinstance(fingerprint, list)
+
+
+def test_fingerprint_items_in_order(fp_settings):
+    # 1. Build it, and each item by hand as the docstring says.
+    table, origins, settings, keywords = fp_arguments(fp_settings)
+    fingerprint = fp_of(table, origins, settings, keywords)
+    topups = settings.topups
+    expected = [
+        [20, 21],
+        fp_asdict(settings.receivables),
+        fp_asdict(settings.stage1),
+        fp_asdict(settings.stage2),
+        [topups.method, topups.window, topups.with_level],
+        keywords["block_columns"],
+        ["TR02", "TR04"],
+        WEEK_ZERO.isoformat(),
+        table_fingerprint(table),
+        table_fingerprint(keywords["new_cash"]),
+        table_fingerprint(keywords["refunds"]),
+        table_fingerprint(keywords["unidentified"]),
+        table_fingerprint(keywords["levels"]),
+        table_fingerprint(keywords["calendar"]),
+        source_fingerprint(*(FP_HURDLE_FOLDER / name for name in MODEL_CODE)),
+    ]
+    # 2. Item by item, so a failure names the item.
+    assert len(fingerprint) == len(expected)
+    for index, (found, wanted) in enumerate(zip(fingerprint, expected)):
+        assert found == wanted, index
+
+
+def test_fingerprint_is_deterministic_and_equal_for_fresh_copies_of_the_inputs(fp_settings):
+    # Two builds of the same inputs (fresh tables each time) give the same fingerprint.
+    first = fp_of(*fp_arguments(fp_settings))
+    second = fp_of(*fp_arguments(fp_settings))
+    assert first == second
+
+
+def test_fingerprint_with_the_real_settings_hits_the_cache_on_the_second_call(fp_settings,
+                                                                               tmp_path):
+    # 1. The first call fits (here: a stand-in result) and writes the cache.
+    fitted = Forecast(totals=pd.DataFrame({"total": [1.5, 2.5]}),
+                      customers=pd.DataFrame({"key": ["K1"]}))
+    calls = []
+
+    def fit():
+        calls.append(1)
+        return fitted
+
+    load_with_cache("hurdle_rolling_forecasts", fp_of(*fp_arguments(fp_settings)), fit,
+                    tmp_path)
+    # 2. The second call, with a fingerprint built afresh from the same inputs, reads it.
+    again = load_with_cache("hurdle_rolling_forecasts", fp_of(*fp_arguments(fp_settings)), fit,
+                            tmp_path)
+    assert calls == [1]
+    assert isinstance(again, Forecast)
+    pd.testing.assert_frame_equal(again.totals, fitted.totals)
+    pd.testing.assert_frame_equal(again.customers, fitted.customers)
+
+
+def test_fingerprint_does_not_change_its_inputs(fp_settings):
+    table, origins, settings, keywords = fp_arguments(fp_settings)
+    before_table, before_origins = table.copy(), list(origins)
+    before_blocks = {name: list(columns) for name, columns in keywords["block_columns"].items()}
+    before_companies = list(keywords["companies"])
+    fp_of(table, origins, settings, keywords)
+    pd.testing.assert_frame_equal(table, before_table)
+    assert origins == before_origins
+    assert keywords["block_columns"] == before_blocks
+    assert keywords["companies"] == before_companies
+
+
+def test_fingerprint_takes_rolling_forecasts_arguments_without_the_callback():
+    # Step 17 passes both the same arguments; only on_origin_done is the fit's alone.
+    fit_parameters = dict(fp_inspect.signature(rolling_forecasts).parameters)
+    del fit_parameters["on_origin_done"]
+    print_parameters = dict(fp_inspect.signature(rolling_fingerprint).parameters)
+    assert list(print_parameters) == list(fit_parameters)
+    for name, parameter in print_parameters.items():
+        assert parameter.kind == fit_parameters[name].kind, name
+
+
+# --- what changes it: one input at a time ----------------------------------------------------
+
+def fp_change_table_value(table, origins, settings, keywords):
+    table.loc[0, "amount"] += 0.01
+    return table, origins, settings, keywords
+
+
+def fp_change_table_index(table, origins, settings, keywords):
+    return table.set_axis(table.index + 100), origins, settings, keywords
+
+
+def fp_change_table_column_name(table, origins, settings, keywords):
+    return table.rename(columns={"amount": "amount_nominal"}), origins, settings, keywords
+
+
+def fp_change_one_keyword_table(name):
+    """Change the first float of one keyword table (or series) by 0.001."""
+    def change(table, origins, settings, keywords):
+        changed = keywords[name].copy()
+        if isinstance(changed, pd.Series):
+            changed.iloc[0] += 0.001
+        else:
+            column = [c for c in changed.columns if changed[c].dtype == "float64"][0]
+            changed.loc[changed.index[0], column] += 0.001
+        return table, origins, settings, {**keywords, name: changed}
+    return change
+
+
+def fp_change_origins(table, origins, settings, keywords):
+    return table, origins + [22], settings, keywords
+
+
+def fp_change_settings_by(section, field, how):
+    """Change one field relative to its current value (so the test holds whatever the toml)."""
+    def change(table, origins, settings, keywords):
+        value = getattr(getattr(settings, section), field)
+        return table, origins, fp_with(settings, section, **{field: how(value)}), keywords
+    return change
+
+
+def fp_change_keyword(name, how):
+    def change(table, origins, settings, keywords):
+        return table, origins, settings, {**keywords, name: how(keywords[name])}
+    return change
+
+
+FP_CHANGES = {
+    # The origins.
+    "an origin added": fp_change_origins,
+    # [receivables], [stage1], [stage2] and the method of [topups].
+    "receivables horizons": fp_change_settings_by("receivables", "horizons", lambda v: v + 1),
+    "receivables min_cleared_for_delay": fp_change_settings_by(
+        "receivables", "min_cleared_for_delay", lambda v: v + 1),
+    "receivables overdue_age_days": fp_change_settings_by(
+        "receivables", "overdue_age_days", lambda v: tuple(v) + (999,)),
+    "stage1 learning_rate": fp_change_settings_by("stage1", "learning_rate", lambda v: v / 2),
+    "stage1 max_iter": fp_change_settings_by("stage1", "max_iter", lambda v: v + 1),
+    "stage1 random_seed": fp_change_settings_by("stage1", "random_seed", lambda v: v + 1),
+    "stage1 company_as_feature": fp_change_settings_by("stage1", "company_as_feature",
+                                                       lambda v: not v),
+    "stage1 feature_blocks": fp_change_settings_by("stage1", "feature_blocks",
+                                                   lambda v: tuple(v)[:-1]),
+    "stage2 loss": fp_change_settings_by(
+        "stage2", "loss", lambda v: "gamma" if v != "gamma" else "poisson"),
+    "stage2 learning_rate": fp_change_settings_by("stage2", "learning_rate", lambda v: v / 2),
+    "stage2 own_mean_prior_weeks": fp_change_settings_by("stage2", "own_mean_prior_weeks",
+                                                         lambda v: v + 0.5),
+    "topups method": fp_change_settings_by(
+        "topups", "method", lambda v: "ridge" if v != "ridge" else "mean"),
+    "topups window": fp_change_settings_by("topups", "window", lambda v: v + 1),
+    "topups with_level": fp_change_settings_by("topups", "with_level", lambda v: not v),
+    # The other arguments.
+    "a block column added": fp_change_keyword(
+        "block_columns", lambda v: {**v, "history": v["history"] + ["paying_weeks_4"]}),
+    "a block removed": fp_change_keyword(
+        "block_columns", lambda v: {"history": v["history"]}),
+    "a company added": fp_change_keyword("companies", lambda v: v + ["TR05"]),
+    "week zero a week later": fp_change_keyword("week_zero", lambda v: v + timedelta(days=7)),
+    # The tables.
+    "a table value": fp_change_table_value,
+    "the table's index": fp_change_table_index,
+    "a table column name": fp_change_table_column_name,
+    **{f"a {name} value": fp_change_one_keyword_table(name) for name in FP_TABLE_NAMES[1:]},
+}
+
+
+@pytest.mark.parametrize("change", list(FP_CHANGES.values()), ids=list(FP_CHANGES))
+def test_fingerprint_changes_when_an_input_changes(fp_settings, change):
+    # 1. The fingerprint of the inputs as they are.
+    before = fp_of(*fp_arguments(fp_settings))
+    # 2. One input changed: the fingerprint is different (after the JSON round trip too, as
+    #    load_with_cache compares it).
+    after = fp_of(*change(*fp_arguments(fp_settings)))
+    assert after != before
+    assert fp_json.loads(fp_json.dumps(after)) != fp_json.loads(fp_json.dumps(before))
+
+
+def test_fingerprint_changes_when_a_table_dtype_changes(fp_settings):
+    # The same numbers as float instead of int: a different fingerprint (dtypes count).
+    table, origins, settings, keywords = fp_arguments(fp_settings)
+    before = fp_of(table, origins, settings, keywords)
+    changed = table.astype({"origin_week": "float64"})
+    assert fp_of(changed, origins, settings, keywords) != before
+
+
+def test_fingerprint_changes_when_the_table_rows_are_reordered(fp_settings):
+    table, origins, settings, keywords = fp_arguments(fp_settings)
+    before = fp_of(table, origins, settings, keywords)
+    reordered = table.iloc[::-1]
+    assert fp_of(reordered, origins, settings, keywords) != before
+
+
+# --- what does not change it -----------------------------------------------------------------
+
+FP_NO_CHANGES = {
+    # [diagnostic] and [joint_diagnostic] never change a forecast.
+    "diagnostic run": fp_change_settings_by("diagnostic", "run", lambda v: not v),
+    "diagnostic origin": fp_change_settings_by("diagnostic", "origin", lambda v: v + 1),
+    "diagnostic hgb_max_iter": fp_change_settings_by("diagnostic", "hgb_max_iter",
+                                                     lambda v: tuple(v) + (7,)),
+    "joint_diagnostic run": fp_change_settings_by("joint_diagnostic", "run", lambda v: not v),
+    # [evaluation]: which origins come from the argument, not from the settings.
+    "evaluation run": fp_change_settings_by("evaluation", "run", lambda v: not v),
+    "evaluation with_model": fp_change_settings_by("evaluation", "with_model",
+                                                   lambda v: not v),
+    "evaluation validation_origins": fp_change_settings_by(
+        "evaluation", "validation_origins", lambda v: tuple(v) + (99,)),
+    "evaluation rule_doubtful_days": fp_change_settings_by(
+        "evaluation", "rule_doubtful_days", lambda v: v + 1),
+    # [topups]: only the comparison's fields.
+    "topups compare": fp_change_settings_by("topups", "compare", lambda v: not v),
+    "topups compare_first_origin": fp_change_settings_by(
+        "topups", "compare_first_origin", lambda v: v - 1),
+    "topups compare_last_origin": fp_change_settings_by(
+        "topups", "compare_last_origin", lambda v: v - 1),
+    "topups compare_windows": fp_change_settings_by(
+        "topups", "compare_windows", lambda v: tuple(v) + (26,)),
+    # Printing, and where the cache goes.
+    "debug demo_origin": fp_change_settings_by("debug", "demo_origin", lambda v: v + 1),
+    "data cache_folder": fp_change_settings_by(
+        "data", "cache_folder", lambda v: FpPath(v) / "elsewhere"),
+    # The origins' order and repeats; the companies' order.
+    "origins reversed": lambda t, o, s, k: (t, list(reversed(o)), s, k),
+    "origins repeated": lambda t, o, s, k: (t, o + o + [o[0]], s, k),
+    "origins as a tuple": lambda t, o, s, k: (t, tuple(o), s, k),
+    "companies reversed": fp_change_keyword("companies", lambda v: list(reversed(v))),
+    # A copy of each table.
+    "copies of the tables": lambda t, o, s, k: (
+        t.copy(), o, s, {**k, **{n: k[n].copy() for n in FP_TABLE_NAMES[1:]}}),
+}
+
+
+@pytest.mark.parametrize("change", list(FP_NO_CHANGES.values()), ids=list(FP_NO_CHANGES))
+def test_fingerprint_does_not_change_for_what_no_forecast_reads(fp_settings, change):
+    before = fp_of(*fp_arguments(fp_settings))
+    after = fp_of(*change(*fp_arguments(fp_settings)))
+    assert after == before
+
+
+# --- MODEL_CODE: the source files it hashes --------------------------------------------------
+
+def test_model_code_files_all_exist_beside_evaluate():
+    for name in MODEL_CODE:
+        assert (FP_HURDLE_FOLDER / name).is_file(), name
+
+
+def test_model_code_is_a_tuple_of_distinct_python_file_names_without_evaluate():
+    assert isinstance(MODEL_CODE, tuple)
+    assert len(set(MODEL_CODE)) == len(MODEL_CODE)
+    assert all(name.endswith(".py") and "/" not in name and "\\" not in name
+               for name in MODEL_CODE)
+    assert "evaluate.py" not in MODEL_CODE
+
+
+def test_model_code_holds_the_modules_one_forecast_runs():
+    # forecast() and the stages, top-ups and price levels it calls.
+    for name in ("forecast.py", "stage1.py", "stage2.py", "topups.py", "prices.py",
+                 "training_table.py", "benchmark.py"):
+        assert name in MODEL_CODE, name
+
+
+def fp_hurdle_imports(file_name):
+    """The hurdle modules `file_name` imports (`from .x import`, `from . import x` or
+    `from collection_estimation.hurdle.x import`, anywhere in the file), as file names."""
+    tree = fp_ast.parse((FP_HURDLE_FOLDER / file_name).read_text(encoding="utf-8"))
+    found = set()
+    for node in fp_ast.walk(tree):
+        if not isinstance(node, fp_ast.ImportFrom):
+            continue
+        if node.level == 1 and node.module:
+            found.add(node.module.split(".")[0] + ".py")
+        elif node.level == 1:
+            found.update(alias.name + ".py" for alias in node.names)
+        elif node.module and node.module.startswith("collection_estimation.hurdle."):
+            found.add(node.module.split(".")[2] + ".py")
+    return found
+
+
+def test_model_code_covers_every_hurdle_module_one_forecast_imports():
+    # A change to any module forecast.py reaches (by import, transitively) can change a
+    # forecast; if its file is not hashed, the cache would serve forecasts made by the old
+    # code. Walk the imports from forecast.py.
+    reached, waiting = set(), ["forecast.py"]
+    while waiting:
+        name = waiting.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        waiting.extend(fp_hurdle_imports(name) - reached)
+    missing = sorted(reached - set(MODEL_CODE))
+    assert missing == [], f"forecast.py reaches {missing}, which MODEL_CODE does not hash"
+
+
+@pytest.fixture
+def fp_code_copy(tmp_path, monkeypatch):
+    """The MODEL_CODE files (and evaluate.py) copied to tmp_path, and evaluate's __file__
+    pointed there, so editing a copy is like editing the code."""
+    for name in MODEL_CODE + ("evaluate.py",):
+        fp_shutil.copyfile(FP_HURDLE_FOLDER / name, tmp_path / name)
+    monkeypatch.setattr(evaluate_module, "__file__", str(tmp_path / "evaluate.py"))
+    return tmp_path
+
+
+@pytest.mark.parametrize("name", MODEL_CODE)
+def test_fingerprint_changes_when_a_model_code_file_is_edited(fp_settings, fp_code_copy, name):
+    # 1. With the copies as they are, the fingerprint as before the edit.
+    before = fp_of(*fp_arguments(fp_settings))
+    # 2. One copied file gets one more line: the fingerprint changes, in the code's item only.
+    with open(fp_code_copy / name, "a", encoding="utf-8") as edited:
+        edited.write("# edited\n")
+    after = fp_of(*fp_arguments(fp_settings))
+    assert after != before
+    assert after[:-1] == before[:-1]
+
+
+def test_fingerprint_with_the_copied_code_equals_the_real_one(fp_settings, fp_code_copy):
+    # Identical bytes in another folder: the same fingerprint (a hash of content, not paths).
+    copied = fp_of(*fp_arguments(fp_settings))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(evaluate_module, "__file__", str(FP_HURDLE_FOLDER / "evaluate.py"))
+        real = fp_of(*fp_arguments(fp_settings))
+    assert copied == real
+
+
+def test_fingerprint_does_not_change_when_evaluate_itself_is_edited(fp_settings, fp_code_copy):
+    # evaluate.py is left out on purpose (it changes often).
+    before = fp_of(*fp_arguments(fp_settings))
+    with open(fp_code_copy / "evaluate.py", "a", encoding="utf-8") as edited:
+        edited.write("# edited\n")
+    assert fp_of(*fp_arguments(fp_settings)) == before
+
+
+def test_fingerprint_fails_if_a_model_code_file_is_missing(fp_settings, fp_code_copy):
+    # A missing file is an error, not a silently shorter fingerprint.
+    (fp_code_copy / MODEL_CODE[0]).unlink()
+    with pytest.raises(FileNotFoundError):
+        fp_of(*fp_arguments(fp_settings))

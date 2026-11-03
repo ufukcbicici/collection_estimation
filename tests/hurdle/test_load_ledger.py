@@ -49,6 +49,12 @@ CHANGED_NOTE = ('hurdle_ledger: the inputs have changed since the cache was writ
 DAMAGED_NOTE_START = 'hurdle_ledger: the cache could not be loaded ('
 
 
+def hit_note(cache_folder, name='hurdle_ledger'):
+    """The line read_cache prints on a hit (since 2026-11-03), with its newline."""
+    return (f"{name}: read from the cache; delete {cache_folder / (name + '.pkl')} "
+            f"to make it again.\n")
+
+
 def five_lines():
     """An invoice, its payment, an unapplied payment, a credit memo and its refund."""
     return [invoice(), payment(), unapplied_payment(), credit_memo(), refund()]
@@ -206,11 +212,11 @@ def test_second_call_keeps_none_in_text_columns(ledger_file, cache_folder, monke
     assert second['clearing_document'].tolist() == [None] * 5
 
 
-def test_second_call_prints_nothing(ledger_file, cache_folder, capsys):
+def test_second_call_prints_the_hit_note_only(ledger_file, cache_folder, capsys):
     load_ledger(ledger_file, AS_OF, LAYOUT, cache_folder)
     capsys.readouterr()
     load_ledger(ledger_file, AS_OF, LAYOUT, cache_folder)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 # --- re-read when an input changes ---------------------------------------------------------
@@ -286,7 +292,7 @@ def test_as_of_of_another_kind_on_the_same_day_is_a_cache_hit(ledger_file, cache
     capsys.readouterr()
     served = load_ledger(ledger_file, SAME_DAY[second], LAYOUT, cache_folder)
     assert len(spy.calls) == 1
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
     pd.testing.assert_frame_equal(served, built, check_exact=True)
 
 
@@ -354,7 +360,7 @@ def test_an_equal_layout_built_separately_is_a_cache_hit(ledger_file, cache_fold
     assert equal == LAYOUT and equal is not LAYOUT
     load_ledger(ledger_file, AS_OF, equal, cache_folder)
     assert len(spy.calls) == 1
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_codes_as_lists_instead_of_tuples_are_a_cache_hit(ledger_file, cache_folder, spy):
@@ -505,7 +511,7 @@ def test_after_a_reread_the_next_call_hits_again(ledger_file, cache_folder, spy,
     capsys.readouterr()
     load_ledger(ledger_file, date(2026, 9, 30), LAYOUT, cache_folder)
     assert len(spy.calls) == 2
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 # --- errors --------------------------------------------------------------------------------
@@ -564,7 +570,8 @@ def test_collections_cache_in_the_same_folder_is_unaffected(tmp_path, ledger_fol
     monkeypatch.setattr(read_collections, 'read_all_files', fail)
     pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
                                   collections)
-    assert 'hurdle_collections' not in capsys.readouterr().out
+    # Only the hit note of the collections cache: it was not read again.
+    assert capsys.readouterr().out == hit_note(cache_folder, 'hurdle_collections')
 
 
 # --- integration with the synthetic ledger (SLOW: one ~30 s read) ---------------------------

@@ -40,6 +40,12 @@ DAMAGED_NOTE_START = "hurdle_collections: the cache could not be loaded ("
 DAMAGED_NOTE_END = "); reading the inputs again."
 
 
+def hit_note(cache_folder):
+    """The line read_cache prints on a hit (since 2026-11-03), with its newline."""
+    return (f"hurdle_collections: read from the cache; delete {cache_folder / CACHE_FILE} "
+            f"to make it again.\n")
+
+
 def full_fingerprint(daily_files, layout=SYNTHETIC_LAYOUT):
     """What `load_collections` saves: [the per-file list, the layout as a dict,
     [sha256 of read_collections.py]]."""
@@ -179,12 +185,12 @@ def test_second_call_does_not_read_the_workbooks(days_folder, cache_folder, monk
                                   first)
 
 
-def test_second_call_prints_nothing(days_folder, cache_folder, capsys):
+def test_second_call_prints_the_hit_note_only(days_folder, cache_folder, capsys):
     daily_files = two_days(days_folder)
     load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     capsys.readouterr()
     load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def cached_table(days_folder, cache_folder, monkeypatch):
@@ -289,7 +295,7 @@ def test_third_call_after_a_re_read_is_a_cache_hit(days_folder, cache_folder, mo
     forbid_reading(monkeypatch)
     pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
                                   second)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_third_call_returns_the_new_table_not_the_old_one(days_folder, cache_folder,
@@ -470,7 +476,7 @@ def damage_then_reload(days_folder, cache_folder, damage, read_spy, capsys, monk
     forbid_reading(monkeypatch)
     pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
                                   first)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
     return first, reloaded
 
 
@@ -543,7 +549,7 @@ def test_read_cache_returns_the_table_when_the_fingerprint_matches(written_cache
     cache_file, fingerprint_file, fingerprint, table = written_cache
     capsys.readouterr()
     pd.testing.assert_frame_equal(read_cache(cache_file, fingerprint_file, fingerprint), table)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_file.parent)
 
 
 def test_read_cache_returns_none_with_the_changed_note_when_the_fingerprint_differs(
@@ -687,7 +693,7 @@ def test_after_a_code_change_the_next_call_is_a_cache_hit(days_folder, cache_fol
     forbid_reading(monkeypatch)
     pd.testing.assert_frame_equal(load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder),
                                   second)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_unchanged_code_is_a_cache_hit(days_folder, cache_folder, read_spy, capsys):
@@ -697,7 +703,7 @@ def test_unchanged_code_is_a_cache_hit(days_folder, cache_folder, read_spy, caps
     load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     load_collections(daily_files, SYNTHETIC_LAYOUT, cache_folder)
     assert read_spy.calls == 1
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder) * 2
 
 
 def test_editing_a_copy_of_the_source_file_changes_the_hash(tmp_path):
@@ -839,7 +845,7 @@ def test_an_equal_layout_built_afresh_is_a_cache_hit(days_folder, cache_folder, 
                               headers=dict(SYNTHETIC_LAYOUT.headers))
     assert equal == SYNTHETIC_LAYOUT and equal is not SYNTHETIC_LAYOUT
     pd.testing.assert_frame_equal(load_collections(daily_files, equal, cache_folder), first)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_the_same_headers_in_another_order_are_a_cache_hit(days_folder, cache_folder,
@@ -852,7 +858,7 @@ def test_the_same_headers_in_another_order_are_a_cache_hit(days_folder, cache_fo
     reversed_headers = dict(reversed(list(SYNTHETIC_LAYOUT.headers.items())))
     table = load_collections(daily_files, layout_with(headers=reversed_headers), cache_folder)
     pd.testing.assert_frame_equal(table, first)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_after_a_layout_change_the_next_call_with_it_is_a_cache_hit(days_folder, cache_folder,
@@ -864,7 +870,7 @@ def test_after_a_layout_change_the_next_call_with_it_is_a_cache_hit(days_folder,
     forbid_reading(monkeypatch)
     pd.testing.assert_frame_equal(load_collections(daily_files, with_turkish_alias(),
                                                    cache_folder), second)
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(cache_folder)
 
 
 def test_switching_back_to_the_old_layout_reads_again(days_folder, cache_folder, read_spy,

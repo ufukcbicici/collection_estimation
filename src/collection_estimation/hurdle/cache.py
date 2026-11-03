@@ -1,6 +1,7 @@
-"""A cache for tables that are slow to read (the daily files, the AR ledger).
+"""A cache for tables that are slow to read or make (the daily files, the AR ledger, the
+forecasts at every evaluation origin).
 
-A table is kept as a pickle beside a JSON "fingerprint" of everything it was built from:
+A table (or any result made of tables) is kept as a pickle beside a JSON "fingerprint" of everything it was built from:
 the input files (full path, size, last-modified time), any settings, and the source code of
 the reader. If any of these changes, or the cache is damaged, the table is read again.
 """
@@ -11,8 +12,8 @@ from pathlib import Path
 import pandas as pd
 
 
-def load_with_cache(name: str, fingerprint: list, read, cache_folder: Path) -> pd.DataFrame:
-    """The table built by `read()`, cached as <name>.pkl beside <name>_fingerprint.json.
+def load_with_cache(name: str, fingerprint: list, read, cache_folder: Path):
+    """The table (or other result) built by `read()`, cached as <name>.pkl beside <name>_fingerprint.json.
 
     `read` is a function with no arguments that builds the table. The cache is used only if
     its saved fingerprint equals `fingerprint`; otherwise, or if the cache is damaged,
@@ -35,9 +36,9 @@ def load_with_cache(name: str, fingerprint: list, read, cache_folder: Path) -> p
     # Remove the old fingerprint before replacing the pickle: if writing is interrupted,
     # the old fingerprint must never end up beside a new table.
     fingerprint_file.unlink(missing_ok=True)
-    # A pickle keeps the table exactly (text IDs, None for missing text, column types).
-    # Only ever load pickles this code wrote itself.
-    table.to_pickle(cache_file)
+    # A pickle keeps the table exactly (text IDs, None for missing text, column types), and
+    # can hold a result made of several tables. Only ever load pickles this code wrote itself.
+    pd.to_pickle(table, cache_file)
     fingerprint_file.write_text(fingerprint_text, encoding="utf-8")
     return table
 
@@ -54,7 +55,9 @@ def read_cache(cache_file: Path, fingerprint_file: Path, fingerprint: list):
             print(f"{cache_file.stem}: the inputs have changed since the cache was written; "
                   f"reading them again.")
             return None
-        return pd.read_pickle(cache_file)
+        cached = pd.read_pickle(cache_file)
+        print(f"{cache_file.stem}: read from the cache; delete {cache_file} to make it again.")
+        return cached
     except Exception as error:
         # A damaged cache (e.g. a run interrupted while writing it) can fail in many ways;
         # whatever the reason, the inputs themselves are still there to be read again.
@@ -81,3 +84,15 @@ def source_fingerprint(*source_files: Path) -> list[str]:
     """
     return [hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
             for source_file in source_files]
+
+
+def table_fingerprint(table: pd.DataFrame | pd.Series) -> list[str]:
+    """[a hash of the column names and types, a hash of every value and of the index] of a
+    table (or series), so that a change to a table a result was made from forces one remake. A
+    few seconds for a training table of about a million rows, against minutes of fitting."""
+    if isinstance(table, pd.Series):
+        table = table.to_frame()
+    columns = json.dumps([[str(name), str(dtype)] for name, dtype in table.dtypes.items()])
+    values = pd.util.hash_pandas_object(table, index=True).to_numpy()
+    return [hashlib.sha256(columns.encode("utf-8")).hexdigest(),
+            hashlib.sha256(values.tobytes()).hexdigest()]

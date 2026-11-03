@@ -5329,10 +5329,20 @@ def test_step_16_and_17_imports():
     evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.evaluate"]
     assert len(evaluate_imports) == 1
-    # U14.3 added REFERENCES and deflated_reference to the one import of evaluate.
+    # U14.3 added REFERENCES and deflated_reference to the one import of evaluate; U14.5
+    # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
+    # added rolling_fingerprint.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
-        ("REFERENCES", None), ("actual_totals", None), ("deflated_reference", None),
-        ("rolling_forecasts", None), ("rule_reference", None)]
+        ("HORIZON_TOTAL", None), ("POOLED", None), ("REFERENCES", None),
+        ("actual_totals", None), ("deflated_reference", None), ("evaluation_scores", None),
+        ("rolling_fingerprint", None), ("rolling_forecasts", None), ("rule_reference", None),
+        ("stack_forecasts", None)]
+    # The cache's one function, in an import of its own, right after evaluate's.
+    cache_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+                     and node.module == "collection_estimation.hurdle.cache"]
+    assert len(cache_imports) == 1
+    assert [(a.name, a.asname) for a in cache_imports[0].names] == [("load_with_cache", None)]
+    assert module.body.index(cache_imports[0]) == module.body.index(evaluate_imports[0]) + 1
 
 
 STEP_16_17_NAMES = """
@@ -5358,6 +5368,12 @@ KEYWORDS = dict(block_columns={}, companies=[], new_cash=None, refunds=None, uni
 inspect.signature(script.forecast).bind("table", 0, "settings", **KEYWORDS)
 inspect.signature(script.rolling_forecasts).bind("table", [0], "settings", **KEYWORDS,
                                                  on_origin_done=print)
+# The cache of step 17: the fingerprint takes the fit's arguments (no callback).
+from collection_estimation.hurdle import cache as cache_module
+assert script.rolling_fingerprint is evaluate.rolling_fingerprint
+assert script.load_with_cache is cache_module.load_with_cache
+inspect.signature(script.rolling_fingerprint).bind("table", [0], "settings", **KEYWORDS)
+inspect.signature(script.load_with_cache).bind("name", [], print, "folder")
 inspect.signature(script.actual_totals).bind("weekly", "weeks", "levels", [], [0], 5)
 # U14.3.
 assert script.deflated_reference is evaluate.deflated_reference
@@ -5371,6 +5387,14 @@ inspect.signature(script.rule_reference).bind(
     "ledger", "rates", [0], "settings", companies=[], new_cash=None, refunds=None,
     unidentified=None, levels=None, calendar=None, week_zero=None)
 inspect.signature(script.show_rule_reference).bind("rule", "actual")
+# U14.5.
+assert script.stack_forecasts is evaluate.stack_forecasts
+assert script.evaluation_scores is evaluate.evaluation_scores
+assert script.POOLED is evaluate.POOLED and script.POOLED == "pooled"
+assert script.HORIZON_TOTAL is evaluate.HORIZON_TOTAL and script.HORIZON_TOTAL == "total"
+inspect.signature(script.stack_forecasts).bind(None, "reference", "rule")
+inspect.signature(script.evaluation_scores).bind("forecasts", "actual", 5)
+inspect.signature(script.show_evaluation_scores).bind("scores", 5)
 print("ok")
 """
 
@@ -5409,18 +5433,23 @@ def test_step_17_calls_rolling_forecasts_once_with_a_progress_callback():
     assert len(calls) == 1
     call = calls[0]
     assert [ast.unparse(a) for a in call.args] == ["table", "origins", "settings"]
-    assert keywords_of(call) == {**FORECAST_KEYWORDS, "on_origin_done": "progress"}
-    assigned = [node for node in branch.body if isinstance(node, ast.Assign)
-                and node.value is call]
-    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["rolled"]
-    # progress is defined inside the branch, before the call, with rolling_forecasts' four
+    # Since the cache (2026-11-03): block_columns is a name assigned in the branch, and the
+    # call is the one statement of fit_every_origin, which load_with_cache calls on a miss.
+    assert keywords_of(call) == {**FORECAST_KEYWORDS, "block_columns": "block_columns",
+                                 "on_origin_done": "progress"}
+    fits = [node for node in branch.body
+            if isinstance(node, ast.FunctionDef) and node.name == "fit_every_origin"]
+    assert len(fits) == 1
+    assert len(fits[0].body) == 1 and isinstance(fits[0].body[0], ast.Return)
+    assert fits[0].body[0].value is call
+    # progress is defined inside the branch, before the fit, with rolling_forecasts' four
     # callback arguments (done, total, origin, seconds).
     defs = [(i, node) for i, node in enumerate(branch.body)
             if isinstance(node, ast.FunctionDef) and node.name == "progress"]
     assert len(defs) == 1
     index, progress = defs[0]
     assert [a.arg for a in progress.args.args] == ["done", "total", "at", "seconds"]
-    assert index < branch.body.index(assigned[0])
+    assert index < branch.body.index(fits[0])
     assert all(calls_to(node, "rolling_forecasts") == [] for node in branch.orelse)
 
 
@@ -5673,9 +5702,10 @@ def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and
 
 
 def test_step_17_ends_with_the_deflated_reference_and_its_printout():
-    # U14.4 appended the financial rule's two statements after the reference's two.
+    # U14.4 appended the financial rule's two statements after the reference's two, and
+    # U14.5 the scores' three after those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-4:-2] == [
+    assert statements[-7:-5] == [
         "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
         "settings.receivables.horizons, week_zero)",
         "show_deflated_reference(reference, rolled, rolled_actual)"]
@@ -5696,8 +5726,9 @@ def test_step_17_is_still_the_last_step_after_the_deflated_reference():
     body = main_body()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
-    # Since U14.4 the deflated reference's printout is third from last, before the rule's two.
-    assert ast.unparse(body[-1].body[-3]) == (
+    # Since U14.5 the deflated reference's printout is sixth from last, before the rule's two
+    # statements and the scores' three.
+    assert ast.unparse(body[-1].body[-6]) == (
         "show_deflated_reference(reference, rolled, rolled_actual)")
 
 
@@ -5873,8 +5904,9 @@ def test_step_17_shows_the_rule_reference_once_with_the_rule_and_the_actual():
 
 
 def test_step_17_ends_with_the_rule_reference_and_its_printout():
+    # Since U14.5 the scores' three statements follow the rule's two.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-2:] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
+    assert statements[-5:-3] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
 
 
 def test_step_17_is_still_the_last_step_after_the_rule_reference():
@@ -5882,7 +5914,8 @@ def test_step_17_is_still_the_last_step_after_the_rule_reference():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    assert ast.unparse(body[-1].body[-1]) == SHOW_RULE_STATEMENT
+    # Since U14.5 the rule's printout is fourth from last, before the scores' three.
+    assert ast.unparse(body[-1].body[-4]) == SHOW_RULE_STATEMENT
 
 
 def test_step_17_rule_reference_uses_the_same_origins_as_the_rolling_forecasts():
@@ -6104,8 +6137,9 @@ def test_step_17_statement_order_with_the_with_model_branch():
     block = step_17_block()
     body = block.body
     shapes = [type(node).__name__ for node in body]
+    # U14.5 appended stack_forecasts, evaluation_scores (two Assign) and the printout (Expr).
     assert shapes == ["Assign", "Expr", "Assign", "Assign", "If", "Assign", "Expr", "Assign",
-                      "Expr"]
+                      "Expr", "Assign", "Assign", "Expr"]
     assert ast.unparse(body[0]) == "origins = list(settings.evaluation.validation_origins)"
     assert ast.unparse(body[2]).startswith("rolled_actual = actual_totals(")
     assert ast.unparse(body[3]) == "rolled = None"
@@ -6114,16 +6148,30 @@ def test_step_17_statement_order_with_the_with_model_branch():
     assert ast.unparse(body[6]) == "show_deflated_reference(reference, rolled, rolled_actual)"
     assert ast.unparse(body[7]).startswith("rule = rule_reference(")
     assert ast.unparse(body[8]) == "show_rule_reference(rule, rolled_actual)"
+    assert ast.unparse(body[9]) == "forecasts = stack_forecasts(rolled, reference, rule)"
+    assert ast.unparse(body[10]) == ("scores = evaluation_scores(forecasts, rolled_actual, "
+                                     "settings.receivables.horizons)")
+    assert ast.unparse(body[11]) == ("show_evaluation_scores(scores, "
+                                     "settings.receivables.horizons)")
 
 
 def test_step_17_with_model_branch_body_in_order():
     branch = with_model_if().body
+    # Since the cache (2026-11-03): the block columns, the fit as a function, the
+    # fingerprint, and the forecasts from load_with_cache.
     assert [type(node).__name__ for node in branch] == ["Assign", "FunctionDef", "Assign",
+                                                        "FunctionDef", "Assign", "Assign",
                                                         "Expr"]
     assert ast.unparse(branch[0]) == "started = time.perf_counter()"
     assert branch[1].name == "progress"
-    assert ast.unparse(branch[2]).startswith("rolled = rolling_forecasts(")
-    assert ast.unparse(branch[3]) == "show_rolling_forecasts(rolled, rolled_actual)"
+    assert ast.unparse(branch[2]) == ("block_columns = block_feature_columns(history, calendar, "
+                                      "owed)")
+    assert branch[3].name == "fit_every_origin"
+    assert ast.unparse(branch[4]).startswith("fingerprint = rolling_fingerprint(")
+    assert ast.unparse(branch[5]) == ("rolled = load_with_cache('hurdle_rolling_forecasts', "
+                                      "fingerprint, fit_every_origin, "
+                                      "settings.data.cache_folder)")
+    assert ast.unparse(branch[6]) == "show_rolling_forecasts(rolled, rolled_actual)"
 
 
 def test_step_17_the_else_branch_prints_the_skip_line_only():
@@ -6178,8 +6226,18 @@ STEP_17_NAMES = ["weekly", "weeks", "levels", "companies", "table", "history", "
                  "owed", "new_cash", "refunds", "unidentified", "week_zero", "ledger", "rates"]
 
 
-def run_step_17(with_model):
-    """Execute step 17's `if` with fake inputs and functions; return (calls, printed)."""
+STEP_17_FINGERPRINT = ["<fingerprint>", 1]
+
+
+def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
+                rolled_result=None):
+    """Execute step 17's `if` with fake inputs and functions; return (calls, printed,
+    rolled_result, actual_result).
+
+    By default `load_with_cache` is a recorder that always misses: it records its call, then
+    calls the fit function it was given (so rolling_forecasts is recorded right after it). A
+    real `load_with_cache` (and a real `cache_folder`) can be passed instead; `rolled_result`
+    is what the fake rolling_forecasts returns (a fresh object() by default)."""
     calls, printed = [], []
 
     def recorder(name, result):
@@ -6188,23 +6246,36 @@ def run_step_17(with_model):
             return result
         return call
 
-    rolled_result, actual_result = object(), object()
+    def always_miss(*args, **kwargs):
+        calls.append(("load_with_cache", args, kwargs))
+        return args[2]()
+
+    rolled_result = object() if rolled_result is None else rolled_result
+    actual_result = object()
     namespace = {name: f"<{name}>" for name in STEP_17_NAMES}
     settings = SimpleNamespace(
         evaluation=SimpleNamespace(run=True, with_model=with_model,
                                    validation_origins=(33, 34, 35)),
-        receivables=SimpleNamespace(horizons=5))
+        receivables=SimpleNamespace(horizons=5),
+        data=SimpleNamespace(cache_folder=cache_folder))
     namespace.update(
         settings=settings, time=SimpleNamespace(perf_counter=lambda: 0.0),
         print=lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
         actual_totals=recorder("actual_totals", actual_result),
         rolling_forecasts=recorder("rolling_forecasts", rolled_result),
+        # The cache of the rolling forecasts (2026-11-03).
+        rolling_fingerprint=recorder("rolling_fingerprint", STEP_17_FINGERPRINT),
+        load_with_cache=always_miss if load_with_cache is None else load_with_cache,
         block_feature_columns=recorder("block_feature_columns", "<blocks>"),
         show_rolling_forecasts=recorder("show_rolling_forecasts", None),
         deflated_reference=recorder("deflated_reference", "<reference>"),
         show_deflated_reference=recorder("show_deflated_reference", None),
         rule_reference=recorder("rule_reference", "<rule>"),
-        show_rule_reference=recorder("show_rule_reference", None))
+        show_rule_reference=recorder("show_rule_reference", None),
+        # U14.5.
+        stack_forecasts=recorder("stack_forecasts", "<forecasts>"),
+        evaluation_scores=recorder("evaluation_scores", "<scores>"),
+        show_evaluation_scores=recorder("show_evaluation_scores", None))
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
@@ -6216,10 +6287,14 @@ def names_called(calls):
 
 def test_step_17_with_model_true_calls_everything_in_order():
     calls, printed, _, _ = run_step_17(True)
-    assert names_called(calls) == ["actual_totals", "rolling_forecasts",
+    # Since the cache (2026-11-03): the fingerprint, then load_with_cache, which (on a miss)
+    # calls the fit, i.e. rolling_forecasts.
+    assert names_called(calls) == ["actual_totals", "rolling_fingerprint", "load_with_cache",
+                                   "rolling_forecasts",
                                    "show_rolling_forecasts", "deflated_reference",
                                    "show_deflated_reference", "rule_reference",
-                                   "show_rule_reference"]
+                                   "show_rule_reference", "stack_forecasts",
+                                   "evaluation_scores", "show_evaluation_scores"]
     assert SKIP_LINE not in printed
 
 
@@ -6227,7 +6302,8 @@ def test_step_17_with_model_false_does_not_call_rolling_forecasts():
     calls, printed, _, _ = run_step_17(False)
     assert names_called(calls) == ["actual_totals", "deflated_reference",
                                    "show_deflated_reference", "rule_reference",
-                                   "show_rule_reference"]
+                                   "show_rule_reference", "stack_forecasts",
+                                   "evaluation_scores", "show_evaluation_scores"]
     assert "block_feature_columns" not in [name for name, _, _ in calls]
 
 
@@ -6358,3 +6434,501 @@ def test_show_deflated_reference_with_the_model_counts_only_pairs_the_model_has(
     assert "over the 2 consolidated (origin, h)" in lines[0]
     # Without (10, 1): hurdle 1.5 + 3.0 = 4.5 vs actual 2.0 + 2.0 = 4.0 -> 1.125.
     assert lines[1] == "          hurdle model" + " " * 13 + "4.5 vs actual 4.0 (ratio 1.125)"
+
+
+
+# Step 17, U14.5: every method's forecasts stacked, scored against the actual cash, and the
+# scores' printout, right after the rule's printout. Wiring on main()'s syntax tree and by
+# running step 17's block with fakes (run_step_17 above); the printout on a hand-made scores
+# table, in a separate process.
+
+EVAL_STACK_STATEMENT = "forecasts = stack_forecasts(rolled, reference, rule)"
+EVAL_SCORES_STATEMENT = ("scores = evaluation_scores(forecasts, rolled_actual, "
+                    "settings.receivables.horizons)")
+EVAL_SHOW_STATEMENT = "show_evaluation_scores(scores, settings.receivables.horizons)"
+
+
+def test_step_17_ends_with_the_three_score_statements():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    assert statements[-3:] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT, EVAL_SHOW_STATEMENT]
+
+
+def test_step_17_scores_come_right_after_show_rule_reference():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    shown = statements.index(SHOW_RULE_STATEMENT)
+    assert statements[shown + 1:shown + 4] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT,
+                                               EVAL_SHOW_STATEMENT]
+
+
+def test_step_17_is_still_the_last_step_after_the_scores():
+    body = main_body()
+    assert isinstance(body[-1], ast.If)
+    assert ast.unparse(body[-1].test) == "settings.evaluation.run"
+    assert body[-1].orelse == []
+    assert ast.unparse(body[-1].body[-1]) == EVAL_SHOW_STATEMENT
+
+
+@pytest.mark.parametrize("name", ["stack_forecasts", "evaluation_scores",
+                                  "show_evaluation_scores"])
+def test_step_17_calls_each_score_function_once_in_main(name):
+    assert len(calls_to(main_tree(), name)) == 1, name
+    assert len(calls_to(step_17_block(), name)) == 1, name
+
+
+@pytest.mark.parametrize("name", ["stack_forecasts", "evaluation_scores",
+                                  "show_evaluation_scores"])
+def test_step_17_score_statements_are_direct_statements_of_the_evaluation_block(name):
+    # Directly in the `if settings.evaluation.run:` body: not in the with_model branch, so
+    # they run with or without the model.
+    block = step_17_block()
+    direct = [node for node in block.body if isinstance(node, (ast.Assign, ast.Expr))
+              and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+              and node.value.func.id == name]
+    assert len(direct) == 1, name
+    assert calls_to(with_model_if(block), name) == [], name
+
+
+def test_step_17_score_calls_take_no_keywords():
+    block = step_17_block()
+    for name in ("stack_forecasts", "evaluation_scores", "show_evaluation_scores"):
+        assert calls_to(block, name)[0].keywords == [], name
+
+
+def test_step_17_scores_use_the_horizons_setting_twice():
+    block = step_17_block()
+    scored = calls_to(block, "evaluation_scores")[0]
+    shown = calls_to(block, "show_evaluation_scores")[0]
+    assert ast.unparse(scored.args[2]) == "settings.receivables.horizons"
+    assert ast.unparse(shown.args[1]) == "settings.receivables.horizons"
+
+
+def test_step_17_stacks_the_rolled_reference_and_rule_made_before_it():
+    # rolled (None or the model's), reference and rule are all assigned before the stack.
+    block = step_17_block()
+    statements = [ast.unparse(node) for node in block.body]
+    stack = statements.index(EVAL_STACK_STATEMENT)
+    for prefix in ("rolled = None", "reference = deflated_reference(", "rule = rule_reference("):
+        made = [i for i, s in enumerate(statements) if s.startswith(prefix)]
+        assert len(made) == 1 and made[0] < stack, prefix
+
+
+def test_step_17_scores_against_the_rolled_actual_not_step_16s_actual():
+    scored = calls_to(step_17_block(), "evaluation_scores")[0]
+    assert [ast.unparse(a) for a in scored.args][:2] == ["forecasts", "rolled_actual"]
+
+
+def test_show_evaluation_scores_is_a_module_level_function_with_two_parameters():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_evaluation_scores"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["scores", "horizons"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == []
+
+
+def test_show_evaluation_scores_comes_right_after_show_rule_reference_in_the_file():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+    assert names.index("show_evaluation_scores") == names.index("show_rule_reference") + 1
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_passes_the_stack_on_to_the_scores_and_the_printout(with_model):
+    calls, _, rolled, actual = run_step_17(with_model)
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    # 1. The stack gets the model's forecasts (or None), the reference and the rule.
+    expected_rolled = rolled if with_model else None
+    args, kwargs = by_name["stack_forecasts"]
+    assert args[0] is expected_rolled
+    assert args[1:] == ("<reference>", "<rule>") and kwargs == {}
+    # 2. The scores get the stack, the rolled actual and the horizons setting.
+    args, kwargs = by_name["evaluation_scores"]
+    assert args[0] == "<forecasts>" and args[1] is actual and args[2] == 5 and kwargs == {}
+    # 3. The printout gets the scores and the horizons setting.
+    assert by_name["show_evaluation_scores"] == (("<scores>", 5), {})
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_each_score_function_runs_once(with_model):
+    calls, _, _, _ = run_step_17(with_model)
+    names = [name for name, _, _ in calls]
+    for name in ("stack_forecasts", "evaluation_scores", "show_evaluation_scores"):
+        assert names.count(name) == 1, name
+    # And they are the last three calls, in that order.
+    assert names[-3:] == ["stack_forecasts", "evaluation_scores", "show_evaluation_scores"]
+
+
+# show_evaluation_scores on a hand-made scores table, horizons 2, companies TR02, TR03 and ALL.
+# Only the columns it reads carry numbers (method, company_code, horizon, rows, wape, bias,
+# mape); the others are 0.0. Consolidated (ALL):
+#   hurdle   pooled WAPE 0.20, bias -0.10, MAPE 0.25; h1 0.10, h2 0.30; total 0.05
+#   deflated pooled WAPE 0.15, bias  0.05, MAPE 0.20; h1 0.1236 (-> 0.124), h2 0.18; total 0.08
+#   rule     pooled WAPE 0.40, bias -0.35, MAPE 0.50; h1 0.30, no h2 row, no total row (NaN)
+# Per company, pooled WAPE: hurdle 0.31 / 0.42 / 0.20; deflated 0.25 / 0.35 / 0.15;
+# rule 0.60 / 0.70 / 0.40. hurdle's TR02 h1 row (WAPE 9.99) must not reach the per-company
+# table, which holds the pooled rows only.
+SHOW_EVAL_SCORES = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import SCORE_COLUMNS
+
+nan = float("nan")
+# (method, company_code, horizon, rows, wape, bias, mape)
+given = [
+    ("hurdle", "TR02", "1", 3, 9.99, 0.0, nan),
+    ("hurdle", "TR02", "pooled", 6, 0.31, -0.2, nan),
+    ("hurdle", "TR03", "pooled", 6, 0.42, 0.1, nan),
+    ("hurdle", "ALL", "1", 3, 0.1, -0.15, 0.12),
+    ("hurdle", "ALL", "2", 3, 0.3, -0.05, 0.33),
+    ("hurdle", "ALL", "pooled", 6, 0.2, -0.1, 0.25),
+    ("hurdle", "ALL", "total", 2, 0.05, -0.1, 0.06),
+    ("deflated", "TR02", "pooled", 6, 0.25, 0.0, nan),
+    ("deflated", "TR03", "pooled", 6, 0.35, 0.02, nan),
+    ("deflated", "ALL", "1", 3, 0.1236, 0.04, 0.13),
+    ("deflated", "ALL", "2", 3, 0.18, 0.06, 0.2),
+    ("deflated", "ALL", "pooled", 6, 0.15, 0.05, 0.2),
+    ("deflated", "ALL", "total", 2, 0.08, 0.05, 0.09),
+    ("rule", "TR02", "pooled", 6, 0.6, -0.4, nan),
+    ("rule", "TR03", "pooled", 6, 0.7, -0.5, nan),
+    ("rule", "ALL", "1", 3, 0.3, -0.3, 0.4),
+    ("rule", "ALL", "pooled", 6, 0.4, -0.35, 0.5),
+]
+read = ["method", "company_code", "horizon", "rows", "wape", "bias", "mape"]
+scores = pd.DataFrame([dict(zip(read, row)) for row in given])
+for column in SCORE_COLUMNS:
+    if column not in scores:
+        scores[column] = 0.0
+scores = scores[SCORE_COLUMNS]
+if __WITHOUT_MODEL__:
+    scores = scores[scores["method"] != "hurdle"].reset_index(drop=True)
+before = scores.copy()
+script.show_evaluation_scores(scores, __HORIZONS__)
+pd.testing.assert_frame_equal(scores, before)
+print("ok")
+"""
+
+
+def run_show_eval_scores(without_model=False, horizons=2):
+    code = (SHOW_EVAL_SCORES.replace("__WITHOUT_MODEL__", str(without_model))
+            .replace("__HORIZONS__", str(horizons)))
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+@pytest.fixture(scope="module")
+def eval_lines():
+    return run_show_eval_scores()
+
+
+@pytest.fixture(scope="module")
+def no_model_eval_lines():
+    return run_show_eval_scores(without_model=True)
+
+
+EVAL_SCORES_HEADER = ("        scores (U14.5), consolidated, over 6 (origin, h) with data "
+                 "(h1 ... h2: WAPE per h):")
+EVAL_PER_COMPANY_TITLE = "        pooled WAPE per company:"
+
+
+def test_show_evaluation_scores_exact_printout_with_the_hurdle(eval_lines):
+    assert eval_lines == [
+        EVAL_SCORES_HEADER,
+        "          WAPE  bias  MAPE     h1    h2  2-week total WAPE",
+        "method                                                    ",
+        "hurdle    0.20 -0.10  0.25  0.100  0.30               0.05",
+        "deflated  0.15  0.05  0.20  0.124  0.18               0.08",
+        "rule      0.40 -0.35  0.50  0.300   NaN                NaN",
+        EVAL_PER_COMPANY_TITLE,
+        "company_code  TR02  TR03   ALL",
+        "method                        ",
+        "hurdle        0.31  0.42  0.20",
+        "deflated      0.25  0.35  0.15",
+        "rule          0.60  0.70  0.40",
+    ]
+
+
+def test_show_evaluation_scores_exact_printout_without_the_hurdle(no_model_eval_lines):
+    assert no_model_eval_lines == [
+        EVAL_SCORES_HEADER,
+        "          WAPE  bias  MAPE     h1    h2  2-week total WAPE",
+        "method                                                    ",
+        "deflated  0.15  0.05   0.2  0.124  0.18               0.08",
+        "rule      0.40 -0.35   0.5  0.300   NaN                NaN",
+        EVAL_PER_COMPANY_TITLE,
+        "company_code  TR02  TR03   ALL",
+        "method                        ",
+        "deflated      0.25  0.35  0.15",
+        "rule          0.60  0.70  0.40",
+    ]
+
+
+def test_show_evaluation_scores_without_the_hurdle_has_no_hurdle_line(no_model_eval_lines):
+    assert not any(line.startswith("hurdle") for line in no_model_eval_lines)
+    # One consolidated line and one per-company line fewer.
+    assert len(no_model_eval_lines) == 10
+
+
+def test_show_evaluation_scores_the_methods_in_the_order_they_come(eval_lines):
+    consolidated = [line.split()[0] for line in eval_lines[3:6]]
+    per_company = [line.split()[0] for line in eval_lines[9:12]]
+    assert consolidated == per_company == ["hurdle", "deflated", "rule"]
+
+
+def test_show_evaluation_scores_a_missing_h_or_total_shows_nan_not_zero(eval_lines):
+    # rule has no "2" row and no "total" row.
+    assert row_cells(eval_lines[:6], "rule")[-2:] == ["NaN", "NaN"]
+
+
+def test_show_evaluation_scores_rounds_to_three_decimals(eval_lines):
+    # deflated's h1 WAPE 0.1236 shows as 0.124.
+    assert row_cells(eval_lines[:6], "deflated")[4] == "0.124"
+
+
+def test_show_evaluation_scores_per_company_uses_the_pooled_rows_only(eval_lines):
+    # hurdle's TR02 h1 WAPE 9.99 is not the pooled 0.31.
+    assert not any("9.99" in line for line in eval_lines)
+    assert row_cells(eval_lines[6:], "hurdle")[1] == "0.31"
+
+
+def test_show_evaluation_scores_header_follows_the_horizons_argument():
+    # Horizons 3 on the same table: an h3 column (NaN, no "3" rows) and a 3-week total.
+    lines = run_show_eval_scores(horizons=3)
+    assert lines[0] == ("        scores (U14.5), consolidated, over 6 (origin, h) with data "
+                        "(h1 ... h3: WAPE per h):")
+    assert lines[1].split() == ["WAPE", "bias", "MAPE", "h1", "h2", "h3", "3-week", "total",
+                                "WAPE"]
+    assert row_cells(lines[:6], "hurdle")[6] == "NaN"
+
+
+# Step 17, the cache of the rolling forecasts (2026-11-03): inside the with_model branch the
+# fit is a function (fit_every_origin), the fingerprint is made from the same arguments
+# (rolling_fingerprint, without the progress callback), and load_with_cache either reads the
+# forecasts or calls the fit. Wiring on main()'s syntax tree; then step 17's block run with
+# fakes (run_step_17 above), and with the real load_with_cache over a tmp_path cache folder.
+
+from collection_estimation.hurdle import cache as step17_cache  # noqa: E402
+
+CACHED_ROLLING_NAME = "hurdle_rolling_forecasts"
+
+
+def fit_every_origin_def(branch=None):
+    branch = branch if branch is not None else with_model_if()
+    found = [node for node in branch.body
+             if isinstance(node, ast.FunctionDef) and node.name == "fit_every_origin"]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_step_17_fit_every_origin_takes_no_arguments_and_returns_the_fit():
+    fit = fit_every_origin_def()
+    arguments = fit.args
+    assert arguments.args == [] and arguments.kwonlyargs == [] and arguments.posonlyargs == []
+    assert arguments.vararg is None and arguments.kwarg is None
+    assert len(fit.body) == 1 and isinstance(fit.body[0], ast.Return)
+    assert ast.unparse(fit.body[0].value.func) == "rolling_forecasts"
+
+
+def test_step_17_fingerprint_and_fit_get_identical_arguments_but_the_callback():
+    # 1. The two calls, both inside the with_model branch.
+    branch = with_model_if()
+    fit_call = calls_to(branch, "rolling_forecasts")[0]
+    print_calls = calls_to(branch, "rolling_fingerprint")
+    assert len(print_calls) == 1
+    print_call = print_calls[0]
+    # 2. The same positional arguments, and the same keywords apart from on_origin_done.
+    assert ([ast.unparse(a) for a in print_call.args]
+            == [ast.unparse(a) for a in fit_call.args] == ["table", "origins", "settings"])
+    fit_keywords = keywords_of(fit_call)
+    assert fit_keywords.pop("on_origin_done") == "progress"
+    assert keywords_of(print_call) == fit_keywords
+    # 3. In the same order too (readability: one can be checked against the other).
+    assert [k.arg for k in print_call.keywords] == [k.arg for k in fit_call.keywords
+                                                    if k.arg != "on_origin_done"]
+
+
+def test_step_17_fingerprint_is_assigned_once_before_load_with_cache():
+    branch = with_model_if()
+    fingerprints = [i for i, node in enumerate(branch.body) if isinstance(node, ast.Assign)
+                    and [ast.unparse(t) for t in node.targets] == ["fingerprint"]]
+    loads = [i for i, node in enumerate(branch.body) if isinstance(node, ast.Assign)
+             and calls_to(node, "load_with_cache")]
+    assert len(fingerprints) == 1 and len(loads) == 1
+    assert fingerprints[0] < loads[0]
+    assert fit_every_origin_def(branch) in branch.body[:loads[0]]
+
+
+def test_step_17_load_with_cache_gets_the_name_fingerprint_fit_and_cache_folder():
+    branch = with_model_if()
+    loads = calls_to(branch, "load_with_cache")
+    assert len(loads) == 1
+    load = loads[0]
+    assert load.keywords == []
+    assert [ast.unparse(a) for a in load.args] == [
+        repr(CACHED_ROLLING_NAME), "fingerprint", "fit_every_origin",
+        "settings.data.cache_folder"]
+    # The fit function itself is passed (not called): load_with_cache calls it on a miss.
+    assert isinstance(load.args[2], ast.Name)
+    # Its result is the forecasts the rest of step 17 uses.
+    assigned = [node for node in branch.body if isinstance(node, ast.Assign)
+                and node.value is load]
+    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["rolled"]
+
+
+def test_step_17_block_columns_are_made_once_and_used_by_both():
+    branch = with_model_if()
+    made = [node for node in branch.body if isinstance(node, ast.Assign)
+            and [ast.unparse(t) for t in node.targets] == ["block_columns"]]
+    assert len(made) == 1
+    assert ast.unparse(made[0].value) == "block_feature_columns(history, calendar, owed)"
+    assert len(calls_to(branch, "block_feature_columns")) == 1
+    for name in ("rolling_forecasts", "rolling_fingerprint"):
+        assert keywords_of(calls_to(branch, name)[0])["block_columns"] == "block_columns", name
+
+
+def test_step_17_the_cache_calls_appear_once_in_main_and_only_in_the_branch():
+    tree = main_tree()
+    block = step_17_block()
+    branch = with_model_if(block)
+    outside = [node for node in block.body if node is not branch]
+    for name in ("rolling_fingerprint", "load_with_cache"):
+        assert len(calls_to(tree, name)) == 1, name
+        assert calls_in(outside, name) == [], name
+        assert calls_in(branch.orelse, name) == [], name
+    assert CACHED_ROLLING_NAME in ast.unparse(branch)
+    assert ast.unparse(tree).count(CACHED_ROLLING_NAME) == 1
+
+
+# Running step 17's block with the fakes of run_step_17 (load_with_cache always misses).
+
+def by_name_of(calls):
+    found = {}
+    for name, args, kwargs in calls:
+        assert name not in found, f"{name} called twice"
+        found[name] = (args, kwargs)
+    return found
+
+
+def test_step_17_run_fingerprint_and_fit_receive_the_same_arguments():
+    calls, _, _, _ = run_step_17(True)
+    by_name = by_name_of(calls)
+    fit_args, fit_kwargs = by_name["rolling_forecasts"]
+    print_args, print_kwargs = by_name["rolling_fingerprint"]
+    # The very same objects, positionally and by keyword, apart from the callback.
+    assert len(print_args) == len(fit_args) == 3
+    for found, wanted in zip(print_args, fit_args):
+        assert found is wanted
+    fit_kwargs = dict(fit_kwargs)
+    assert callable(fit_kwargs.pop("on_origin_done"))
+    assert set(print_kwargs) == set(fit_kwargs)
+    for name in fit_kwargs:
+        assert print_kwargs[name] is fit_kwargs[name], name
+    assert print_kwargs["block_columns"] == "<blocks>"
+
+
+def test_step_17_run_load_with_cache_gets_name_fingerprint_fit_and_folder():
+    calls, _, rolled, _ = run_step_17(True, cache_folder="<the cache folder>")
+    args, kwargs = by_name_of(calls)["load_with_cache"]
+    assert kwargs == {}
+    assert args[0] == CACHED_ROLLING_NAME
+    assert args[1] is STEP_17_FINGERPRINT          # what rolling_fingerprint returned
+    assert callable(args[2])
+    assert args[3] == "<the cache folder>"
+
+
+def test_step_17_run_the_fit_function_is_what_calls_rolling_forecasts():
+    # 1. In the run, rolling_forecasts is called only from inside load_with_cache.
+    calls, _, rolled, _ = run_step_17(True)
+    names = [name for name, _, _ in calls]
+    assert names.index("rolling_forecasts") == names.index("load_with_cache") + 1
+    # 2. Calling the fit function again calls rolling_forecasts again, with the same inputs.
+    fit = by_name_of(calls)["load_with_cache"][0][2]
+    before = len(calls)
+    assert fit() is rolled
+    assert [name for name, _, _ in calls[before:]] == ["rolling_forecasts"]
+
+
+def test_step_17_run_the_result_of_load_with_cache_is_the_rolled_forecasts():
+    cached = object()
+
+    def always_hit(*args, **kwargs):
+        return cached
+
+    calls, _, _, actual = run_step_17(True, load_with_cache=always_hit)
+    by_name = by_name_of(calls)
+    assert "rolling_forecasts" not in by_name
+    assert by_name["show_rolling_forecasts"][0] == (cached, actual)
+    assert by_name["show_deflated_reference"][0][1] is cached
+    assert by_name["stack_forecasts"][0][0] is cached
+
+
+def test_step_17_run_with_model_false_calls_none_of_the_cache():
+    loaded = []
+    calls, _, _, _ = run_step_17(False, load_with_cache=lambda *a, **k: loaded.append(a))
+    names = [name for name, _, _ in calls]
+    for name in ("rolling_fingerprint", "load_with_cache", "rolling_forecasts",
+                 "block_feature_columns"):
+        assert name not in names, name
+    assert loaded == []
+
+
+# Running step 17's block with the REAL load_with_cache over a tmp_path cache folder (the
+# fingerprint is still the fake's fixed STEP_17_FINGERPRINT).
+
+def real_cache_run(cache_folder, rolled_result):
+    return run_step_17(True, cache_folder=cache_folder,
+                       load_with_cache=step17_cache.load_with_cache,
+                       rolled_result=rolled_result)
+
+
+def test_step_17_with_a_prefilled_cache_does_not_call_rolling_forecasts(tmp_path, capsys):
+    # 1. A cache written under the fingerprint step 17 will make.
+    cached = {"forecasts": [1.5, 2.5]}
+    step17_cache.load_with_cache(CACHED_ROLLING_NAME, STEP_17_FINGERPRINT, lambda: cached,
+                                 tmp_path)
+    capsys.readouterr()
+    # 2. Step 17 reads it: no fit, and the cached forecasts go on to the printout and stack.
+    calls, _, _, actual = real_cache_run(tmp_path, rolled_result={"never": "used"})
+    by_name = by_name_of(calls)
+    assert "rolling_forecasts" not in by_name
+    assert by_name["show_rolling_forecasts"][0][0] == cached
+    assert by_name["stack_forecasts"][0][0] == cached
+    # 3. The real cache said where it read from.
+    pickle_file = tmp_path / f"{CACHED_ROLLING_NAME}.pkl"
+    assert capsys.readouterr().out == (f"{CACHED_ROLLING_NAME}: read from the cache; delete "
+                                       f"{pickle_file} to make it again.\n")
+
+
+def test_step_17_with_an_empty_cache_fits_once_then_reads(tmp_path):
+    # 1. No cache: the fit runs once and the cache files are written.
+    fitted = {"forecasts": [3.0]}
+    calls, _, _, _ = real_cache_run(tmp_path, rolled_result=fitted)
+    assert [name for name, _, _ in calls].count("rolling_forecasts") == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        f"{CACHED_ROLLING_NAME}.pkl", f"{CACHED_ROLLING_NAME}_fingerprint.json"]
+    # 2. The next run of step 17 reads the cache: no fit, the same forecasts.
+    calls, _, _, _ = real_cache_run(tmp_path, rolled_result={"other": 1})
+    by_name = by_name_of(calls)
+    assert "rolling_forecasts" not in by_name
+    assert by_name["show_rolling_forecasts"][0][0] == fitted
+
+
+def test_step_17_with_a_cache_under_another_fingerprint_fits_again(tmp_path):
+    # A cache made from other inputs (another fingerprint) is not used.
+    step17_cache.load_with_cache(CACHED_ROLLING_NAME, ["older inputs"], lambda: {"old": 1},
+                                 tmp_path)
+    fitted = {"forecasts": [4.0]}
+    calls, _, _, _ = real_cache_run(tmp_path, rolled_result=fitted)
+    by_name = by_name_of(calls)
+    assert "rolling_forecasts" in by_name
+    assert by_name["show_rolling_forecasts"][0][0] == fitted
+
+
+def test_step_17_the_cache_goes_to_the_settings_cache_folder(tmp_path):
+    folder = tmp_path / "nested" / "cache"
+    real_cache_run(folder, rolled_result={"forecasts": [1.0]})
+    assert (folder / f"{CACHED_ROLLING_NAME}.pkl").is_file()
+    assert not (tmp_path / f"{CACHED_ROLLING_NAME}.pkl").exists()

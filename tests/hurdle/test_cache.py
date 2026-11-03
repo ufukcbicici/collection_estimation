@@ -35,6 +35,11 @@ def damaged_start(name=NAME):
 DAMAGED_END = "); reading the inputs again."
 
 
+def hit_note(cache_file):
+    """The one line read_cache prints on a hit (with its newline)."""
+    return f"{cache_file.stem}: read from the cache; delete {cache_file} to make it again.\n"
+
+
 def tiny_table():
     # dtype=object explicitly: pandas 3 would otherwise infer its `str` dtype and turn the
     # None into NaN before the cache ever sees it (the readers build object columns).
@@ -148,11 +153,12 @@ def test_second_call_keeps_leading_zero_text(cache_folder):
     assert list(second['customer'].iloc[:2]) == ['0012345', '0000002']
 
 
-def test_second_call_prints_nothing(cache_folder, capsys):
+def test_second_call_prints_the_hit_note_only(cache_folder, capsys):
     load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
     capsys.readouterr()
     load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
-    assert capsys.readouterr().out == ''
+    cache_file, _ = files(cache_folder)
+    assert capsys.readouterr().out == hit_note(cache_file)
 
 
 def test_second_call_does_not_rewrite_the_files(cache_folder):
@@ -269,7 +275,7 @@ def test_a_tuple_fingerprint_hits_on_the_second_call(cache_folder, capsys, finge
     capsys.readouterr()
     table = load_with_cache(NAME, fingerprint, fail_read, cache_folder)
     assert read.calls == 1
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(files(cache_folder)[0])
     pd.testing.assert_frame_equal(table, tiny_table())
 
 
@@ -370,7 +376,7 @@ def test_unencodable_fingerprint_over_an_existing_cache_then_old_fingerprint_ser
     capsys.readouterr()
     served = load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
     pd.testing.assert_frame_equal(served, tiny_table())
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(files(cache_folder)[0])
 
 
 def test_read_cache_with_an_unencodable_fingerprint_returns_none_with_the_damaged_note(
@@ -433,7 +439,7 @@ def test_damaged_cache_is_repaired_and_the_next_call_hits(cache_folder, capsys):
     capsys.readouterr()
     pd.testing.assert_frame_equal(load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder),
                                   tiny_table())
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == hit_note(files(cache_folder)[0])
 
 
 @pytest.mark.parametrize('which', ['pickle', 'fingerprint'])
@@ -521,8 +527,9 @@ class PickleWriteFailed(OSError):
 
 
 def failing_to_pickle(partial: bytes | None):
-    """A stand-in for DataFrame.to_pickle: optionally writes `partial` bytes, then raises."""
-    def to_pickle(self, path, *args, **kwargs):
+    """A stand-in for pd.to_pickle(obj, path): optionally writes `partial` bytes, then raises.
+    load_with_cache writes with pd.to_pickle, so that it can cache any picklable result."""
+    def to_pickle(obj, path, *args, **kwargs):
         if partial is not None:
             Path(path).write_bytes(partial)
         raise PickleWriteFailed('disk full')
@@ -532,7 +539,7 @@ def failing_to_pickle(partial: bytes | None):
 @pytest.mark.parametrize('partial', [None, b'\x80\x05\x95half'], ids=['untouched', 'partial'])
 def test_pickle_write_failure_propagates(cache_folder, monkeypatch, partial):
     load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
-    monkeypatch.setattr(pd.DataFrame, 'to_pickle', failing_to_pickle(partial))
+    monkeypatch.setattr(pd, 'to_pickle', failing_to_pickle(partial))
     with pytest.raises(PickleWriteFailed, match='disk full'):
         load_with_cache(NAME, other_fingerprint(), CountingRead(new_table()), cache_folder)
 
@@ -541,7 +548,7 @@ def test_pickle_write_failure_propagates(cache_folder, monkeypatch, partial):
 def test_pickle_write_failure_removes_the_old_fingerprint_file(cache_folder, monkeypatch,
                                                                partial):
     load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
-    monkeypatch.setattr(pd.DataFrame, 'to_pickle', failing_to_pickle(partial))
+    monkeypatch.setattr(pd, 'to_pickle', failing_to_pickle(partial))
     with pytest.raises(PickleWriteFailed):
         load_with_cache(NAME, other_fingerprint(), CountingRead(new_table()), cache_folder)
     cache_file, fingerprint_file = files(cache_folder)
@@ -556,7 +563,7 @@ def test_after_a_pickle_write_failure_the_next_call_reads_again(cache_folder, mo
                                                                 fingerprint_next):
     load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
     with monkeypatch.context() as patch:
-        patch.setattr(pd.DataFrame, 'to_pickle', failing_to_pickle(partial))
+        patch.setattr(pd, 'to_pickle', failing_to_pickle(partial))
         with pytest.raises(PickleWriteFailed):
             load_with_cache(NAME, other_fingerprint(), CountingRead(new_table()),
                             cache_folder)
@@ -790,3 +797,386 @@ def test_source_fingerprint_survives_a_json_round_trip(tmp_path):
 def test_source_fingerprint_of_a_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         source_fingerprint(tmp_path / 'missing.py')
+
+
+# --- results that are not one DataFrame (2026-11-03: pd.to_pickle) -------------------------
+# load_with_cache saves with pd.to_pickle, so it caches any picklable result, e.g. step 17's
+# forecast.Forecast (a frozen dataclass holding two DataFrames).
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+
+from collection_estimation.hurdle.cache import table_fingerprint  # noqa: E402
+from collection_estimation.hurdle.forecast import Forecast  # noqa: E402
+
+
+@dataclass(frozen=True)
+class TwoTables:
+    """A dataclass of two tables, like Forecast (module level, so that it pickles)."""
+    first: pd.DataFrame
+    second: pd.DataFrame
+
+
+def a_forecast():
+    totals = pd.DataFrame({'company_code': pd.Series(['TR02', 'ALL'], dtype=object),
+                           'origin_week': pd.Series([33, 33], dtype='int64'),
+                           'total': [1.5e6, 2.25e6], 'fallback': [False, True]})
+    customers = pd.DataFrame({'key': pd.Series(['0012345|TR02', None], dtype=object,
+                                               index=[7, 3]),
+                              'expected': pd.Series([10.0, 0.5], index=[7, 3])})
+    return Forecast(totals=totals, customers=customers)
+
+
+class CountingMake:
+    """A zero-argument `read` for any result: counts calls, returns what `make()` builds."""
+
+    def __init__(self, make):
+        self.make = make
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.make()
+
+
+def test_a_forecast_round_trips_through_the_cache(cache_folder):
+    # 1. The first call builds the Forecast and caches it.
+    make = CountingMake(a_forecast)
+    first = load_with_cache(NAME, FINGERPRINT, make, cache_folder)
+    # 2. The second call reads it back without building: a Forecast with equal tables.
+    second = load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    assert make.calls == 1
+    assert type(second) is Forecast
+    pd.testing.assert_frame_equal(second.totals, first.totals)
+    pd.testing.assert_frame_equal(second.customers, first.customers)
+
+
+def test_a_cached_forecast_keeps_dtypes_index_and_none(cache_folder):
+    load_with_cache(NAME, FINGERPRINT, a_forecast, cache_folder)
+    served = load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    expected = a_forecast()
+    assert dict(served.totals.dtypes) == dict(expected.totals.dtypes)
+    assert list(served.customers.index) == [7, 3]
+    assert served.customers['key'].iloc[1] is None
+
+
+def test_the_first_call_returns_the_very_object_read_built(cache_folder):
+    # On a miss, the result is returned as built (not a re-read copy).
+    built = a_forecast()
+    assert load_with_cache(NAME, FINGERPRINT, lambda: built, cache_folder) is built
+
+
+def test_a_dataclass_of_two_tables_round_trips(cache_folder):
+    original = TwoTables(first=tiny_table(), second=pd.DataFrame({'x': [1, 2, 3]}))
+    load_with_cache(NAME, FINGERPRINT, lambda: original, cache_folder)
+    served = load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    assert type(served) is TwoTables
+    pd.testing.assert_frame_equal(served.first, original.first)
+    pd.testing.assert_frame_equal(served.second, original.second)
+
+
+@pytest.mark.parametrize('result', [
+    {'a': pd.DataFrame({'x': [1.0]}), 'b': [1, 2]},
+    [pd.DataFrame({'x': [1]}), pd.DataFrame({'y': ['p']})],
+    pd.Series([1.0, 2.0], index=[10, 11], name='price_level'),
+], ids=['dict', 'list-of-frames', 'series'])
+def test_other_picklable_results_round_trip(cache_folder, result):
+    load_with_cache(NAME, FINGERPRINT, lambda: result, cache_folder)
+    served = load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    if isinstance(result, pd.Series):
+        pd.testing.assert_series_equal(served, result)
+    elif isinstance(result, dict):
+        pd.testing.assert_frame_equal(served['a'], result['a'])
+        assert served['b'] == result['b']
+    else:
+        for found, wanted in zip(served, result):
+            pd.testing.assert_frame_equal(found, wanted)
+
+
+def test_a_forecast_cache_is_replaced_when_the_fingerprint_changes(cache_folder):
+    # 1. A Forecast cached under the first fingerprint.
+    load_with_cache(NAME, FINGERPRINT, a_forecast, cache_folder)
+    # 2. A changed fingerprint builds again: a plain table this time, served from then on.
+    load_with_cache(NAME, other_fingerprint(), tiny_table, cache_folder)
+    served = load_with_cache(NAME, other_fingerprint(), fail_read, cache_folder)
+    pd.testing.assert_frame_equal(served, tiny_table())
+
+
+def test_an_unpicklable_result_propagates_and_leaves_no_fingerprint(cache_folder):
+    # A result pickle cannot write (a lambda inside) fails loudly; no fingerprint is left
+    # beside whatever the pickle file holds, so the next call builds again.
+    def unpicklable():
+        return {'f': lambda: 1}
+    with pytest.raises(Exception):
+        load_with_cache(NAME, FINGERPRINT, unpicklable, cache_folder)
+    _, fingerprint_file = files(cache_folder)
+    assert not fingerprint_file.exists()
+    read = CountingRead()
+    load_with_cache(NAME, FINGERPRINT, read, cache_folder)
+    assert read.calls == 1
+
+
+# --- the note printed on a hit ----------------------------------------------------------------
+
+def test_the_hit_note_exact_text(cache_folder, capsys):
+    load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
+    capsys.readouterr()
+    load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    output = capsys.readouterr().out
+    expected = (f"tiny: read from the cache; delete {cache_folder / 'tiny.pkl'} "
+                f"to make it again.\n")
+    assert output == expected
+
+
+def test_the_hit_note_names_the_cache_and_its_pickle(cache_folder, capsys):
+    load_with_cache('hurdle_rolling_forecasts', FINGERPRINT, a_forecast, cache_folder)
+    capsys.readouterr()
+    load_with_cache('hurdle_rolling_forecasts', FINGERPRINT, fail_read, cache_folder)
+    pickle_file = cache_folder / 'hurdle_rolling_forecasts.pkl'
+    assert capsys.readouterr().out == hit_note(pickle_file)
+    assert pickle_file.is_file()           # the file the note says to delete exists
+
+
+def test_the_hit_note_with_the_folder_given_as_a_string(cache_folder, capsys):
+    load_with_cache(NAME, FINGERPRINT, CountingRead(), str(cache_folder))
+    capsys.readouterr()
+    load_with_cache(NAME, FINGERPRINT, fail_read, str(cache_folder))
+    assert capsys.readouterr().out == hit_note(cache_folder / 'tiny.pkl')
+
+
+def test_the_hit_note_is_printed_once_per_hit(cache_folder, capsys):
+    load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
+    capsys.readouterr()
+    for _ in range(3):
+        load_with_cache(NAME, FINGERPRINT, fail_read, cache_folder)
+    assert capsys.readouterr().out == hit_note(files(cache_folder)[0]) * 3
+
+
+def test_no_hit_note_on_a_changed_fingerprint(cache_folder, capsys):
+    # A miss prints the changed note only, then nothing about a hit.
+    load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
+    capsys.readouterr()
+    load_with_cache(NAME, other_fingerprint(), CountingRead(), cache_folder)
+    output = capsys.readouterr().out
+    assert output == changed_note() + '\n'
+    assert 'read from the cache' not in output
+
+
+def test_no_hit_note_on_a_damaged_pickle(cache_folder, capsys):
+    read = build_then_damage(cache_folder, lambda pkl, _: pkl.write_bytes(b'junk'))
+    capsys.readouterr()
+    load_with_cache(NAME, FINGERPRINT, read, cache_folder)
+    output = capsys.readouterr().out
+    assert output.startswith(damaged_start()) and output.endswith(DAMAGED_END + '\n')
+    assert output.count('\n') == 1
+    assert 'read from the cache' not in output
+
+
+def test_no_note_at_all_on_the_first_call_with_a_forecast(cache_folder, capsys):
+    load_with_cache(NAME, FINGERPRINT, a_forecast, cache_folder)
+    assert capsys.readouterr().out == ''
+
+
+def test_after_a_change_the_next_identical_call_prints_the_hit_note(cache_folder, capsys):
+    load_with_cache(NAME, FINGERPRINT, CountingRead(), cache_folder)
+    load_with_cache(NAME, other_fingerprint(), CountingRead(), cache_folder)
+    capsys.readouterr()
+    load_with_cache(NAME, other_fingerprint(), fail_read, cache_folder)
+    assert capsys.readouterr().out == hit_note(files(cache_folder)[0])
+
+
+def test_read_cache_prints_the_hit_note_with_the_cache_file_stem(tmp_path, capsys):
+    # The note's name is the pickle's stem, whatever the fingerprint file is called.
+    cache_file = tmp_path / 'some_table.pkl'
+    fingerprint_file = tmp_path / 'whatever.json'
+    tiny_table().to_pickle(cache_file)
+    fingerprint_file.write_text('[1]', encoding='utf-8')
+    read_cache(cache_file, fingerprint_file, [1])
+    assert capsys.readouterr().out == hit_note(cache_file)
+
+
+def test_read_cache_prints_no_hit_note_on_a_mismatch(tmp_path, capsys):
+    cache_file = tmp_path / 'some_table.pkl'
+    fingerprint_file = tmp_path / 'some_table_fingerprint.json'
+    tiny_table().to_pickle(cache_file)
+    fingerprint_file.write_text('[1]', encoding='utf-8')
+    read_cache(cache_file, fingerprint_file, [2])
+    assert 'read from the cache' not in capsys.readouterr().out
+
+
+# --- table_fingerprint ------------------------------------------------------------------------
+
+def fingerprinted_table():
+    return pd.DataFrame({
+        'company_code': pd.Series(['TR02', 'TR04', 'TR02'], dtype=object),
+        'origin_week': pd.Series([33, 33, 34], dtype='int64'),
+        'amount': [10.5, -2.25, 0.0],
+    })
+
+
+def test_table_fingerprint_is_two_sha256_hex_digests():
+    found = table_fingerprint(fingerprinted_table())
+    assert isinstance(found, list) and len(found) == 2
+    for digest in found:
+        assert isinstance(digest, str) and len(digest) == 64
+        assert all(char in '0123456789abcdef' for char in digest)
+
+
+def test_table_fingerprint_by_hand():
+    # The definition: [sha256 of the JSON of [[name, dtype], ...]; sha256 of the bytes of
+    # pandas' row hashes, index included].
+    table = fingerprinted_table()
+    columns = json.dumps([['company_code', 'object'], ['origin_week', 'int64'],
+                          ['amount', 'float64']])
+    rows = pd.util.hash_pandas_object(table, index=True).to_numpy().tobytes()
+    assert table_fingerprint(table) == [hashlib.sha256(columns.encode('utf-8')).hexdigest(),
+                                        hashlib.sha256(rows).hexdigest()]
+
+
+def test_table_fingerprint_is_deterministic():
+    table = fingerprinted_table()
+    assert table_fingerprint(table) == table_fingerprint(table)
+
+
+def test_table_fingerprint_equal_for_equal_tables_and_copies():
+    table = fingerprinted_table()
+    assert table_fingerprint(fingerprinted_table()) == table_fingerprint(table)
+    assert table_fingerprint(table.copy()) == table_fingerprint(table)
+    assert table_fingerprint(table.copy(deep=False)) == table_fingerprint(table)
+
+
+def test_table_fingerprint_is_the_same_in_another_process(tmp_path):
+    # A cache is only useful across runs: the fingerprint must not depend on the process
+    # (no per-process hash seed).
+    script = tmp_path / 'fingerprint.py'
+    script.write_text(
+        "import json, pandas as pd\n"
+        "from collection_estimation.hurdle.cache import table_fingerprint\n"
+        "table = pd.DataFrame({'company_code': pd.Series(['TR02', 'TR04', 'TR02'], "
+        "dtype=object), 'origin_week': pd.Series([33, 33, 34], dtype='int64'), "
+        "'amount': [10.5, -2.25, 0.0]})\n"
+        "print(json.dumps(table_fingerprint(table)))\n", encoding='utf-8')
+    source_folder = Path(__file__).resolve().parents[2] / 'src'
+    environment = {**os.environ, 'PYTHONPATH': str(source_folder),
+                   'PYTHONHASHSEED': '12345'}
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                            env=environment)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == table_fingerprint(fingerprinted_table())
+
+
+def test_table_fingerprint_survives_a_json_round_trip():
+    found = table_fingerprint(fingerprinted_table())
+    assert json.loads(json.dumps(found, indent=1)) == found
+
+
+def test_table_fingerprint_does_not_change_the_table():
+    table = fingerprinted_table()
+    table_fingerprint(table)
+    pd.testing.assert_frame_equal(table, fingerprinted_table())
+
+
+def changed_value(table):
+    table.loc[1, 'amount'] = -2.2500001
+    return table
+
+
+def changed_text(table):
+    table.loc[2, 'company_code'] = 'TR05'
+    return table
+
+
+def changed_index(table):
+    return table.set_axis([0, 1, 5])
+
+
+def changed_column_name(table):
+    return table.rename(columns={'amount': 'amount_try'})
+
+
+def changed_dtype(table):
+    return table.astype({'origin_week': 'float64'})
+
+
+def changed_row_order(table):
+    return table.iloc[[2, 0, 1]]
+
+
+def changed_row_order_reset(table):
+    return table.iloc[[2, 0, 1]].reset_index(drop=True)
+
+
+def changed_column_order(table):
+    return table[['amount', 'company_code', 'origin_week']]
+
+
+def added_row(table):
+    return pd.concat([table, table.iloc[[0]]], ignore_index=True)
+
+
+def dropped_row(table):
+    return table.iloc[:2]
+
+
+def added_column(table):
+    return table.assign(extra=1.0)
+
+
+def zero_sign(table):
+    table.loc[2, 'amount'] = -0.0
+    return table
+
+
+TABLE_CHANGES = [changed_value, changed_text, changed_index, changed_column_name,
+                 changed_dtype, changed_row_order, changed_row_order_reset,
+                 changed_column_order, added_row, dropped_row, added_column, zero_sign]
+
+
+@pytest.mark.parametrize('change', TABLE_CHANGES, ids=[c.__name__ for c in TABLE_CHANGES])
+def test_table_fingerprint_changes_when_the_table_changes(change):
+    before = table_fingerprint(fingerprinted_table())
+    after = table_fingerprint(change(fingerprinted_table()))
+    assert after != before
+
+
+def test_table_fingerprint_a_dtype_change_moves_the_first_digest():
+    before = table_fingerprint(fingerprinted_table())
+    after = table_fingerprint(changed_dtype(fingerprinted_table()))
+    assert after[0] != before[0]
+
+
+def test_table_fingerprint_a_value_change_moves_only_the_second_digest():
+    before = table_fingerprint(fingerprinted_table())
+    after = table_fingerprint(changed_value(fingerprinted_table()))
+    assert after[0] == before[0] and after[1] != before[1]
+
+
+def test_table_fingerprint_of_a_series_is_that_of_its_frame():
+    levels = pd.Series([1.0, 1.02, 1.05], index=pd.Index([10, 11, 12]), name='price_level')
+    assert table_fingerprint(levels) == table_fingerprint(levels.to_frame())
+
+
+def test_table_fingerprint_of_a_series_changes_with_a_value_the_index_or_the_name():
+    levels = pd.Series([1.0, 1.02, 1.05], index=[10, 11, 12], name='price_level')
+    before = table_fingerprint(levels)
+    other_value = levels.copy()
+    other_value.iloc[1] = 1.03
+    assert table_fingerprint(other_value) != before
+    assert table_fingerprint(levels.set_axis([10, 11, 13])) != before
+    assert table_fingerprint(levels.rename('level')) != before
+
+
+def test_table_fingerprint_of_an_unnamed_series_works():
+    unnamed = pd.Series([1.0, 2.0])
+    found = table_fingerprint(unnamed)
+    assert found == table_fingerprint(unnamed.copy())
+    assert len(found) == 2
+
+
+def test_table_fingerprint_of_empty_tables():
+    # No rows: still two digests; the columns still count.
+    empty = pd.DataFrame({'x': pd.Series([], dtype='float64')})
+    assert len(table_fingerprint(empty)) == 2
+    assert table_fingerprint(empty) != table_fingerprint(pd.DataFrame())
+    assert table_fingerprint(pd.DataFrame()) == table_fingerprint(pd.DataFrame())
