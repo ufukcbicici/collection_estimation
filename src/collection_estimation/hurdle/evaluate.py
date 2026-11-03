@@ -11,8 +11,8 @@ checked cheaply is checked for every origin before the first (slow) fit.
 
 U14.3, the `deflated` reference: `benchmark.deflated_forecasts` on all the cash of each company
 (and of all of them, fitted on its own), deflated, refitted at every origin on the weeks known
-at it, then times the price level projected at the origin, as the model's total is. With and
-without the recent level.
+at it, then times the price level projected at the origin, as the model's total is. In three
+variants: with the recent level, without it, and without it but with a trend.
 
 U14.4, the financial-rule reference: what a finance person would forecast from the open
 invoices, with no model. Each invoice open at the origin is expected on its due date plus the
@@ -40,8 +40,12 @@ ACTUAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "actual", "
 # (TRY of week 0), forecast nominal TRY: real_forecast x price_level.
 REFERENCE_COLUMNS = ["company_code", "origin_week", "h", "target_week", "reference",
                      "real_forecast", "price_level", "forecast", "fallback"]
-# The two variants of the `deflated` reference: with the recent level among the inputs or not.
-REFERENCES = {"deflated": True, "deflated_nolevel": False}
+# The variants of the `deflated` reference, each (with_level, with_trend): the recent level
+# among the inputs or not, and the week number (a straight-line trend) or not. deflated_trend
+# was the best setting of a scratch grid on the validation origins (2026-11-03).
+REFERENCES = {"deflated": (True, False),
+              "deflated_nolevel": (False, False),
+              "deflated_trend": (False, True)}
 
 # What the financial rule decides for each open invoice (the `status` column).
 DOUBTFUL = "doubtful"                # too long past due: left out
@@ -197,7 +201,7 @@ def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Ser
     level of T + h projected at T (`prices.projected_levels` from `week_zero`).
 
     Columns `REFERENCE_COLUMNS`, sorted by company (the companies, then "ALL"), origin, h and
-    reference ("deflated", then "deflated_nolevel").
+    reference (in the order of `REFERENCES`: "deflated", "deflated_nolevel", "deflated_trend").
 
     Raises ValueError if `origins` is empty, `horizons` is below 1, the company list holds
     "ALL" or is empty, or the weekly amounts hold cash of a company outside the list, as
@@ -236,9 +240,9 @@ def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Ser
     for company, series in real.items():
         for origin in origins:
             for h in range(1, horizons + 1):
-                for reference, with_level in REFERENCES.items():
+                for reference, (with_level, with_trend) in REFERENCES.items():
                     made = deflated_forecasts(series, calendar, h, origin, [origin],
-                                              with_level).iloc[0]
+                                              with_level, with_trend).iloc[0]
                     level = float(projected[origin].loc[origin + h])
                     rows.append({"company_code": company, "origin_week": origin, "h": h,
                                  "target_week": origin + h, "reference": reference,

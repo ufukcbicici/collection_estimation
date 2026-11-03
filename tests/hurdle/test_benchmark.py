@@ -710,3 +710,211 @@ def test_benchmark_forecasts_on_cash_totals_of_a_panel_end_to_end():
     result = benchmark_forecasts(totals, calendar(), 40, wanted, True)
     assert len(result) == len(wanted)
     assert np.isfinite(result["forecast"]).all() and (result["forecast"] > 0).all()
+
+
+# --- deflated_forecasts: with_trend (U14.3's deflated_trend) ---------------------------------
+#
+# `with_trend` appends the target week's number to every input row (training and forecast), so
+# the ridge can fit a straight line through time. Off by default; the default must be exactly
+# the old behaviour.
+
+def straight_line(weeks, intercept=1000.0, slope=20.0):
+    """Cash that is an exact straight line in the week number, with no calendar signal."""
+    weeks = list(weeks)
+    return pd.Series([intercept + slope * w for w in weeks], index=pd.Index(weeks),
+                     dtype="float64")
+
+
+@pytest.mark.parametrize("with_level", [True, False])
+@pytest.mark.parametrize("h", [1, 3, 5])
+def test_with_trend_false_equals_the_default(with_level, h):
+    # Explicit False (by name and by position) and the omitted argument: the same frame, exactly.
+    series = noisy_series(range(0, 60), seed=h)
+    origins = [40, 43, 47]
+    omitted = deflated_forecasts(series, calendar(), h, 40, origins, with_level)
+    explicit = deflated_forecasts(series, calendar(), h, 40, origins, with_level,
+                                  with_trend=False)
+    by_position = deflated_forecasts(series, calendar(), h, 40, origins, with_level, False)
+    pd.testing.assert_frame_equal(omitted, explicit, check_exact=True)
+    pd.testing.assert_frame_equal(omitted, by_position, check_exact=True)
+
+
+def test_with_trend_has_the_same_columns_and_rows():
+    series = noisy_series(range(0, 60))
+    result = deflated_forecasts(series, calendar(), 2, 40, [45, 41], False, with_trend=True)
+    assert list(result.columns) == FORECAST_COLUMNS
+    assert result["origin_week"].tolist() == [45, 41]
+    assert result["target_week"].tolist() == [47, 43]
+    assert result["fallback"].dtype == bool
+
+
+@pytest.mark.parametrize("h", [1, 3, 5])
+def test_with_trend_extrapolates_a_straight_line_that_the_calendar_cannot(h):
+    # A real-terms straight line, 1,000 + 20 w, with no calendar signal at all.
+    cal = calendar()
+    series = straight_line(range(0, 70))
+    origins = list(range(40, 60))
+    truth = straight_line([o + h for o in origins]).to_numpy()
+    # Step 1: the forecasts with the trend, without it, and with the level only.
+    trend = deflated_forecasts(series, cal, h, 40, origins, False, with_trend=True)
+    no_trend = deflated_forecasts(series, cal, h, 40, origins, False)
+    level_only = deflated_forecasts(series, cal, h, 40, origins, True)
+    # Step 2: the trend recovers the line (within 1%), never falling back.
+    assert not trend["fallback"].any()
+    np.testing.assert_allclose(trend["forecast"], truth, rtol=0.01)
+    # Step 3: its error is a small fraction of the error of either variant without a trend.
+    trend_error = np.abs(trend["forecast"].to_numpy() - truth).mean()
+    no_trend_error = np.abs(no_trend["forecast"].to_numpy() - truth).mean()
+    level_error = np.abs(level_only["forecast"].to_numpy() - truth).mean()
+    assert trend_error < 0.1 * no_trend_error
+    assert trend_error < 0.1 * level_error
+
+
+def test_with_trend_and_with_level_together_extrapolate_the_line():
+    cal = calendar()
+    series = straight_line(range(0, 70))
+    origins = list(range(40, 60))
+    truth = straight_line([o + 2 for o in origins]).to_numpy()
+    # Both inputs: the level and the week number.
+    both = deflated_forecasts(series, cal, 2, 40, origins, True, with_trend=True)
+    assert not both["fallback"].any()
+    np.testing.assert_allclose(both["forecast"], truth, rtol=0.01)
+    # (No "better than level-only" claim here: on an exact line the recent level is itself a
+    # straight line in the week number, collinear with the trend, so level-only also tracks
+    # the line closely. That the trend still changes a level forecast is tested on noise below.)
+
+
+def test_with_trend_and_with_level_on_noise_is_finite_and_differs_from_level_only():
+    series = noisy_series(range(0, 60), seed=21)
+    both = deflated_forecasts(series, calendar(), 1, 40, [40, 45, 50], True, with_trend=True)
+    level_only = deflated_forecasts(series, calendar(), 1, 40, [40, 45, 50], True)
+    assert np.isfinite(both["forecast"]).all()
+    assert not np.allclose(both["forecast"], level_only["forecast"])
+
+
+def test_with_trend_uses_the_week_number_not_the_row_position():
+    # Every third week missing: a trend on the row count would put the line in the wrong place.
+    cal = calendar()
+    weeks = [w for w in range(0, 70) if w % 3 != 0]
+    series = straight_line(weeks)
+    origins = [41, 44, 50]
+    truth = straight_line([o + 1 for o in origins]).to_numpy()
+    result = deflated_forecasts(series, cal, 1, 40, origins, False, with_trend=True)
+    assert not result["fallback"].any()
+    np.testing.assert_allclose(result["forecast"], truth, rtol=0.01)
+
+
+def test_with_trend_a_constant_series_stays_that_constant():
+    series = pd.Series(500.0, index=range(0, 50))
+    result = deflated_forecasts(series, calendar(), 2, 40, [40, 45], False, with_trend=True)
+    np.testing.assert_allclose(result["forecast"], 500.0, rtol=1e-6)
+
+
+def test_with_trend_is_deterministic_and_does_not_change_its_inputs():
+    cal, series = calendar(), noisy_series(range(0, 60), seed=9)
+    copies = cal.copy(deep=True), series.copy(deep=True)
+    origins = [40, 44]
+    a = deflated_forecasts(series, cal, 2, 40, origins, True, with_trend=True)
+    b = deflated_forecasts(series, cal, 2, 40, origins, True, with_trend=True)
+    pd.testing.assert_frame_equal(a, b)
+    pd.testing.assert_frame_equal(cal, copies[0])
+    pd.testing.assert_series_equal(series, copies[1])
+    assert origins == [40, 44]
+
+
+# --- with_trend: no leakage ------------------------------------------------------------------
+
+@pytest.mark.parametrize("with_level", [True, False])
+@pytest.mark.parametrize("h", [1, 3, 5])
+def test_with_trend_never_reads_a_week_after_the_origin(with_level, h):
+    # Origins at or after train_until: scrambling every value after the origin moves nothing.
+    series = straight_line(range(0, 70)) + noisy_series(range(0, 70), seed=h, level=0.0)
+    rng = np.random.default_rng(200 + h)
+    for origin in (40, 43, 50):
+        base = deflated_forecasts(series, calendar(), h, 40, [origin], with_level,
+                                  with_trend=True)
+        changed = series.copy()
+        after = changed.index > origin
+        changed[after] = rng.random(int(after.sum())) * 1e6
+        again = deflated_forecasts(changed, calendar(), h, 40, [origin], with_level,
+                                   with_trend=True)
+        pd.testing.assert_frame_equal(base, again)
+
+
+def test_with_trend_the_line_is_fitted_only_on_weeks_up_to_train_until():
+    # Without the level, weeks after train_until (even at or before the origin) are neither
+    # training weeks nor inputs: a jump in the line after week 40 must not bend the trend.
+    series = straight_line(range(0, 70))
+    base = deflated_forecasts(series, calendar(), 2, 40, [50, 55], False, with_trend=True)
+    changed = series.copy()
+    changed[changed.index > 40] = 1e7
+    again = deflated_forecasts(changed, calendar(), 2, 40, [50, 55], False, with_trend=True)
+    pd.testing.assert_frame_equal(base, again)
+    # And it still extrapolates the line seen up to week 40, not the jump.
+    np.testing.assert_allclose(base["forecast"], straight_line([52, 57]).to_numpy(), rtol=0.01)
+
+
+def test_with_trend_dropping_weeks_after_the_origin_changes_nothing():
+    series = noisy_series(range(0, 70), seed=11) + straight_line(range(0, 70))
+    for origin in (40, 47):
+        base = deflated_forecasts(series, calendar(), 3, 40, [origin], True, with_trend=True)
+        cut = deflated_forecasts(series.loc[:origin], calendar(), 3, 40, [origin], True,
+                                 with_trend=True)
+        pd.testing.assert_frame_equal(base, cut)
+
+
+# --- with_trend: fallback --------------------------------------------------------------------
+
+def test_with_trend_falls_back_with_too_few_training_weeks():
+    series = straight_line(range(0, 20))
+    origins = [10, 12, 15]
+    result = deflated_forecasts(series, calendar(), 1, MIN_TRAINING_WEEKS - 2, origins, False,
+                                with_trend=True)
+    assert result["fallback"].all()
+    assert result["forecast"].tolist() == pytest.approx(
+        [recent_level(series, o) for o in origins])
+
+
+def test_with_trend_exactly_min_training_weeks_fits_a_model():
+    series = straight_line(range(0, 20))
+    result = deflated_forecasts(series, calendar(), 1, MIN_TRAINING_WEEKS - 1, [11], False,
+                                with_trend=True)
+    assert not result["fallback"].any()
+
+
+def test_with_trend_a_falling_line_extrapolated_below_zero_falls_back_to_the_level():
+    # Weeks 0..30 fall on 2,000 - 50 w (500 at week 30); weeks 37..40 hold 100 (the level).
+    # Trained up to 30 and forecast at origin 40 for week 41, the line gives 2,000 - 2,050 < 0,
+    # so the trend forecast falls back to the recent level. Without the trend it does not.
+    line = straight_line(range(0, 31), intercept=2000.0, slope=-50.0)
+    recent = pd.Series(100.0, index=range(37, 41))
+    series = pd.concat([line, recent])
+    trend = deflated_forecasts(series, calendar(), 1, 30, [40], False, with_trend=True)
+    no_trend = deflated_forecasts(series, calendar(), 1, 30, [40], False)
+    assert trend["fallback"].tolist() == [True]
+    assert trend["forecast"].iloc[0] == pytest.approx(100.0)
+    assert no_trend["fallback"].tolist() == [False]
+
+
+@pytest.mark.parametrize("value", [-5.0, 0.0, np.nan, np.inf])
+def test_with_trend_falls_back_on_bad_predictions_by_monkeypatch(monkeypatch, value):
+    from sklearn.pipeline import Pipeline
+    monkeypatch.setattr(Pipeline, "predict", lambda self, x: np.full(len(x), value))
+    series = noisy_series(range(0, 50))
+    result = deflated_forecasts(series, calendar(), 1, 40, [44], True, with_trend=True)
+    assert result["fallback"].tolist() == [True]
+    assert result["forecast"].iloc[0] == pytest.approx(recent_level(series, 44))
+
+
+def test_with_trend_still_refuses_a_calendar_without_a_target_week():
+    with pytest.raises(ValueError) as error:
+        deflated_forecasts(noisy_series(range(0, 50)), calendar(0, 44), 3, 40, [40, 42], False,
+                           with_trend=True)
+    assert str(error.value) == "the calendar has no rows for weeks [45]"
+
+
+def test_with_trend_still_refuses_an_origin_without_a_recent_level():
+    weeks = [w for w in range(0, 50) if not 41 <= w <= 44]
+    with pytest.raises(ValueError, match="origin 44: no week with data"):
+        deflated_forecasts(noisy_series(weeks), calendar(), 2, 40, [40, 44], False,
+                           with_trend=True)

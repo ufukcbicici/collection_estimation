@@ -1161,9 +1161,20 @@ def test_reference_columns():
                                  "real_forecast", "price_level", "forecast", "fallback"]
 
 
-def test_references_are_the_two_variants_with_level_first():
-    assert REFERENCES == {"deflated": True, "deflated_nolevel": False}
-    assert list(REFERENCES) == ["deflated", "deflated_nolevel"]
+def test_references_are_the_three_variants_in_order():
+    # Each variant is (with_level, with_trend); the order is the row order of the output.
+    assert REFERENCES == {"deflated": (True, False),
+                          "deflated_nolevel": (False, False),
+                          "deflated_trend": (False, True)}
+    assert list(REFERENCES) == ["deflated", "deflated_nolevel", "deflated_trend"]
+
+
+def test_references_variants_are_distinct_settings():
+    # Two names with the same (with_level, with_trend) would be the same forecast twice.
+    settings = list(REFERENCES.values())
+    assert len(set(settings)) == len(settings)
+    for with_level, with_trend in settings:
+        assert isinstance(with_level, bool) and isinstance(with_trend, bool)
 
 
 # --- shape, order, dtypes -------------------------------------------------------------------
@@ -1173,7 +1184,8 @@ def test_reference_has_exactly_the_reference_columns(d_result):
 
 
 def test_reference_row_count(d_result):
-    assert len(d_result) == (len(D_COMPANIES) + 1) * len(D_ORIGINS) * D_HORIZONS * 2
+    # (companies + ALL) x origins x horizons x the three variants.
+    assert len(d_result) == (len(D_COMPANIES) + 1) * len(D_ORIGINS) * D_HORIZONS * 3
 
 
 def test_reference_row_order(d_result):
@@ -1228,20 +1240,21 @@ def test_reference_all_comes_last_even_when_a_company_sorts_after_it():
     weekly = d_weekly()
     weekly["company_code"] = weekly["company_code"].map({"1000": "ZZZ", "2000": "AAA"})
     found = d_run(weekly=weekly, companies=["ZZZ", "AAA"], origins=[20], horizons=1)
-    assert list(found["company_code"]) == ["AAA", "AAA", "ZZZ", "ZZZ", "ALL", "ALL"]
+    # One row per variant (three) for each company, ALL last.
+    assert list(found["company_code"]) == ["AAA"] * 3 + ["ZZZ"] * 3 + ["ALL"] * 3
 
 
 def test_reference_integer_company_codes_work_and_sort_numerically():
     weekly = d_weekly()
     weekly["company_code"] = weekly["company_code"].map({"1000": 10, "2000": 9})
     found = d_run(weekly=weekly, companies=[10, 9], origins=[20], horizons=1)
-    assert list(found["company_code"]) == [9, 9, 10, 10, "ALL", "ALL"]
+    assert list(found["company_code"]) == [9] * 3 + [10] * 3 + ["ALL"] * 3
 
 
 def test_reference_company_with_no_cash_at_all_gets_zero_and_falls_back():
     found = d_run(companies=["1000", "2000", "3000"], origins=[20], horizons=2)
     part = found[found["company_code"] == "3000"]
-    assert len(part) == 4
+    assert len(part) == 2 * 3          # two horizons x three variants
     assert (part["real_forecast"] == 0.0).all()
     assert (part["forecast"] == 0.0).all()
     assert part["fallback"].all()     # a prediction of 0 is not above 0
@@ -1249,7 +1262,7 @@ def test_reference_company_with_no_cash_at_all_gets_zero_and_falls_back():
 
 def test_reference_single_origin_single_horizon():
     found = d_run(origins=[20], horizons=1)
-    assert len(found) == 3 * 1 * 1 * 2
+    assert len(found) == 3 * 1 * 1 * 3
     assert set(found["h"]) == {1}
 
 
@@ -1262,9 +1275,9 @@ def test_reference_equals_deflated_forecasts_on_the_hand_built_series(d_result, 
                       None if company == CONSOLIDATED else company)
     for origin in D_ORIGINS:
         for h in range(1, D_HORIZONS + 1):
-            for reference, with_level in REFERENCES.items():
+            for reference, (with_level, with_trend) in REFERENCES.items():
                 made = benchmark.deflated_forecasts(series, kw["calendar"], h, origin, [origin],
-                                                    with_level).iloc[0]
+                                                    with_level, with_trend).iloc[0]
                 found = d_row(d_result, company, origin, h, reference)
                 assert found["real_forecast"] == pytest.approx(made["forecast"], rel=1e-9), \
                     (company, origin, h, reference)
@@ -1368,6 +1381,38 @@ def test_reference_the_two_variants_differ_somewhere(d_result):
     assert not np.allclose(wide["deflated"], wide["deflated_nolevel"])
 
 
+def test_reference_the_trend_variant_differs_from_the_no_level_one(d_result):
+    # deflated_trend is deflated_nolevel plus the week number: on this series it must move.
+    wide = d_result.pivot(index=["company_code", "origin_week", "h"], columns="reference",
+                          values="real_forecast")
+    assert not np.allclose(wide["deflated_trend"], wide["deflated_nolevel"])
+
+
+@pytest.mark.parametrize("company", ["1000", "2000", CONSOLIDATED])
+def test_reference_deflated_trend_is_the_trend_forecast_times_the_projected_level(d_result,
+                                                                                  company):
+    kw = d_inputs()
+    # Step 1: the deflated series by hand (company or consolidated).
+    series = d_series(kw["weekly"], kw["weeks"], kw["levels"],
+                      None if company == CONSOLIDATED else company)
+    for origin in D_ORIGINS:
+        # Step 2: the price levels projected at this origin for its target weeks.
+        targets = [origin + h for h in range(1, D_HORIZONS + 1)]
+        projected = projected_levels(WEEK_ZERO, origin, targets)
+        for h in range(1, D_HORIZONS + 1):
+            # Step 3: the direct call, no level, with the trend, refitted at the origin.
+            made = benchmark.deflated_forecasts(series, kw["calendar"], h, origin, [origin],
+                                                with_level=False, with_trend=True).iloc[0]
+            expected_level = float(projected.loc[origin + h])
+            # Step 4: the reference row must be that forecast, re-inflated at the origin.
+            found = d_row(d_result, company, origin, h, "deflated_trend")
+            assert found["real_forecast"] == pytest.approx(made["forecast"], rel=1e-9)
+            assert found["price_level"] == expected_level
+            assert found["forecast"] == pytest.approx(made["forecast"] * expected_level,
+                                                      rel=1e-9)
+            assert bool(found["fallback"]) == bool(made["fallback"])
+
+
 # --- consolidated ------------------------------------------------------------------------------
 
 def test_reference_all_is_fitted_on_the_summed_series(d_result):
@@ -1377,9 +1422,9 @@ def test_reference_all_is_fitted_on_the_summed_series(d_result):
     pd.testing.assert_series_equal(total, by_company, check_exact=False, rtol=1e-12)
     for origin in D_ORIGINS:
         for h in range(1, D_HORIZONS + 1):
-            for reference, with_level in REFERENCES.items():
+            for reference, (with_level, with_trend) in REFERENCES.items():
                 made = benchmark.deflated_forecasts(total, kw["calendar"], h, origin, [origin],
-                                                    with_level).iloc[0]
+                                                    with_level, with_trend).iloc[0]
                 found = d_row(d_result, CONSOLIDATED, origin, h, reference)
                 assert found["real_forecast"] == pytest.approx(made["forecast"], rel=1e-9)
 
@@ -1451,8 +1496,9 @@ def test_reference_a_missing_target_week_still_gets_a_row(d_result):
 def test_reference_target_week_past_the_weeks_table_still_gets_a_row():
     # Weeks run to 40; origin 39, h 3 forecasts week 42, which the calendar covers.
     found = d_run(origins=[39], horizons=3)
-    assert list(found[found["company_code"] == "1000"]["target_week"]) == [40, 40, 41, 41,
-                                                                          42, 42]
+    # Three variants per target week.
+    assert list(found[found["company_code"] == "1000"]["target_week"]) == (
+        [40] * 3 + [41] * 3 + [42] * 3)
 
 
 # --- no leak -----------------------------------------------------------------------------------
@@ -1576,7 +1622,7 @@ def test_reference_no_data_in_the_recent_level_weeks_raises():
 def test_reference_three_of_four_level_weeks_missing_does_not_raise():
     weeks = make_weeks(D_LAST, missing=D_MISSING | {17, 18, 19})
     found = d_run(weeks=weeks, origins=[20], horizons=1)
-    assert len(found) == 6
+    assert len(found) == 3 * 3          # (two companies + ALL) x three variants
 
 
 def test_reference_week_zero_not_a_monday_raises():
@@ -1614,7 +1660,7 @@ def test_reference_order_of_the_weekly_rows_does_not_matter(d_result):
 
 def test_reference_empty_weekly_gives_zero_forecasts_that_fall_back():
     found = d_run(weekly=d_weekly().iloc[0:0], origins=[20], horizons=1)
-    assert len(found) == 6
+    assert len(found) == 3 * 3          # (two companies + ALL) x three variants
     assert (found["real_forecast"] == 0.0).all() and (found["forecast"] == 0.0).all()
     assert found["fallback"].all()
 

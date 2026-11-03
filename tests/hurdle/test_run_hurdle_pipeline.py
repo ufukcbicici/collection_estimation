@@ -5716,12 +5716,15 @@ def test_show_deflated_reference_is_a_module_level_function_with_three_parameter
 #   hurdle model (ALL): 2.0 + 1.5 + 3.0           = 6.5 M, ratio 1.300 (wk 13's 1.0 M left out)
 #   deflated (ALL):     1.0 + 2.0 + 2.0           = 5.0 M, ratio 1.000 (wk 13's 7.0 M left out)
 #   deflated_nolevel:   0.5 + 1.0 + 1.0           = 2.5 M, ratio 0.500 (wk 13's 9e9 left out)
-# TR02's rows (9e9 everywhere) must enter no sum. The reference has 2 x 2 x 2 x 2 = 16 rows.
+#   deflated_trend:     1.5 + 2.5 + 3.0           = 7.0 M, ratio 1.400 (wk 13's 8e8 left out)
+# TR02's rows (9e9 everywhere) must enter no sum. The reference has 2 companies x 4 (origin, h)
+# x 3 variants = 24 rows.
 # Fallbacks count over the SAME rows as the sums: the 3 consolidated (origin, h) with data,
 # (10, 1), (10, 2), (11, 1). deflated: ALL [T, F, F] = 1 of 3 (ALL's (11, 2) fallback has no
 # actual, and TR02's fallbacks are not consolidated: neither counts); deflated_nolevel: ALL
-# [F, F, F] = 0 of 3 (TR02's one fallback does not count). Counting every row of a variant
-# instead would give 3 of 8 and 1 of 8.
+# [F, F, F] = 0 of 3 (TR02's one fallback does not count); deflated_trend: ALL [F, T, F] = 1 of
+# 3 (its (11, 2) fallback and TR02's four do not count). Counting every row of a variant
+# instead would give 3 of 8, 1 of 8 and 6 of 8.
 SHOW_REFERENCE = """
 import pandas as pd
 import run_hurdle_pipeline as script
@@ -5742,11 +5745,13 @@ actual["actual_real"] = 0.0
 values = {("TR02", "deflated"): ([9e9] * 4, [False, False, False, True]),
           ("TR02", "deflated_nolevel"): ([9e9] * 4, [False, False, True, False]),
           ("ALL", "deflated"): ([1e6, 2e6, 2e6, 7e6], [True, False, False, True]),
-          ("ALL", "deflated_nolevel"): ([5e5, 1e6, 1e6, 9e9], [False] * 4)}
+          ("ALL", "deflated_nolevel"): ([5e5, 1e6, 1e6, 9e9], [False] * 4),
+          ("TR02", "deflated_trend"): ([9e9] * 4, [True] * 4),
+          ("ALL", "deflated_trend"): ([1.5e6, 2.5e6, 3e6, 8e8], [False, True, False, True])}
 rows = []
 for company in ("TR02", "ALL"):
     for i in range(4):
-        for reference in ("deflated", "deflated_nolevel"):
+        for reference in ("deflated", "deflated_nolevel", "deflated_trend"):
             forecast, fallback = values[(company, reference)]
             rows.append({"company_code": company, "origin_week": keys["origin_week"][i],
                          "h": keys["h"][i], "target_week": keys["target_week"][i],
@@ -5768,14 +5773,15 @@ def reference_lines():
     return lines[:-1]
 
 
-def test_show_deflated_reference_prints_four_lines(reference_lines):
-    assert len(reference_lines) == 4
+def test_show_deflated_reference_prints_five_lines(reference_lines):
+    # The header, the hurdle model, and one line per variant (three).
+    assert len(reference_lines) == 5
 
 
 def test_show_deflated_reference_header_counts_the_rows_and_the_consolidated_pairs(
         reference_lines):
     assert reference_lines[0] == (
-        "        the deflated reference (U14.3): 16 rows; over the 3 consolidated (origin, h) "
+        "        the deflated reference (U14.3): 24 rows; over the 3 consolidated (origin, h) "
         "with data, nominal, million TRY:")
 
 
@@ -5794,9 +5800,15 @@ def test_show_deflated_reference_nolevel_line_with_its_fallback_count(reference_
                                   "(ratio 0.500), fell back to the recent level in 0 of 3")
 
 
+def test_show_deflated_reference_trend_line_with_its_fallback_count(reference_lines):
+    # deflated_trend is 14 characters, padded to 17, then the sum right-aligned in 10.
+    assert reference_lines[4] == ("          deflated_trend" + " " * 11 + "7.0 vs actual 5.0 "
+                                  "(ratio 1.400), fell back to the recent level in 1 of 3")
+
+
 def test_show_deflated_reference_lines_follow_the_references_order(reference_lines):
     names = [line.split()[0] for line in reference_lines[1:]]
-    assert names == ["hurdle", "deflated", "deflated_nolevel"]
+    assert names == ["hurdle", "deflated", "deflated_nolevel", "deflated_trend"]
 
 
 def test_show_deflated_reference_the_hurdle_line_has_no_fallback_count(reference_lines):
@@ -6276,7 +6288,7 @@ def test_step_17_the_progress_callback_prints_one_line():
 
 
 # show_deflated_reference with rolled=None: the same data as SHOW_REFERENCE above; the
-# "hurdle model" line is left out, the other three lines are the same as with rolled.
+# "hurdle model" line is left out, the other four lines are the same as with rolled.
 
 SHOW_REFERENCE_NO_MODEL = SHOW_REFERENCE.replace(
     "script.show_deflated_reference(reference, Forecast(totals=totals, customers=customers), "
@@ -6297,8 +6309,9 @@ def no_model_reference_lines():
     return lines[:-1]
 
 
-def test_show_deflated_reference_without_the_model_prints_three_lines(no_model_reference_lines):
-    assert len(no_model_reference_lines) == 3
+def test_show_deflated_reference_without_the_model_prints_four_lines(no_model_reference_lines):
+    # The header and one line per variant (three).
+    assert len(no_model_reference_lines) == 4
     assert not any("hurdle" in line for line in no_model_reference_lines)
 
 
@@ -6306,7 +6319,7 @@ def test_show_deflated_reference_without_the_model_header_is_the_same(no_model_r
                                                                       reference_lines):
     assert no_model_reference_lines[0] == reference_lines[0]
     assert no_model_reference_lines[0] == (
-        "        the deflated reference (U14.3): 16 rows; over the 3 consolidated (origin, h) "
+        "        the deflated reference (U14.3): 24 rows; over the 3 consolidated (origin, h) "
         "with data, nominal, million TRY:")
 
 
@@ -6318,6 +6331,9 @@ def test_show_deflated_reference_without_the_model_reference_lines_by_hand(
     assert no_model_reference_lines[2] == ("          deflated_nolevel" + " " * 9 + "2.5 vs "
                                            "actual 5.0 (ratio 0.500), fell back to the recent "
                                            "level in 0 of 3")
+    assert no_model_reference_lines[3] == ("          deflated_trend" + " " * 11 + "7.0 vs "
+                                           "actual 5.0 (ratio 1.400), fell back to the recent "
+                                           "level in 1 of 3")
 
 
 def test_show_deflated_reference_with_and_without_the_model_differ_only_by_its_line(

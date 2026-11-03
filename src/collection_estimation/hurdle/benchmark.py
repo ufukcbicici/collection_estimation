@@ -4,14 +4,17 @@ The hurdle model is compared with it. Rebuilt from the old `weekly_models.make_d
 which this package never imports; the method is the same:
 
   - the cash is deflated (TRY of week 0), so the inflation drift is divided out and no trend
-    is needed;
+    is needed for it (a trend for real growth is optional, see below);
   - one model per horizon h: the target week's cash from the target week's calendar features
     and, optionally, the recent level (the mean cash of the LEVEL_WEEKS weeks ending at the
     origin, i.e. h weeks before the target: the level a forecast made at the origin knows);
   - ridge regression on standardised inputs, its penalty chosen from ALPHAS by RidgeCV (about
     40 training weeks against 5 or 6 inputs is too few for plain least squares);
   - a fallback to the recent level when there are fewer than MIN_TRAINING_WEEKS training weeks
-    or the prediction is not above 0.
+    or the prediction is not above 0;
+  - optionally (`with_trend`, U14.3's `deflated_trend`), the target week's number as one more
+    input: a straight-line trend in the real cash, for a business that grows (or shrinks)
+    faster than prices. Off by default, as in the old method.
 
 What it forecasts: the same totals as the hurdle model. For horizon h the series is y_h(w),
 the cash in week w from the customers known at w - h (`cash_totals` of the panel rows with
@@ -61,16 +64,18 @@ def recent_level(series: pd.Series, origin: int, weeks: int = LEVEL_WEEKS) -> fl
 
 
 def deflated_forecasts(series: pd.Series, calendar: pd.DataFrame, h: int, train_until: int,
-                       origins: list[int], with_level: bool) -> pd.DataFrame:
+                       origins: list[int], with_level: bool,
+                       with_trend: bool = False) -> pd.DataFrame:
     """The `deflated` forecast of `series` (y_h: cash per target week, deflated, indexed by
     week, weeks without data absent) for horizon `h`, made at each of `origins` (target week
     origin + h).
 
     The model is fitted once, on the target weeks up to `train_until`; each training week w
     is described by the calendar features of w (`calendar`: one row per week, a `week` column
-    and the features) and, if `with_level`, by the recent level at its origin w - h. A week
-    whose level has no data is not used. Each forecast uses the target week's calendar and
-    the level at its origin (weeks up to the origin only).
+    and the features), if `with_level` by the recent level at its origin w - h, and if
+    `with_trend` by the week number w itself. A week whose level has no data is not used.
+    Each forecast uses the target week's calendar (and number) and the level at its origin
+    (weeks up to the origin only).
 
     Returns one row per origin: origin_week, h, target_week, forecast and fallback (True when
     the forecast is the recent level: too few training weeks, or a prediction that is not
@@ -90,6 +95,9 @@ def deflated_forecasts(series: pd.Series, calendar: pd.DataFrame, h: int, train_
             if np.isnan(level):
                 return None
             row.insert(0, level)
+        if with_trend:
+            # The trend: the week number, so the ridge can fit a straight line through time.
+            row.append(float(target_week))
         return row
 
     x, y = [], []
