@@ -2999,11 +2999,17 @@ statements = [ast.unparse(node) for node in body]
 diagnostic = [i for i, node in enumerate(body)
               if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.diagnostic.run"]
 assert len(diagnostic) == 1, diagnostic
-step_14 = statements[diagnostic[0] + 1:]
+# Step 14 is found by content, not by its distance from the end of main(): it runs from just
+# after step 13's `if settings.diagnostic.run:` up to (not including) step 15's
+# `if settings.joint_diagnostic.run:` (steps 16 and 17 follow since U13 and U14).
+joint = [i for i, node in enumerate(body)
+         if isinstance(node, ast.If) and ast.unparse(node.test) == "settings.joint_diagnostic.run"]
+assert len(joint) == 1, joint
+assert diagnostic[0] < joint[0], (diagnostic, joint)
 # U11.3: the stage 2 scores (checked below): two statements. U11.4 added the cash-by-p check
-# after them (two statements) and U11.5 step 15's `if` last: five statements in all.
-scores_part = body[-5:-3]
-step_14 = step_14[:-5]
+# after them (two statements), just before step 15's `if`: four statements in all.
+scores_part = body[joint[0] - 4:joint[0] - 2]
+step_14 = statements[diagnostic[0] + 1:joint[0] - 4]
 assert step_14 == [
     "stage2_columns = feature_columns(block_feature_columns(history, calendar, owed), "
     "settings.stage2.feature_blocks)",
@@ -3050,16 +3056,17 @@ assert [ast.unparse(n) for n in branch.orelse] == [
 ], [ast.unparse(n) for n in branch.orelse]
 # U11.4: the amount-weighted check of the whole model on the labelled forecast rows (paid or
 # not), with stage 1's HGB p and stage 2's m.
-assert ast.unparse(body[-3]) == "labelled = forecast_rows['label_status'] == 'labelled'"
-cash_check = body[-2]
+assert (ast.unparse(body[joint[0] - 2])
+        == "labelled = forecast_rows['label_status'] == 'labelled'"), ast.unparse(body[joint[0] - 2])
+cash_check = body[joint[0] - 1]
 assert isinstance(cash_check, ast.If) and ast.unparse(cash_check.test) == "labelled.any()"
 assert cash_check.orelse == []
 assert [ast.unparse(n) for n in cash_check.body] == [
     "show_cash_by_p_group(cash_by_p_group(predictions['stage 1 (HGB)'][labelled], "
     "m[labelled], forecast_rows.loc[labelled, 'amount_deflated'], "
     "settings.diagnostic.calibration_groups))"], [ast.unparse(n) for n in cash_check.body]
-# U11.5: step 15 closes main(), behind its own run switch.
-step_15 = body[-1]
+# U11.5: step 15 follows step 14's checks, behind its own run switch.
+step_15 = body[joint[0]]
 assert isinstance(step_15, ast.If) and ast.unparse(step_15.test) == "settings.joint_diagnostic.run"
 assert step_15.orelse == []
 assert [ast.unparse(n) for n in step_15.body] == [
@@ -3097,7 +3104,7 @@ print("ok")
 """
 
 
-def test_step_14_is_wired_in_last_after_step_13():
+def test_step_14_is_wired_in_after_step_13_and_before_step_15():
     result = run_code(STEP_14_WIRING)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
@@ -5200,3 +5207,399 @@ def test_compare_topups_a_mean_window_outside_the_comparison_is_still_named(comp
 def test_compare_topups_prints_nothing_between_the_rows_and_the_last_line(compare_topups_run):
     for label, run in compare_topups_run["runs"].items():
         assert run["after_rows"] == [run["last"]], label
+
+
+# Steps 16 (U13.4 + U14.1) and 17 (U14.2): the wiring is checked on main()'s syntax tree, read
+# from the file; the names the script imports, in a separate process (as for the other steps).
+# The printouts run on tiny hand-made frames, every number worked out by hand, also in a
+# separate process (importing the script reconfigures sys.stdout and sys.path).
+
+FORECAST_KEYWORDS = {
+    "block_columns": "block_feature_columns(history, calendar, owed)",
+    "companies": "companies", "new_cash": "new_cash", "refunds": "refunds",
+    "unidentified": "unidentified", "levels": "levels", "calendar": "calendar",
+    "week_zero": "week_zero"}
+
+
+def main_body():
+    return main_tree().body
+
+
+def index_of_if(body, test):
+    found = [i for i, node in enumerate(body)
+             if isinstance(node, ast.If) and ast.unparse(node.test) == test]
+    assert len(found) == 1, (test, found)
+    return found[0]
+
+
+def step_16_body():
+    """main()'s statements after step 15's `if` and before step 17's."""
+    body = main_body()
+    return body[index_of_if(body, "settings.joint_diagnostic.run") + 1:
+                index_of_if(body, "settings.evaluation.run")]
+
+
+def step_17_block():
+    body = main_body()
+    return body[index_of_if(body, "settings.evaluation.run")]
+
+
+def keywords_of(call):
+    assert all(k.arg is not None for k in call.keywords), ast.unparse(call)   # no **kwargs
+    return {k.arg: ast.unparse(k.value) for k in call.keywords}
+
+
+def calls_in(nodes, name):
+    return [call for node in nodes for call in calls_to(node, name)]
+
+
+def test_step_16_comes_after_step_15_and_before_step_17():
+    body = main_body()
+    assert (index_of_if(body, "settings.joint_diagnostic.run")
+            < index_of_if(body, "settings.evaluation.run"))
+    assert step_16_body(), "nothing between step 15 and step 17"
+    # Step 16 runs whatever the switches say: none of its statements is an `if`.
+    assert not any(isinstance(node, ast.If) for node in step_16_body())
+
+
+def test_step_16_calls_forecast_once_with_the_origin_and_its_keyword_arguments():
+    assert len(calls_to(main_tree(), "forecast")) == 1
+    step_16 = step_16_body()   # one parse: the call is matched by identity below
+    calls = calls_in(step_16, "forecast")
+    assert len(calls) == 1
+    call = calls[0]
+    assert [ast.unparse(a) for a in call.args] == ["table", "origin", "settings"]
+    assert keywords_of(call) == FORECAST_KEYWORDS
+    assigned = [node for node in step_16 if isinstance(node, ast.Assign)
+                and node.value is call]
+    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["result"]
+
+
+def test_step_16_statements_in_order():
+    assert [ast.unparse(node) for node in step_16_body()] == [
+        "started = time.perf_counter()",
+        "result = forecast(table, origin, settings, block_columns=block_feature_columns("
+        "history, calendar, owed), companies=companies, new_cash=new_cash, refunds=refunds, "
+        "unidentified=unidentified, levels=levels, calendar=calendar, week_zero=week_zero)",
+        "show_customer_forecasts(result.customers, forecast_rows, time.perf_counter() - "
+        "started, predictions['stage 1 (HGB)'] * m)",
+        "show_forecast_totals(result.totals)",
+        "actual = actual_totals(weekly, weeks, levels, companies, [origin], "
+        "settings.receivables.horizons)",
+        "show_actual_totals(actual, weekly, weeks)",
+        "show_forecast_vs_actual(result.totals, actual)",
+    ]
+
+
+def test_step_16_customer_forecasts_are_checked_against_step_14s_p_times_m():
+    calls = calls_in(step_16_body(), "show_customer_forecasts")
+    assert len(calls) == 1 and len(calls_to(main_tree(), "show_customer_forecasts")) == 1
+    args = [ast.unparse(a) for a in calls[0].args]
+    assert args[:2] == ["result.customers", "forecast_rows"]
+    # Stage 1's HGB p (not the LR baseline's) times step 14's m.
+    assert args[3] == "predictions['stage 1 (HGB)'] * m"
+
+
+def test_step_16_actual_totals_at_the_one_origin():
+    calls = calls_in(step_16_body(), "actual_totals")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "weekly", "weeks", "levels", "companies", "[origin]", "settings.receivables.horizons"]
+    assert calls[0].keywords == []
+
+
+def test_step_16_shows_the_totals_and_the_forecast_beside_the_actual_once():
+    tree = main_tree()
+    for name, args in (("show_forecast_totals", ["result.totals"]),
+                       ("show_actual_totals", ["actual", "weekly", "weeks"]),
+                       ("show_forecast_vs_actual", ["result.totals", "actual"])):
+        assert len(calls_to(tree, name)) == 1, name
+        call = calls_in(step_16_body(), name)
+        assert len(call) == 1, name
+        assert [ast.unparse(a) for a in call[0].args] == args, name
+
+
+def test_step_16_and_17_imports():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    forecast_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+                        and node.module == "collection_estimation.hurdle.forecast"]
+    assert len(forecast_imports) == 1
+    assert [(a.name, a.asname) for a in forecast_imports[0].names] == [
+        ("CONSOLIDATED", None), ("forecast", None)]
+    evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+                        and node.module == "collection_estimation.hurdle.evaluate"]
+    assert len(evaluate_imports) == 1
+    assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
+        ("actual_totals", None), ("rolling_forecasts", None)]
+
+
+STEP_16_17_NAMES = """
+import inspect
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import evaluate
+from collection_estimation.hurdle import forecast as forecast_module
+
+assert script.forecast is forecast_module.forecast
+assert script.CONSOLIDATED is forecast_module.CONSOLIDATED
+assert script.CONSOLIDATED == "ALL"
+assert script.actual_totals is evaluate.actual_totals
+assert script.rolling_forecasts is evaluate.rolling_forecasts
+inspect.signature(script.show_customer_forecasts).bind("customers", "forecast_rows", 1.0,
+                                                       "expected")
+inspect.signature(script.show_forecast_totals).bind("totals")
+inspect.signature(script.show_actual_totals).bind("actual", "weekly", "weeks")
+inspect.signature(script.show_forecast_vs_actual).bind("totals", "actual")
+inspect.signature(script.show_rolling_forecasts).bind("rolled", "actual")
+# The keyword arguments steps 16 and 17 pass are the ones forecast and rolling_forecasts take.
+KEYWORDS = dict(block_columns={}, companies=[], new_cash=None, refunds=None, unidentified=None,
+                levels=None, calendar=None, week_zero=None)
+inspect.signature(script.forecast).bind("table", 0, "settings", **KEYWORDS)
+inspect.signature(script.rolling_forecasts).bind("table", [0], "settings", **KEYWORDS,
+                                                 on_origin_done=print)
+inspect.signature(script.actual_totals).bind("weekly", "weeks", "levels", [], [0], 5)
+print("ok")
+"""
+
+
+def test_step_16_and_17_names_are_the_modules_functions():
+    result = run_code(STEP_16_17_NAMES)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def test_step_17_is_the_last_statement_of_main_behind_its_run_switch():
+    body = main_body()
+    last = body[-1]
+    assert isinstance(last, ast.If) and ast.unparse(last.test) == "settings.evaluation.run"
+    assert last.orelse == []
+    assert index_of_if(body, "settings.evaluation.run") == len(body) - 1
+
+
+def test_step_17_uses_the_validation_origins_only():
+    block = step_17_block()
+    origins = [node for node in block.body if isinstance(node, ast.Assign)
+               and [ast.unparse(t) for t in node.targets] == ["origins"]]
+    assert len(origins) == 1
+    assert ast.unparse(origins[0].value) == "list(settings.evaluation.validation_origins)"
+    assert block.body.index(origins[0]) == 0
+    # The test origins are scored only in U16: never named anywhere in main().
+    assert "test_origins" not in main_source()
+    assert "test_origins" not in ast.unparse(main_tree())
+
+
+def test_step_17_calls_rolling_forecasts_once_with_a_progress_callback():
+    assert len(calls_to(main_tree(), "rolling_forecasts")) == 1
+    block = step_17_block()
+    calls = calls_to(block, "rolling_forecasts")
+    assert len(calls) == 1
+    call = calls[0]
+    assert [ast.unparse(a) for a in call.args] == ["table", "origins", "settings"]
+    assert keywords_of(call) == {**FORECAST_KEYWORDS, "on_origin_done": "progress"}
+    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+                and node.value is call]
+    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["rolled"]
+    # progress is defined inside the block, before the call, with rolling_forecasts' four
+    # callback arguments (done, total, origin, seconds).
+    defs = [(i, node) for i, node in enumerate(block.body)
+            if isinstance(node, ast.FunctionDef) and node.name == "progress"]
+    assert len(defs) == 1
+    index, progress = defs[0]
+    assert [a.arg for a in progress.args.args] == ["done", "total", "at", "seconds"]
+    assert index < block.body.index(assigned[0])
+
+
+def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
+    block = step_17_block()
+    calls = calls_to(block, "actual_totals")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "weekly", "weeks", "levels", "companies", "origins", "settings.receivables.horizons"]
+    assert len(calls_to(main_tree(), "actual_totals")) == 2   # step 16 and step 17
+    shows = calls_to(block, "show_rolling_forecasts")
+    assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
+    assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
+    statements = [ast.unparse(node) for node in block.body]
+    assert statements[-2] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
+                              "origins, settings.receivables.horizons)")
+    assert statements[-1] == "show_rolling_forecasts(rolled, rolled_actual)"
+
+
+def row_cells(lines, first):
+    """The whitespace-split cells of the one line whose first cell is `first`."""
+    rows = [line.split() for line in lines if line.split()[:1] == [first]]
+    assert len(rows) == 1, (first, lines)
+    return rows[0]
+
+
+# show_forecast_vs_actual at origin 10, h = 1, 2, companies TR02 and TR03 and ALL. Forecast
+# (nominal TRY) and actual:
+#   ALL  h1 (week 11): 3,000,000 vs 2,000,000 -> 1.5;  h2 (week 12): 1,000,000 vs no row
+#   TR02 h1:           2,000,000 vs 1,000,000 -> 2.0;  h2:            500,000 vs 1,000,000 -> 0.5
+#   TR03 h1:           1,000,000 vs 1,000,000 -> 1.0;  h2:            500,000 vs no row
+# In millions the consolidated table reads 3.0 / 2.0 / 1.5 and 1.0 / no data / no data.
+SHOW_VS_ACTUAL = """
+import pandas as pd
+import run_hurdle_pipeline as script
+
+totals = pd.DataFrame({
+    "company_code": ["TR02", "TR02", "TR03", "TR03", "ALL", "ALL"],
+    "origin_week": [10] * 6, "h": [1, 2, 1, 2, 1, 2], "target_week": [11, 12, 11, 12, 11, 12],
+    "total": [2e6, 5e5, 1e6, 5e5, 3e6, 1e6]})
+actual = pd.DataFrame({
+    "company_code": ["TR02", "TR02", "TR03", "ALL"],
+    "origin_week": [10] * 4, "h": [1, 2, 1, 1], "target_week": [11, 12, 11, 11],
+    "actual": [1e6, 1e6, 1e6, 2e6], "actual_real": [0.0] * 4})
+script.show_forecast_vs_actual(totals, actual)
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def vs_actual_lines():
+    result = run_code(SHOW_VS_ACTUAL)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_forecast_vs_actual_header_lines(vs_actual_lines):
+    assert vs_actual_lines[0] == (
+        "        forecast vs actual at week 10, nominal (actual = gross receipts + refunds; "
+        "ratio = forecast / actual; one origin: an illustration, not a score)")
+    assert vs_actual_lines[1] == "        consolidated, million TRY:"
+    assert vs_actual_lines.count("        ratio per company and h:") == 1
+
+
+def test_show_forecast_vs_actual_consolidated_table(vs_actual_lines):
+    split = vs_actual_lines.index("        ratio per company and h:")
+    table = vs_actual_lines[2:split]
+    assert table[0].split() == ["target_week", "forecast", "actual", "ratio"]
+    assert table[1].split() == ["h"]
+    one = row_cells(table, "1")
+    assert one[1] == "11" and [float(v) for v in one[2:]] == [3.0, 2.0, 1.5]
+    two = row_cells(table, "2")
+    # A target week without an actual shows "no data", never 0.
+    assert two[1] == "12" and float(two[2]) == 1.0
+    assert two[3:] == ["no", "data", "no", "data"]
+    assert len(table) == 4
+
+
+def test_show_forecast_vs_actual_ratio_per_company(vs_actual_lines):
+    split = vs_actual_lines.index("        ratio per company and h:")
+    table = vs_actual_lines[split + 1:]
+    assert table[0].split() == ["h", "1", "2"]
+    assert table[1].split() == ["company_code"]
+    all_row = row_cells(table, "ALL")
+    assert float(all_row[1]) == 1.5 and all_row[2:] == ["no", "data"]
+    assert [float(v) for v in row_cells(table, "TR02")[1:]] == [2.0, 0.5]
+    tr03 = row_cells(table, "TR03")
+    assert float(tr03[1]) == 1.0 and tr03[2:] == ["no", "data"]
+    assert len(table) == 5
+
+
+# show_actual_totals: one origin (10), h = 1, 2. The consolidated actual is 150 + 70 = 220 TRY;
+# the weekly amounts of the target weeks 11 and 12 are (100 - 10) + (60 + 0) + (80 - 10) = 220;
+# week 13 (999) is not a target week and stays out. 4 actual rows, companies TR02 and ALL;
+# 2 of the calendar's 4 weeks are missing.
+SHOW_ACTUAL = """
+import pandas as pd
+import run_hurdle_pipeline as script
+
+actual = pd.DataFrame({
+    "company_code": ["TR02", "TR02", "ALL", "ALL"], "origin_week": [10] * 4,
+    "h": [1, 2, 1, 2], "target_week": [11, 12, 11, 12],
+    "actual": [80.0, 70.0, 150.0, 70.0], "actual_real": [0.0] * 4})
+weekly = pd.DataFrame({
+    "company_code": ["TR02", "TR03", "TR02", "TR02"], "week": [11, 11, 12, 13],
+    "gross_receipts": [100.0, 60.0, 80.0, 999.0], "refunds": [-10.0, 0.0, -10.0, 0.0]})
+weeks = pd.DataFrame({"week": [10, 11, 12, 13], "is_missing": [False, True, False, True]})
+script.show_actual_totals(actual, weekly, weeks)
+print("ok")
+"""
+
+
+def test_show_actual_totals_by_hand():
+    result = run_code(SHOW_ACTUAL)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "        actual cash (U14.1): 4 rows (2 companies with ALL); consolidated 220.00 TRY vs "
+        "the weekly amounts of its target weeks 220.00 TRY; 2 missing weeks in the calendar "
+        "(no rows)",
+        "ok"]
+
+
+# show_rolling_forecasts at origins 10 and 11, h = 1, 2. Consolidated forecast vs actual:
+#   origin 10: h1 (week 11) 2,000,000 / 1,000,000 = 2.0; h2 (week 12) 1,500,000 / 2,000,000 = 0.75
+#   origin 11: h1 (week 12) 3,000,000 / 2,000,000 = 1.5; h2 (week 13) 1,000,000 / no row
+# Over the 3 with data: forecast 6.5 M vs actual 5.0 M, ratio 1.300. TR02's rows (8 total rows
+# in all, TR02's forecasts 9e9 each) must not enter the pivot or the sums; 7 customer rows.
+SHOW_ROLLING = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.forecast import Forecast
+
+keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
+totals = pd.concat([
+    pd.DataFrame({"company_code": ["TR02"] * 4, **keys, "total": [9e9, 9e9, 9e9, 9e9]}),
+    pd.DataFrame({"company_code": ["ALL"] * 4, **keys,
+                  "total": [2e6, 1.5e6, 3e6, 1e6]})], ignore_index=True)
+customers = pd.DataFrame({"key": [f"TR02-{i}" for i in range(7)]})
+WITH_ACTUAL = __WITH_ACTUAL__
+if WITH_ACTUAL:
+    three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
+    actual = pd.concat([
+        pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
+        pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
+        ignore_index=True)
+else:
+    actual = pd.DataFrame({"company_code": pd.Series([], dtype=object),
+                           **{k: pd.Series([], dtype="int64") for k in keys},
+                           "actual": pd.Series([], dtype="float64")})
+actual["actual_real"] = 0.0
+script.show_rolling_forecasts(Forecast(totals=totals, customers=customers), actual)
+print("ok")
+"""
+
+
+def run_show_rolling(with_actual):
+    result = run_code(SHOW_ROLLING.replace("__WITH_ACTUAL__", str(with_actual)))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+@pytest.fixture(scope="module")
+def rolling_lines():
+    return run_show_rolling(True)
+
+
+def test_show_rolling_forecasts_first_line_counts_the_rows(rolling_lines):
+    assert rolling_lines[0] == ("        7 customer rows, 8 total rows; consolidated forecast / "
+                                "actual per origin and h (nominal):")
+
+
+def test_show_rolling_forecasts_ratio_pivot_per_origin_and_h(rolling_lines):
+    table = rolling_lines[1:-1]
+    assert table[0].split() == ["h", "1", "2"]
+    assert table[1].split() == ["origin_week"]
+    assert [float(v) for v in row_cells(table, "10")[1:]] == [2.0, 0.75]
+    eleven = row_cells(table, "11")
+    # A target week without an actual shows "no data", never 0 or a ratio.
+    assert float(eleven[1]) == 1.5 and eleven[2:] == ["no", "data"]
+    assert len(table) == 4   # TR02's ratios are not in the pivot
+
+
+def test_show_rolling_forecasts_sums_line(rolling_lines):
+    assert rolling_lines[-1] == ("        over all 3 consolidated (origin, h) with data: forecast "
+                                 "6.5 M vs actual 5.0 M TRY (ratio 1.300)")
+
+
+def test_show_rolling_forecasts_without_any_actual_shows_no_data_everywhere():
+    lines = run_show_rolling(False)
+    table = lines[1:-1]
+    assert row_cells(table, "10")[1:] == ["no", "data", "no", "data"]
+    assert row_cells(table, "11")[1:] == ["no", "data", "no", "data"]
+    assert lines[-1].startswith("        over all 0 consolidated (origin, h) with data: "
+                                "forecast 0.0 M vs actual 0.0 M TRY (ratio ")

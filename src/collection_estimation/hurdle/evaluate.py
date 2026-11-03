@@ -5,11 +5,19 @@ U14.1, the actual cash: per company and consolidated, for every origin and h, th
 came in the target week, nominal and deflated (TRY of week 0). It is read straight from the
 weekly amounts, not rebuilt from the model's parts: gross receipts + refunds (refunds are
 negative), which `side_tables.check_side_tables` proves equals the panel's cash + A + G + R.
+
+U14.2, the forecasts: `forecast.forecast` at every origin, stacked. Everything that can be
+checked cheaply is checked for every origin before the first (slow) fit.
 """
+import time
+from datetime import date
+from typing import Callable
+
 import pandas as pd
 
-from .forecast import CONSOLIDATED
-from .prices import deflate
+from .forecast import CONSOLIDATED, Forecast, forecast
+from .prices import deflate, projected_levels
+from .topups import topup_forecasts
 
 # The columns of the table `actual_totals` returns, in order.
 ACTUAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "actual", "actual_real"]
@@ -71,3 +79,64 @@ def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
     found["company_code"] = found["company_code"].astype(object)
     found["actual_real"] = deflate(found["actual"], found["target_week"], levels)
     return found[ACTUAL_COLUMNS]
+
+
+def rolling_forecasts(table: pd.DataFrame, origins: list[int], settings, *,
+                      block_columns: dict[str, list[str]], companies: list[str],
+                      new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+                      levels: pd.Series, calendar: pd.DataFrame, week_zero: date,
+                      on_origin_done: Callable[[int, int, int, float], None] | None = None
+                      ) -> Forecast:
+    """`forecast.forecast` at every origin in `origins` (sorted, each once), with its
+    `totals` and `customers` stacked in origin order. The other arguments are `forecast`'s.
+    Each origin is fitted afresh on the rows known at it; nothing passes between origins.
+
+    Before the first fit, for every origin: the table has rows at it, for h = 1 to
+    `[receivables] horizons`; the top-ups (`topup_forecasts`, all origins at once) and the
+    projected price levels (`projected_levels`) can be made. A mistake in the settings or the
+    inputs then fails in seconds, not after the fits of the origins before it.
+
+    `on_origin_done(done, total, origin, seconds)`, if given, is called after each origin
+    (e.g. to print progress).
+
+    Raises ValueError if `origins` is empty, the table's index holds a label twice (the
+    actual cash is joined to the customer rows by index), the company list holds "ALL", an
+    origin has no rows or rows for other h, and as the cheap steps and `forecast` do.
+    """
+    origins = sorted(set(origins))
+    if not origins:
+        raise ValueError("there are no origins to forecast at")
+    if table.index.has_duplicates:
+        repeated = table.index[table.index.duplicated()].unique()
+        raise ValueError(f"the table's index holds {len(repeated)} labels more than once "
+                         f"(first: {list(repeated[:5])}); the customer rows are joined by index")
+    if CONSOLIDATED in companies:
+        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
+                         f"a company")
+    horizons = settings.receivables.horizons
+    wanted = set(range(1, horizons + 1))
+    h_at = table.groupby("origin_week")["h"].unique()
+    for origin in origins:
+        if origin not in h_at.index:
+            raise ValueError(f"the table has no rows at origin week {origin}")
+        found = {int(h) for h in h_at[origin]}
+        if found != wanted:
+            raise ValueError(f"the table's rows at origin week {origin} are for h "
+                             f"{sorted(found)}, but [receivables] horizons is {horizons}")
+    # Dry runs, only to fail in seconds: forecast() makes both again for its own origin.
+    topup_forecasts(new_cash, refunds, unidentified, levels, calendar, origins, horizons,
+                    settings.topups.method, settings.topups.window, settings.topups.with_level)
+    for origin in origins:
+        projected_levels(week_zero, origin, [origin + h for h in range(1, horizons + 1)])
+
+    results = []
+    for done, origin in enumerate(origins, start=1):
+        started = time.perf_counter()
+        results.append(forecast(table, origin, settings, block_columns=block_columns,
+                                companies=companies, new_cash=new_cash, refunds=refunds,
+                                unidentified=unidentified, levels=levels, calendar=calendar,
+                                week_zero=week_zero))
+        if on_origin_done is not None:
+            on_origin_done(done, len(origins), origin, time.perf_counter() - started)
+    return Forecast(totals=pd.concat([r.totals for r in results], ignore_index=True),
+                    customers=pd.concat([r.customers for r in results]))

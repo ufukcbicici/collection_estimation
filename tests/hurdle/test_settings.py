@@ -198,6 +198,10 @@ VALID = {
     "topups": {"method": '"ridge"', "window": "8", "with_level": "false", "compare": "false",
                "compare_first_origin": "20", "compare_last_origin": "35",
                "compare_windows": "[13, 4]"},
+    # U14.2: the evaluation over many origins. Values differ from synthetic.toml's on purpose
+    # (unsorted lists, run true); 44 + 13 = 57 keeps every horizons value the tests use legal.
+    "evaluation": {"run": "true", "validation_origins": "[44, 37, 40]",
+                   "test_origins": "[60, 57]"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -2218,7 +2222,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -2726,7 +2730,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="diagnostic")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -3459,7 +3463,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="stage2")
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4127,7 +4131,7 @@ def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, r
     message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic")
     assert message == (
         f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4629,7 +4633,7 @@ def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="calendar")
     assert message == (
         f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4864,9 +4868,11 @@ def test_every_topup_setting_is_frozen(tmp_path, repo, attribute):
 
 
 def test_settings_has_a_topups_field_between_joint_diagnostic_and_debug():
+    # U14.2 put `evaluation` between topups and debug; topups still follows joint_diagnostic
+    # and still comes before debug.
     names = [field.name for field in dataclasses.fields(Settings)]
     assert names.index("joint_diagnostic") + 1 == names.index("topups")
-    assert names.index("topups") + 1 == names.index("debug")
+    assert names.index("topups") < names.index("debug")
 
 
 def test_the_topups_do_not_change_the_other_sections(tmp_path, repo):
@@ -4884,7 +4890,7 @@ def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="topups")
     assert message == (
         f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -5335,3 +5341,353 @@ def test_the_synthetic_topups_window_is_among_its_compare_windows():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.topups.window in settings.topups.compare_windows
     assert settings.topups.compare_last_origin <= settings.diagnostic.origin
+
+
+# =============================================================================================
+# U14.2: the [evaluation] section, `EvaluationSettings` and `read_evaluation`.
+#
+# VALID holds run = true, validation_origins = [44, 37, 40] and test_origins = [60, 57]
+# (unsorted on purpose); with [receivables] horizons = 5 the last validation target week is 49.
+# =============================================================================================
+
+from collection_estimation.hurdle.settings import (  # noqa: E402
+    EvaluationSettings, read_evaluation)
+
+EVALUATION = f"{FILE_NAME} [evaluation]"
+EVALUATION_KEYS = ["run", "test_origins", "validation_origins"]
+
+
+def evaluation_table(**changes):
+    table = {"run": True, "validation_origins": [44, 37, 40], "test_origins": [60, 49]}
+    table.update(changes)
+    return table
+
+
+def evaluation_error(horizons=5, **changes):
+    with pytest.raises(ValueError) as error:
+        read_evaluation(evaluation_table(**changes), horizons, "here")
+    return str(error.value)
+
+
+# --- the dataclass and its place in Settings -------------------------------------------
+
+def test_evaluation_settings_fields_in_order():
+    assert [field.name for field in dataclasses.fields(EvaluationSettings)] == [
+        "run", "validation_origins", "test_origins"]
+
+
+def test_settings_has_an_evaluation_field_between_topups_and_debug():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("topups") + 1 == names.index("evaluation")
+    assert names.index("evaluation") + 1 == names.index("debug")
+
+
+def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
+    evaluation = load(tmp_path, repo).evaluation
+    for attribute in ("run", "validation_origins", "test_origins"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(evaluation, attribute, None)
+    assert hash(evaluation) == hash(dataclasses.replace(evaluation))
+
+
+def test_settings_evaluation_attribute_is_frozen(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        settings.evaluation = None
+
+
+# --- read through the file ----------------------------------------------------------------
+
+def test_the_evaluation_section_is_read(tmp_path, repo):
+    evaluation = load(tmp_path, repo).evaluation
+    assert isinstance(evaluation, EvaluationSettings)
+    assert evaluation == EvaluationSettings(run=True, validation_origins=(37, 40, 44),
+                                            test_origins=(57, 60))
+
+
+def test_the_origin_lists_are_tuples_of_ints(tmp_path, repo):
+    evaluation = load(tmp_path, repo).evaluation
+    for origins in (evaluation.validation_origins, evaluation.test_origins):
+        assert type(origins) is tuple
+        assert all(type(origin) is int for origin in origins)
+
+
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_run_is_read_as_a_bool(tmp_path, repo, text, expected):
+    run = load(tmp_path, repo, changes={("evaluation", "run"): text}).evaluation.run
+    assert run is expected
+
+
+def test_the_evaluation_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("evaluation", "run"): "false",
+                                      ("evaluation", "validation_origins"): "[3]",
+                                      ("evaluation", "test_origins"): "[8]"})
+    for name in ("data", "companies", "receivables", "history", "calendar", "stage1",
+                 "stage2", "diagnostic", "joint_diagnostic", "topups", "debug"):
+        assert getattr(a, name) == getattr(b, name), name
+    assert a.evaluation != b.evaluation
+
+
+def test_a_missing_evaluation_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="evaluation")
+    assert message == (
+        f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', "
+        f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
+        f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', 'stage2', "
+        f"'topups']")
+
+
+def test_an_evaluation_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="evaluation",
+                                 top="evaluation = 5")
+    assert message == f"{EVALUATION} is 5, not a section"
+
+
+@pytest.mark.parametrize("key", EVALUATION_KEYS)
+def test_a_missing_evaluation_setting_raises_the_exact_message(tmp_path, repo, key):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", key): REMOVE})
+    assert message == (f"{EVALUATION}: missing [{key!r}]; expected exactly "
+                       f"{EVALUATION_KEYS}")
+
+
+def test_an_unknown_evaluation_setting_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "horizons"): "5"})
+    assert message == (f"{EVALUATION}: unknown ['horizons']; expected exactly "
+                       f"{EVALUATION_KEYS}")
+
+
+def test_an_evaluation_typo_names_the_missing_and_the_unknown_setting(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={
+        ("evaluation", "test_origins"): REMOVE, ("evaluation", "test_origin"): "[57]"})
+    assert message == (f"{EVALUATION}: missing ['test_origins']; unknown ['test_origin']; "
+                       f"expected exactly {EVALUATION_KEYS}")
+
+
+def test_an_evaluation_sub_table_counts_as_an_unknown_setting(tmp_path, repo):
+    message = raises_naming(tmp_path, repo, "[evaluation]", "unknown", "'more'",
+                            extra="[evaluation.more]\nx = 1\n")
+    assert "missing" not in message
+
+
+def test_a_bad_evaluation_value_through_the_file_names_the_section(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "validation_origins"): "[]"})
+    assert message == f"{EVALUATION}: validation_origins is empty"
+
+
+def test_the_overlap_check_uses_the_receivables_horizons(tmp_path, repo):
+    # 44 + 13 = 57, the first test origin: fine. 44 + 14 = 58: refused.
+    fine = load(tmp_path, repo, changes={("receivables", "horizons"): "13"})
+    assert fine.evaluation.validation_origins[-1] + 13 == fine.evaluation.test_origins[0]
+    message = exact_message_from(tmp_path, repo, changes={("receivables", "horizons"): "14"})
+    assert message == (f"{EVALUATION}: the last validation origin 44 forecasts up to week 58, "
+                       f"which is not before the first test target week 58 (first test "
+                       f"origin 57 + 1)")
+
+
+def test_a_bad_horizons_is_reported_by_receivables_not_evaluation(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("receivables", "horizons"): "0"})
+    assert "[receivables]" in message
+    assert "[evaluation]" not in message
+
+
+def test_the_overlap_check_does_not_use_the_diagnostic_origin(tmp_path, repo):
+    # The diagnostic origin (40) lies inside validation; it has no say in [evaluation].
+    settings = load(tmp_path, repo, changes={("diagnostic", "origin"): "100"})
+    assert settings.evaluation.test_origins == (57, 60)
+
+
+# --- read_evaluation called directly --------------------------------------------------
+
+def test_read_evaluation_by_hand():
+    assert read_evaluation(evaluation_table(), 5, "here") == EvaluationSettings(
+        run=True, validation_origins=(37, 40, 44), test_origins=(49, 60))
+
+
+@pytest.mark.parametrize("validation, test, expected_validation, expected_test", [
+    ([3], [9], (3,), (9,)),
+    ([5, 1, 3], [20, 10], (1, 3, 5), (10, 20)),
+    ([0], [5], (0,), (5,)),
+    ([44, 43, 42, 41, 40, 39, 38, 37], [59, 49, 55], (37, 38, 39, 40, 41, 42, 43, 44),
+     (49, 55, 59)),
+])
+def test_read_evaluation_returns_both_lists_sorted(validation, test, expected_validation,
+                                                   expected_test):
+    found = read_evaluation(evaluation_table(validation_origins=validation, test_origins=test),
+                            5, "here")
+    assert found.validation_origins == expected_validation
+    assert found.test_origins == expected_test
+
+
+def test_read_evaluation_run_false():
+    assert read_evaluation(evaluation_table(run=False), 5, "here").run is False
+
+
+@pytest.mark.parametrize("key", ["validation_origins", "test_origins"])
+def test_an_empty_origin_list_has_the_exact_message(key):
+    assert evaluation_error(**{key: []}) == f"here: {key} is empty"
+
+
+def test_both_lists_empty_names_validation_first():
+    assert (evaluation_error(validation_origins=[], test_origins=[])
+            == "here: validation_origins is empty")
+
+
+@pytest.mark.parametrize("key", ["validation_origins", "test_origins"])
+@pytest.mark.parametrize("bad, shown", [(5, "5"), ("[3]", "'[3]'"), (True, "True"),
+                                        ({"a": 1}, "{'a': 1}"), ((3, 4), "(3, 4)")],
+                         ids=["int", "text", "bool", "table", "tuple"])
+def test_an_origin_list_that_is_not_a_list_has_the_exact_message(key, bad, shown):
+    assert evaluation_error(**{key: bad}) == f"here: {key} is {shown}, not a list of week numbers"
+
+
+@pytest.mark.parametrize("key", ["validation_origins", "test_origins"])
+@pytest.mark.parametrize("item, shown", [(-1, "-1"), (True, "True"), (False, "False"),
+                                         (1.5, "1.5"), (40.0, "40.0"), ("40", "'40'"),
+                                         ([40], "[40]"), (None, "None")],
+                         ids=["negative", "true", "false", "fraction", "whole-float", "text",
+                              "list", "none"])
+def test_a_bad_origin_has_the_exact_message(key, item, shown):
+    good = [37, 38] if key == "validation_origins" else [49, 50]
+    message = evaluation_error(**{key: good + [item]})
+    assert message == f"here: {key} holds {shown}, not a week number (0 or more)"
+
+
+@pytest.mark.parametrize("key", ["validation_origins", "test_origins"])
+@pytest.mark.parametrize("values, repeated", [([40, 40], [40]), ([42, 40, 42, 40, 41],
+                                                                 [40, 42])])
+def test_repeated_origins_have_the_exact_message(key, values, repeated):
+    if key == "test_origins":
+        values = [v + 20 for v in values]
+        repeated = [v + 20 for v in repeated]
+    else:
+        values = [v - 10 for v in values]
+        repeated = [v - 10 for v in repeated]
+    message = evaluation_error(**{key: values})
+    assert message == f"here: {key} lists {repeated} more than once"
+
+
+@pytest.mark.parametrize("horizons", [1, 5, 13])
+def test_last_validation_target_on_the_first_test_origin_is_allowed(horizons):
+    found = read_evaluation(evaluation_table(validation_origins=[30, 40],
+                                             test_origins=[40 + horizons + 3, 40 + horizons]),
+                            horizons, "here")
+    assert found.validation_origins[-1] + horizons == found.test_origins[0]
+
+
+@pytest.mark.parametrize("horizons", [1, 5, 13])
+def test_one_week_more_is_refused_with_the_exact_message(horizons):
+    first_test = 40 + horizons - 1
+    message = evaluation_error(horizons, validation_origins=[30, 40],
+                               test_origins=[first_test + 5, first_test])
+    assert message == (f"here: the last validation origin 40 forecasts up to week "
+                       f"{40 + horizons}, which is not before the first test target week "
+                       f"{first_test + 1} (first test origin {first_test} + 1)")
+
+
+def test_the_overlap_check_uses_the_sorted_extremes():
+    # Written unsorted: 44 is the last validation origin, 49 the first test origin.
+    assert read_evaluation(evaluation_table(validation_origins=[44, 37],
+                                            test_origins=[60, 49]), 5, "here")
+    message = evaluation_error(validation_origins=[37, 45], test_origins=[60, 49])
+    assert "last validation origin 45" in message
+    assert "first test origin 49" in message
+
+
+def test_test_origins_before_validation_are_refused():
+    message = evaluation_error(validation_origins=[40], test_origins=[10])
+    assert message == ("here: the last validation origin 40 forecasts up to week 45, which is "
+                       "not before the first test target week 11 (first test origin 10 + 1)")
+
+
+def test_an_origin_in_both_lists_is_refused():
+    message = evaluation_error(validation_origins=[40, 45], test_origins=[45, 60])
+    assert "last validation origin 45" in message
+
+
+@pytest.mark.parametrize("bad, shown", [(1, "1"), (0, "0"), ("true", "'true'"),
+                                        (None, "None"), ([True], "[True]")])
+def test_run_that_is_not_a_bool_has_the_exact_message(bad, shown):
+    assert evaluation_error(run=bad) == f"here: run is {shown}, not true or false"
+
+
+def test_run_not_a_bool_through_the_file(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "run"): '"yes"'})
+    assert message == f"{EVALUATION}: run is 'yes', not true or false"
+
+
+def test_the_origin_lists_are_checked_before_run():
+    assert (evaluation_error(run="yes", validation_origins=[])
+            == "here: validation_origins is empty")
+
+
+def test_the_overlap_is_checked_before_run():
+    message = evaluation_error(run="yes", validation_origins=[40], test_origins=[41])
+    assert message.startswith("here: the last validation origin 40")
+
+
+def test_validation_items_are_checked_before_test_items():
+    message = evaluation_error(validation_origins=[-1], test_origins=["x"])
+    assert message == "here: validation_origins holds -1, not a week number (0 or more)"
+
+
+def test_every_item_is_checked_before_a_list_is_found_empty():
+    message = evaluation_error(validation_origins=[], test_origins=[1.5])
+    assert message == "here: test_origins holds 1.5, not a week number (0 or more)"
+
+
+@pytest.mark.parametrize("key", EVALUATION_KEYS)
+def test_read_evaluation_with_a_key_absent_raises_key_error(key):
+    # Through the file, check_keys reports a missing key first; on its own it is a KeyError.
+    table = evaluation_table()
+    del table[key]
+    with pytest.raises(KeyError):
+        read_evaluation(table, 5, "here")
+
+
+def test_read_evaluation_ignores_an_unknown_key_on_its_own():
+    # Unknown keys are check_keys' job (load_settings); read_evaluation reads only its three.
+    found = read_evaluation(evaluation_table(extra=1), 5, "here")
+    assert found == read_evaluation(evaluation_table(), 5, "here")
+
+
+def test_read_evaluation_does_not_change_its_table():
+    table = evaluation_table()
+    read_evaluation(table, 5, "here")
+    assert table == evaluation_table()
+    assert table["validation_origins"] == [44, 37, 40]
+
+
+def test_read_evaluation_result_does_not_follow_later_changes_to_the_lists():
+    table = evaluation_table()
+    found = read_evaluation(table, 5, "here")
+    table["validation_origins"].append(1)
+    table["test_origins"].append(100)
+    assert found.validation_origins == (37, 40, 44)
+    assert found.test_origins == (49, 60)
+
+
+def test_read_evaluation_is_deterministic():
+    assert (read_evaluation(evaluation_table(), 5, "here")
+            == read_evaluation(evaluation_table(), 5, "here"))
+
+
+# synthetic.toml (its run value is not asserted: the committed file and a local one differ)
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_evaluation_settings():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    evaluation = settings.evaluation
+    assert isinstance(evaluation.run, bool)
+    # Validation starts at 33 since 2026-11-02 (Ufuk), about as large as the test.
+    assert evaluation.validation_origins == tuple(range(33, 45))
+    assert evaluation.test_origins == tuple(range(49, 60))
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
+def test_the_synthetic_validation_cannot_see_the_test():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    evaluation = settings.evaluation
+    horizons = settings.receivables.horizons
+    assert evaluation.validation_origins[-1] + horizons <= evaluation.test_origins[0]

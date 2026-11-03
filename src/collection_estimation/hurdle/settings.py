@@ -149,6 +149,15 @@ class TopupSettings:
 
 
 @dataclass(frozen=True)
+class EvaluationSettings:
+    """The evaluation over many origins (U14, `evaluate.py`). Validation is scored now; the
+    test origins are scored once, in U16 (the v1 test)."""
+    run: bool                              # run pipeline step 17 (slow: one fit per origin)
+    validation_origins: tuple[int, ...]    # sorted; scored in U14
+    test_origins: tuple[int, ...]          # sorted; every target week after validation's
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -190,6 +199,7 @@ class Settings:
     diagnostic: DiagnosticSettings
     joint_diagnostic: JointDiagnosticSettings
     topups: TopupSettings
+    evaluation: EvaluationSettings
     debug: DebugSettings
 
 
@@ -206,7 +216,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
                      "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                     "topups", "debug"},
+                     "topups", "evaluation", "debug"},
                name)
 
     data = raw["data"]
@@ -250,6 +260,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     topups = raw["topups"]
     check_keys(topups, {"method", "window", "with_level", "compare", "compare_first_origin",
                         "compare_last_origin", "compare_windows"}, f"{name} [topups]")
+    evaluation = raw["evaluation"]
+    check_keys(evaluation, {"run", "validation_origins", "test_origins"},
+               f"{name} [evaluation]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -360,6 +373,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                                f"{name} [joint_diagnostic]"),
         topups=read_topups(topups, week_setting(diagnostic, "origin", f"{name} [diagnostic]"),
                            f"{name} [topups]"),
+        evaluation=read_evaluation(evaluation,
+                                   count_setting(receivables, "horizons", f"{name} [receivables]"),
+                                   f"{name} [evaluation]"),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
@@ -427,6 +443,23 @@ def read_topups(table: dict, diagnostic_origin: int, where: str) -> TopupSetting
         compare_last_origin=last_origin,
         compare_windows=compare_windows,
     )
+
+
+def read_evaluation(table: dict, horizons: int, where: str) -> EvaluationSettings:
+    """The [evaluation] section, checked. Both origin lists are non-empty, and validation
+    cannot see the test: its last target week (last validation origin + `horizons`) comes
+    before the first test target week (first test origin + 1)."""
+    validation = tuple(sorted(week_list_setting(table, "validation_origins", where)))
+    test = tuple(sorted(week_list_setting(table, "test_origins", where)))
+    for key, origins in (("validation_origins", validation), ("test_origins", test)):
+        if not origins:
+            raise ValueError(f"{where}: {key} is empty")
+    if validation[-1] + horizons > test[0]:
+        raise ValueError(f"{where}: the last validation origin {validation[-1]} forecasts up to "
+                         f"week {validation[-1] + horizons}, which is not before the first test "
+                         f"target week {test[0] + 1} (first test origin {test[0]} + 1)")
+    return EvaluationSettings(run=bool_setting(table, "run", where),
+                              validation_origins=validation, test_origins=test)
 
 
 def read_collections_layout(table: dict, where: str) -> CollectionsLayout:

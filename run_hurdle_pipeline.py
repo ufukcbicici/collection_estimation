@@ -66,7 +66,7 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
-from collection_estimation.hurdle.evaluate import actual_totals  # noqa: E402
+from collection_estimation.hurdle.evaluate import actual_totals, rolling_forecasts  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -564,6 +564,29 @@ def main():
                            settings.receivables.horizons)
     show_actual_totals(actual, weekly, weeks)
     show_forecast_vs_actual(result.totals, actual)
+
+    # Step 17: the evaluation (U14) over the validation origins ([evaluation]; the test
+    # origins are scored only in U16). Built unit by unit; for now, the forecast at every
+    # validation origin beside the cash that came.
+    if settings.evaluation.run:
+        origins = list(settings.evaluation.validation_origins)
+        print(f"Step 17: evaluation over the validation origins {origins[0]}-{origins[-1]} "
+              f"({len(origins)} origins, two fits each)")
+        started = time.perf_counter()
+
+        def progress(done, total, at, seconds):
+            left = (time.perf_counter() - started) / done * (total - done)
+            print(f"  ... origin {at}: {done} of {total} done ({seconds:.0f} s), about "
+                  f"{left / 60:.0f} min left")
+
+        rolled = rolling_forecasts(table, origins, settings,
+                                   block_columns=block_feature_columns(history, calendar, owed),
+                                   companies=companies, new_cash=new_cash, refunds=refunds,
+                                   unidentified=unidentified, levels=levels, calendar=calendar,
+                                   week_zero=week_zero, on_origin_done=progress)
+        rolled_actual = actual_totals(weekly, weeks, levels, companies, origins,
+                                      settings.receivables.horizons)
+        show_rolling_forecasts(rolled, rolled_actual)
 
     # Later steps follow as each unit is built.
 
@@ -1322,6 +1345,26 @@ def show_forecast_totals(totals):
     first = totals[(totals["h"] == 1)].set_index("company_code")
     print("        per company at h = 1, million TRY:")
     print((first[["customers", "real_total", "total"]] / 1e6).round(2).to_string())
+
+
+def show_rolling_forecasts(rolled, actual):
+    """Step 17's forecasts (U14.2): per origin and h, the consolidated forecast / actual
+    (nominal; a target week without data shows "no data"), and the sums over all of them.
+    Scores come with U14.5."""
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    rows = rolled.totals[keys + ["total"]].merge(actual[keys + ["actual"]], on=keys,
+                                                 how="left", validate="one_to_one")
+    consolidated = rows[rows["company_code"] == CONSOLIDATED]
+    ratio = (consolidated.assign(ratio=consolidated["total"] / consolidated["actual"])
+             .pivot(index="origin_week", columns="h", values="ratio"))
+    print(f"        {rolled.customers.shape[0]:,} customer rows, {len(rolled.totals)} total rows; "
+          f"consolidated forecast / actual per origin and h (nominal):")
+    print(ratio.round(2).fillna("no data").to_string())
+    with_actual = consolidated.dropna(subset=["actual"])
+    print(f"        over all {len(with_actual)} consolidated (origin, h) with data: forecast "
+          f"{with_actual['total'].sum() / 1e6:,.1f} M vs actual "
+          f"{with_actual['actual'].sum() / 1e6:,.1f} M TRY (ratio "
+          f"{with_actual['total'].sum() / with_actual['actual'].sum():.3f})")
 
 
 def show_actual_totals(actual, weekly, weeks):

@@ -5,6 +5,10 @@ Every table is hand-made; nothing is read from data/. The properties that matter
 tested directly: actual = gross receipts + refunds of the TARGET week, deflated by the TARGET
 week's level; a missing week or a week past the calendar has no row (no data is not 0), while
 a company with no line in a week with data gets a real 0.0; "ALL" is the sum of the companies.
+
+U14.2, at the end: `rolling_forecasts`, `forecast.forecast` at every origin, stacked, on the
+small training table and side tables of test_forecast.py. Every cheap check must fire before
+the first fit, which the tests prove by replacing the fits with spies that fail if called.
 """
 import numpy as np
 import pandas as pd
@@ -510,3 +514,559 @@ def test_concatenating_an_empty_result_with_a_non_empty_one_keeps_the_dtypes(bas
     joined = pd.concat(parts, ignore_index=True)
     assert_actual_dtypes(joined)
     pd.testing.assert_frame_equal(joined, full)
+
+
+# =============================================================================================
+# U14.2: `rolling_forecasts`, `forecast.forecast` at every origin, stacked.
+#
+# The small training table, settings and side tables are the ones test_forecast.py builds for
+# `forecast` (8 customers, companies TR02 and TR04, origins 0..30, h 1..5, ten trees), so one
+# origin takes well under a second. Nothing reads data/.
+# =============================================================================================
+
+import time  # noqa: E402
+from datetime import date, timedelta  # noqa: E402
+
+from collection_estimation.hurdle import evaluate as evaluate_module  # noqa: E402
+from collection_estimation.hurdle import forecast as forecast_module  # noqa: E402
+from collection_estimation.hurdle.evaluate import rolling_forecasts  # noqa: E402
+from collection_estimation.hurdle.forecast import Forecast, forecast  # noqa: E402
+from collection_estimation.hurdle.inflation import InflationCoverageError  # noqa: E402
+from collection_estimation.hurdle.prices import projected_levels  # noqa: E402
+from tests.hurdle.test_forecast import (  # noqa: E402
+    F_COMPANIES, WEEK_ZERO, f_inputs, f_settings, f_side_tables, make_table)
+
+R_ORIGINS = [18, 22, 26]
+
+
+@pytest.fixture(scope="module")
+def r_table():
+    return make_table()
+
+
+def r_run(table, origins=R_ORIGINS, settings=None, on_origin_done=None, **overrides):
+    kwargs = f_inputs()
+    kwargs.update(overrides)
+    return rolling_forecasts(table, origins, settings or f_settings(),
+                             on_origin_done=on_origin_done, **kwargs)
+
+
+def r_by_hand(table, origins, settings=None, **overrides):
+    """`forecast` called by hand at each origin and stacked as the docstring says."""
+    kwargs = f_inputs()
+    kwargs.update(overrides)
+    results = [forecast(table, origin, settings or f_settings(), **kwargs) for origin in origins]
+    return (pd.concat([r.totals for r in results], ignore_index=True),
+            pd.concat([r.customers for r in results]))
+
+
+@pytest.fixture(scope="module")
+def r_result(r_table):
+    return r_run(r_table)
+
+
+def spy_on_the_fits(monkeypatch):
+    """Replace `forecast` (as evaluate sees it) and the stage fits with recorders that fail."""
+    called = []
+
+    def recorder(name):
+        def step(*args, **kwargs):
+            called.append(name)
+            raise AssertionError(f"{name} must not be called")
+        return step
+
+    monkeypatch.setattr(evaluate_module, "forecast", recorder("forecast"))
+    for name in ("fit_stage1", "fit_stage2", "customer_forecasts"):
+        monkeypatch.setattr(forecast_module, name, recorder(name))
+    return called
+
+
+def refused_before_any_fit(monkeypatch, table, origins=R_ORIGINS, settings=None, **overrides):
+    """Run with every fit spied on; return the ValueError's message (no fit may have run)."""
+    called = spy_on_the_fits(monkeypatch)
+    with pytest.raises(ValueError) as error:
+        r_run(table, origins, settings, **overrides)
+    assert called == [], called
+    return str(error.value)
+
+
+def with_label_repeated(table, pairs):
+    """A copy of `table` whose index gives row `copy_to` the label of row `copy_from`."""
+    table = table.copy()
+    labels = list(table.index)
+    for copy_from, copy_to in pairs:
+        labels[copy_to] = labels[copy_from]
+    table.index = pd.Index(labels)
+    return table
+
+
+# --- the result is forecast() at every origin, stacked -----------------------------------
+
+def test_rolling_returns_a_forecast(r_result):
+    assert isinstance(r_result, Forecast)
+
+
+def test_rolling_equals_forecast_by_hand_per_origin_stacked(r_table, r_result):
+    totals, customers = r_by_hand(r_table, R_ORIGINS)
+    pd.testing.assert_frame_equal(r_result.totals, totals)
+    pd.testing.assert_frame_equal(r_result.customers, customers)
+
+
+def test_rolling_totals_have_a_fresh_range_index(r_result):
+    assert list(r_result.totals.index) == list(range(len(r_result.totals)))
+
+
+def test_rolling_customers_keep_the_tables_index(r_table, r_result):
+    index = r_result.customers.index
+    assert not isinstance(index, pd.RangeIndex)
+    assert index.is_unique
+    assert set(index) <= set(r_table.index)
+    # Each customer row is the table's row with that label.
+    at = r_table.loc[index]
+    for column in ("origin_week", "h", "key"):
+        assert (at[column].to_numpy() == r_result.customers[column].to_numpy()).all(), column
+
+
+def test_rolling_customers_are_every_row_at_every_origin(r_table, r_result):
+    wanted = r_table.index[r_table["origin_week"].isin(R_ORIGINS)]
+    assert set(r_result.customers.index) == set(wanted)
+    assert len(r_result.customers) == len(wanted)
+
+
+def test_rolling_stacks_in_origin_order(r_result):
+    for frame in (r_result.totals, r_result.customers):
+        origins = frame["origin_week"].to_numpy()
+        assert (np.diff(origins) >= 0).all()
+        assert sorted(set(origins)) == R_ORIGINS
+
+
+@pytest.mark.parametrize("origin", R_ORIGINS)
+def test_each_origins_slice_equals_a_single_forecast(r_table, r_result, origin):
+    alone = forecast(r_table, origin, f_settings(), **f_inputs())
+    totals = r_result.totals[r_result.totals["origin_week"] == origin].reset_index(drop=True)
+    customers = r_result.customers[r_result.customers["origin_week"] == origin]
+    pd.testing.assert_frame_equal(totals, alone.totals)
+    pd.testing.assert_frame_equal(customers, alone.customers)
+
+
+@pytest.mark.parametrize("origin", R_ORIGINS)
+def test_each_origins_slice_equals_rolling_at_that_origin_alone(r_table, r_result, origin):
+    alone = r_run(r_table, [origin])
+    totals = r_result.totals[r_result.totals["origin_week"] == origin].reset_index(drop=True)
+    customers = r_result.customers[r_result.customers["origin_week"] == origin]
+    pd.testing.assert_frame_equal(totals, alone.totals)
+    pd.testing.assert_frame_equal(customers, alone.customers)
+
+
+def test_a_single_origin_equals_forecast(r_table):
+    alone = forecast(r_table, 22, f_settings(), **f_inputs())
+    rolled = r_run(r_table, [22])
+    pd.testing.assert_frame_equal(rolled.totals, alone.totals.reset_index(drop=True))
+    pd.testing.assert_frame_equal(rolled.customers, alone.customers)
+
+
+@pytest.mark.parametrize("given", [[26, 18, 22], [22, 26, 18, 22, 18], (26, 22, 18),
+                                   {18, 22, 26}],
+                         ids=["unsorted", "repeated", "tuple", "set"])
+def test_unsorted_or_repeated_origins_equal_sorted_unique(r_table, r_result, given):
+    found = r_run(r_table, given)
+    pd.testing.assert_frame_equal(found.totals, r_result.totals)
+    pd.testing.assert_frame_equal(found.customers, r_result.customers)
+
+
+def test_each_origin_is_forecast_once_in_sorted_order(r_table, monkeypatch):
+    seen = []
+    real = evaluate_module.forecast
+
+    def recording(table, origin, settings, **kwargs):
+        seen.append(origin)
+        return real(table, origin, settings, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "forecast", recording)
+    r_run(r_table, [26, 18, 26, 22])
+    assert seen == [18, 22, 26]
+
+
+def test_forecast_gets_the_documented_arguments(r_table, monkeypatch):
+    calls = []
+    real = evaluate_module.forecast
+
+    def recording(table, origin, settings, **kwargs):
+        calls.append((table, origin, settings, kwargs))
+        return real(table, origin, settings, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "forecast", recording)
+    settings = f_settings()
+    kwargs = f_inputs()
+    rolling_forecasts(r_table, [18, 22], settings, **kwargs)
+    assert [c[1] for c in calls] == [18, 22]
+    for table, _, given_settings, given in calls:
+        assert table is r_table
+        assert given_settings is settings
+        assert set(given) == set(kwargs)
+        for name, value in kwargs.items():
+            assert given[name] is value, name
+
+
+def test_rolling_is_deterministic(r_table, r_result):
+    again = r_run(r_table)
+    pd.testing.assert_frame_equal(again.totals, r_result.totals)
+    pd.testing.assert_frame_equal(again.customers, r_result.customers)
+
+
+def test_rolling_with_other_settings_equals_by_hand(r_table):
+    settings = f_settings(horizons=3, method="ridge", with_level=False)
+    table = r_table[r_table["h"] <= 3]
+    found = r_run(table, [26, 20], settings)
+    totals, customers = r_by_hand(table, [20, 26], settings)
+    pd.testing.assert_frame_equal(found.totals, totals)
+    pd.testing.assert_frame_equal(found.customers, customers)
+
+
+# --- the callback --------------------------------------------------------------------------
+
+def test_callback_is_called_once_per_origin_in_order(r_table):
+    calls = []
+    r_run(r_table, [26, 18, 22, 18], on_origin_done=lambda *args: calls.append(args))
+    assert [(done, total, origin) for done, total, origin, _ in calls] == [
+        (1, 3, 18), (2, 3, 22), (3, 3, 26)]
+
+
+def test_callback_seconds_are_non_negative_floats(r_table):
+    calls = []
+    r_run(r_table, on_origin_done=lambda *args: calls.append(args))
+    assert len(calls) == 3
+    for _, _, _, seconds in calls:
+        assert isinstance(seconds, float)
+        assert seconds >= 0.0
+
+
+def test_callback_gets_four_positional_arguments(r_table):
+    calls = []
+
+    def callback(*args, **kwargs):
+        assert kwargs == {}
+        calls.append(args)
+
+    r_run(r_table, [22], on_origin_done=callback)
+    assert len(calls) == 1
+    assert len(calls[0]) == 4
+    assert calls[0][:3] == (1, 1, 22)
+
+
+def test_callback_runs_after_each_origins_forecast_before_the_next(r_table, monkeypatch):
+    events = []
+    real = evaluate_module.forecast
+
+    def recording(table, origin, settings, **kwargs):
+        events.append(("forecast", origin))
+        return real(table, origin, settings, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "forecast", recording)
+    r_run(r_table, on_origin_done=lambda done, total, origin, s: events.append(("done", origin)))
+    assert events == [("forecast", 18), ("done", 18), ("forecast", 22), ("done", 22),
+                      ("forecast", 26), ("done", 26)]
+
+
+def test_callback_seconds_time_the_forecast_of_that_origin(r_table, monkeypatch):
+    # A forecast that sleeps 0.05 s: the reported time covers it.
+    real = evaluate_module.forecast
+
+    def slow(table, origin, settings, **kwargs):
+        time.sleep(0.05)
+        return real(table, origin, settings, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "forecast", slow)
+    calls = []
+    r_run(r_table, [22], on_origin_done=lambda *args: calls.append(args))
+    assert calls[0][3] >= 0.05
+
+
+def test_callback_does_not_change_the_result(r_table, r_result):
+    with_callback = r_run(r_table, on_origin_done=lambda *args: None)
+    pd.testing.assert_frame_equal(with_callback.totals, r_result.totals)
+    pd.testing.assert_frame_equal(with_callback.customers, r_result.customers)
+
+
+def test_no_callback_is_the_default(r_table, r_result):
+    found = rolling_forecasts(r_table, R_ORIGINS, f_settings(), **f_inputs())
+    pd.testing.assert_frame_equal(found.totals, r_result.totals)
+
+
+def test_callback_is_not_called_when_refused_up_front(r_table):
+    calls = []
+    with pytest.raises(ValueError):
+        r_run(r_table, [18, 99], on_origin_done=lambda *args: calls.append(args))
+    assert calls == []
+
+
+# --- refused before any fit -------------------------------------------------------------
+
+@pytest.mark.parametrize("origins", [[], (), set()], ids=["list", "tuple", "set"])
+def test_no_origins_exact_message(r_table, monkeypatch, origins):
+    message = refused_before_any_fit(monkeypatch, r_table, origins)
+    assert message == "there are no origins to forecast at"
+
+
+def test_duplicate_index_label_exact_message(r_table, monkeypatch):
+    table = with_label_repeated(r_table, [(0, 1), (2, 3)])
+    first = [int(r_table.index[0]), int(r_table.index[2])]
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message == (f"the table's index holds 2 labels more than once (first: {first}); "
+                       f"the customer rows are joined by index")
+
+
+def test_duplicate_index_message_shows_at_most_five_labels(r_table, monkeypatch):
+    table = with_label_repeated(r_table, [(2 * i, 2 * i + 1) for i in range(7)])
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message.startswith("the table's index holds 7 labels more than once (first: [")
+    shown = message.split("(first: [")[1].split("]")[0].split(", ")
+    assert len(shown) == 5
+
+
+def test_a_label_three_times_counts_once(r_table, monkeypatch):
+    table = with_label_repeated(r_table, [(0, 1), (0, 2)])
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message.startswith("the table's index holds 1 labels more than once")
+
+
+def test_duplicate_index_outside_the_origins_is_still_refused(r_table, monkeypatch):
+    # The two rows sharing a label are at origin 0, not one of the origins forecast.
+    at_zero = np.flatnonzero(r_table["origin_week"].to_numpy() == 0)
+    table = with_label_repeated(r_table, [(at_zero[0], at_zero[1])])
+    message = refused_before_any_fit(monkeypatch, table)
+    assert "more than once" in message
+
+
+def test_all_in_companies_exact_message(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, companies=["TR02", "TR04", "ALL"])
+    assert message == "'ALL' is the code of the consolidated rows; it cannot be a company"
+
+
+def test_origin_with_no_rows_exact_message(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, [99])
+    assert message == "the table has no rows at origin week 99"
+
+
+def test_only_the_last_origin_missing_is_found_before_any_fit(r_table, monkeypatch):
+    # 18 and 22 are fine; the missing one sorts last, so a check inside the loop would fit
+    # 18 and 22 first.
+    message = refused_before_any_fit(monkeypatch, r_table, [22, 99, 18])
+    assert message == "the table has no rows at origin week 99"
+
+
+def test_an_origin_between_good_ones_with_no_rows(r_table, monkeypatch):
+    table = r_table[r_table["origin_week"] != 22]
+    message = refused_before_any_fit(monkeypatch, table, [18, 22, 26])
+    assert message == "the table has no rows at origin week 22"
+
+
+def test_the_first_missing_origin_in_sorted_order_is_named(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, [120, 99, 18])
+    assert message == "the table has no rows at origin week 99"
+
+
+@pytest.mark.parametrize("horizons", [3, 4, 6])
+def test_horizons_setting_unlike_the_table_exact_message(r_table, monkeypatch, horizons):
+    message = refused_before_any_fit(monkeypatch, r_table, settings=f_settings(horizons))
+    assert message == (f"the table's rows at origin week 18 are for h [1, 2, 3, 4, 5], but "
+                       f"[receivables] horizons is {horizons}")
+
+
+def test_only_the_last_origin_missing_an_h_is_found_before_any_fit(r_table, monkeypatch):
+    table = r_table[~((r_table["origin_week"] == 26) & (r_table["h"] == 5))]
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message == ("the table's rows at origin week 26 are for h [1, 2, 3, 4], but "
+                       "[receivables] horizons is 5")
+
+
+def test_only_the_last_origin_with_an_extra_h_is_found_before_any_fit(r_table, monkeypatch):
+    extra = r_table[(r_table["origin_week"] == 26) & (r_table["h"] == 5)].copy()
+    extra["h"] = 6
+    extra["target_week"] = 32
+    extra.index = extra.index + 100_000
+    table = pd.concat([r_table, extra])
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message == ("the table's rows at origin week 26 are for h [1, 2, 3, 4, 5, 6], but "
+                       "[receivables] horizons is 5")
+
+
+def test_h_check_lists_plain_ints_for_a_float_h_column(r_table, monkeypatch):
+    table = r_table[~((r_table["origin_week"] == 26) & (r_table["h"] == 5))].copy()
+    table["h"] = table["h"].astype("float64")
+    message = refused_before_any_fit(monkeypatch, table)
+    assert message.endswith("are for h [1, 2, 3, 4], but [receivables] horizons is 5")
+
+
+def test_a_float_h_column_that_matches_passes_the_check(r_table):
+    table = r_table.copy()
+    table["h"] = table["h"].astype("float64")
+    totals, customers = r_by_hand(table, [22])
+    found = r_run(table, [22])
+    pd.testing.assert_frame_equal(found.totals, totals)
+    pd.testing.assert_frame_equal(found.customers, customers)
+
+
+def test_a_mismatch_at_an_origin_not_forecast_is_not_refused(r_table):
+    # Origin 10 lacks h 5; only origin 26 is forecast, so the check passes. (The rows of
+    # origin 10 are still training rows, so the forecast is compared with forecast() on the
+    # same table, not with the full table's.)
+    table = r_table[~((r_table["origin_week"] == 10) & (r_table["h"] == 5))]
+    found = r_run(table, [26])
+    totals, customers = r_by_hand(table, [26])
+    pd.testing.assert_frame_equal(found.totals, totals)
+    pd.testing.assert_frame_equal(found.customers, customers)
+
+
+def test_unknown_topup_method_is_refused_before_any_fit(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, settings=f_settings(method="median"))
+    assert message == "method is 'median'; it must be one of ('mean', 'ridge')"
+
+
+def test_topup_window_below_one_is_refused_before_any_fit(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, settings=f_settings(window=0))
+    assert message == "window is 0; the trailing mean needs at least 1 week"
+
+
+def test_topup_data_missing_only_for_the_last_origin_is_found_before_any_fit(r_table,
+                                                                              monkeypatch):
+    # The new-customer cash of target weeks 23..26 removed: origin 26 has no week with data in
+    # its 4-week window, 18 and 22 do (their windows end at 18 and 22).
+    new_cash, refunds, unidentified = f_side_tables()
+    new_cash = new_cash[~new_cash["target_week"].between(23, 26)]
+    message = refused_before_any_fit(monkeypatch, r_table, settings=f_settings(window=4),
+                                     new_cash=new_cash, refunds=refunds,
+                                     unidentified=unidentified)
+    assert message == ("h 1, origin 26: no week with data in the 4 weeks up to the origin, so "
+                       "no trailing mean")
+
+
+def test_non_monday_week_zero_is_refused_before_any_fit(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, week_zero=date(2025, 6, 3))
+    assert message == ("week_zero 2025-06-03 is a Tuesday, not a Monday; weeks run Monday to "
+                       "Sunday")
+
+
+def a_week_zero_where_only_the_later_origin_lacks_tufe(early, late):
+    """A Monday from which `projected_levels` works at `early` but raises at `late`."""
+    day = date(2015, 1, 5)   # a Monday
+    while day < date(2040, 1, 1):
+        try:
+            projected_levels(day, early, [early + 1])
+        except InflationCoverageError:
+            day += timedelta(days=7)
+            continue
+        try:
+            projected_levels(day, late, [late + 1])
+        except InflationCoverageError:
+            return day
+        day += timedelta(days=7)
+    raise AssertionError("no such week_zero: the TUFE table never ends?")
+
+
+def test_price_projection_failing_only_for_the_last_origin_is_found_before_any_fit(
+        r_table, monkeypatch):
+    week_zero = a_week_zero_where_only_the_later_origin_lacks_tufe(22, 26)
+    called = spy_on_the_fits(monkeypatch)
+    with pytest.raises(InflationCoverageError) as error:
+        r_run(r_table, week_zero=week_zero)
+    assert called == []
+    assert str(error.value).startswith("week 26 ")
+
+
+# --- the order of the up-front checks ---------------------------------------------------
+
+def test_order_no_origins_before_duplicate_index(r_table, monkeypatch):
+    table = with_label_repeated(r_table, [(0, 1)])
+    message = refused_before_any_fit(monkeypatch, table, [])
+    assert message == "there are no origins to forecast at"
+
+
+def test_order_duplicate_index_before_all(r_table, monkeypatch):
+    table = with_label_repeated(r_table, [(0, 1)])
+    message = refused_before_any_fit(monkeypatch, table, companies=["ALL"])
+    assert "more than once" in message
+
+
+def test_order_all_before_missing_origin(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, [99], companies=["TR02", "ALL"])
+    assert message.startswith("'ALL' is the code")
+
+
+def test_order_missing_origin_before_h_mismatch_of_a_later_origin(r_table, monkeypatch):
+    table = r_table[~((r_table["origin_week"] == 26) & (r_table["h"] == 5))]
+    message = refused_before_any_fit(monkeypatch, table, [26, 20, 21.5])
+    # 20 is fine, 21.5 has no rows and sorts before 26.
+    assert message == "the table has no rows at origin week 21.5"
+
+
+def test_order_table_checks_before_the_topups(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, [18, 99],
+                                     settings=f_settings(method="median"))
+    assert message == "the table has no rows at origin week 99"
+
+
+def test_order_topups_before_the_price_projection(r_table, monkeypatch):
+    message = refused_before_any_fit(monkeypatch, r_table, settings=f_settings(window=0),
+                                     week_zero=date(2025, 6, 3))
+    assert message == "window is 0; the trailing mean needs at least 1 week"
+
+
+def test_topups_are_made_once_for_all_origins_up_front(r_table, monkeypatch):
+    calls = []
+    real = evaluate_module.topup_forecasts
+
+    def recording(*args, **kwargs):
+        calls.append(list(args[5]))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "topup_forecasts", recording)
+    spy_on_the_fits(monkeypatch)
+    with pytest.raises(AssertionError, match="must not be called"):
+        r_run(r_table, [26, 18, 22])
+    assert calls == [[18, 22, 26]]
+
+
+def test_levels_are_projected_for_every_origin_up_front(r_table, monkeypatch):
+    calls = []
+    real = evaluate_module.projected_levels
+
+    def recording(week_zero, origin, targets, *args, **kwargs):
+        calls.append((week_zero, origin, list(targets)))
+        return real(week_zero, origin, targets, *args, **kwargs)
+
+    monkeypatch.setattr(evaluate_module, "projected_levels", recording)
+    spy_on_the_fits(monkeypatch)
+    with pytest.raises(AssertionError, match="must not be called"):
+        r_run(r_table, [26, 18, 22])
+    assert calls == [(WEEK_ZERO, o, [o + h for h in range(1, 6)]) for o in [18, 22, 26]]
+
+
+# --- inputs are not changed -------------------------------------------------------------
+
+def test_rolling_does_not_change_its_inputs(r_table):
+    table = r_table.copy(deep=True)
+    kwargs = f_inputs()
+    frames = {name: kwargs[name].copy(deep=True)
+              for name in ("new_cash", "refunds", "unidentified", "calendar", "levels")}
+    block_columns = {key: list(value) for key, value in kwargs["block_columns"].items()}
+    origins = [26, 18, 22, 18]
+    settings = f_settings()
+    rolling_forecasts(table, origins, settings, **kwargs)
+    pd.testing.assert_frame_equal(table, r_table)
+    for name in ("new_cash", "refunds", "unidentified", "calendar"):
+        pd.testing.assert_frame_equal(kwargs[name], frames[name])
+    pd.testing.assert_series_equal(kwargs["levels"], frames["levels"])
+    assert kwargs["block_columns"] == block_columns
+    assert kwargs["companies"] == list(F_COMPANIES)
+    assert kwargs["week_zero"] == WEEK_ZERO
+    assert origins == [26, 18, 22, 18]
+    assert settings == f_settings()
+
+
+def test_rolling_result_is_not_a_view_of_the_table(r_table):
+    table = r_table.copy(deep=True)
+    found = rolling_forecasts(table, [22], f_settings(), **f_inputs())
+    before = found.customers.copy(deep=True)
+    table.loc[:, "origin_week"] = -1
+    pd.testing.assert_frame_equal(found.customers, before)
