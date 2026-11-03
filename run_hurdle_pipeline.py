@@ -66,7 +66,12 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
-from collection_estimation.hurdle.evaluate import actual_totals, rolling_forecasts  # noqa: E402
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    REFERENCES,
+    actual_totals,
+    deflated_reference,
+    rolling_forecasts,
+)
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
 from collection_estimation.hurdle.known import known_weeks  # noqa: E402
 from collection_estimation.hurdle.panel import (  # noqa: E402
@@ -587,6 +592,10 @@ def main():
         rolled_actual = actual_totals(weekly, weeks, levels, companies, origins,
                                       settings.receivables.horizons)
         show_rolling_forecasts(rolled, rolled_actual)
+        # U14.3: the `deflated` reference at the same origins, refitted at each.
+        reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins,
+                                       settings.receivables.horizons, week_zero)
+        show_deflated_reference(reference, rolled, rolled_actual)
 
     # Later steps follow as each unit is built.
 
@@ -1365,6 +1374,30 @@ def show_rolling_forecasts(rolled, actual):
           f"{with_actual['total'].sum() / 1e6:,.1f} M vs actual "
           f"{with_actual['actual'].sum() / 1e6:,.1f} M TRY (ratio "
           f"{with_actual['total'].sum() / with_actual['actual'].sum():.3f})")
+
+
+def show_deflated_reference(reference, rolled, actual):
+    """Step 17's `deflated` reference (U14.3): over all consolidated (origin, h) with data,
+    the model's forecast and each reference's against the actual cash (nominal), and how
+    often each fell back to the recent level there. Scores come with U14.5."""
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    consolidated = actual[actual["company_code"] == CONSOLIDATED][keys + ["actual"]]
+    wide = reference.pivot(index=keys, columns="reference", values="forecast").reset_index()
+    fallbacks = reference.pivot(index=keys, columns="reference", values="fallback").add_suffix(
+        " fallback").reset_index()
+    rows = (consolidated.merge(rolled.totals[keys + ["total"]], on=keys, validate="one_to_one")
+            .merge(wide, on=keys, validate="one_to_one")
+            .merge(fallbacks, on=keys, validate="one_to_one"))
+    print(f"        the deflated reference (U14.3): {len(reference)} rows; over the "
+          f"{len(rows)} consolidated (origin, h) with data, nominal, million TRY:")
+    for name, column in (("hurdle model", "total"), *((r, r) for r in REFERENCES)):
+        fell_back = ""
+        if column in REFERENCES:
+            fell_back = (f", fell back to the recent level in "
+                         f"{int(rows[column + ' fallback'].sum())} of {len(rows)}")
+        print(f"          {name:<17} {rows[column].sum() / 1e6:>10,.1f} vs actual "
+              f"{rows['actual'].sum() / 1e6:,.1f} (ratio "
+              f"{rows[column].sum() / rows['actual'].sum():.3f}){fell_back}")
 
 
 def show_actual_totals(actual, weekly, weeks):

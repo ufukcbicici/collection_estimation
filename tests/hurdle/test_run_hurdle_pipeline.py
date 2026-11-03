@@ -5329,8 +5329,10 @@ def test_step_16_and_17_imports():
     evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.evaluate"]
     assert len(evaluate_imports) == 1
+    # U14.3 added REFERENCES and deflated_reference to the one import of evaluate.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
-        ("actual_totals", None), ("rolling_forecasts", None)]
+        ("REFERENCES", None), ("actual_totals", None), ("deflated_reference", None),
+        ("rolling_forecasts", None)]
 
 
 STEP_16_17_NAMES = """
@@ -5357,6 +5359,12 @@ inspect.signature(script.forecast).bind("table", 0, "settings", **KEYWORDS)
 inspect.signature(script.rolling_forecasts).bind("table", [0], "settings", **KEYWORDS,
                                                  on_origin_done=print)
 inspect.signature(script.actual_totals).bind("weekly", "weeks", "levels", [], [0], 5)
+# U14.3.
+assert script.deflated_reference is evaluate.deflated_reference
+assert script.REFERENCES is evaluate.REFERENCES
+inspect.signature(script.deflated_reference).bind("weekly", "weeks", "levels", "calendar", [],
+                                                  [0], 5, None)
+inspect.signature(script.show_deflated_reference).bind("reference", "rolled", "actual")
 print("ok")
 """
 
@@ -5419,9 +5427,10 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
     statements = [ast.unparse(node) for node in block.body]
-    assert statements[-2] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
+    # U14.3's two statements follow these two (see the deflated reference tests below).
+    assert statements[-4] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
                               "origins, settings.receivables.horizons)")
-    assert statements[-1] == "show_rolling_forecasts(rolled, rolled_actual)"
+    assert statements[-3] == "show_rolling_forecasts(rolled, rolled_actual)"
 
 
 def row_cells(lines, first):
@@ -5603,3 +5612,181 @@ def test_show_rolling_forecasts_without_any_actual_shows_no_data_everywhere():
     assert row_cells(table, "11")[1:] == ["no", "data", "no", "data"]
     assert lines[-1].startswith("        over all 0 consolidated (origin, h) with data: "
                                 "forecast 0.0 M vs actual 0.0 M TRY (ratio ")
+
+
+# Step 17, U14.3: the `deflated` reference at the validation origins, right after the rolling
+# forecasts' printout, and its printout. Wiring on main()'s syntax tree, as above.
+
+DEFLATED_REFERENCE_ARGS = ["weekly", "weeks", "levels", "calendar", "companies", "origins",
+                           "settings.receivables.horizons", "week_zero"]
+
+
+def test_step_17_calls_deflated_reference_once_with_its_arguments():
+    assert len(calls_to(main_tree(), "deflated_reference")) == 1
+    block = step_17_block()
+    calls = calls_to(block, "deflated_reference")
+    assert len(calls) == 1
+    call = calls[0]
+    assert [ast.unparse(a) for a in call.args] == DEFLATED_REFERENCE_ARGS
+    assert call.keywords == []
+    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+                and node.value is call]
+    assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["reference"]
+
+
+def test_step_17_deflated_reference_is_a_direct_statement_of_the_evaluation_block():
+    # Directly in the `if settings.evaluation.run:` body, not nested deeper, not in an else.
+    block = step_17_block()
+    direct = [node for node in block.body if isinstance(node, ast.Assign)
+              and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+              and node.value.func.id == "deflated_reference"]
+    assert len(direct) == 1
+    assert block.orelse == []
+
+
+def test_step_17_deflated_reference_comes_after_show_rolling_forecasts():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    shown = statements.index("show_rolling_forecasts(rolled, rolled_actual)")
+    made = statements.index("reference = deflated_reference(weekly, weeks, levels, calendar, "
+                            "companies, origins, settings.receivables.horizons, week_zero)")
+    assert made == shown + 1
+
+
+def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and_actual():
+    assert len(calls_to(main_tree(), "show_deflated_reference")) == 1
+    calls = calls_to(step_17_block(), "show_deflated_reference")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["reference", "rolled", "rolled_actual"]
+    assert calls[0].keywords == []
+
+
+def test_step_17_ends_with_the_deflated_reference_and_its_printout():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    assert statements[-4:] == [
+        "rolled_actual = actual_totals(weekly, weeks, levels, companies, origins, "
+        "settings.receivables.horizons)",
+        "show_rolling_forecasts(rolled, rolled_actual)",
+        "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
+        "settings.receivables.horizons, week_zero)",
+        "show_deflated_reference(reference, rolled, rolled_actual)"]
+
+
+def test_step_17_deflated_reference_uses_the_same_origins_as_the_rolling_forecasts():
+    block = step_17_block()
+    rolled = calls_to(block, "rolling_forecasts")[0]
+    reference = calls_to(block, "deflated_reference")[0]
+    assert ast.unparse(rolled.args[1]) == "origins" == ast.unparse(reference.args[5])
+    # origins is assigned once in the block, before both calls.
+    assigned = [node for node in block.body if isinstance(node, ast.Assign)
+                and "origins" in [ast.unparse(t) for t in node.targets]]
+    assert len(assigned) == 1
+
+
+def test_step_17_is_still_the_last_step_after_the_deflated_reference():
+    body = main_body()
+    assert isinstance(body[-1], ast.If)
+    assert ast.unparse(body[-1].test) == "settings.evaluation.run"
+    last = body[-1].body[-1]
+    assert ast.unparse(last) == "show_deflated_reference(reference, rolled, rolled_actual)"
+
+
+def test_show_deflated_reference_is_a_module_level_function_with_three_parameters():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_deflated_reference"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["reference", "rolled", "actual"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+
+
+# show_deflated_reference at origins 10 and 11, h = 1, 2, companies TR02 and ALL.
+# Consolidated actual: (10, 1) wk 11 1,000,000; (10, 2) wk 12 2,000,000; (11, 1) wk 12
+# 2,000,000; (11, 2) wk 13 has no row. Over the 3 with data, actual 5.0 M.
+#   hurdle model (ALL): 2.0 + 1.5 + 3.0           = 6.5 M, ratio 1.300 (wk 13's 1.0 M left out)
+#   deflated (ALL):     1.0 + 2.0 + 2.0           = 5.0 M, ratio 1.000 (wk 13's 7.0 M left out)
+#   deflated_nolevel:   0.5 + 1.0 + 1.0           = 2.5 M, ratio 0.500 (wk 13's 9e9 left out)
+# TR02's rows (9e9 everywhere) must enter no sum. The reference has 2 x 2 x 2 x 2 = 16 rows.
+# Fallbacks count over the SAME rows as the sums: the 3 consolidated (origin, h) with data,
+# (10, 1), (10, 2), (11, 1). deflated: ALL [T, F, F] = 1 of 3 (ALL's (11, 2) fallback has no
+# actual, and TR02's fallbacks are not consolidated: neither counts); deflated_nolevel: ALL
+# [F, F, F] = 0 of 3 (TR02's one fallback does not count). Counting every row of a variant
+# instead would give 3 of 8 and 1 of 8.
+SHOW_REFERENCE = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.forecast import Forecast
+
+keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
+totals = pd.concat([
+    pd.DataFrame({"company_code": ["TR02"] * 4, **keys, "total": [9e9] * 4}),
+    pd.DataFrame({"company_code": ["ALL"] * 4, **keys, "total": [2e6, 1.5e6, 3e6, 1e6]})],
+    ignore_index=True)
+customers = pd.DataFrame({"key": ["TR02-0"]})
+three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
+actual = pd.concat([
+    pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
+    pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
+    ignore_index=True)
+actual["actual_real"] = 0.0
+values = {("TR02", "deflated"): ([9e9] * 4, [False, False, False, True]),
+          ("TR02", "deflated_nolevel"): ([9e9] * 4, [False, False, True, False]),
+          ("ALL", "deflated"): ([1e6, 2e6, 2e6, 7e6], [True, False, False, True]),
+          ("ALL", "deflated_nolevel"): ([5e5, 1e6, 1e6, 9e9], [False] * 4)}
+rows = []
+for company in ("TR02", "ALL"):
+    for i in range(4):
+        for reference in ("deflated", "deflated_nolevel"):
+            forecast, fallback = values[(company, reference)]
+            rows.append({"company_code": company, "origin_week": keys["origin_week"][i],
+                         "h": keys["h"][i], "target_week": keys["target_week"][i],
+                         "reference": reference, "real_forecast": forecast[i] / 2.0,
+                         "price_level": 2.0, "forecast": forecast[i],
+                         "fallback": fallback[i]})
+reference = pd.DataFrame(rows)
+script.show_deflated_reference(reference, Forecast(totals=totals, customers=customers), actual)
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def reference_lines():
+    result = run_code(SHOW_REFERENCE)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_deflated_reference_prints_four_lines(reference_lines):
+    assert len(reference_lines) == 4
+
+
+def test_show_deflated_reference_header_counts_the_rows_and_the_consolidated_pairs(
+        reference_lines):
+    assert reference_lines[0] == (
+        "        the deflated reference (U14.3): 16 rows; over the 3 consolidated (origin, h) "
+        "with data, nominal, million TRY:")
+
+
+def test_show_deflated_reference_hurdle_model_line(reference_lines):
+    assert reference_lines[1] == ("          hurdle model" + " " * 13
+                                  + "6.5 vs actual 5.0 (ratio 1.300)")
+
+
+def test_show_deflated_reference_deflated_line_with_its_fallback_count(reference_lines):
+    assert reference_lines[2] == ("          deflated" + " " * 17 + "5.0 vs actual 5.0 (ratio "
+                                  "1.000), fell back to the recent level in 1 of 3")
+
+
+def test_show_deflated_reference_nolevel_line_with_its_fallback_count(reference_lines):
+    assert reference_lines[3] == ("          deflated_nolevel" + " " * 9 + "2.5 vs actual 5.0 "
+                                  "(ratio 0.500), fell back to the recent level in 0 of 3")
+
+
+def test_show_deflated_reference_lines_follow_the_references_order(reference_lines):
+    names = [line.split()[0] for line in reference_lines[1:]]
+    assert names == ["hurdle", "deflated", "deflated_nolevel"]
+
+
+def test_show_deflated_reference_the_hurdle_line_has_no_fallback_count(reference_lines):
+    assert "fell back" not in reference_lines[1]

@@ -8,6 +8,11 @@ negative), which `side_tables.check_side_tables` proves equals the panel's cash 
 
 U14.2, the forecasts: `forecast.forecast` at every origin, stacked. Everything that can be
 checked cheaply is checked for every origin before the first (slow) fit.
+
+U14.3, the `deflated` reference: `benchmark.deflated_forecasts` on all the cash of each company
+(and of all of them, fitted on its own), deflated, refitted at every origin on the weeks known
+at it, then times the price level projected at the origin, as the model's total is. With and
+without the recent level.
 """
 import time
 from datetime import date
@@ -15,12 +20,19 @@ from typing import Callable
 
 import pandas as pd
 
+from .benchmark import deflated_forecasts
 from .forecast import CONSOLIDATED, Forecast, forecast
 from .prices import deflate, projected_levels
 from .topups import topup_forecasts
 
 # The columns of the table `actual_totals` returns, in order.
 ACTUAL_COLUMNS = ["company_code", "origin_week", "h", "target_week", "actual", "actual_real"]
+# The columns of the table `deflated_reference` returns, in order. real_forecast is deflated
+# (TRY of week 0), forecast nominal TRY: real_forecast x price_level.
+REFERENCE_COLUMNS = ["company_code", "origin_week", "h", "target_week", "reference",
+                     "real_forecast", "price_level", "forecast", "fallback"]
+# The two variants of the `deflated` reference: with the recent level among the inputs or not.
+REFERENCES = {"deflated": True, "deflated_nolevel": False}
 
 
 def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
@@ -140,3 +152,73 @@ def rolling_forecasts(table: pd.DataFrame, origins: list[int], settings, *,
             on_origin_done(done, len(origins), origin, time.perf_counter() - started)
     return Forecast(totals=pd.concat([r.totals for r in results], ignore_index=True),
                     customers=pd.concat([r.customers for r in results]))
+
+
+def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
+                       calendar: pd.DataFrame, companies: list[str], origins: list[int],
+                       horizons: int, week_zero: date) -> pd.DataFrame:
+    """The `deflated` reference made at every origin in `origins`, for h = 1 to `horizons`,
+    per company in `companies` and consolidated (company "ALL"), in both variants of
+    `REFERENCES`.
+
+    The series of a company is its cash (gross receipts + refunds, as in `actual_totals`) in
+    each week with data, divided by the week's published price level (`levels`), TRY of week
+    0; a week with data where the company has no line is a real 0, a week without data is not
+    in the series. The consolidated series is all the companies' cash, fitted on its own (so
+    the companies' forecasts need not add up to it). At each origin T and h,
+    `benchmark.deflated_forecasts` is fitted on the series' weeks up to T, with `calendar`
+    (the calendar features of every week), and forecasts week T + h; then times the price
+    level of T + h projected at T (`prices.projected_levels` from `week_zero`).
+
+    Columns `REFERENCE_COLUMNS`, sorted by company (the companies, then "ALL"), origin, h and
+    reference ("deflated", then "deflated_nolevel").
+
+    Raises ValueError if `origins` is empty, `horizons` is below 1, the company list holds
+    "ALL" or is empty, or the weekly amounts hold cash of a company outside the list, as
+    `deflate` does for a week with no price level, and as `deflated_forecasts` (no calendar
+    row for a week, no data in the weeks of the recent level) and `projected_levels` do.
+    """
+    origins = sorted(set(origins))
+    if not origins:
+        raise ValueError("there are no origins to forecast at")
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    if not companies:
+        raise ValueError("the company list is empty")
+    if CONSOLIDATED in companies:
+        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
+                         f"a company")
+    outside = sorted(set(weekly["company_code"]) - set(companies), key=str)
+    if outside:
+        raise ValueError(f"the weekly amounts have cash of companies not in the list: {outside}")
+
+    # The cash per week with data (rows) and company (columns), 0 where a company has no line.
+    with_data = sorted(set(weeks.loc[~weeks["is_missing"], "week"]))
+    net = weekly.assign(actual=weekly["gross_receipts"] + weekly["refunds"])
+    cash = (net[net["week"].isin(with_data)]
+            .pivot_table(index="week", columns="company_code", values="actual", aggfunc="sum")
+            .reindex(index=with_data, columns=sorted(set(companies)), fill_value=0.0)
+            .fillna(0.0))
+    cash[CONSOLIDATED] = cash.sum(axis=1)
+    week_numbers = pd.Series(cash.index, index=cash.index)
+    real = {company: deflate(cash[company], week_numbers, levels) for company in cash.columns}
+
+    projected = {origin: projected_levels(week_zero, origin,
+                                          [origin + h for h in range(1, horizons + 1)])
+                 for origin in origins}
+    rows = []
+    for company, series in real.items():
+        for origin in origins:
+            for h in range(1, horizons + 1):
+                for reference, with_level in REFERENCES.items():
+                    made = deflated_forecasts(series, calendar, h, origin, [origin],
+                                              with_level).iloc[0]
+                    level = float(projected[origin].loc[origin + h])
+                    rows.append({"company_code": company, "origin_week": origin, "h": h,
+                                 "target_week": origin + h, "reference": reference,
+                                 "real_forecast": float(made["forecast"]), "price_level": level,
+                                 "forecast": float(made["forecast"]) * level,
+                                 "fallback": bool(made["fallback"])})
+    found = pd.DataFrame(rows, columns=REFERENCE_COLUMNS)
+    found[["company_code", "reference"]] = found[["company_code", "reference"]].astype(object)
+    return found
