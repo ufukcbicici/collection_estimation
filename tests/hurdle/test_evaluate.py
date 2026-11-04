@@ -4200,6 +4200,11 @@ FP_NO_CHANGES = {
         "evaluation", "validation_origins", lambda v: tuple(v) + (99,)),
     "evaluation rule_doubtful_days": fp_change_settings_by(
         "evaluation", "rule_doubtful_days", lambda v: v + 1),
+    # U14.5c: the paired bootstrap scores the forecasts; it never makes one.
+    "evaluation bootstrap_samples": fp_change_settings_by(
+        "evaluation", "bootstrap_samples", lambda v: v + 1),
+    "evaluation bootstrap_seed": fp_change_settings_by(
+        "evaluation", "bootstrap_seed", lambda v: v + 1),
     # [topups]: only the comparison's fields.
     "topups compare": fp_change_settings_by("topups", "compare", lambda v: not v),
     "topups compare_first_origin": fp_change_settings_by(
@@ -4328,3 +4333,868 @@ def test_fingerprint_fails_if_a_model_code_file_is_missing(fp_settings, fp_code_
     (fp_code_copy / MODEL_CODE[0]).unlink()
     with pytest.raises(FileNotFoundError):
         fp_of(*fp_arguments(fp_settings))
+
+
+# =============================================================================================
+# U14.5c: `scored_rows` (the checks and the join `evaluation_scores` used to do itself), and the
+# paired bootstrap of WAPE: `weighted_wape`, `drawn_counts`, `resampled_weeks`,
+# `resampled_origins` (circular blocks), `bootstrap_row` and `paired_wape_bootstrap`.
+#
+# The tables are built with s_forecasts / s_actual above. Where an interval is checked
+# exactly, the expected resamples are rebuilt here from the documented recipe (the same
+# default_rng(seed), the same draws), independently of the code under test.
+# =============================================================================================
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    BOOTSTRAP_COLUMNS, bootstrap_row, drawn_counts, paired_wape_bootstrap, resampled_origins,
+    resampled_weeks, scored_rows, weighted_wape)
+
+
+# --- scored_rows -------------------------------------------------------------------------------
+
+def test_scored_rows_columns_are_the_forecasts_plus_actual():
+    rows = scored_rows(e_forecasts(), e_actual(), E_HORIZONS)
+    assert list(rows.columns) == STACK_COLUMNS + ["actual"]
+    # actual_real (a decoy in s_actual) is not carried over.
+    assert "actual_real" not in rows.columns
+
+
+def test_scored_rows_is_an_inner_join_on_the_rows_with_actual():
+    # 2 methods x 2 companies x 3 (origin, h) with actual; (11, 2) -> week 13 has none.
+    rows = scored_rows(e_forecasts(), e_actual(), E_HORIZONS)
+    assert len(rows) == 12
+    assert not ((rows["origin_week"] == 11) & (rows["h"] == 2)).any()
+    assert not (rows["forecast"] == 999.0).any()
+
+
+def test_scored_rows_puts_each_forecast_beside_the_actual_of_its_own_row():
+    rows = scored_rows(e_forecasts(), e_actual(), E_HORIZONS)
+    hurdle_all = rows[(rows["method"] == HURDLE) & (rows["company_code"] == "ALL")]
+    by_key = {(o, h): (f, a) for o, h, f, a in zip(hurdle_all["origin_week"], hurdle_all["h"],
+                                                   hurdle_all["forecast"], hurdle_all["actual"])}
+    assert by_key == {(10, 1): (110.0, 100.0), (10, 2): (150.0, 200.0), (11, 1): (140.0, 200.0)}
+
+
+def test_scored_rows_an_actual_row_for_a_company_nobody_forecasts_is_refused():
+    # An actual row for a company nobody forecasts is checked: every method must have it.
+    actual = pd.concat([e_actual(), s_actual([("TR09", 10, 1, 11, 5.0)])], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^'hurdle' has no forecast for 1 rows"):
+        scored_rows(e_forecasts(), actual, E_HORIZONS)
+
+
+@pytest.mark.parametrize("horizons", [0, -3])
+def test_scored_rows_refuses_horizons_below_one_with_the_exact_message(horizons):
+    with pytest.raises(ValueError) as error:
+        scored_rows(e_forecasts(), e_actual(), horizons)
+    assert str(error.value) == f"horizons is {horizons}; horizons start at 1"
+
+
+def test_scored_rows_refuses_an_h_outside_with_the_exact_message():
+    extra = s_forecasts([(HURDLE, "ALL", 12, 3, 15, 1.0)])
+    with pytest.raises(ValueError) as error:
+        scored_rows(pd.concat([e_forecasts(), extra], ignore_index=True), e_actual(), E_HORIZONS)
+    assert str(error.value) == "forecasts for h [3]; horizons is 2"
+
+
+def test_scored_rows_refuses_a_repeat_a_nonfinite_and_a_missing_forecast():
+    # 1. A repeat.
+    forecasts = e_forecasts()
+    with pytest.raises(ValueError, match=r"^1 forecasts are there twice"):
+        scored_rows(pd.concat([forecasts, forecasts.iloc[[0]]], ignore_index=True), e_actual(),
+                    E_HORIZONS)
+    # 2. A NaN.
+    with pytest.raises(ValueError, match=r"^1 forecasts are NaN or infinite"):
+        scored_rows(nonfinite_forecasts(NAN), e_actual(), E_HORIZONS)
+    # 3. A missing forecast for a row with actual.
+    dropped = forecasts[~is_row(forecasts, RULE, "ALL", 10, 2)]
+    with pytest.raises(ValueError, match=r"^'rule' has no forecast for 1 rows"):
+        scored_rows(dropped, e_actual(), E_HORIZONS)
+
+
+def test_scored_rows_and_evaluation_scores_refuse_with_the_same_message():
+    # evaluation_scores delegates its checks: the very same message for the same input.
+    broken = nonfinite_forecasts(float("inf"))
+    with pytest.raises(ValueError) as from_rows:
+        scored_rows(broken, e_actual(), E_HORIZONS)
+    with pytest.raises(ValueError) as from_scores:
+        evaluation_scores(broken, e_actual(), E_HORIZONS)
+    assert str(from_rows.value) == str(from_scores.value)
+
+
+def test_scored_rows_does_not_change_its_inputs():
+    forecasts, actual = e_forecasts(), e_actual()
+    before = (forecasts.copy(), actual.copy())
+    scored_rows(forecasts, actual, E_HORIZONS)
+    pd.testing.assert_frame_equal(forecasts, before[0])
+    pd.testing.assert_frame_equal(actual, before[1])
+
+
+# --- weighted_wape -------------------------------------------------------------------------------
+
+def test_weighted_wape_with_unit_weights_is_the_plain_wape():
+    # errors 10, 50, 60 over actual 100, 200, 200: 120 / 500.
+    found = weighted_wape(np.array([10.0, 50.0, 60.0]), np.array([100.0, 200.0, 200.0]),
+                          np.ones(3))
+    assert found == pytest.approx(0.24)
+    assert type(found) is float
+
+
+def test_weighted_wape_by_hand_with_weights():
+    # weights 2, 0, 1: (2*10 + 0*50 + 1*60) / (2*100 + 0 + 1*200) = 80 / 400.
+    found = weighted_wape(np.array([10.0, 50.0, 60.0]), np.array([100.0, 200.0, 200.0]),
+                          np.array([2.0, 0.0, 1.0]))
+    assert found == pytest.approx(0.2)
+
+
+def test_weighted_wape_with_whole_weights_equals_repeating_the_rows():
+    errors, actual = np.array([3.0, 7.0, 1.0]), np.array([10.0, 20.0, 5.0])
+    weights = np.array([3.0, 1.0, 2.0])
+    repeated_errors = np.repeat(errors, weights.astype(int))
+    repeated_actual = np.repeat(actual, weights.astype(int))
+    assert weighted_wape(errors, actual, weights) == pytest.approx(
+        weighted_wape(repeated_errors, repeated_actual, np.ones(len(repeated_actual))))
+
+
+def test_weighted_wape_does_not_depend_on_the_scale_of_the_weights():
+    errors, actual = np.array([3.0, 7.0]), np.array([10.0, 20.0])
+    assert weighted_wape(errors, actual, np.array([1.0, 2.0])) == pytest.approx(
+        weighted_wape(errors, actual, np.array([5.0, 10.0])))
+
+
+# --- drawn_counts --------------------------------------------------------------------------------
+
+def test_drawn_counts_by_hand():
+    found = drawn_counts(np.array([3, 5, 7]), [5, 5, 3])
+    assert list(found) == [1.0, 2.0, 0.0]
+    assert found.dtype == np.float64
+
+
+def test_drawn_counts_repeated_values_each_get_the_count():
+    # Two rows of week 5 (two origins aim at it): both count as often as week 5 was drawn.
+    found = drawn_counts(np.array([5, 5, 3, 9]), [5, 5, 5, 9])
+    assert list(found) == [3.0, 3.0, 0.0, 1.0]
+
+
+def test_drawn_counts_nothing_drawn_gives_zeros():
+    assert list(drawn_counts(np.array([1, 2]), [])) == [0.0, 0.0]
+
+
+def test_drawn_counts_ignores_drawn_values_not_among_the_values():
+    assert list(drawn_counts(np.array([1, 2]), [2, 8, 8])) == [0.0, 1.0]
+
+
+def test_drawn_counts_sum_equals_the_number_drawn_when_values_are_distinct():
+    values = np.array([10, 11, 12, 13])
+    drawn = [12, 10, 12, 13, 13, 13]
+    assert drawn_counts(values, drawn).sum() == len(drawn)
+
+
+# --- resampled_weeks -----------------------------------------------------------------------------
+
+def test_resampled_weeks_is_a_list_as_long_as_the_weeks_drawn_from_them():
+    weeks = [11, 12, 13, 14, 15]
+    drawn = resampled_weeks(weeks, np.random.default_rng(3))
+    assert isinstance(drawn, list)
+    assert len(drawn) == len(weeks)
+    assert set(drawn) <= set(weeks)
+
+
+def test_resampled_weeks_is_rng_choice_with_replacement():
+    weeks = [11, 12, 13, 14, 15]
+    expected = np.random.default_rng(42).choice(weeks, size=5, replace=True)
+    assert resampled_weeks(weeks, np.random.default_rng(42)) == list(expected)
+
+
+def test_resampled_weeks_draws_with_replacement():
+    # Over many draws of 5 weeks, some resample repeats a week (without replacement none would).
+    rng = np.random.default_rng(0)
+    assert any(len(set(resampled_weeks([1, 2, 3, 4, 5], rng))) < 5 for _ in range(50))
+
+
+def test_resampled_weeks_of_one_week_is_that_week():
+    assert resampled_weeks([7], np.random.default_rng(1)) == [7]
+
+
+# --- resampled_origins: circular blocks ----------------------------------------------------------
+
+def test_resampled_origins_length_and_members():
+    origins = [33, 34, 35, 36, 37, 38, 39]
+    rng = np.random.default_rng(5)
+    for _ in range(200):
+        drawn = resampled_origins(origins, 3, rng)
+        assert len(drawn) == len(origins)
+        assert set(drawn) <= set(origins)
+
+
+def test_resampled_origins_by_hand_from_the_starts():
+    # 1. The starts the same rng gives (one per block): blocks of 2 out of 5 origins need 3
+    #    blocks (6 drawn, cut to 5).
+    origins = [10, 11, 12, 13, 14]
+    starter = np.random.default_rng(9)
+    starts = [int(starter.integers(0, 5)) for _ in range(3)]
+    # 2. Each block runs on from its start, wrapping past the last origin.
+    expected = [origins[(start + step) % 5] for start in starts for step in range(2)][:5]
+    assert resampled_origins(origins, 2, np.random.default_rng(9)) == expected
+
+
+def test_resampled_origins_a_block_past_the_end_wraps_to_the_first():
+    # Find a seed whose first start is the last origin: its block of 3 is last, first, second.
+    origins = [20, 21, 22, 23]
+    for seed in range(1000):
+        if int(np.random.default_rng(seed).integers(0, 4)) == 3:
+            break
+    drawn = resampled_origins(origins, 3, np.random.default_rng(seed))
+    assert drawn[:3] == [23, 20, 21]
+
+
+def test_resampled_origins_with_block_one_is_a_plain_resample():
+    origins = [1, 2, 3, 4, 5, 6]
+    starter = np.random.default_rng(17)
+    expected = [origins[int(starter.integers(0, 6))] for _ in range(6)]
+    assert resampled_origins(origins, 1, np.random.default_rng(17)) == expected
+
+
+def test_resampled_origins_with_block_equal_to_the_count_is_a_rotation():
+    # One block covers every origin once, starting anywhere: each origin exactly once.
+    origins = [40, 41, 42, 43, 44]
+    rng = np.random.default_rng(2)
+    for _ in range(50):
+        drawn = resampled_origins(origins, 5, rng)
+        assert sorted(drawn) == origins
+        start = origins.index(drawn[0])
+        assert drawn == origins[start:] + origins[:start]
+
+
+def test_resampled_origins_consecutive_draws_within_a_block_are_neighbours():
+    # Inside each block of 3, each origin is the next one (circularly) after the previous.
+    origins = [10, 11, 12, 13, 14, 15, 16]
+    rng = np.random.default_rng(8)
+    for _ in range(100):
+        drawn = resampled_origins(origins, 3, rng)
+        for block_start in range(0, len(drawn), 3):
+            block = drawn[block_start:block_start + 3]
+            for before, after in zip(block, block[1:]):
+                assert origins.index(after) == (origins.index(before) + 1) % len(origins)
+
+
+@pytest.mark.parametrize("count, block", [(6, 3), (7, 3), (12, 5), (4, 4), (5, 2)])
+def test_resampled_origins_every_origin_is_drawn_equally_often_in_the_long_run(count, block):
+    # The circular block bootstrap draws every origin, the first and last included, as often
+    # as the middle ones (a non-circular version under-draws the ends).
+    origins = list(range(30, 30 + count))
+    rng = np.random.default_rng(20261104)
+    tally = dict.fromkeys(origins, 0)
+    resamples = 20000
+    for _ in range(resamples):
+        for origin in resampled_origins(origins, block, rng):
+            tally[origin] += 1
+    expected = resamples          # n draws per resample over n origins: once each on average
+    for origin, seen in tally.items():
+        assert abs(seen / expected - 1) < 0.03, (origin, seen, expected)
+    # The ends against the middle, explicitly.
+    middle = tally[origins[count // 2]]
+    assert abs(tally[origins[0]] / middle - 1) < 0.05
+    assert abs(tally[origins[-1]] / middle - 1) < 0.05
+
+
+def test_resampled_origins_of_one_origin_is_that_origin():
+    assert resampled_origins([50], 1, np.random.default_rng(0)) == [50]
+
+
+# --- bootstrap_row -------------------------------------------------------------------------------
+
+def bs_cycling_weights(vectors):
+    """A draw_weights that ignores the rng and hands out `vectors` in turn (so the expected
+    differences can be worked out by hand)."""
+    state = {"next": 0}
+
+    def draw(rng):
+        found = np.asarray(vectors[state["next"] % len(vectors)], dtype="float64")
+        state["next"] += 1
+        return found
+    return draw
+
+
+def test_bootstrap_row_keys_are_the_bootstrap_columns():
+    found = bootstrap_row("a", "b", POOLED, np.array([1.0]), np.array([2.0]), np.array([10.0]),
+                          lambda rng: np.ones(1), 3, 0)
+    assert list(found) == BOOTSTRAP_COLUMNS
+    assert (found["method"], found["against"], found["horizon"]) == ("a", "b", POOLED)
+    assert found["rows"] == 1 and found["samples"] == 3
+
+
+def test_bootstrap_row_observed_numbers_by_hand():
+    # errors 10, 20 vs 30, 30 over actual 100, 100: wape 30/200 = 0.15, against
+    # 60/200 = 0.3, difference -0.15.
+    found = bootstrap_row("a", "b", POOLED, np.array([10.0, 20.0]), np.array([30.0, 30.0]),
+                          np.array([100.0, 100.0]), lambda rng: np.ones(2), 5, 0)
+    assert found["wape"] == pytest.approx(0.15)
+    assert found["wape_against"] == pytest.approx(0.3)
+    assert found["difference"] == pytest.approx(-0.15)
+
+
+def test_bootstrap_row_low_high_and_share_by_hand_from_known_weights():
+    # 1. errors a = 10, 40, b = 20, 20, actual 100, 100 (observed: 50/200 - 40/200 = +0.05).
+    error, error_against, actual = (np.array([10.0, 40.0]), np.array([20.0, 20.0]),
+                                    np.array([100.0, 100.0]))
+    # 2. Four resamples with weights (2, 0), (0, 2), (1, 1), (2, 0): differences
+    #    10/100 - 20/100 = -0.1;  40/100 - 20/100 = +0.2;  +0.05;  -0.1.
+    vectors = [[2, 0], [0, 2], [1, 1], [2, 0]]
+    differences = np.array([-0.1, 0.2, 0.05, -0.1])
+    found = bootstrap_row("a", "b", POOLED, error, error_against, actual,
+                          bs_cycling_weights(vectors), 4, 0)
+    assert found["difference"] == pytest.approx(0.05)
+    assert found["low"] == pytest.approx(np.quantile(differences, 0.05))
+    assert found["high"] == pytest.approx(np.quantile(differences, 0.95))
+    # 3. Two of four below 0.
+    assert found["share_better"] == pytest.approx(0.5)
+
+
+def test_bootstrap_row_identical_methods_give_zero_everywhere():
+    error = np.array([5.0, 9.0, 1.0])
+    found = bootstrap_row("a", "b", POOLED, error, error.copy(), np.array([10.0, 20.0, 30.0]),
+                          lambda rng: rng.integers(1, 4, size=3).astype(float), 200, 7)
+    assert found["difference"] == 0.0
+    assert found["low"] == 0.0 and found["high"] == 0.0
+    # A tie is never "better".
+    assert found["share_better"] == 0.0
+
+
+def test_bootstrap_row_better_in_every_row_is_better_in_every_resample():
+    found = bootstrap_row("a", "b", POOLED, np.array([1.0, 2.0, 3.0]),
+                          np.array([2.0, 3.0, 4.0]), np.array([10.0, 10.0, 10.0]),
+                          lambda rng: rng.integers(0, 3, size=3).astype(float) + 0.5, 300, 1)
+    assert found["share_better"] == 1.0
+    assert found["high"] < 0.0 and found["difference"] < 0.0
+
+
+def test_bootstrap_row_with_one_sample_has_its_one_difference_as_both_ends():
+    found = bootstrap_row("a", "b", POOLED, np.array([10.0, 40.0]), np.array([20.0, 20.0]),
+                          np.array([100.0, 100.0]), bs_cycling_weights([[0, 2]]), 1, 0)
+    assert found["low"] == pytest.approx(0.2) and found["high"] == pytest.approx(0.2)
+    assert found["share_better"] == 0.0
+    assert found["samples"] == 1
+
+
+def test_bootstrap_row_calls_draw_weights_once_per_sample_with_a_seeded_rng():
+    # 1. Record the first number each call's rng gives.
+    seen = []
+
+    def draw(rng):
+        seen.append(float(rng.random()))
+        return np.ones(2)
+    bootstrap_row("a", "b", POOLED, np.ones(2), np.ones(2), np.ones(2), draw, 6, 123)
+    # 2. Six calls, all on one rng seeded with 123, in sequence.
+    reference = np.random.default_rng(123)
+    assert seen == [float(reference.random()) for _ in range(6)]
+
+
+def test_bootstrap_row_numbers_are_python_floats():
+    found = bootstrap_row("a", "b", POOLED, np.array([1.0, 3.0]), np.array([2.0, 1.0]),
+                          np.array([5.0, 5.0]), lambda rng: rng.integers(1, 3, 2).astype(float),
+                          20, 0)
+    for name in ("wape", "wape_against", "difference", "low", "high", "share_better"):
+        assert isinstance(found[name], float), name
+
+
+# --- paired_wape_bootstrap: the running example ---------------------------------------------------
+# Horizons 2; origins 10 ... 13; consolidated actual by target week: 11: 100, 12: 200,
+# 13: 150, 14: 120; week 15 has none, so (13, 2) is not scored and origin 13 is incomplete.
+#   (origin, h, target):  (10,1,11) (10,2,12) (11,1,12) (11,2,13) (12,1,13) (12,2,14) (13,1,14)
+#   actual                   100       200       200       150       150       120       120
+#   hurdle                   110       190       230       140       160       100       130
+#   deflated                  80       240       150       180       120       150        90
+#   twin                  = hurdle everywhere
+# hurdle |e|: 10 10 30 10 10 20 10 = 100;  deflated |e|: 20 40 50 30 30 30 30 = 230;
+# actual sum 1040: pooled WAPE hurdle 100/1040, deflated 230/1040; hurdle better in every row.
+# Totals of the complete origins 10, 11, 12 (actual 300, 350, 270 = 920):
+#   hurdle 300, 370, 260 -> |e| 0, 20, 10 = 30;  deflated 320, 330, 270 -> |e| 20, 20, 0 = 40.
+# Every (origin, h) of origin 13 at h = 2 forecasts 999 (never scored). TR02 is a decoy
+# (forecast 5, actual 4 everywhere): only "ALL" is bootstrapped.
+
+BS_HORIZONS = 2
+BS_PAIRS = [(10, 1, 11), (10, 2, 12), (11, 1, 12), (11, 2, 13), (12, 1, 13), (12, 2, 14),
+            (13, 1, 14), (13, 2, 15)]
+BS_ACTUAL_BY_WEEK = {11: 100.0, 12: 200.0, 13: 150.0, 14: 120.0}
+BS_VALUES = {
+    HURDLE: [110.0, 190.0, 230.0, 140.0, 160.0, 100.0, 130.0, 999.0],
+    "deflated": [80.0, 240.0, 150.0, 180.0, 120.0, 150.0, 90.0, 999.0],
+    "twin": [110.0, 190.0, 230.0, 140.0, 160.0, 100.0, 130.0, 999.0],
+}
+
+
+def bs_forecasts(values=None):
+    values = BS_VALUES if values is None else values
+    rows = []
+    for method, by_pair in values.items():
+        for company in ("TR02", "ALL"):
+            for (origin, h, target), value in zip(BS_PAIRS, by_pair):
+                rows.append((method, company, origin, h, target,
+                             value if company == "ALL" else 5.0))
+    return s_forecasts(rows)
+
+
+def bs_actual(by_week=None):
+    by_week = BS_ACTUAL_BY_WEEK if by_week is None else by_week
+    rows = []
+    for company in ("TR02", "ALL"):
+        for origin, h, target in BS_PAIRS:
+            if target in by_week:
+                rows.append((company, origin, h, target,
+                             by_week[target] if company == "ALL" else 4.0))
+    return s_actual(rows)
+
+
+def bs_run(pairs=((HURDLE, "deflated"),), samples=300, seed=11, forecasts=None, actual=None,
+           horizons=BS_HORIZONS):
+    forecasts = bs_forecasts() if forecasts is None else forecasts
+    actual = bs_actual() if actual is None else actual
+    return paired_wape_bootstrap(forecasts, actual, list(pairs), horizons, samples, seed)
+
+
+def bs_row(result, method, against, horizon):
+    found = result[(result["method"] == method) & (result["against"] == against)
+                   & (result["horizon"] == horizon)]
+    assert len(found) == 1, (method, against, horizon, len(found))
+    return found.iloc[0]
+
+
+def bs_expected_differences(errors, errors_against, actual, units, kind, samples, seed,
+                            horizons):
+    """The resampled differences rebuilt from the recipe: `units` is each value's target week
+    (pooled) or origin (total)."""
+    rng = np.random.default_rng(seed)
+    distinct = sorted(set(units))
+    count = len(distinct)
+    differences = []
+    for _ in range(samples):
+        # 1. Draw the target weeks (pooled) or circular blocks of origins (total).
+        if kind == POOLED:
+            drawn = list(rng.choice(distinct, size=count, replace=True))
+        else:
+            block = min(horizons, count)
+            drawn = []
+            while len(drawn) < count:
+                start = int(rng.integers(0, count))
+                drawn += [distinct[(start + step) % count] for step in range(block)]
+            drawn = drawn[:count]
+        # 2. Each value counts as often as its unit was drawn.
+        weights = np.array([drawn.count(unit) for unit in units], dtype=float)
+        mine = (weights * errors).sum() / (weights * actual).sum()
+        theirs = (weights * errors_against).sum() / (weights * actual).sum()
+        differences.append(mine - theirs)
+    return np.array(differences)
+
+
+def test_bootstrap_has_exactly_the_bootstrap_columns_and_a_fresh_index():
+    result = bs_run()
+    assert BOOTSTRAP_COLUMNS == ["method", "against", "horizon", "rows", "wape", "wape_against",
+                                 "difference", "low", "high", "share_better", "samples"]
+    assert list(result.columns) == BOOTSTRAP_COLUMNS
+    assert list(result.index) == list(range(len(result)))
+
+
+def test_bootstrap_one_pooled_and_one_total_row_per_pair_in_pair_order():
+    result = bs_run(pairs=[(HURDLE, "deflated"), ("deflated", "twin"), (HURDLE, "twin")])
+    assert list(zip(result["method"], result["against"], result["horizon"])) == [
+        (HURDLE, "deflated", POOLED), (HURDLE, "deflated", HORIZON_TOTAL),
+        ("deflated", "twin", POOLED), ("deflated", "twin", HORIZON_TOTAL),
+        (HURDLE, "twin", POOLED), (HURDLE, "twin", HORIZON_TOTAL)]
+
+
+def test_bootstrap_rows_count_the_origin_h_pooled_and_the_complete_origins_total():
+    result = bs_run()
+    # 7 consolidated (origin, h) with actual; 3 complete origins (13 misses week 15).
+    assert bs_row(result, HURDLE, "deflated", POOLED)["rows"] == 7
+    assert bs_row(result, HURDLE, "deflated", HORIZON_TOTAL)["rows"] == 3
+
+
+def test_bootstrap_observed_wapes_by_hand():
+    result = bs_run()
+    pooled = bs_row(result, HURDLE, "deflated", POOLED)
+    assert pooled["wape"] == pytest.approx(100.0 / 1040.0)
+    assert pooled["wape_against"] == pytest.approx(230.0 / 1040.0)
+    assert pooled["difference"] == pytest.approx(-130.0 / 1040.0)
+    total = bs_row(result, HURDLE, "deflated", HORIZON_TOTAL)
+    assert total["wape"] == pytest.approx(30.0 / 920.0)
+    assert total["wape_against"] == pytest.approx(40.0 / 920.0)
+    assert total["difference"] == pytest.approx(-10.0 / 920.0)
+
+
+def test_bootstrap_observed_wapes_equal_evaluation_scores_for_all():
+    # The observed numbers are the consolidated pooled and total WAPEs of evaluation_scores.
+    forecasts, actual = bs_forecasts(), bs_actual()
+    scores = evaluation_scores(forecasts, actual, BS_HORIZONS)
+    result = bs_run(pairs=[(HURDLE, "deflated"), ("deflated", "twin")])
+    for method, against in [(HURDLE, "deflated"), ("deflated", "twin")]:
+        for horizon in (POOLED, HORIZON_TOTAL):
+            row = bs_row(result, method, against, horizon)
+            assert row["wape"] == pytest.approx(
+                score_of(scores, method, CONSOLIDATED, horizon)["wape"])
+            assert row["wape_against"] == pytest.approx(
+                score_of(scores, against, CONSOLIDATED, horizon)["wape"])
+            assert row["rows"] == score_of(scores, method, CONSOLIDATED, horizon)["rows"]
+
+
+def test_bootstrap_pooled_interval_matches_the_recipe_exactly():
+    # 1. The seven scored rows of the running example, in (origin, h) order.
+    scored = [(o, h, t) for o, h, t in BS_PAIRS if t in BS_ACTUAL_BY_WEEK]
+    weeks = [t for _, _, t in scored]
+    actual = np.array([BS_ACTUAL_BY_WEEK[t] for t in weeks])
+    hurdle = np.array([BS_VALUES[HURDLE][BS_PAIRS.index(p)] for p in scored])
+    deflated = np.array([BS_VALUES["deflated"][BS_PAIRS.index(p)] for p in scored])
+    # 2. The differences over the same resamples, rebuilt.
+    differences = bs_expected_differences(np.abs(hurdle - actual), np.abs(deflated - actual),
+                                          actual, weeks, POOLED, 300, 11, BS_HORIZONS)
+    row = bs_row(bs_run(samples=300, seed=11), HURDLE, "deflated", POOLED)
+    assert row["low"] == pytest.approx(np.quantile(differences, 0.05), rel=1e-9, abs=1e-12)
+    assert row["high"] == pytest.approx(np.quantile(differences, 0.95), rel=1e-9, abs=1e-12)
+    assert row["share_better"] == pytest.approx((differences < 0).mean())
+
+
+def test_bootstrap_total_interval_matches_the_recipe_exactly():
+    # 1. The complete origins' totals (10, 11, 12), by hand from the table above.
+    actual = np.array([300.0, 350.0, 270.0])
+    hurdle_errors = np.array([0.0, 20.0, 10.0])
+    deflated_errors = np.array([20.0, 20.0, 0.0])
+    # 2. Circular blocks of min(2, 3) = 2 origins, rebuilt.
+    differences = bs_expected_differences(hurdle_errors, deflated_errors, actual, [10, 11, 12],
+                                          HORIZON_TOTAL, 300, 11, BS_HORIZONS)
+    row = bs_row(bs_run(samples=300, seed=11), HURDLE, "deflated", HORIZON_TOTAL)
+    assert row["low"] == pytest.approx(np.quantile(differences, 0.05), rel=1e-9, abs=1e-12)
+    assert row["high"] == pytest.approx(np.quantile(differences, 0.95), rel=1e-9, abs=1e-12)
+    assert row["share_better"] == pytest.approx((differences < 0).mean())
+
+
+def test_bootstrap_an_identical_method_gives_zero_and_never_better():
+    result = bs_run(pairs=[(HURDLE, "twin")])
+    for horizon in (POOLED, HORIZON_TOTAL):
+        row = bs_row(result, HURDLE, "twin", horizon)
+        assert row["difference"] == 0.0, horizon
+        assert (row["low"], row["high"]) == (0.0, 0.0), horizon
+        assert row["share_better"] == 0.0, horizon
+        assert row["wape"] == row["wape_against"], horizon
+
+
+def test_bootstrap_better_in_every_week_is_better_in_every_pooled_resample():
+    # hurdle's error is below deflated's in every scored (origin, h).
+    row = bs_row(bs_run(samples=500), HURDLE, "deflated", POOLED)
+    assert row["share_better"] == 1.0
+    assert row["low"] <= row["high"] < 0.0
+
+
+def test_bootstrap_the_reversed_pair_mirrors_the_pair():
+    # Same seed, same resamples: the differences change sign, so the interval mirrors and the
+    # shares of "better" add up to 1 minus the share of ties.
+    result = bs_run(pairs=[(HURDLE, "deflated"), ("deflated", HURDLE)])
+    for horizon in (POOLED, HORIZON_TOTAL):
+        forward = bs_row(result, HURDLE, "deflated", horizon)
+        backward = bs_row(result, "deflated", HURDLE, horizon)
+        assert backward["difference"] == pytest.approx(-forward["difference"])
+        assert backward["low"] == pytest.approx(-forward["high"])
+        assert backward["high"] == pytest.approx(-forward["low"])
+        assert backward["wape"] == pytest.approx(forward["wape_against"])
+        assert forward["share_better"] + backward["share_better"] <= 1.0 + 1e-12
+
+
+def test_bootstrap_interval_holds_the_observed_difference_side_and_is_ordered():
+    result = bs_run(pairs=[(HURDLE, "deflated"), ("deflated", HURDLE)], samples=400)
+    for _, row in result.iterrows():
+        assert row["low"] <= row["high"]
+        assert 0.0 <= row["share_better"] <= 1.0
+        assert row["samples"] == 400
+
+
+def test_bootstrap_samples_one_gives_one_difference_as_both_ends():
+    result = bs_run(samples=1)
+    for _, row in result.iterrows():
+        assert row["low"] == row["high"]
+        assert row["share_better"] in (0.0, 1.0)
+        assert row["samples"] == 1
+
+
+def test_bootstrap_one_target_week_gives_a_point_interval():
+    # Horizons 1, one origin: one (origin, h), one week, one origin. Every resample draws the
+    # same week (and the same origin), so the interval is the observed difference.
+    forecasts = s_forecasts([("a", "ALL", 10, 1, 11, 90.0), ("b", "ALL", 10, 1, 11, 130.0)])
+    actual = s_actual([("ALL", 10, 1, 11, 100.0)])
+    result = paired_wape_bootstrap(forecasts, actual, [("a", "b")], 1, 50, 3)
+    assert list(result["horizon"]) == [POOLED, HORIZON_TOTAL]
+    for _, row in result.iterrows():
+        # a: 10/100, b: 30/100, difference -0.2.
+        assert row["rows"] == 1
+        assert row["difference"] == pytest.approx(-0.2)
+        assert row["low"] == pytest.approx(-0.2) and row["high"] == pytest.approx(-0.2)
+        assert row["share_better"] == 1.0
+
+
+def test_bootstrap_is_deterministic():
+    pd.testing.assert_frame_equal(bs_run(pairs=[(HURDLE, "deflated"), ("deflated", "twin")]),
+                                  bs_run(pairs=[(HURDLE, "deflated"), ("deflated", "twin")]))
+
+
+def test_bootstrap_another_seed_changes_the_interval_not_the_observed_numbers():
+    first = bs_row(bs_run(seed=1, samples=200), HURDLE, "deflated", POOLED)
+    second = bs_row(bs_run(seed=2, samples=200), HURDLE, "deflated", POOLED)
+    for name in ("wape", "wape_against", "difference", "rows"):
+        assert first[name] == second[name], name
+    # Over four target weeks and 200 resamples, the two seeds' 5% and 95% points differ.
+    assert (first["low"], first["high"]) != (second["low"], second["high"])
+
+
+def test_bootstrap_a_pairs_rows_do_not_depend_on_the_other_pairs_or_their_order():
+    # 1. The pair alone.
+    alone = bs_run(pairs=[(HURDLE, "deflated")])
+    # 2. The same pair after another, and before another.
+    after = bs_run(pairs=[("deflated", "twin"), (HURDLE, "deflated")])
+    before = bs_run(pairs=[(HURDLE, "deflated"), ("twin", "deflated")])
+    mine_after = after[after["method"] == HURDLE].reset_index(drop=True)
+    mine_before = before[before["method"] == HURDLE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(mine_after, alone)
+    pd.testing.assert_frame_equal(mine_before, alone)
+
+
+def test_bootstrap_swapping_the_pairs_swaps_the_blocks_of_rows():
+    one = bs_run(pairs=[(HURDLE, "deflated"), ("deflated", "twin")])
+    two = bs_run(pairs=[("deflated", "twin"), (HURDLE, "deflated")])
+    pd.testing.assert_frame_equal(one.iloc[[2, 3, 0, 1]].reset_index(drop=True), two)
+
+
+def test_bootstrap_the_same_pair_twice_gives_the_same_rows_twice():
+    result = bs_run(pairs=[(HURDLE, "deflated"), (HURDLE, "deflated")])
+    first = result.iloc[:2].reset_index(drop=True)
+    second = result.iloc[2:].reset_index(drop=True)
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_bootstrap_empty_pairs_give_an_empty_table_with_the_columns():
+    result = bs_run(pairs=[])
+    assert result.empty
+    assert list(result.columns) == BOOTSTRAP_COLUMNS
+
+
+def test_bootstrap_an_incomplete_origin_is_left_out_of_the_total_only():
+    # Origin 13's h = 1 forecast changed: the pooled row moves, the total row does not.
+    values = {name: list(v) for name, v in BS_VALUES.items()}
+    values[HURDLE][6] = 5000.0                     # (13, 1, 14)
+    changed = bs_run(forecasts=bs_forecasts(values))
+    base = bs_run()
+    assert (bs_row(changed, HURDLE, "deflated", POOLED)["wape"]
+            != bs_row(base, HURDLE, "deflated", POOLED)["wape"])
+    pd.testing.assert_series_equal(bs_row(changed, HURDLE, "deflated", HORIZON_TOTAL),
+                                   bs_row(base, HURDLE, "deflated", HORIZON_TOTAL))
+
+
+def test_bootstrap_no_complete_origin_means_no_total_row():
+    # Only week 11 and 13 have actual: every origin misses one of its two weeks.
+    actual = bs_actual({11: 100.0, 13: 150.0})
+    result = bs_run(actual=actual)
+    assert list(result["horizon"]) == [POOLED]
+    assert result.iloc[0]["rows"] == 3            # (10,1), (11,2), (12,1)
+
+
+def test_bootstrap_total_block_is_cut_to_the_number_of_complete_origins():
+    # Horizons 3 but only origins 10 and 11 complete: blocks of min(3, 2) = 2, so every
+    # resample is a rotation of the two origins and the total interval is a point.
+    pairs3 = [(o, h, o + h) for o in (10, 11, 12) for h in (1, 2, 3)]
+    weeks = {11: 100.0, 12: 100.0, 13: 100.0, 14: 100.0}       # origin 12 misses week 15
+    rows_a = [("a", "ALL", o, h, t, 110.0 + o) for o, h, t in pairs3]
+    rows_b = [("b", "ALL", o, h, t, 80.0) for o, h, t in pairs3]
+    forecasts = s_forecasts(rows_a + rows_b)
+    actual = s_actual([("ALL", o, h, t, weeks[t]) for o, h, t in pairs3 if t in weeks])
+    result = paired_wape_bootstrap(forecasts, actual, [("a", "b")], 3, 100, 4)
+    total = bs_row(result, "a", "b", HORIZON_TOTAL)
+    assert total["rows"] == 2
+    assert total["low"] == pytest.approx(total["difference"])
+    assert total["high"] == pytest.approx(total["difference"])
+
+
+def test_bootstrap_a_week_without_actual_is_left_out():
+    # (13, 2) -> week 15 has no actual: its forecast, whatever it is, changes nothing.
+    values = {name: list(v) for name, v in BS_VALUES.items()}
+    values[HURDLE][7] = 1e12
+    pd.testing.assert_frame_equal(bs_run(forecasts=bs_forecasts(values)), bs_run())
+
+
+def test_bootstrap_uses_the_consolidated_rows_only():
+    # TR02's forecasts and actual changed: the same result.
+    forecasts, actual = bs_forecasts(), bs_actual()
+    forecasts.loc[forecasts["company_code"] == "TR02", "forecast"] = 1e6
+    actual.loc[actual["company_code"] == "TR02", "actual"] = 1.0
+    pd.testing.assert_frame_equal(bs_run(forecasts=forecasts, actual=actual), bs_run())
+
+
+def test_bootstrap_a_company_actual_of_zero_is_not_refused():
+    # The "above 0" check is on the consolidated actual only.
+    actual = bs_actual()
+    actual.loc[actual["company_code"] == "TR02", "actual"] = 0.0
+    result = bs_run(actual=actual)
+    assert len(result) == 2
+
+
+def test_bootstrap_does_not_change_its_inputs():
+    forecasts, actual = bs_forecasts(), bs_actual()
+    pairs = [(HURDLE, "deflated")]
+    before = (forecasts.copy(), actual.copy(), list(pairs))
+    paired_wape_bootstrap(forecasts, actual, pairs, BS_HORIZONS, 50, 0)
+    pd.testing.assert_frame_equal(forecasts, before[0])
+    pd.testing.assert_frame_equal(actual, before[1])
+    assert pairs == before[2]
+
+
+def test_bootstrap_does_not_depend_on_the_row_order_of_its_inputs():
+    forecasts, actual = bs_forecasts(), bs_actual()
+    shuffled_forecasts = forecasts.sample(frac=1.0, random_state=5).reset_index(drop=True)
+    shuffled_actual = actual.sample(frac=1.0, random_state=6).reset_index(drop=True)
+    shuffled = paired_wape_bootstrap(shuffled_forecasts, shuffled_actual, [(HURDLE, "deflated")],
+                                     BS_HORIZONS, 300, 11)
+    pd.testing.assert_frame_equal(shuffled, bs_run(), check_exact=False, rtol=1e-12)
+
+
+def test_bootstrap_does_not_depend_on_the_scale_of_the_money():
+    # WAPE is a ratio: every forecast and actual times 1000 gives the same numbers.
+    forecasts, actual = bs_forecasts(), bs_actual()
+    forecasts["forecast"] *= 1000.0
+    actual["actual"] *= 1000.0
+    pd.testing.assert_frame_equal(bs_run(forecasts=forecasts, actual=actual), bs_run(),
+                                  check_exact=False, rtol=1e-9)
+
+
+def test_bootstrap_end_to_end_on_stacked_forecasts(stack_inputs):
+    # The pipeline's shape: stack_forecasts' table, the hurdle against each other method.
+    rolled, reference, rule = stack_inputs
+    forecasts = stack_forecasts(rolled, reference, rule)
+    actual = s_actual([(c, o, h, t, 1000.0) for c in ("TR02", "ALL")
+                       for o, h, t in S_PAIRS[:3]])
+    pairs = [(HURDLE, other) for other in dict.fromkeys(forecasts["method"]) if other != HURDLE]
+    result = paired_wape_bootstrap(forecasts, actual, pairs, 2, 100, 0)
+    assert list(dict.fromkeys(result["against"])) == [*REFERENCES, RULE]
+    assert set(result["method"]) == {HURDLE}
+    assert len(result) == 2 * len(pairs)
+
+
+# --- paired_wape_bootstrap: refusals --------------------------------------------------------------
+
+@pytest.mark.parametrize("samples", [0, -1, -2000])
+def test_bootstrap_samples_below_one_exact_message(samples):
+    with pytest.raises(ValueError) as error:
+        bs_run(samples=samples)
+    assert str(error.value) == f"samples is {samples}; at least 1 is needed"
+
+
+def test_bootstrap_a_pair_with_the_same_method_twice_exact_message():
+    with pytest.raises(ValueError) as error:
+        bs_run(pairs=[(HURDLE, "deflated"), ("twin", "twin")])
+    assert str(error.value) == "the pair ('twin', 'twin') compares a method with itself"
+
+
+def test_bootstrap_a_pair_naming_an_unknown_method_exact_message():
+    with pytest.raises(ValueError) as error:
+        bs_run(pairs=[(HURDLE, "arima")])
+    assert str(error.value) == ("the pair ('hurdle', 'arima') names methods with no forecasts: "
+                                "['arima']")
+
+
+def test_bootstrap_a_pair_naming_two_unknown_methods_lists_both_sorted():
+    with pytest.raises(ValueError) as error:
+        bs_run(pairs=[("zeta", "alpha")])
+    assert str(error.value) == ("the pair ('zeta', 'alpha') names methods with no forecasts: "
+                                "['alpha', 'zeta']")
+
+
+def test_bootstrap_the_same_unknown_method_twice_is_a_self_pair_first():
+    with pytest.raises(ValueError, match=r"compares a method with itself$"):
+        bs_run(pairs=[("arima", "arima")])
+
+
+def test_bootstrap_the_samples_check_comes_before_the_pair_checks():
+    with pytest.raises(ValueError, match=r"^samples is 0; at least 1 is needed$"):
+        bs_run(pairs=[("x", "x")], samples=0)
+
+
+def test_bootstrap_the_first_bad_pair_is_named():
+    with pytest.raises(ValueError, match=r"^the pair \('hurdle', 'nope'\)"):
+        bs_run(pairs=[(HURDLE, "deflated"), (HURDLE, "nope"), ("twin", "twin")])
+
+
+def test_bootstrap_the_pair_checks_come_before_scored_rows_checks():
+    # horizons 0 would be refused by scored_rows; the bad pair is reported first.
+    with pytest.raises(ValueError, match=r"^the pair \('hurdle', 'nope'\)"):
+        bs_run(pairs=[(HURDLE, "nope")], horizons=0)
+
+
+def test_bootstrap_scored_rows_refusals_apply():
+    # 1. Horizons below 1.
+    with pytest.raises(ValueError) as error:
+        bs_run(horizons=0)
+    assert str(error.value) == "horizons is 0; horizons start at 1"
+    # 2. A NaN forecast, even for a company the bootstrap does not use.
+    forecasts = bs_forecasts()
+    forecasts.loc[forecasts.index[0], "forecast"] = NAN
+    with pytest.raises(ValueError, match=r"^1 forecasts are NaN or infinite"):
+        bs_run(forecasts=forecasts)
+    # 3. A method missing a row with actual, in a method no pair uses.
+    forecasts = bs_forecasts()
+    gone = (forecasts["method"] == "twin") & (forecasts["origin_week"] == 10)
+    with pytest.raises(ValueError, match=r"^'twin' has no forecast for 4 rows"):
+        bs_run(forecasts=forecasts[~gone])
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, -500.0])
+def test_bootstrap_a_consolidated_actual_not_above_zero_exact_message(bad):
+    actual = bs_actual()
+    week_12 = (actual["company_code"] == "ALL") & (actual["target_week"] == 12)
+    actual.loc[week_12, "actual"] = bad
+    with pytest.raises(ValueError) as error:
+        bs_run(actual=actual)
+    assert str(error.value) == "every consolidated actual must be above 0 for a WAPE"
+
+
+def test_bootstrap_scored_rows_checks_come_before_the_actual_check():
+    actual = bs_actual()
+    actual.loc[actual["company_code"] == "ALL", "actual"] = 0.0
+    with pytest.raises(ValueError, match=r"^horizons is 0"):
+        bs_run(actual=actual, horizons=0)
+
+
+BS_NO_CONSOLIDATED = "there are no consolidated ('ALL') rows with actual cash to compare"
+
+
+def test_bootstrap_with_no_consolidated_rows_refuses_rather_than_returning_nan():
+    # Only TR02 has forecasts and actual: nothing consolidated to bootstrap. (Before the fix
+    # this returned a NaN row with share_better 0.0, shown as "first better in 0%".)
+    forecasts = s_forecasts([("a", "TR02", 10, 1, 11, 5.0), ("b", "TR02", 10, 1, 11, 6.0)])
+    actual = s_actual([("TR02", 10, 1, 11, 4.0)])
+    with pytest.raises(ValueError) as error:
+        paired_wape_bootstrap(forecasts, actual, [("a", "b")], 1, 5, 0)
+    assert str(error.value) == BS_NO_CONSOLIDATED
+
+
+def test_bootstrap_with_no_consolidated_rows_raises_no_numpy_warning():
+    # The refusal comes before any WAPE is divided out.
+    import warnings
+    forecasts = s_forecasts([("a", "TR02", 10, 1, 11, 5.0), ("b", "TR02", 10, 1, 11, 6.0)])
+    actual = s_actual([("TR02", 10, 1, 11, 4.0)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match=r"^there are no consolidated"):
+            paired_wape_bootstrap(forecasts, actual, [("a", "b")], 1, 5, 0)
+
+
+def test_bootstrap_refusal_order_scored_rows_then_no_consolidated_then_actual():
+    # 1. Only TR02 rows and horizons 0: scored_rows' horizons message comes first.
+    forecasts = s_forecasts([("a", "TR02", 10, 1, 11, 5.0), ("b", "TR02", 10, 1, 11, 6.0)])
+    actual = s_actual([("TR02", 10, 1, 11, 0.0)])
+    with pytest.raises(ValueError, match=r"^horizons is 0; horizons start at 1$"):
+        paired_wape_bootstrap(forecasts, actual, [("a", "b")], 0, 5, 0)
+    # 2. Valid horizons, no ALL rows, a TR02 actual of 0: the no-consolidated message, not
+    #    the actual > 0 one.
+    with pytest.raises(ValueError) as error:
+        paired_wape_bootstrap(forecasts, actual, [("a", "b")], 1, 5, 0)
+    assert str(error.value) == BS_NO_CONSOLIDATED
+    # 3. ALL rows present but their actual 0: the actual > 0 message.
+    zero_week = bs_actual()
+    zero_week.loc[zero_week["company_code"] == "ALL", "actual"] = 0.0
+    with pytest.raises(ValueError) as error:
+        bs_run(actual=zero_week)
+    assert str(error.value) == "every consolidated actual must be above 0 for a WAPE"

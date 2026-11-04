@@ -68,11 +68,13 @@ from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
 from collection_estimation.hurdle.evaluate import (  # noqa: E402
     HORIZON_TOTAL,
+    HURDLE,
     POOLED,
     REFERENCES,
     actual_totals,
     deflated_reference,
     evaluation_scores,
+    paired_wape_bootstrap,
     rolling_fingerprint,
     rolling_forecasts,
     rule_reference,
@@ -632,6 +634,16 @@ def main():
         forecasts = stack_forecasts(rolled, reference, rule)
         scores = evaluation_scores(forecasts, rolled_actual, settings.receivables.horizons)
         show_evaluation_scores(scores, settings.receivables.horizons)
+        # U14.5c: is the hurdle model (without it, deflated_trend) really more accurate than
+        # each other method, or only luckier on these weeks?
+        subject = HURDLE if rolled is not None else "deflated_trend"
+        pairs = [(subject, other) for other in dict.fromkeys(forecasts["method"])
+                 if other != subject]
+        bootstrap = paired_wape_bootstrap(forecasts, rolled_actual, pairs,
+                                          settings.receivables.horizons,
+                                          settings.evaluation.bootstrap_samples,
+                                          settings.evaluation.bootstrap_seed)
+        show_paired_bootstrap(bootstrap)
 
     # Later steps follow as each unit is built.
 
@@ -1514,6 +1526,24 @@ def show_evaluation_scores(scores, horizons):
     per_company = per_company.reindex(index=methods, columns=companies)
     print("        pooled WAPE per company:")
     print(per_company.round(3).to_string())
+
+
+def show_paired_bootstrap(bootstrap):
+    """Step 17's paired bootstrap (U14.5c): per pair and measure, the two WAPEs, their
+    difference with its 90% interval, and how often the first method was better."""
+    samples = int(bootstrap["samples"].iloc[0])
+    print(f"        paired bootstrap (U14.5c), consolidated, {samples} resamples; difference = "
+          f"WAPE of the first - WAPE of the second (below 0: the first is better):")
+    lines = []
+    for _, row in bootstrap.iterrows():
+        lines.append({"pair": f"{row['method']} vs {row['against']}",
+                      "measure": row["horizon"],
+                      "WAPE": f"{row['wape']:.3f}",
+                      "WAPE against": f"{row['wape_against']:.3f}",
+                      "difference": f"{row['difference']:+.3f}",
+                      "90% interval": f"[{row['low']:+.3f}, {row['high']:+.3f}]",
+                      "first better in": f"{row['share_better']:.0%}"})
+    print(pd.DataFrame(lines).set_index("pair").to_string())
 
 
 def show_actual_totals(actual, weekly, weeks):

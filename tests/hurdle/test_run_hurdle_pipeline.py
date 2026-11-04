@@ -5331,12 +5331,12 @@ def test_step_16_and_17_imports():
     assert len(evaluate_imports) == 1
     # U14.3 added REFERENCES and deflated_reference to the one import of evaluate; U14.5
     # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
-    # added rolling_fingerprint.
+    # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
-        ("HORIZON_TOTAL", None), ("POOLED", None), ("REFERENCES", None),
+        ("HORIZON_TOTAL", None), ("HURDLE", None), ("POOLED", None), ("REFERENCES", None),
         ("actual_totals", None), ("deflated_reference", None), ("evaluation_scores", None),
-        ("rolling_fingerprint", None), ("rolling_forecasts", None), ("rule_reference", None),
-        ("stack_forecasts", None)]
+        ("paired_wape_bootstrap", None), ("rolling_fingerprint", None),
+        ("rolling_forecasts", None), ("rule_reference", None), ("stack_forecasts", None)]
     # The cache's one function, in an import of its own, right after evaluate's.
     cache_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                      and node.module == "collection_estimation.hurdle.cache"]
@@ -5395,6 +5395,11 @@ assert script.HORIZON_TOTAL is evaluate.HORIZON_TOTAL and script.HORIZON_TOTAL =
 inspect.signature(script.stack_forecasts).bind(None, "reference", "rule")
 inspect.signature(script.evaluation_scores).bind("forecasts", "actual", 5)
 inspect.signature(script.show_evaluation_scores).bind("scores", 5)
+# U14.5c.
+assert script.HURDLE is evaluate.HURDLE and script.HURDLE == "hurdle"
+assert script.paired_wape_bootstrap is evaluate.paired_wape_bootstrap
+inspect.signature(script.paired_wape_bootstrap).bind("forecasts", "actual", [], 5, 2000, 0)
+inspect.signature(script.show_paired_bootstrap).bind("bootstrap")
 print("ok")
 """
 
@@ -5702,10 +5707,10 @@ def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and
 
 
 def test_step_17_ends_with_the_deflated_reference_and_its_printout():
-    # U14.4 appended the financial rule's two statements after the reference's two, and
-    # U14.5 the scores' three after those.
+    # U14.4 appended the financial rule's two statements after the reference's two,
+    # U14.5 the scores' three after those, and U14.5c the bootstrap's four after those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-7:-5] == [
+    assert statements[-11:-9] == [
         "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
         "settings.receivables.horizons, week_zero)",
         "show_deflated_reference(reference, rolled, rolled_actual)"]
@@ -5726,9 +5731,9 @@ def test_step_17_is_still_the_last_step_after_the_deflated_reference():
     body = main_body()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
-    # Since U14.5 the deflated reference's printout is sixth from last, before the rule's two
-    # statements and the scores' three.
-    assert ast.unparse(body[-1].body[-6]) == (
+    # Since U14.5c the deflated reference's printout is tenth from last, before the rule's two
+    # statements, the scores' three and the bootstrap's four.
+    assert ast.unparse(body[-1].body[-10]) == (
         "show_deflated_reference(reference, rolled, rolled_actual)")
 
 
@@ -5904,9 +5909,10 @@ def test_step_17_shows_the_rule_reference_once_with_the_rule_and_the_actual():
 
 
 def test_step_17_ends_with_the_rule_reference_and_its_printout():
-    # Since U14.5 the scores' three statements follow the rule's two.
+    # Since U14.5 the scores' three statements follow the rule's two, and since U14.5c the
+    # bootstrap's four follow those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-5:-3] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
+    assert statements[-9:-7] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
 
 
 def test_step_17_is_still_the_last_step_after_the_rule_reference():
@@ -5914,8 +5920,9 @@ def test_step_17_is_still_the_last_step_after_the_rule_reference():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    # Since U14.5 the rule's printout is fourth from last, before the scores' three.
-    assert ast.unparse(body[-1].body[-4]) == SHOW_RULE_STATEMENT
+    # Since U14.5c the rule's printout is eighth from last, before the scores' three and the
+    # bootstrap's four.
+    assert ast.unparse(body[-1].body[-8]) == SHOW_RULE_STATEMENT
 
 
 def test_step_17_rule_reference_uses_the_same_origins_as_the_rolling_forecasts():
@@ -6137,9 +6144,10 @@ def test_step_17_statement_order_with_the_with_model_branch():
     block = step_17_block()
     body = block.body
     shapes = [type(node).__name__ for node in body]
-    # U14.5 appended stack_forecasts, evaluation_scores (two Assign) and the printout (Expr).
+    # U14.5 appended stack_forecasts, evaluation_scores (two Assign) and the printout (Expr);
+    # U14.5c subject, pairs, the bootstrap (three Assign) and its printout (Expr).
     assert shapes == ["Assign", "Expr", "Assign", "Assign", "If", "Assign", "Expr", "Assign",
-                      "Expr", "Assign", "Assign", "Expr"]
+                      "Expr", "Assign", "Assign", "Expr", "Assign", "Assign", "Assign", "Expr"]
     assert ast.unparse(body[0]) == "origins = list(settings.evaluation.validation_origins)"
     assert ast.unparse(body[2]).startswith("rolled_actual = actual_totals(")
     assert ast.unparse(body[3]) == "rolled = None"
@@ -6153,6 +6161,10 @@ def test_step_17_statement_order_with_the_with_model_branch():
                                      "settings.receivables.horizons)")
     assert ast.unparse(body[11]) == ("show_evaluation_scores(scores, "
                                      "settings.receivables.horizons)")
+    assert ast.unparse(body[12]) == BOOT_SUBJECT_STATEMENT
+    assert ast.unparse(body[13]) == BOOT_PAIRS_STATEMENT
+    assert ast.unparse(body[14]) == BOOT_CALL_STATEMENT
+    assert ast.unparse(body[15]) == BOOT_SHOW_STATEMENT
 
 
 def test_step_17_with_model_branch_body_in_order():
@@ -6227,6 +6239,11 @@ STEP_17_NAMES = ["weekly", "weeks", "levels", "companies", "table", "history", "
 
 
 STEP_17_FINGERPRINT = ["<fingerprint>", 1]
+# U14.5c: the fake stack's methods, and the fake [evaluation] bootstrap settings.
+STEP_17_HURDLE = "hurdle"
+STEP_17_OTHER_METHODS = ["deflated", "deflated_nolevel", "deflated_trend", "rule"]
+STEP_17_SAMPLES = 2000
+STEP_17_SEED = 7
 
 
 def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
@@ -6250,12 +6267,21 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         calls.append(("load_with_cache", args, kwargs))
         return args[2]()
 
+    def fake_stack(rolled, reference, rule):
+        # U14.5c reads the stacked methods, so the fake stack holds them, as stack_forecasts
+        # would: the hurdle model's only if rolled is not None.
+        calls.append(("stack_forecasts", (rolled, reference, rule), {}))
+        methods = ([STEP_17_HURDLE] if rolled is not None else []) + STEP_17_OTHER_METHODS
+        return {"method": [method for method in methods for _ in range(2)]}
+
     rolled_result = object() if rolled_result is None else rolled_result
     actual_result = object()
     namespace = {name: f"<{name}>" for name in STEP_17_NAMES}
     settings = SimpleNamespace(
         evaluation=SimpleNamespace(run=True, with_model=with_model,
-                                   validation_origins=(33, 34, 35)),
+                                   validation_origins=(33, 34, 35),
+                                   bootstrap_samples=STEP_17_SAMPLES,
+                                   bootstrap_seed=STEP_17_SEED),
         receivables=SimpleNamespace(horizons=5),
         data=SimpleNamespace(cache_folder=cache_folder))
     namespace.update(
@@ -6273,9 +6299,13 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         rule_reference=recorder("rule_reference", "<rule>"),
         show_rule_reference=recorder("show_rule_reference", None),
         # U14.5.
-        stack_forecasts=recorder("stack_forecasts", "<forecasts>"),
+        stack_forecasts=fake_stack,
         evaluation_scores=recorder("evaluation_scores", "<scores>"),
-        show_evaluation_scores=recorder("show_evaluation_scores", None))
+        show_evaluation_scores=recorder("show_evaluation_scores", None),
+        # U14.5c.
+        HURDLE=STEP_17_HURDLE,
+        paired_wape_bootstrap=recorder("paired_wape_bootstrap", "<bootstrap>"),
+        show_paired_bootstrap=recorder("show_paired_bootstrap", None))
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
@@ -6294,7 +6324,8 @@ def test_step_17_with_model_true_calls_everything_in_order():
                                    "show_rolling_forecasts", "deflated_reference",
                                    "show_deflated_reference", "rule_reference",
                                    "show_rule_reference", "stack_forecasts",
-                                   "evaluation_scores", "show_evaluation_scores"]
+                                   "evaluation_scores", "show_evaluation_scores",
+                                   "paired_wape_bootstrap", "show_paired_bootstrap"]
     assert SKIP_LINE not in printed
 
 
@@ -6303,7 +6334,8 @@ def test_step_17_with_model_false_does_not_call_rolling_forecasts():
     assert names_called(calls) == ["actual_totals", "deflated_reference",
                                    "show_deflated_reference", "rule_reference",
                                    "show_rule_reference", "stack_forecasts",
-                                   "evaluation_scores", "show_evaluation_scores"]
+                                   "evaluation_scores", "show_evaluation_scores",
+                                   "paired_wape_bootstrap", "show_paired_bootstrap"]
     assert "block_feature_columns" not in [name for name, _, _ in calls]
 
 
@@ -6448,9 +6480,11 @@ EVAL_SCORES_STATEMENT = ("scores = evaluation_scores(forecasts, rolled_actual, "
 EVAL_SHOW_STATEMENT = "show_evaluation_scores(scores, settings.receivables.horizons)"
 
 
-def test_step_17_ends_with_the_three_score_statements():
+def test_step_17_has_the_three_score_statements_right_before_the_bootstrap():
+    # Since U14.5c the bootstrap's four statements follow the scores' three.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-3:] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT, EVAL_SHOW_STATEMENT]
+    assert statements[-7:-4] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT,
+                                 EVAL_SHOW_STATEMENT]
 
 
 def test_step_17_scores_come_right_after_show_rule_reference():
@@ -6465,7 +6499,8 @@ def test_step_17_is_still_the_last_step_after_the_scores():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    assert ast.unparse(body[-1].body[-1]) == EVAL_SHOW_STATEMENT
+    # Since U14.5c the scores' printout is fifth from last, before the bootstrap's four.
+    assert ast.unparse(body[-1].body[-5]) == EVAL_SHOW_STATEMENT
 
 
 @pytest.mark.parametrize("name", ["stack_forecasts", "evaluation_scores",
@@ -6544,7 +6579,9 @@ def test_step_17_passes_the_stack_on_to_the_scores_and_the_printout(with_model):
     assert args[1:] == ("<reference>", "<rule>") and kwargs == {}
     # 2. The scores get the stack, the rolled actual and the horizons setting.
     args, kwargs = by_name["evaluation_scores"]
-    assert args[0] == "<forecasts>" and args[1] is actual and args[2] == 5 and kwargs == {}
+    # (The fake stack's result: a table of its methods, for U14.5c to read.)
+    assert isinstance(args[0], dict) and "method" in args[0]
+    assert args[1] is actual and args[2] == 5 and kwargs == {}
     # 3. The printout gets the scores and the horizons setting.
     assert by_name["show_evaluation_scores"] == (("<scores>", 5), {})
 
@@ -6555,8 +6592,9 @@ def test_step_17_each_score_function_runs_once(with_model):
     names = [name for name, _, _ in calls]
     for name in ("stack_forecasts", "evaluation_scores", "show_evaluation_scores"):
         assert names.count(name) == 1, name
-    # And they are the last three calls, in that order.
-    assert names[-3:] == ["stack_forecasts", "evaluation_scores", "show_evaluation_scores"]
+    # And they come in that order, right before the bootstrap's two calls (U14.5c).
+    assert names[-5:-2] == ["stack_forecasts", "evaluation_scores", "show_evaluation_scores"]
+    assert names[-2:] == ["paired_wape_bootstrap", "show_paired_bootstrap"]
 
 
 # show_evaluation_scores on a hand-made scores table, horizons 2, companies TR02, TR03 and ALL.
@@ -6932,3 +6970,278 @@ def test_step_17_the_cache_goes_to_the_settings_cache_folder(tmp_path):
     real_cache_run(folder, rolled_result={"forecasts": [1.0]})
     assert (folder / f"{CACHED_ROLLING_NAME}.pkl").is_file()
     assert not (tmp_path / f"{CACHED_ROLLING_NAME}.pkl").exists()
+
+
+
+# Step 17, U14.5c: the paired bootstrap of WAPE, right after the scores' printout. The subject
+# is the hurdle model if it ran, else deflated_trend; it is paired with every other method in
+# the stack, in the stack's order. Wiring on main()'s syntax tree, then step 17's block run with
+# fakes (run_step_17 above), then show_paired_bootstrap's exact printout on a hand-made table,
+# in a separate process.
+
+BOOT_SUBJECT_STATEMENT = "subject = HURDLE if rolled is not None else 'deflated_trend'"
+BOOT_PAIRS_STATEMENT = ("pairs = [(subject, other) for other in dict.fromkeys(forecasts['method']) "
+                        "if other != subject]")
+BOOT_CALL_STATEMENT = ("bootstrap = paired_wape_bootstrap(forecasts, rolled_actual, pairs, "
+                       "settings.receivables.horizons, settings.evaluation.bootstrap_samples, "
+                       "settings.evaluation.bootstrap_seed)")
+BOOT_SHOW_STATEMENT = "show_paired_bootstrap(bootstrap)"
+BOOT_STATEMENTS = [BOOT_SUBJECT_STATEMENT, BOOT_PAIRS_STATEMENT, BOOT_CALL_STATEMENT,
+                   BOOT_SHOW_STATEMENT]
+
+
+def test_step_17_ends_with_the_four_bootstrap_statements():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    assert statements[-4:] == BOOT_STATEMENTS
+
+
+def test_step_17_bootstrap_comes_right_after_show_evaluation_scores():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    shown = statements.index(EVAL_SHOW_STATEMENT)
+    assert statements[shown + 1:] == BOOT_STATEMENTS
+
+
+def test_step_17_is_still_the_last_step_after_the_bootstrap():
+    body = main_body()
+    assert isinstance(body[-1], ast.If)
+    assert ast.unparse(body[-1].test) == "settings.evaluation.run"
+    assert body[-1].orelse == []
+    assert ast.unparse(body[-1].body[-1]) == BOOT_SHOW_STATEMENT
+
+
+@pytest.mark.parametrize("name", ["paired_wape_bootstrap", "show_paired_bootstrap"])
+def test_step_17_calls_each_bootstrap_function_once_in_main(name):
+    assert len(calls_to(main_tree(), name)) == 1, name
+    assert len(calls_to(step_17_block(), name)) == 1, name
+
+
+@pytest.mark.parametrize("name", ["paired_wape_bootstrap", "show_paired_bootstrap"])
+def test_step_17_bootstrap_statements_are_outside_the_with_model_branch(name):
+    # Directly in the `if settings.evaluation.run:` body: they run with or without the model.
+    block = step_17_block()
+    direct = [node for node in block.body if isinstance(node, (ast.Assign, ast.Expr))
+              and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+              and node.value.func.id == name]
+    assert len(direct) == 1, name
+    assert calls_to(with_model_if(block), name) == [], name
+
+
+def test_step_17_bootstrap_calls_take_no_keywords_and_the_settings_by_name():
+    block = step_17_block()
+    call = calls_to(block, "paired_wape_bootstrap")[0]
+    assert call.keywords == []
+    assert [ast.unparse(a) for a in call.args] == [
+        "forecasts", "rolled_actual", "pairs", "settings.receivables.horizons",
+        "settings.evaluation.bootstrap_samples", "settings.evaluation.bootstrap_seed"]
+    # Not [joint_diagnostic]'s bootstrap_samples, a different setting.
+    assert "joint_diagnostic" not in ast.unparse(call)
+    shown = calls_to(block, "show_paired_bootstrap")[0]
+    assert shown.keywords == [] and [ast.unparse(a) for a in shown.args] == ["bootstrap"]
+
+
+def test_step_17_subject_pairs_and_bootstrap_are_assigned_once():
+    for name in ("subject", "pairs", "bootstrap"):
+        assert len(assignments_to(step_17_block(), name)) == 1, name
+    assert len(assignments_to(main_tree(), "subject")) == 1
+
+
+def test_step_17_the_subject_uses_the_hurdle_constant_not_a_literal():
+    subject = assignments_to(step_17_block(), "subject")[0].value
+    assert isinstance(subject, ast.IfExp)
+    assert ast.unparse(subject.body) == "HURDLE"
+    assert ast.unparse(subject.test) == "rolled is not None"
+    assert ast.literal_eval(subject.orelse) == "deflated_trend"
+
+
+def test_show_paired_bootstrap_is_a_module_level_function_with_one_parameter():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_paired_bootstrap"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["bootstrap"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_show_paired_bootstrap_sits_between_show_evaluation_scores_and_show_actual_totals():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+    shown = names.index("show_paired_bootstrap")
+    assert names[shown - 1] == "show_evaluation_scores"
+    assert names[shown + 1] == "show_actual_totals"
+
+
+# Running step 17's block with the fakes of run_step_17.
+
+def test_step_17_run_with_the_model_pairs_the_hurdle_with_every_other_method():
+    calls, _, _, actual = run_step_17(True)
+    by_name = by_name_of(calls)
+    args, kwargs = by_name["paired_wape_bootstrap"]
+    assert kwargs == {}
+    # The stack's methods in order: hurdle, then the four others, each once.
+    assert args[2] == [("hurdle", "deflated"), ("hurdle", "deflated_nolevel"),
+                       ("hurdle", "deflated_trend"), ("hurdle", "rule")]
+
+
+def test_step_17_run_without_the_model_pairs_deflated_trend_with_the_others():
+    calls, _, _, _ = run_step_17(False)
+    args, _ = by_name_of(calls)["paired_wape_bootstrap"]
+    assert args[2] == [("deflated_trend", "deflated"), ("deflated_trend", "deflated_nolevel"),
+                       ("deflated_trend", "rule")]
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_run_bootstrap_gets_the_stack_the_rolled_actual_and_the_settings(with_model):
+    calls, _, _, actual = run_step_17(with_model)
+    by_name = by_name_of(calls)
+    args, _ = by_name["paired_wape_bootstrap"]
+    # 1. The very table the scores were made from, and the rolled actual cash.
+    assert args[0] is by_name["evaluation_scores"][0][0]
+    assert args[1] is actual
+    # 2. horizons, then [evaluation]'s samples and seed.
+    assert args[3:] == (5, STEP_17_SAMPLES, STEP_17_SEED)
+    assert len(args) == 6
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_run_the_printout_gets_the_bootstrap_table(with_model):
+    calls, _, _, _ = run_step_17(with_model)
+    assert by_name_of(calls)["show_paired_bootstrap"] == (("<bootstrap>",), {})
+
+
+def test_step_17_run_a_cached_model_is_still_the_subject():
+    # rolled from the cache (not fitted) is not None: the hurdle is the subject.
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: object())
+    pairs = by_name_of(calls)["paired_wape_bootstrap"][0][2]
+    assert {method for method, _ in pairs} == {"hurdle"}
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_run_the_subject_is_never_paired_with_itself(with_model):
+    calls, _, _, _ = run_step_17(with_model)
+    pairs = by_name_of(calls)["paired_wape_bootstrap"][0][2]
+    assert all(method != against for method, against in pairs)
+    # Every other stacked method exactly once.
+    assert len({against for _, against in pairs}) == len(pairs)
+
+
+def test_step_17_run_the_bootstrap_settings_follow_the_settings_object():
+    # 1. Run step 17's block with other bootstrap settings in its fake settings.
+    calls, printed = [], []
+
+    def recorder(name, result):
+        def call(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return result
+        return call
+
+    namespace = {name: f"<{name}>" for name in STEP_17_NAMES}
+    namespace.update(
+        settings=SimpleNamespace(
+            evaluation=SimpleNamespace(run=True, with_model=False, validation_origins=(40,),
+                                       bootstrap_samples=13, bootstrap_seed=0),
+            receivables=SimpleNamespace(horizons=3), data=SimpleNamespace(cache_folder="c")),
+        time=SimpleNamespace(perf_counter=lambda: 0.0),
+        print=lambda *args, **kwargs: printed.append(args),
+        HURDLE="hurdle",
+        stack_forecasts=lambda *args: {"method": ["deflated", "deflated_trend", "rule"]},
+        **{name: recorder(name, f"<{name} result>") for name in (
+            "actual_totals", "deflated_reference", "show_deflated_reference", "rule_reference",
+            "show_rule_reference", "evaluation_scores", "show_evaluation_scores",
+            "paired_wape_bootstrap", "show_paired_bootstrap")})
+    module = ast.Module(body=[step_17_block()], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
+    # 2. The bootstrap got horizons 3, 13 samples and seed 0.
+    args, _ = by_name_of(calls)["paired_wape_bootstrap"]
+    assert args[2] == [("deflated_trend", "deflated"), ("deflated_trend", "rule")]
+    assert args[3:] == (3, 13, 0)
+
+
+# show_paired_bootstrap on a hand-made bootstrap table (BOOTSTRAP_COLUMNS), 2000 samples:
+#   hurdle vs deflated  pooled  WAPE 0.16012 -> 0.16, against 0.1534 -> 0.153,
+#                               difference +0.00672 -> "+0.007", interval [-0.0123, +0.0271]
+#                               -> "[-0.012, +0.027]", better in 0.304 -> "30%"
+#   hurdle vs deflated  total   0.08 / 0.1, -0.02 -> "-0.020", [-0.05, +0.0112] ->
+#                               "[-0.050, +0.011]", 0.9 -> "90%"
+#   hurdle vs rule      pooled  0.16012 / 0.4, -0.23988 -> "-0.240", [-0.3, -0.18] ->
+#                               "[-0.300, -0.180]", 1.0 -> "100%"
+#   hurdle vs twin      pooled  0.2 / 0.2, 0.0 -> "+0.000", [0, 0] -> "[+0.000, +0.000]",
+#                               0.0 -> "0%"
+SHOW_BOOTSTRAP = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
+
+given = [
+    ("hurdle", "deflated", "pooled", 7, 0.16012, 0.1534, 0.00672, -0.0123, 0.0271, 0.304, 2000),
+    ("hurdle", "deflated", "total", 11, 0.08, 0.1, -0.02, -0.05, 0.0112, 0.9, 2000),
+    ("hurdle", "rule", "pooled", 7, 0.16012, 0.4, -0.23988, -0.3, -0.18, 1.0, 2000),
+    ("hurdle", "twin", "pooled", 7, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 2000),
+]
+bootstrap = pd.DataFrame(given, columns=BOOTSTRAP_COLUMNS)
+before = bootstrap.copy()
+script.show_paired_bootstrap(bootstrap)
+pd.testing.assert_frame_equal(bootstrap, before)
+print("ok")
+"""
+
+BOOT_HEADER = ("        paired bootstrap (U14.5c), consolidated, 2000 resamples; difference = "
+               "WAPE of the first - WAPE of the second (below 0: the first is better):")
+
+
+@pytest.fixture(scope="module")
+def bootstrap_lines():
+    result = run_code(SHOW_BOOTSTRAP)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_paired_bootstrap_exact_printout(bootstrap_lines):
+    # Every line 91 characters wide (pandas pads the index title line to the full width).
+    assert bootstrap_lines == [
+        BOOT_HEADER,
+        "                   measure   WAPE WAPE against difference      90% interval "
+        "first better in",
+        "pair" + " " * 87,
+        "hurdle vs deflated  pooled  0.160        0.153     +0.007  [-0.012, +0.027]    "
+        "         30%",
+        "hurdle vs deflated   total  0.080        0.100     -0.020  [-0.050, +0.011]    "
+        "         90%",
+        "hurdle vs rule      pooled  0.160        0.400     -0.240  [-0.300, -0.180]    "
+        "        100%",
+        "hurdle vs twin      pooled  0.200        0.200     +0.000  [+0.000, +0.000]    "
+        "          0%",
+    ]
+
+
+def test_show_paired_bootstrap_both_wapes_have_three_decimals(bootstrap_lines):
+    # 0.16012 -> "0.160" (not "0.16"), 0.08 -> "0.080"; 0.1534 -> "0.153".
+    rows = [line.split() for line in bootstrap_lines[3:]]
+    # From the end: share, interval (two cells), difference, WAPE against, WAPE.
+    wapes = [row[-6] for row in rows]
+    against = [row[-5] for row in rows]
+    assert wapes == ["0.160", "0.080", "0.160", "0.200"]
+    assert against == ["0.153", "0.100", "0.400", "0.200"]
+
+
+def test_show_paired_bootstrap_header_names_the_sample_count(bootstrap_lines):
+    assert bootstrap_lines[0] == BOOT_HEADER
+    assert "2000 resamples" in bootstrap_lines[0]
+
+
+def test_show_paired_bootstrap_one_line_per_row_in_order(bootstrap_lines):
+    # Header, the column titles, the index title, then the four rows as they came.
+    rows = bootstrap_lines[3:]
+    assert len(rows) == 4
+    assert [row.split("  ")[0].strip() for row in rows] == [
+        "hurdle vs deflated", "hurdle vs deflated", "hurdle vs rule", "hurdle vs twin"]
+
+
+def test_show_paired_bootstrap_signs_and_percentages(bootstrap_lines):
+    # A difference is always signed, the interval's ends too; the share is a whole percentage.
+    joined = "\n".join(bootstrap_lines[3:])
+    for text in ("+0.007", "-0.020", "-0.240", "+0.000", "[-0.012, +0.027]",
+                 "[-0.300, -0.180]", "30%", "90%", "100%", " 0%"):
+        assert text in joined, text

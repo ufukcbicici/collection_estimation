@@ -201,9 +201,11 @@ VALID = {
     # U14.2: the evaluation over many origins. Values differ from synthetic.toml's on purpose
     # (unsorted lists, run true); 44 + 13 = 57 keeps every horizons value the tests use legal.
     # U14.4: rule_doubtful_days 60 (synthetic.toml has 90).
+    # U14.5c: the paired bootstrap, 300 samples and seed 11 (synthetic.toml has 2000 and
+    # 20261104; [joint_diagnostic] above has its own bootstrap_samples, 500).
     "evaluation": {"run": "true", "validation_origins": "[44, 37, 40]",
                    "test_origins": "[60, 57]", "rule_doubtful_days": "60",
-                   "with_model": "true"},
+                   "with_model": "true", "bootstrap_samples": "300", "bootstrap_seed": "11"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -5356,13 +5358,14 @@ from collection_estimation.hurdle.settings import (  # noqa: E402
     EvaluationSettings, read_evaluation)
 
 EVALUATION = f"{FILE_NAME} [evaluation]"
-EVALUATION_KEYS = ["rule_doubtful_days", "run", "test_origins", "validation_origins",
-                   "with_model"]
+EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "rule_doubtful_days", "run",
+                   "test_origins", "validation_origins", "with_model"]
 
 
 def evaluation_table(**changes):
     table = {"run": True, "validation_origins": [44, 37, 40], "test_origins": [60, 49],
-             "rule_doubtful_days": 60, "with_model": True}
+             "rule_doubtful_days": 60, "with_model": True, "bootstrap_samples": 300,
+             "bootstrap_seed": 11}
     table.update(changes)
     return table
 
@@ -5377,7 +5380,8 @@ def evaluation_error(horizons=5, **changes):
 
 def test_evaluation_settings_fields_in_order():
     assert [field.name for field in dataclasses.fields(EvaluationSettings)] == [
-        "run", "with_model", "validation_origins", "test_origins", "rule_doubtful_days"]
+        "run", "with_model", "validation_origins", "test_origins", "rule_doubtful_days",
+        "bootstrap_samples", "bootstrap_seed"]
 
 
 def test_settings_has_an_evaluation_field_between_topups_and_debug():
@@ -5389,7 +5393,7 @@ def test_settings_has_an_evaluation_field_between_topups_and_debug():
 def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
     evaluation = load(tmp_path, repo).evaluation
     for attribute in ("run", "with_model", "validation_origins", "test_origins",
-                      "rule_doubtful_days"):
+                      "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed"):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(evaluation, attribute, None)
     assert hash(evaluation) == hash(dataclasses.replace(evaluation))
@@ -5408,7 +5412,8 @@ def test_the_evaluation_section_is_read(tmp_path, repo):
     assert isinstance(evaluation, EvaluationSettings)
     assert evaluation == EvaluationSettings(run=True, with_model=True,
                                             validation_origins=(37, 40, 44),
-                                            test_origins=(57, 60), rule_doubtful_days=60)
+                                            test_origins=(57, 60), rule_doubtful_days=60,
+                                            bootstrap_samples=300, bootstrap_seed=11)
 
 
 def test_the_origin_lists_are_tuples_of_ints(tmp_path, repo):
@@ -5509,7 +5514,7 @@ def test_the_overlap_check_does_not_use_the_diagnostic_origin(tmp_path, repo):
 def test_read_evaluation_by_hand():
     assert read_evaluation(evaluation_table(), 5, "here") == EvaluationSettings(
         run=True, with_model=True, validation_origins=(37, 40, 44), test_origins=(49, 60),
-        rule_doubtful_days=60)
+        rule_doubtful_days=60, bootstrap_samples=300, bootstrap_seed=11)
 
 
 @pytest.mark.parametrize("validation, test, expected_validation, expected_test", [
@@ -5654,7 +5659,7 @@ def test_read_evaluation_with_a_key_absent_raises_key_error(key):
 
 
 def test_read_evaluation_ignores_an_unknown_key_on_its_own():
-    # Unknown keys are check_keys' job (load_settings); read_evaluation reads only its five.
+    # Unknown keys are check_keys' job (load_settings); read_evaluation reads only its seven.
     found = read_evaluation(evaluation_table(extra=1), 5, "here")
     assert found == read_evaluation(evaluation_table(), 5, "here")
 
@@ -5692,6 +5697,11 @@ def test_the_synthetic_evaluation_settings():
     assert evaluation.test_origins == tuple(range(49, 60))
     # U14.4 (2026-11-03): a finance person would not count on cash more than 90 days past due.
     assert evaluation.rule_doubtful_days == 90
+    # U14.5c (2026-11-04): the paired bootstrap, 2000 resamples, seeded.
+    assert evaluation.bootstrap_samples == 2000
+    assert evaluation.bootstrap_seed == 20261104
+    # [joint_diagnostic]'s own bootstrap_samples is a different setting.
+    assert type(settings.joint_diagnostic.bootstrap_samples) is int
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -5834,8 +5844,8 @@ def test_with_model_is_independent_of_run(tmp_path, repo):
 def test_with_model_missing_through_the_file_has_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, changes={("evaluation", "with_model"): REMOVE})
     assert message == (f"{EVALUATION}: missing ['with_model']; expected exactly "
-                       f"['rule_doubtful_days', 'run', 'test_origins', 'validation_origins', "
-                       f"'with_model']")
+                       f"['bootstrap_samples', 'bootstrap_seed', 'rule_doubtful_days', 'run', "
+                       f"'test_origins', 'validation_origins', 'with_model']")
 
 
 def test_with_model_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
@@ -5900,3 +5910,187 @@ def test_read_evaluation_without_with_model_raises_key_error():
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_with_model_is_a_bool_whatever_its_value():
     assert isinstance(load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).evaluation.with_model, bool)
+
+
+# =============================================================================================
+# U14.5c: [evaluation] bootstrap_samples and bootstrap_seed, the paired bootstrap's resample
+# count (a count, 1 or more, `count_setting`) and its seed (0 or more, `seed_setting`). Both
+# required; read after rule_doubtful_days, samples before seed. VALID holds 300 and 11.
+# [joint_diagnostic] has a bootstrap_samples of its own (500 in VALID): the two never mix.
+# =============================================================================================
+
+BOOTSTRAP_EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "rule_doubtful_days", "run",
+                             "test_origins", "validation_origins", "with_model"]
+
+
+def test_bootstrap_settings_are_read_through_the_file(tmp_path, repo):
+    evaluation = load(tmp_path, repo).evaluation
+    assert (evaluation.bootstrap_samples, evaluation.bootstrap_seed) == (300, 11)
+    assert type(evaluation.bootstrap_samples) is int
+    assert type(evaluation.bootstrap_seed) is int
+
+
+def test_the_evaluation_keys_pin_holds_both_bootstrap_keys():
+    # The sorted list check_keys prints; the shared EVALUATION_KEYS must be the same.
+    assert EVALUATION_KEYS == BOOTSTRAP_EVALUATION_KEYS
+
+
+def test_evaluation_bootstrap_samples_is_not_the_joint_diagnostics(tmp_path, repo):
+    # 1. Each section keeps its own value (VALID: 300 in [evaluation], 500 in the joint one).
+    settings = load(tmp_path, repo)
+    assert settings.evaluation.bootstrap_samples == 300
+    assert settings.joint_diagnostic.bootstrap_samples == 500
+    # 2. Changing one leaves the other alone, both ways.
+    evaluation_changed = load(tmp_path, repo,
+                              changes={("evaluation", "bootstrap_samples"): "7"})
+    assert evaluation_changed.joint_diagnostic.bootstrap_samples == 500
+    joint_changed = load(tmp_path, repo,
+                         changes={("joint_diagnostic", "bootstrap_samples"): "9"})
+    assert joint_changed.evaluation.bootstrap_samples == 300
+
+
+@pytest.mark.parametrize("text, expected", [("1", 1), ("2", 2), ("2000", 2000),
+                                            ("100000", 100000)])
+def test_bootstrap_samples_good_values_through_the_file(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo, changes={("evaluation", "bootstrap_samples"): text}).evaluation
+    assert found.bootstrap_samples == expected
+    assert type(found.bootstrap_samples) is int
+
+
+@pytest.mark.parametrize("text, expected", [("0", 0), ("1", 1), ("20261104", 20261104),
+                                            ("4294967295", 4294967295)])
+def test_bootstrap_seed_good_values_through_the_file(tmp_path, repo, text, expected):
+    # 0 is a valid seed (unlike a sample count of 0).
+    found = load(tmp_path, repo, changes={("evaluation", "bootstrap_seed"): text}).evaluation
+    assert found.bootstrap_seed == expected
+    assert type(found.bootstrap_seed) is int
+
+
+@pytest.mark.parametrize("key", ["bootstrap_samples", "bootstrap_seed"])
+def test_a_missing_bootstrap_setting_through_the_file_has_the_exact_message(tmp_path, repo,
+                                                                           key):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", key): REMOVE})
+    assert message == (f"{EVALUATION}: missing [{key!r}]; expected exactly "
+                       f"{BOOTSTRAP_EVALUATION_KEYS}")
+
+
+def test_a_bootstrap_samples_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={
+        ("evaluation", "bootstrap_samples"): REMOVE, ("evaluation", "bootstrap_sample"): "300"})
+    assert message == (f"{EVALUATION}: missing ['bootstrap_samples']; unknown "
+                       f"['bootstrap_sample']; expected exactly {BOOTSTRAP_EVALUATION_KEYS}")
+
+
+def test_bootstrap_seed_in_another_section_is_unknown_there(tmp_path, repo):
+    # [joint_diagnostic] has a bootstrap_samples but no seed.
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("joint_diagnostic", "bootstrap_seed"): "1"})
+    assert "[joint_diagnostic]" in message
+    assert "unknown ['bootstrap_seed']" in message
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("true", "True"),
+                                         ("false", "False"), ("1.5", "1.5"),
+                                         ("2000.0", "2000.0"), ('"2000"', "'2000'"),
+                                         ("[2000]", "[2000]")],
+                         ids=["zero", "negative", "true", "false", "fraction", "whole-float",
+                              "text", "list"])
+def test_a_bad_bootstrap_samples_through_the_file_has_the_exact_message(tmp_path, repo, text,
+                                                                        shown):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "bootstrap_samples"): text})
+    assert message == (f"{EVALUATION}: bootstrap_samples is {shown}, not a whole number of 1 "
+                       f"or more")
+
+
+@pytest.mark.parametrize("text, shown", [("-1", "-1"), ("-20261104", "-20261104"),
+                                         ("true", "True"), ("false", "False"), ("1.5", "1.5"),
+                                         ("11.0", "11.0"), ('"11"', "'11'"), ("[11]", "[11]")],
+                         ids=["negative", "very-negative", "true", "false", "fraction",
+                              "whole-float", "text", "list"])
+def test_a_bad_bootstrap_seed_through_the_file_has_the_exact_message(tmp_path, repo, text,
+                                                                     shown):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "bootstrap_seed"): text})
+    assert message == (f"{EVALUATION}: bootstrap_seed is {shown}, not a random seed (a whole "
+                       f"number, 0 or more)")
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 1.5, 300.0, "300", None, [300]],
+                         ids=["zero", "negative", "true", "false", "fraction", "whole-float",
+                              "text", "none", "list"])
+def test_read_evaluation_bad_bootstrap_samples_has_the_exact_message(bad):
+    assert (evaluation_error(bootstrap_samples=bad)
+            == f"here: bootstrap_samples is {bad!r}, not a whole number of 1 or more")
+
+
+@pytest.mark.parametrize("bad", [-1, -100, True, False, 1.5, 11.0, "11", None, [11]],
+                         ids=["negative", "very-negative", "true", "false", "fraction",
+                              "whole-float", "text", "none", "list"])
+def test_read_evaluation_bad_bootstrap_seed_has_the_exact_message(bad):
+    assert (evaluation_error(bootstrap_seed=bad)
+            == f"here: bootstrap_seed is {bad!r}, not a random seed (a whole number, 0 or more)")
+
+
+@pytest.mark.parametrize("samples, seed", [(1, 0), (2, 1), (2000, 20261104), (10**6, 2**63)])
+def test_read_evaluation_good_bootstrap_settings_are_kept_as_given(samples, seed):
+    found = read_evaluation(evaluation_table(bootstrap_samples=samples, bootstrap_seed=seed), 5,
+                            "here")
+    assert (found.bootstrap_samples, found.bootstrap_seed) == (samples, seed)
+    assert type(found.bootstrap_samples) is int and type(found.bootstrap_seed) is int
+
+
+def test_read_evaluation_samples_zero_refused_but_seed_zero_allowed():
+    # The boundary of each: 0 resamples cannot give an interval; seed 0 is a seed like any.
+    assert (evaluation_error(bootstrap_samples=0)
+            == "here: bootstrap_samples is 0, not a whole number of 1 or more")
+    assert read_evaluation(evaluation_table(bootstrap_seed=0), 5, "here").bootstrap_seed == 0
+
+
+@pytest.mark.parametrize("key", ["bootstrap_samples", "bootstrap_seed"])
+def test_read_evaluation_without_a_bootstrap_setting_raises_key_error(key):
+    table = evaluation_table()
+    del table[key]
+    with pytest.raises(KeyError):
+        read_evaluation(table, 5, "here")
+
+
+@pytest.mark.parametrize("field, a_value, b_value", [("bootstrap_samples", 1, 5000),
+                                                     ("bootstrap_seed", 0, 99)])
+def test_a_bootstrap_setting_does_not_change_the_other_evaluation_fields(field, a_value,
+                                                                         b_value):
+    a = read_evaluation(evaluation_table(**{field: a_value}), 5, "here")
+    b = read_evaluation(evaluation_table(**{field: b_value}), 5, "here")
+    assert dataclasses.replace(a, **{field: b_value}) == b
+    assert a != b
+
+
+@pytest.mark.parametrize("key, text", [("bootstrap_samples", "7"), ("bootstrap_seed", "0")])
+def test_a_bootstrap_setting_does_not_change_the_other_sections(tmp_path, repo, key, text):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("evaluation", key): text})
+    for field in dataclasses.fields(Settings):
+        if field.name != "evaluation":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert a.evaluation != b.evaluation
+
+
+def test_rule_doubtful_days_is_checked_before_bootstrap_samples():
+    assert (evaluation_error(rule_doubtful_days=0, bootstrap_samples=0)
+            == "here: rule_doubtful_days is 0, not a whole number of 1 or more")
+
+
+def test_bootstrap_samples_is_checked_before_bootstrap_seed():
+    assert (evaluation_error(bootstrap_samples=0, bootstrap_seed=-1)
+            == "here: bootstrap_samples is 0, not a whole number of 1 or more")
+
+
+def test_the_bootstrap_settings_are_checked_after_the_origin_lists_and_run():
+    # 1. The origin lists (and their overlap) first.
+    assert (evaluation_error(bootstrap_samples=0, bootstrap_seed=-1, validation_origins=[])
+            == "here: validation_origins is empty")
+    # 2. Then run and with_model.
+    assert (evaluation_error(run="yes", bootstrap_samples=0)
+            == "here: run is 'yes', not true or false")
+    assert (evaluation_error(with_model="no", bootstrap_seed=-1)
+            == "here: with_model is 'no', not true or false")

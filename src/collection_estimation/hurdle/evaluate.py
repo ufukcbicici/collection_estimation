@@ -22,7 +22,8 @@ long past due is doubtful and left out. Plus the same top-ups as the model.
 U14.5, the scores: every method's forecasts in one long table (`stack_forecasts`), then per
 method and company the error against the actual cash (`evaluation_scores`): WAPE, bias, the
 mean absolute error in TRY, and MAPE for the consolidated rows; per h, pooled over all h, and
-for the total of the h weeks of each origin.
+for the total of the h weeks of each origin. Then, consolidated, whether one method is really
+more accurate than another or only luckier on these weeks (`paired_wape_bootstrap`).
 """
 import time
 from dataclasses import asdict, dataclass
@@ -91,6 +92,11 @@ HORIZON_TOTAL = "total"              # per origin the sum over its h weeks, then
 # nominal TRY.
 SCORE_COLUMNS = ["method", "company_code", "horizon", "rows", "forecast", "actual", "abs_error",
                  "wape", "bias", "mean_abs_error", "mape"]
+# The columns of the table `paired_wape_bootstrap` returns, in order. horizon is POOLED or
+# HORIZON_TOTAL; difference = wape - wape_against (below 0: method is better); low and high
+# the 5% and 95% points of the difference over the resamples (a 90% interval).
+BOOTSTRAP_COLUMNS = ["method", "against", "horizon", "rows", "wape", "wape_against",
+                     "difference", "low", "high", "share_better", "samples"]
 
 
 def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
@@ -598,23 +604,10 @@ def score_row(method: str, company: str, horizon: str, forecast: pd.Series, actu
             "mean_abs_error": float(errors.mean()), "mape": mape}
 
 
-def evaluation_scores(forecasts: pd.DataFrame, actual: pd.DataFrame,
-                      horizons: int) -> pd.DataFrame:
-    """The scores of every method (`forecasts`, from `stack_forecasts`) against the actual cash
-    (`actual`, from `actual_totals`), per method and company (the companies and "ALL"),
-    nominal TRY. Only the (company, origin, h) with actual cash are scored.
-
-    For each method and company, rows with `horizon`:
-      - "1" ... str(`horizons`): the (origin, h) of that h;
-      - POOLED: every (origin, h) together (a target week counts once per h aiming at it);
-      - HORIZON_TOTAL: per origin, the forecasts and the actual cash added up over its h
-        weeks, then scored as one value per origin. Only origins with actual cash in all
-        `horizons` target weeks; no row if there is none.
-    The numbers are `score_row`'s; MAPE only for "ALL". "ALL" is scored on its own rows, not
-    as the sum of the companies (the `deflated` references fit it on its own).
-
-    Columns `SCORE_COLUMNS`; the methods and companies in the order they come in `forecasts`,
-    per company the h, then POOLED, then HORIZON_TOTAL.
+def scored_rows(forecasts: pd.DataFrame, actual: pd.DataFrame, horizons: int) -> pd.DataFrame:
+    """The forecasts (from `stack_forecasts`) beside the actual cash of their week (column
+    actual, from `actual_totals`): only the (company, origin, h) with actual cash, checked
+    first. Shared by `evaluation_scores` and `paired_wape_bootstrap`.
 
     Raises ValueError if `horizons` is below 1, a forecast's h is not 1 to `horizons`, a
     method has two forecasts for one (company, origin, h), a forecast is NaN or infinite, or
@@ -651,11 +644,35 @@ def evaluation_scores(forecasts: pd.DataFrame, actual: pd.DataFrame,
             raise ValueError(f"{method!r} has no forecast for {len(missing)} rows with actual "
                              f"cash (first: {first})")
 
-    # 3. The rows scored: the forecasts beside the actual cash of their week.
-    rows = forecasts.merge(actual[keys + ["actual"]], on=keys, how="inner",
+    # 3. The forecasts beside the actual cash of their week.
+    return forecasts.merge(actual[keys + ["actual"]], on=keys, how="inner",
                            validate="many_to_one")
 
-    # 4. The scores, method by method and company by company.
+
+def evaluation_scores(forecasts: pd.DataFrame, actual: pd.DataFrame,
+                      horizons: int) -> pd.DataFrame:
+    """The scores of every method (`forecasts`, from `stack_forecasts`) against the actual cash
+    (`actual`, from `actual_totals`), per method and company (the companies and "ALL"),
+    nominal TRY. Only the (company, origin, h) with actual cash are scored.
+
+    For each method and company, rows with `horizon`:
+      - "1" ... str(`horizons`): the (origin, h) of that h;
+      - POOLED: every (origin, h) together (a target week counts once per h aiming at it);
+      - HORIZON_TOTAL: per origin, the forecasts and the actual cash added up over its h
+        weeks, then scored as one value per origin. Only origins with actual cash in all
+        `horizons` target weeks; no row if there is none.
+    The numbers are `score_row`'s; MAPE only for "ALL". "ALL" is scored on its own rows, not
+    as the sum of the companies (the `deflated` references fit it on its own).
+
+    Columns `SCORE_COLUMNS`; the methods and companies in the order they come in `forecasts`,
+    per company the h, then POOLED, then HORIZON_TOTAL.
+
+    Raises ValueError as `scored_rows` does (the checks on the forecasts).
+    """
+    # 1. The rows scored, checked.
+    rows = scored_rows(forecasts, actual, horizons)
+
+    # 2. The scores, method by method and company by company.
     scores = []
     for (method, company), mine in rows.groupby(["method", "company_code"], sort=False):
         with_mape = company == CONSOLIDATED
@@ -681,3 +698,150 @@ def evaluation_scores(forecasts: pd.DataFrame, actual: pd.DataFrame,
                                     complete["actual"], with_mape))
 
     return pd.DataFrame(scores, columns=SCORE_COLUMNS)
+
+
+def weighted_wape(abs_error: np.ndarray, actual: np.ndarray, weights: np.ndarray) -> float:
+    """WAPE with each value counted `weights` times: sum w |error| / sum w actual."""
+    return float((weights * abs_error).sum() / (weights * actual).sum())
+
+
+def drawn_counts(values: np.ndarray, drawn: list) -> np.ndarray:
+    """For each of `values`, how often it is in `drawn` (0 if not)."""
+    times = pd.Series(drawn).value_counts()
+    return pd.Series(values).map(times).fillna(0).to_numpy(dtype="float64")
+
+
+def resampled_weeks(weeks: list[int], rng: np.random.Generator) -> list[int]:
+    """One resample of the target weeks: as many weeks as there are, drawn with replacement.
+    All the forecasts aiming at one week go together, because they share its actual cash."""
+    return list(rng.choice(weeks, size=len(weeks), replace=True))
+
+
+def resampled_origins(origins: list[int], block: int, rng: np.random.Generator) -> list[int]:
+    """One resample of the origins, in blocks of `block` consecutive origins (of the sorted
+    list), each block starting at a random origin, until there are as many origins as before
+    (the last block cut short). Nearby origins share target weeks, so they go together.
+
+    A block that runs past the last origin goes on from the first (a circular block), so that
+    every origin is drawn equally often; without it the first and last origins would be in
+    few blocks and the resamples would lean on the middle ones."""
+    drawn = []
+    while len(drawn) < len(origins):
+        start = int(rng.integers(0, len(origins)))
+        for step in range(block):
+            drawn.append(origins[(start + step) % len(origins)])
+    return drawn[:len(origins)]
+
+
+def bootstrap_row(method: str, against: str, horizon: str, error: np.ndarray,
+                  error_against: np.ndarray, actual: np.ndarray,
+                  draw_weights: Callable[[np.random.Generator], np.ndarray], samples: int,
+                  seed: int) -> dict:
+    """One row of `paired_wape_bootstrap`: the two methods' absolute errors and the actual
+    cash, one value each per row (an (origin, h) or an origin's total), and
+    `draw_weights(rng)`, how often each row counts in one resample."""
+    wape = weighted_wape(error, actual, np.ones(len(actual)))
+    wape_against = weighted_wape(error_against, actual, np.ones(len(actual)))
+
+    # The same resamples for both methods.
+    rng = np.random.default_rng(seed)
+    differences = np.empty(samples)
+    for i in range(samples):
+        weights = draw_weights(rng)
+        differences[i] = (weighted_wape(error, actual, weights)
+                          - weighted_wape(error_against, actual, weights))
+
+    return {"method": method, "against": against, "horizon": horizon, "rows": len(actual),
+            "wape": wape, "wape_against": wape_against, "difference": wape - wape_against,
+            "low": float(np.quantile(differences, 0.05)),
+            "high": float(np.quantile(differences, 0.95)),
+            "share_better": float((differences < 0).mean()), "samples": samples}
+
+
+def paired_wape_bootstrap(forecasts: pd.DataFrame, actual: pd.DataFrame,
+                          pairs: list[tuple[str, str]], horizons: int, samples: int,
+                          seed: int) -> pd.DataFrame:
+    """For each pair (method, against) of methods in `forecasts` (from `stack_forecasts`): is
+    `method` more accurate than `against` on the consolidated cash, or only luckier on these
+    weeks? Both are scored on the same resamples (paired), so the luck they share cancels.
+
+    Two rows per pair, as in `evaluation_scores`:
+      - POOLED: the WAPE over every (origin, h). A resample draws the target weeks with
+        replacement (`resampled_weeks`); every forecast aiming at a drawn week counts as
+        often as the week was drawn.
+      - HORIZON_TOTAL: the WAPE of the per-origin totals over the h weeks (only origins with
+        actual cash in all of them; no row if there is none). A resample draws the origins
+        in blocks of `horizons` consecutive origins (`resampled_origins`; fewer if there are
+        fewer origins).
+    wape and wape_against are measured on the weeks as they are; difference = wape -
+    wape_against; low and high its 5% and 95% points over `samples` resamples;
+    share_better the share of resamples in which `method` has the lower WAPE. Each row
+    starts from `seed`, so a pair's result does not depend on the other pairs.
+
+    Few weeks give wide intervals: a guide, not a proof. Columns `BOOTSTRAP_COLUMNS`, the
+    pairs in their order. Raises ValueError if `samples` is below 1, a pair names a method not
+    in `forecasts` or the same method twice, there is no consolidated row with actual cash or
+    a consolidated actual is not above 0, and as `scored_rows` does.
+    """
+    if samples < 1:
+        raise ValueError(f"samples is {samples}; at least 1 is needed")
+    methods = set(forecasts["method"])
+    for method, against in pairs:
+        if method == against:
+            raise ValueError(f"the pair ({method!r}, {against!r}) compares a method with itself")
+        unknown = sorted({method, against} - methods)
+        if unknown:
+            raise ValueError(f"the pair ({method!r}, {against!r}) names methods with no "
+                             f"forecasts: {unknown}")
+
+    # 1. The consolidated rows with actual cash, checked as for the scores.
+    rows = scored_rows(forecasts, actual, horizons)
+    rows = rows[rows["company_code"] == CONSOLIDATED]
+    if rows.empty:
+        raise ValueError(f"there are no consolidated ({CONSOLIDATED!r}) rows with actual cash "
+                         f"to compare")
+    if not (rows["actual"] > 0).all():
+        raise ValueError("every consolidated actual must be above 0 for a WAPE")
+
+    keys = ["origin_week", "h", "target_week"]
+    results = []
+    for method, against in pairs:
+        # 2. The two methods side by side: one row per (origin, h).
+        mine = rows.loc[rows["method"] == method, keys + ["forecast", "actual"]]
+        theirs = rows.loc[rows["method"] == against, keys + ["forecast"]]
+        both = mine.merge(theirs, on=keys, suffixes=("", "_against"), validate="one_to_one")
+
+        # 3. Pooled: resample the target weeks.
+        weeks = sorted(set(both["target_week"]))
+        row_weeks = both["target_week"].to_numpy()
+
+        def week_weights(rng):
+            return drawn_counts(row_weeks, resampled_weeks(weeks, rng))
+
+        results.append(bootstrap_row(
+            method, against, POOLED,
+            (both["forecast"] - both["actual"]).abs().to_numpy(),
+            (both["forecast_against"] - both["actual"]).abs().to_numpy(),
+            both["actual"].to_numpy(), week_weights, samples, seed))
+
+        # 4. The per-origin totals: resample blocks of consecutive origins.
+        per_origin = both.groupby("origin_week").agg(
+            weeks=("h", "size"), forecast=("forecast", "sum"),
+            forecast_against=("forecast_against", "sum"), actual=("actual", "sum"))
+        complete = per_origin[per_origin["weeks"] == horizons]
+        if complete.empty:
+            continue
+        origins = sorted(complete.index)
+        block = min(horizons, len(origins))
+
+        def origin_weights(rng):
+            return drawn_counts(complete.index.to_numpy(),
+                                resampled_origins(origins, block, rng))
+
+        results.append(bootstrap_row(
+            method, against, HORIZON_TOTAL,
+            (complete["forecast"] - complete["actual"]).abs().to_numpy(),
+            (complete["forecast_against"] - complete["actual"]).abs().to_numpy(),
+            complete["actual"].to_numpy(), origin_weights, samples, seed))
+
+    return pd.DataFrame(results, columns=BOOTSTRAP_COLUMNS)
