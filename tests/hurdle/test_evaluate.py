@@ -4205,6 +4205,9 @@ FP_NO_CHANGES = {
         "evaluation", "bootstrap_samples", lambda v: v + 1),
     "evaluation bootstrap_seed": fp_change_settings_by(
         "evaluation", "bootstrap_seed", lambda v: v + 1),
+    # U14.6: the balance check is a report; it never makes a forecast.
+    "evaluation coherence_factor": fp_change_settings_by(
+        "evaluation", "coherence_factor", lambda v: v + 1),
     # [topups]: only the comparison's fields.
     "topups compare": fp_change_settings_by("topups", "compare", lambda v: not v),
     "topups compare_first_origin": fp_change_settings_by(
@@ -6737,3 +6740,1061 @@ def test_component_bias_a_repeated_row_of_the_actual_is_refused():
     actual = cb_actual()
     with pytest.raises(MergeError):
         cb_run(actual=pd.concat([actual, actual.iloc[[0]]], ignore_index=True))
+
+
+# =============================================================================================
+# U14.6, `with_receipts`, `coherence_row`, `balance_coherence`: does each customer's forecast over
+# the h weeks of an origin fit what it owes at that origin, with the same measures on the actual
+# cash? A report only.
+#
+# The worked example. Horizons 2, factor 1.5; published levels: week 10 1.0, week 11 2.0, week 12
+# 4.0, week 13 5.0, week 14 8.0; week 13 has no data, so origin 11 (targets 12, 13) is dropped
+# whole. Balances are read at h = 1; the h = 2 rows of the table hold a decoy, balance + 1000.
+#
+#   key co.  origin balance limit  forecast        actual (gross / level)        over?
+#   A   TR02 10     100     150    60 + 90 = 150   200/2 + 200/4 = 150           neither: exact
+#   B   TR02 10     100     150    100 + 60 = 160  40/2 + none = 20              forecast
+#   C   TR02 10     40      60     5 + 5 = 10      240/2 + 40/4 = 130            actual
+#   D   TR02 10     0       -      8 + 2 = 10      6/2 + 8/4 = 5                 nothing open
+#   E   TR02 10     -50     -      1 + 3 = 4       no weekly row = 0             nothing open
+#   A   TR02 9      50      75     30 + 30 = 60    15/1 + 200/2 = 115            actual
+#   F   TR04 10     200     300    400 + 0 = 400   1000/2 + refund only = 500    both
+#   G   TR04 10     -10     -      20 + 10 = 30    20/2 + 40/4 = 20              nothing open
+#   A, F at origin 11: forecast 2000 and 4000, balance 7777, in no total.
+#
+# TR02: forecast 394, actual 420, balance 290 (not 290 - 50), 4 with a balance of 6 rows.
+# TR04: forecast 430, actual 520, balance 200, 1 with a balance of 2 rows.
+# ALL: forecast 824, actual 940, balance 490, 5 with a balance of 8 rows.
+# =============================================================================================
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    COHERENCE_COLUMNS, balance_coherence, coherence_row, with_receipts)
+
+BC_HORIZONS = 2
+BC_FACTOR = 1.5
+BC_LEVELS = {10: 1.0, 11: 2.0, 12: 4.0, 13: 5.0, 14: 8.0}
+BC_COMPANY = {"A": "TR02", "B": "TR02", "C": "TR02", "D": "TR02", "E": "TR02", "F": "TR04",
+              "G": "TR04", "Z": "TR02"}
+# (key, origin): (forecast at h = 1, forecast at h = 2, balance).
+BC_ROWS = {("A", 9): (30.0, 30.0, 50.0),
+           ("A", 10): (60.0, 90.0, 100.0),
+           ("B", 10): (100.0, 60.0, 100.0),
+           ("C", 10): (5.0, 5.0, 40.0),
+           ("D", 10): (8.0, 2.0, 0.0),
+           ("E", 10): (1.0, 3.0, -50.0),
+           ("F", 10): (400.0, 0.0, 200.0),
+           ("G", 10): (20.0, 10.0, -10.0),
+           ("A", 11): (1000.0, 1000.0, 7777.0),
+           ("F", 11): (2000.0, 2000.0, 7777.0)}
+# One row per company and "ALL": every column of COHERENCE_COLUMNS, worked out by hand above.
+BC_EXPECTED = {
+    "TR02": dict(rows=6, forecast=394.0, actual=420.0, open_balance=290.0,
+                 forecast_share=394 / 290, actual_share=420 / 290, rows_with_balance=4,
+                 share_forecast_over=0.25, share_actual_over=0.5,
+                 rows_over=1, forecast_over=160.0, actual_over=20.0,
+                 rows_nothing_open=2, forecast_nothing_open=14.0, actual_nothing_open=5.0),
+    "TR04": dict(rows=2, forecast=430.0, actual=520.0, open_balance=200.0,
+                 forecast_share=2.15, actual_share=2.6, rows_with_balance=1,
+                 share_forecast_over=1.0, share_actual_over=1.0,
+                 rows_over=1, forecast_over=400.0, actual_over=500.0,
+                 rows_nothing_open=1, forecast_nothing_open=30.0, actual_nothing_open=20.0),
+    "ALL": dict(rows=8, forecast=824.0, actual=940.0, open_balance=490.0,
+                forecast_share=824 / 490, actual_share=940 / 490, rows_with_balance=5,
+                share_forecast_over=0.4, share_actual_over=0.6,
+                rows_over=2, forecast_over=560.0, actual_over=520.0,
+                rows_nothing_open=3, forecast_nothing_open=44.0, actual_nothing_open=25.0),
+}
+BC_AMOUNT_COLUMNS = ["forecast", "actual", "open_balance", "forecast_over", "actual_over",
+                     "forecast_nothing_open", "actual_nothing_open"]
+BC_COUNT_COLUMNS = ["rows", "rows_with_balance", "rows_over", "rows_nothing_open"]
+BC_RATIO_COLUMNS = ["forecast_share", "actual_share", "share_forecast_over",
+                    "share_actual_over"]
+
+
+def bc_customers(rows=None, horizons=BC_HORIZONS):
+    """One row per (key, origin) x h. p and m are decoys: p x m is not `expected`."""
+    rows = BC_ROWS if rows is None else rows
+    records = []
+    for (key, origin), values in rows.items():
+        for h in range(1, horizons + 1):
+            records.append({"key": key, "company_code": BC_COMPANY[key],
+                            "customer_id": key.lower(), "origin_week": origin, "h": h,
+                            "target_week": origin + h, "p": 0.5, "m": 3.0,
+                            "expected": values[h - 1]})
+    return pd.DataFrame(records, columns=CUSTOMER_COLUMNS)
+
+
+def bc_table(rows=None, horizons=BC_HORIZONS):
+    """The balances at h = 1; later h hold a decoy. Customer Z and origin 8 are never forecast."""
+    rows = BC_ROWS if rows is None else rows
+    extra = {("Z", 10): 5000.0, ("A", 8): 3333.0}
+    records = []
+    for (key, origin), balance in {**{k: v[-1] for k, v in rows.items()}, **extra}.items():
+        for h in range(1, horizons + 1):
+            records.append({"key": key, "origin_week": origin, "h": h, "extra": -1.0,
+                            "open_balance": balance if h == 1 else balance + 1000.0})
+    return pd.DataFrame(records)
+
+
+def bc_weekly():
+    """Refunds are never read. Weeks 9, 13, 14 and the unknown customer are decoys."""
+    return make_weekly([("A", "TR02", "a", 10, 15.0, 0.0),
+                        ("A", "TR02", "a", 11, 200.0, -7.0),
+                        ("A", "TR02", "a", 12, 200.0, 0.0),
+                        ("B", "TR02", "b", 11, 40.0, 0.0),
+                        ("C", "TR02", "c", 11, 240.0, 0.0),
+                        ("C", "TR02", "c", 12, 40.0, 0.0),
+                        ("D", "TR02", "d", 11, 6.0, 0.0),
+                        ("D", "TR02", "d", 12, 8.0, 0.0),
+                        ("F", "TR04", "f", 11, 1000.0, 0.0),
+                        ("F", "TR04", "f", 12, 0.0, -9.0),
+                        ("G", "TR04", "g", 11, 20.0, 0.0),
+                        ("G", "TR04", "g", 12, 40.0, 0.0),
+                        ("A", "TR02", "a", 13, 99999.0, 0.0),
+                        ("A", "TR02", "a", 14, 88888.0, 0.0),
+                        ("E", "TR02", "e", 9, 77777.0, 0.0),
+                        ("not known", "TR02", None, 11, 66666.0, 0.0)])
+
+
+def bc_weeks():
+    return make_weeks(14, missing={13})
+
+
+def bc_levels():
+    return pd.Series(BC_LEVELS)
+
+
+def bc_run(**changes):
+    arguments = dict(customers=bc_customers(), table=bc_table(), weekly=bc_weekly(),
+                     weeks=bc_weeks(), levels=bc_levels(), horizons=BC_HORIZONS,
+                     factor=BC_FACTOR)
+    arguments.update(changes)
+    return balance_coherence(**arguments)
+
+
+def bc_row(result, company="ALL"):
+    selected = result[result["company_code"] == company]
+    assert len(selected) == 1, (company, len(selected))
+    return selected.iloc[0]
+
+
+def bc_refused(expected_message, **changes):
+    with pytest.raises(ValueError) as error:
+        bc_run(**changes)
+    assert str(error.value) == expected_message
+
+
+def bc_subset(*wanted):
+    """The worked example with only these (key, origin) rows, for customers and table alike."""
+    rows = {pair: BC_ROWS[pair] for pair in wanted}
+    return dict(customers=bc_customers(rows), table=bc_table(rows))
+
+
+def bc_one(balance, expected, gross, factor=BC_FACTOR):
+    """One customer, one origin (10), horizons 1, target week 11 at level 2: actual = gross / 2.
+    """
+    customers = bc_customers({("A", 10): (expected, balance)}, horizons=1)
+    table = pd.DataFrame({"key": ["A"], "origin_week": [10], "h": [1],
+                          "open_balance": [balance]})
+    weekly = make_weekly([("A", "TR02", "a", 11, gross, 0.0)])
+    return bc_row(bc_run(customers=customers, table=table, weekly=weekly, horizons=1,
+                         factor=factor))
+
+
+@pytest.fixture(scope="module")
+def bc_result():
+    return bc_run()
+
+
+# --- with_receipts ---------------------------------------------------------------------------
+
+def wr_rows(pairs=(("A", 11), ("B", 11), ("A", 12))):
+    return pd.DataFrame({"key": [key for key, _ in pairs],
+                         "target_week": [week for _, week in pairs],
+                         "kept": [float(i) for i in range(len(pairs))]})
+
+
+def test_with_receipts_adds_the_two_columns_and_keeps_the_rest():
+    found = with_receipts(wr_rows(), bc_weekly(), bc_levels())
+    assert list(found.columns) == ["key", "target_week", "kept", "gross_receipts", "actual_real"]
+
+
+def test_with_receipts_exact_numbers():
+    found = with_receipts(wr_rows(), bc_weekly(), bc_levels())
+    assert found["gross_receipts"].tolist() == [200.0, 40.0, 200.0]
+    # Each by the level of its own target week: 200 / 2, 40 / 2, 200 / 4.
+    assert found["actual_real"].tolist() == [100.0, 20.0, 50.0]
+
+
+def test_with_receipts_keeps_the_rows_in_their_order():
+    pairs = (("G", 12), ("A", 11), ("C", 12), ("B", 11))
+    found = with_receipts(wr_rows(pairs), bc_weekly(), bc_levels())
+    assert list(zip(found["key"], found["target_week"])) == list(pairs)
+    assert found["kept"].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_with_receipts_no_weekly_row_is_a_paid_zero():
+    found = with_receipts(wr_rows((("E", 11), ("B", 12))), bc_weekly(), bc_levels())
+    assert found["gross_receipts"].tolist() == [0.0, 0.0]
+    assert found["actual_real"].tolist() == [0.0, 0.0]
+
+
+def test_with_receipts_empty_weekly_table_gives_zeros():
+    found = with_receipts(wr_rows(), bc_weekly().iloc[0:0], bc_levels())
+    assert found["gross_receipts"].tolist() == [0.0, 0.0, 0.0]
+    assert found["actual_real"].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_with_receipts_refunds_are_not_in_it():
+    # A pays 200 and refunds 7 in week 11; F only refunds in week 12.
+    found = with_receipts(wr_rows((("A", 11), ("F", 12))), bc_weekly(), bc_levels())
+    assert found["gross_receipts"].tolist() == [200.0, 0.0]
+    assert found["actual_real"].tolist() == [100.0, 0.0]
+
+
+def test_with_receipts_reads_only_the_target_week_of_the_key():
+    # A has other weeks, and other customers have week 12: none of it leaks in.
+    found = with_receipts(wr_rows((("D", 12),)), bc_weekly(), bc_levels())
+    assert found["gross_receipts"].tolist() == [8.0]
+
+
+def test_with_receipts_the_same_key_week_on_two_rows_is_served_twice():
+    # Two origins reach the same target week: the many of many_to_one.
+    found = with_receipts(wr_rows((("A", 12), ("A", 12))), bc_weekly(), bc_levels())
+    assert found["gross_receipts"].tolist() == [200.0, 200.0]
+
+
+def test_with_receipts_does_not_take_the_other_weekly_columns():
+    found = with_receipts(wr_rows(), bc_weekly(), bc_levels())
+    for column in ("refunds", "company_code", "customer_id", "week", "lines"):
+        assert column not in found.columns
+
+
+def test_with_receipts_does_not_change_its_inputs():
+    rows, weekly, levels = wr_rows(), bc_weekly(), bc_levels()
+    rows_before, weekly_before, levels_before = rows.copy(), weekly.copy(), levels.copy()
+    found = with_receipts(rows, weekly, levels)
+    assert found is not rows
+    pd.testing.assert_frame_equal(rows, rows_before)
+    pd.testing.assert_frame_equal(weekly, weekly_before)
+    pd.testing.assert_series_equal(levels, levels_before)
+
+
+def test_with_receipts_ignores_the_index_of_the_rows():
+    rows = wr_rows()
+    rows.index = [7, 7, 3]
+    found = with_receipts(rows, bc_weekly(), bc_levels())
+    assert found["actual_real"].tolist() == [100.0, 20.0, 50.0]
+
+
+def test_with_receipts_empty_rows_give_an_empty_table_with_the_columns():
+    found = with_receipts(wr_rows().iloc[0:0], bc_weekly(), bc_levels())
+    assert found.empty
+    assert list(found.columns) == ["key", "target_week", "kept", "gross_receipts", "actual_real"]
+
+
+def test_with_receipts_a_target_week_with_no_level_is_refused():
+    levels = bc_levels().drop(11)
+    with pytest.raises(ValueError) as error:
+        with_receipts(wr_rows(), bc_weekly(), levels)
+    assert str(error.value) == "no price level for weeks [11]"
+
+
+def test_with_receipts_a_target_week_with_no_level_is_refused_even_with_no_cash():
+    # The customer paid nothing that week; 0 / unknown is still refused, not a quiet 0.
+    with pytest.raises(ValueError, match=r"no price level for weeks \[12\]"):
+        with_receipts(wr_rows((("B", 12),)), bc_weekly(), bc_levels().drop(12))
+
+
+def test_with_receipts_a_repeated_key_week_of_the_weekly_table_is_refused():
+    weekly = bc_weekly()
+    with pytest.raises(MergeError):
+        with_receipts(wr_rows(), pd.concat([weekly, weekly.iloc[[0]]], ignore_index=True),
+                      bc_levels())
+
+
+def test_payer_split_gets_its_receipts_from_with_receipts(monkeypatch):
+    # The extraction: payer_split still goes through the helper, and reads what it returns.
+    seen = []
+    real = evaluate_module.with_receipts
+
+    def spy(rows, weekly, levels):
+        seen.append(len(rows))
+        return real(rows, weekly, levels)
+
+    monkeypatch.setattr(evaluate_module, "with_receipts", spy)
+    split = ps_run()
+    assert seen == [9]
+    assert ps_row(split, "ALL", "pooled")["rows"] == 9
+
+
+# --- balance_coherence: the worked example ---------------------------------------------------
+
+def test_coherence_columns_are_pinned():
+    assert COHERENCE_COLUMNS == ["company_code", "rows", "forecast", "actual", "open_balance",
+                                 "forecast_share", "actual_share", "rows_with_balance",
+                                 "share_forecast_over", "share_actual_over", "rows_over",
+                                 "forecast_over", "actual_over", "rows_nothing_open",
+                                 "forecast_nothing_open", "actual_nothing_open"]
+
+
+def test_balance_coherence_result_has_exactly_the_columns_and_rows_in_order(bc_result):
+    assert list(bc_result.columns) == COHERENCE_COLUMNS
+    assert bc_result["company_code"].tolist() == ["TR02", "TR04", "ALL"]
+    assert list(bc_result.index) == [0, 1, 2]
+
+
+@pytest.mark.parametrize("company", list(BC_EXPECTED))
+@pytest.mark.parametrize("column", COHERENCE_COLUMNS[1:])
+def test_balance_coherence_exact_numbers(bc_result, company, column):
+    assert bc_row(bc_result, company)[column] == pytest.approx(BC_EXPECTED[company][column])
+
+
+def test_the_worked_example_pins_every_column():
+    for values in BC_EXPECTED.values():
+        assert sorted(values) == sorted(COHERENCE_COLUMNS[1:])
+
+
+def test_balance_coherence_dtypes(bc_result):
+    for column in BC_COUNT_COLUMNS:
+        assert bc_result[column].dtype == "int64", column
+    for column in BC_AMOUNT_COLUMNS + BC_RATIO_COLUMNS:
+        assert bc_result[column].dtype == "float64", column
+
+
+def test_balance_coherence_companies_are_sorted_whatever_order_they_come_in():
+    customers = bc_customers().iloc[::-1]
+    assert bc_run(customers=customers)["company_code"].tolist() == ["TR02", "TR04", "ALL"]
+
+
+def test_balance_coherence_all_comes_last_even_when_a_code_sorts_after_it():
+    customers = bc_customers()
+    customers["company_code"] = customers["company_code"].map({"TR02": "AAA", "TR04": "ZZZ"})
+    assert bc_run(customers=customers)["company_code"].tolist() == ["AAA", "ZZZ", "ALL"]
+
+
+def test_balance_coherence_one_company_gives_it_and_an_equal_all():
+    found = bc_run(**bc_subset(("A", 10), ("B", 10)))
+    assert found["company_code"].tolist() == ["TR02", "ALL"]
+    for column in COHERENCE_COLUMNS[1:]:
+        assert found.iloc[0][column] == found.iloc[1][column], column
+
+
+# --- ALL is the companies added up -----------------------------------------------------------
+
+@pytest.mark.parametrize("column", BC_AMOUNT_COLUMNS + BC_COUNT_COLUMNS)
+def test_balance_coherence_all_is_the_sum_of_the_companies(bc_result, column):
+    companies = bc_result[bc_result["company_code"] != "ALL"]
+    assert bc_row(bc_result)[column] == pytest.approx(companies[column].sum())
+
+
+def test_balance_coherence_all_shares_come_from_the_all_totals_not_a_mean(bc_result):
+    # The mean of the companies' forecast shares would be (394/290 + 2.15) / 2 = 1.754.
+    total = bc_row(bc_result)
+    assert total["forecast_share"] == pytest.approx(total["forecast"] / total["open_balance"])
+    assert total["forecast_share"] == pytest.approx(824 / 490)
+    # The mean of the companies' over-shares would be (0.25 + 1) / 2 = 0.625, not 2 of 5.
+    assert total["share_forecast_over"] == pytest.approx(0.4)
+
+
+def test_balance_coherence_groups_partition_the_rows(bc_result):
+    assert (bc_result["rows"]
+            == bc_result["rows_with_balance"] + bc_result["rows_nothing_open"]).all()
+
+
+def bc_by_hand(customers, table, weekly, weeks, levels, horizons, factor, company):
+    """The whole report by plain loops, as a second opinion on random tables."""
+    with_data = {w for w, gone in zip(weeks["week"], weeks["is_missing"]) if not gone}
+    paid = {(k, w): g for k, w, g in zip(weekly["key"], weekly["week"], weekly["gross_receipts"])}
+    balances = {(k, o): b for k, o, h, b in zip(table["key"], table["origin_week"], table["h"],
+                                                table["open_balance"]) if h == 1}
+    good_origins = [origin for origin in set(customers["origin_week"])
+                    if all(origin + h in with_data for h in range(1, horizons + 1))]
+    found = dict.fromkeys(COHERENCE_COLUMNS[1:], 0.0)
+    over_forecast = over_actual = 0
+    for (key, origin), rows in customers.groupby(["key", "origin_week"]):
+        if origin not in good_origins:
+            continue
+        if company != "ALL" and rows["company_code"].iloc[0] != company:
+            continue
+        forecast = rows["expected"].sum()
+        actual = sum(paid.get((key, week), 0.0) / levels[week] for week in rows["target_week"])
+        balance = balances[(key, origin)]
+        found["rows"] += 1
+        found["forecast"] += forecast
+        found["actual"] += actual
+        if balance > 0:
+            found["rows_with_balance"] += 1
+            found["open_balance"] += balance
+            over_actual += actual > factor * balance
+            if forecast > factor * balance:
+                over_forecast += 1
+                found["rows_over"] += 1
+                found["forecast_over"] += forecast
+                found["actual_over"] += actual
+        else:
+            found["rows_nothing_open"] += 1
+            found["forecast_nothing_open"] += forecast
+            found["actual_nothing_open"] += actual
+    found["forecast_share"] = found["forecast"] / found["open_balance"]
+    found["actual_share"] = found["actual"] / found["open_balance"]
+    found["share_forecast_over"] = over_forecast / found["rows_with_balance"]
+    found["share_actual_over"] = over_actual / found["rows_with_balance"]
+    return found
+
+
+def bc_random(seed):
+    """Three companies, four origins of which one is incomplete, balances of every sign."""
+    rng = np.random.default_rng(seed)
+    customers, table, weekly = [], [], []
+    for number in range(12):
+        key, company = f"K{number}", ["TR01", "TR02", "TR03"][number % 3]
+        for origin in (5, 6, 7, 8):
+            balance = float(rng.choice([-100.0, 0.0, 50.0, 200.0, 1000.0]))
+            for h in (1, 2, 3):
+                customers.append({"key": key, "company_code": company,
+                                  "customer_id": key.lower(), "origin_week": origin, "h": h,
+                                  "target_week": origin + h, "p": 0.5, "m": 1.0,
+                                  "expected": float(rng.uniform(0, 400))})
+                table.append({"key": key, "origin_week": origin, "h": h,
+                              "open_balance": balance})
+        for week in range(5, 13):
+            if rng.random() < 0.6:
+                weekly.append((key, company, key.lower(), week, float(rng.uniform(0, 600)),
+                               -float(rng.uniform(0, 30))))
+    return dict(customers=pd.DataFrame(customers, columns=CUSTOMER_COLUMNS),
+                table=pd.DataFrame(table), weekly=make_weekly(weekly),
+                weeks=make_weeks(20, missing={11}), levels=make_levels(0, 20), horizons=3,
+                factor=float(rng.choice([0.5, 1.0, 1.5, 2.5])))
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_balance_coherence_equals_plain_loops_on_random_tables(seed):
+    arguments = bc_random(seed)
+    found = balance_coherence(**arguments)
+    assert found["company_code"].tolist() == ["TR01", "TR02", "TR03", "ALL"]
+    for company in found["company_code"]:
+        by_hand = bc_by_hand(**arguments, company=company)
+        got = bc_row(found, company)
+        for column in COHERENCE_COLUMNS[1:]:
+            assert got[column] == pytest.approx(by_hand[column], abs=1e-9), (company, column)
+
+
+# --- the limit: strictly above factor x balance ----------------------------------------------
+
+def test_a_forecast_of_exactly_the_limit_is_not_over():
+    found = bc_one(100.0, 150.0, 0.0)
+    assert found["share_forecast_over"] == 0.0
+    assert found["rows_over"] == 0
+    assert found["forecast_over"] == 0.0
+
+
+def test_a_forecast_just_above_the_limit_is_over():
+    expected = float(np.nextafter(150.0, np.inf))
+    found = bc_one(100.0, expected, 0.0)
+    assert found["share_forecast_over"] == 1.0
+    assert found["rows_over"] == 1
+    assert found["forecast_over"] == expected
+
+
+def test_a_forecast_just_below_the_limit_is_not_over():
+    assert bc_one(100.0, float(np.nextafter(150.0, 0.0)), 0.0)["rows_over"] == 0
+
+
+def test_actual_cash_of_exactly_the_limit_is_not_over():
+    # Gross 300 at level 2 is 150.
+    assert bc_one(100.0, 0.0, 300.0)["share_actual_over"] == 0.0
+
+
+def test_actual_cash_just_above_the_limit_is_over():
+    gross = 2.0 * float(np.nextafter(150.0, np.inf))
+    assert bc_one(100.0, 0.0, gross)["share_actual_over"] == 1.0
+
+
+def test_the_worked_example_customer_a_sits_exactly_on_the_limit_in_both():
+    # A at origin 10: forecast 150 and actual 150 against the limit of 1.5 x 100.
+    found = bc_row(bc_run(**bc_subset(("A", 10))))
+    assert (found["forecast"], found["actual"], found["open_balance"]) == (150.0, 150.0, 100.0)
+    assert found["share_forecast_over"] == 0.0
+    assert found["share_actual_over"] == 0.0
+
+
+def test_the_factor_is_the_one_given():
+    # Factor 1: limits 100, 100, 40, 50, 200.
+    #   forecast over: A10 (150), B10 (160), A9 (60), F10 (400); actual there 150, 20, 115, 500.
+    #   actual over: A10 (150), C10 (130), A9 (115), F10 (500).
+    found = bc_row(bc_run(factor=1.0))
+    assert found["rows_over"] == 4
+    assert found["forecast_over"] == 770.0
+    assert found["actual_over"] == 785.0
+    assert found["share_forecast_over"] == pytest.approx(0.8)
+    assert found["share_actual_over"] == pytest.approx(0.8)
+
+
+def test_a_large_factor_gives_real_zeros_not_nan():
+    found = bc_row(bc_run(factor=100.0))
+    assert found["rows_over"] == 0
+    assert (found["forecast_over"], found["actual_over"]) == (0.0, 0.0)
+    assert (found["share_forecast_over"], found["share_actual_over"]) == (0.0, 0.0)
+
+
+def test_the_factor_changes_only_the_over_columns():
+    a, b = bc_run(factor=1.0), bc_run(factor=100.0)
+    moved = {"share_forecast_over", "share_actual_over", "rows_over", "forecast_over",
+             "actual_over"}
+    for column in set(COHERENCE_COLUMNS) - moved:
+        pd.testing.assert_series_equal(a[column], b[column])
+
+
+def test_the_over_columns_describe_the_customers_whose_forecast_is_over():
+    # C's actual is over its limit and its forecast is not: C is in no over amount, though it
+    # is in the actual's share.
+    found = bc_row(bc_run(**bc_subset(("C", 10))))
+    assert found["share_actual_over"] == 1.0
+    assert found["share_forecast_over"] == 0.0
+    assert found["rows_over"] == 0
+    assert found["actual_over"] == 0.0
+    # B's forecast is over and its actual is not: its actual is what actual_over adds.
+    found = bc_row(bc_run(**bc_subset(("B", 10))))
+    assert found["share_actual_over"] == 0.0
+    assert found["rows_over"] == 1
+    assert found["actual_over"] == 20.0
+
+
+# --- negative and zero balances --------------------------------------------------------------
+
+@pytest.mark.parametrize("balance", [0.0, -0.0, -50.0, -1e9])
+def test_no_positive_balance_means_nothing_open(balance):
+    found = bc_one(balance, 10.0, 8.0)
+    assert found["open_balance"] == 0.0
+    assert found["rows_with_balance"] == 0
+    assert found["rows_nothing_open"] == 1
+    assert found["forecast_nothing_open"] == 10.0
+    assert found["actual_nothing_open"] == 4.0
+
+
+def test_the_smallest_positive_balance_is_a_balance():
+    found = bc_one(1e-9, 0.0, 0.0)
+    assert found["rows_with_balance"] == 1
+    assert found["rows_nothing_open"] == 0
+
+
+@pytest.mark.parametrize("column", ["forecast_share", "actual_share", "share_forecast_over",
+                                    "share_actual_over"])
+@pytest.mark.parametrize("balance", [0.0, -50.0])
+def test_with_no_balance_at_all_the_ratios_are_nan(column, balance):
+    assert np.isnan(bc_one(balance, 10.0, 8.0)[column])
+
+
+def test_with_no_balance_at_all_the_amounts_are_still_reported():
+    found = bc_one(-50.0, 10.0, 8.0)
+    assert (found["rows"], found["forecast"], found["actual"]) == (1, 10.0, 4.0)
+    assert (found["rows_over"], found["forecast_over"], found["actual_over"]) == (0, 0.0, 0.0)
+
+
+def test_a_credit_does_not_lower_the_balance_total():
+    # B 100 and E -50: the total is 100, not 50.
+    found = bc_row(bc_run(**bc_subset(("B", 10), ("E", 10))))
+    assert found["open_balance"] == 100.0
+
+
+def test_the_shares_divide_everyones_cash_by_the_balance_total():
+    # B (160 and 20, balance 100) and D (10 and 5, nothing open): 170 / 100 and 25 / 100, not
+    # 160 / 100 and 20 / 100.
+    found = bc_row(bc_run(**bc_subset(("B", 10), ("D", 10))))
+    assert found["forecast_share"] == pytest.approx(1.7)
+    assert found["actual_share"] == pytest.approx(0.25)
+
+
+def test_the_over_shares_count_customers_with_a_balance_only():
+    # B over and D nothing open: 1 of 1, not 1 of 2. D's huge forecast has no limit to pass.
+    rows = {("B", 10): BC_ROWS[("B", 10)], ("D", 10): (1e9, 1e9, 0.0)}
+    found = bc_row(bc_run(customers=bc_customers(rows), table=bc_table(rows)))
+    assert found["share_forecast_over"] == 1.0
+    assert found["rows_over"] == 1
+    assert found["forecast_over"] == 160.0
+
+
+def test_one_company_with_nothing_open_does_not_touch_the_others_ratios():
+    found = bc_run(**bc_subset(("A", 10), ("G", 10)))
+    assert np.isnan(bc_row(found, "TR04")["forecast_share"])
+    assert bc_row(found, "TR02")["forecast_share"] == 1.5
+    # ALL has a balance: A's 100. Forecast 150 + 30.
+    assert bc_row(found, "ALL")["forecast_share"] == 1.8
+
+
+# --- where the balance comes from ------------------------------------------------------------
+
+def test_the_balance_is_read_at_h_1_not_at_a_later_h(bc_result):
+    # bc_table's later h hold balance + 1000; a sum over h would be far above 490.
+    assert bc_row(bc_result)["open_balance"] == 490.0
+
+
+def test_the_balance_is_read_at_h_1_whatever_the_order_of_the_table():
+    pd.testing.assert_frame_equal(bc_run(table=bc_table().iloc[::-1]), bc_run())
+
+
+def test_each_origin_has_its_own_balance_of_the_same_customer():
+    # A at origin 9 owes 50, at origin 10 owes 100: both count, each once.
+    found = bc_row(bc_run(**bc_subset(("A", 9), ("A", 10))))
+    assert found["open_balance"] == 150.0
+    assert found["rows"] == 2
+    # A's limits are 75 and 150; its forecasts 60 and 150; neither is over.
+    assert found["rows_over"] == 0
+
+
+def test_a_customer_is_one_row_per_origin_not_one_per_h(bc_result):
+    # 8 (customer, origin) pairs against 16 rows of customers.
+    assert bc_row(bc_result)["rows"] == 8
+
+
+def test_a_balance_in_the_table_with_no_forecast_adds_nothing(bc_result):
+    # Z (5000, origin 10) and A at origin 8 (3333) are in the table and were never forecast.
+    assert bc_row(bc_result)["open_balance"] == 490.0
+    assert bc_row(bc_result, "TR02")["rows"] == 6
+
+
+def test_the_balance_is_not_deflated_again():
+    # Target week level 2: the balance stays 100.
+    assert bc_one(100.0, 0.0, 0.0)["open_balance"] == 100.0
+
+
+def test_a_balance_from_a_float_h_column_is_still_read():
+    table = bc_table().astype({"h": "float64"})
+    pd.testing.assert_frame_equal(bc_run(table=table), bc_run())
+
+
+# --- the actual cash -------------------------------------------------------------------------
+
+def test_the_forecast_is_all_h_of_the_origin_summed():
+    # B at origin 10: 100 + 60.
+    assert bc_row(bc_run(**bc_subset(("B", 10))))["forecast"] == 160.0
+
+
+def test_the_forecast_is_the_expected_column_not_p_times_m(bc_result):
+    # p x m is 1.5 on every row, 24.0 over the 16 rows.
+    assert bc_row(bc_result)["forecast"] == 824.0
+
+
+def test_the_forecast_is_not_deflated():
+    assert bc_one(100.0, 80.0, 0.0)["forecast"] == 80.0
+
+
+def test_the_actual_is_deflated_by_the_target_weeks_level_not_the_origins():
+    # C at origin 10: 240 / level of 11 (2) + 40 / level of 12 (4); by the origin's level (1)
+    # it would be 280.
+    assert bc_row(bc_run(**bc_subset(("C", 10))))["actual"] == 130.0
+
+
+def test_a_customer_with_no_weekly_row_paid_zero_and_is_still_counted():
+    found = bc_row(bc_run(**bc_subset(("E", 10))))
+    assert found["rows"] == 1
+    assert found["actual"] == 0.0
+    assert found["forecast"] == 4.0
+
+
+def test_a_customer_with_only_one_of_its_weeks_in_weekly_has_that_week():
+    # B has a row in week 11 and none in week 12.
+    assert bc_row(bc_run(**bc_subset(("B", 10))))["actual"] == 20.0
+
+
+def test_an_empty_weekly_table_gives_zero_actuals_not_nan():
+    found = bc_run(weekly=bc_weekly().iloc[0:0])
+    assert (found["actual"] == 0.0).all()
+    assert (found["actual_share"] == 0.0).all()
+    assert (found["share_actual_over"] == 0.0).all()
+    assert (found["forecast"] == bc_run()["forecast"]).all()
+
+
+def test_refunds_are_not_in_the_actual():
+    weekly = bc_weekly()
+    weekly["refunds"] = -123456.0
+    pd.testing.assert_frame_equal(bc_run(weekly=weekly), bc_run())
+
+
+def test_cash_of_customers_nobody_forecast_is_not_in_the_actual(bc_result):
+    # "not known" paid 66666 in week 11, with data.
+    assert bc_row(bc_result)["actual"] == 940.0
+
+
+def test_the_same_key_week_serves_two_origins(bc_result):
+    # A's week 11 (gross 200) is in origin 9 and in origin 10, each deflated to 100.
+    found = bc_row(bc_run(**bc_subset(("A", 9), ("A", 10))))
+    assert found["actual"] == 115.0 + 150.0
+
+
+# --- only the complete origins ---------------------------------------------------------------
+
+def test_an_origin_with_a_missing_target_week_is_dropped_whole():
+    # A and F at origin 11 are out: their h = 1 (week 12, with data) as well.
+    found = bc_run()
+    without = {pair: values for pair, values in BC_ROWS.items() if pair[1] != 11}
+    pd.testing.assert_frame_equal(found, bc_run(customers=bc_customers(without)))
+
+
+def test_dropping_an_incomplete_origin_does_not_touch_the_others(bc_result):
+    # Origin 10 shares week 12 with the dropped origin 11, and is whole.
+    assert bc_row(bc_result)["forecast"] == 824.0
+    assert bc_row(bc_result)["actual"] == 940.0
+    assert bc_row(bc_result)["open_balance"] == 490.0
+
+
+def test_a_missing_week_at_h_1_drops_the_origin_too():
+    # Week 11 missing: origins 9 (targets 10, 11) and 10 (targets 11, 12) go; origin 11 (12, 13)
+    # is whole once week 13 has data.
+    found = bc_run(weeks=make_weeks(14, missing={11}))
+    total = bc_row(found)
+    assert total["rows"] == 2
+    assert total["forecast"] == 6000.0
+    assert total["open_balance"] == 2 * 7777.0
+
+
+def test_an_origin_whose_target_week_is_past_the_calendar_is_dropped():
+    # The calendar ends at week 12, so origin 11 cannot be whole, week 13 being unknown.
+    pd.testing.assert_frame_equal(bc_run(weeks=make_weeks(12)), bc_run())
+
+
+def test_a_week_with_data_decides_not_the_cash_in_it():
+    # Week 13 has data now: A's forecast at origin 11 is complete, with its gross of 99999.
+    total = bc_row(bc_run(weeks=make_weeks(14)))
+    assert total["rows"] == 10
+    assert total["forecast"] == 824.0 + 6000.0
+    assert total["open_balance"] == 490.0 + 2 * 7777.0
+    # A: 200 / 4 + 99999 / 5; F: 0 + 0.
+    assert total["actual"] == pytest.approx(940.0 + 50.0 + 99999.0 / 5.0)
+
+
+def test_balance_coherence_cash_in_a_missing_week_is_never_counted(bc_result):
+    # A paid 99999 in the missing week 13, which only the dropped origin reaches.
+    assert bc_row(bc_result)["actual"] == 940.0
+
+
+def test_a_dropped_origin_needs_no_price_level():
+    # Week 13 has no data and no level; only the dropped origin 11 reaches it.
+    pd.testing.assert_frame_equal(bc_run(levels=bc_levels().drop(13)), bc_run())
+
+
+def test_a_dropped_origin_needs_no_balance():
+    # Origin 11 has no row in the table: no refusal, since it is not used.
+    table = bc_table()
+    pd.testing.assert_frame_equal(bc_run(table=table[table["origin_week"] != 11]), bc_run())
+
+
+def test_an_origin_with_rows_for_only_some_h_is_dropped():
+    # Origin 10 has no row at h = 2 at all: it cannot cover the same weeks as the actual.
+    customers = bc_customers()
+    customers = customers[~((customers["origin_week"] == 10) & (customers["h"] == 2))]
+    total = bc_row(bc_run(customers=customers))
+    assert total["rows"] == 1
+    assert total["forecast"] == 60.0
+
+
+def test_horizons_above_the_rows_h_leave_no_complete_origin():
+    bc_refused("no origin has data in all its target weeks", horizons=3)
+
+
+def test_horizons_one_needs_only_the_first_week():
+    # Origin 12 reaches 13 (missing) and goes; origins 9, 10, 11 reach weeks with data.
+    rows = {("A", 9): (30.0, 50.0), ("A", 12): (500.0, 700.0), ("B", 11): (70.0, 30.0)}
+    found = bc_row(bc_run(customers=bc_customers(rows, horizons=1),
+                          table=bc_table(rows, horizons=1), horizons=1))
+    assert found["rows"] == 2
+    assert found["forecast"] == 100.0
+    assert found["open_balance"] == 80.0
+    # A's 15 / 1 in week 10; B has no row in week 12.
+    assert found["actual"] == 15.0
+
+
+def test_a_week_is_incomplete_if_any_day_is_missing_as_the_calendar_says():
+    # is_missing decides, not days_with_file: flip it by hand on an otherwise full week.
+    weeks = make_weeks(14)
+    weeks.loc[weeks["week"] == 13, "is_missing"] = True
+    pd.testing.assert_frame_equal(bc_run(weeks=weeks), bc_run())
+
+
+# --- the order and index of the input do not matter ------------------------------------------
+
+def test_the_order_of_the_customers_does_not_matter(bc_result):
+    shuffled = bc_customers().sample(frac=1.0, random_state=3)
+    pd.testing.assert_frame_equal(bc_run(customers=shuffled), bc_result)
+
+
+def test_the_index_of_the_customers_does_not_matter(bc_result):
+    # rolling_forecasts keeps the table's index; here also with repeated labels.
+    customers = bc_customers()
+    customers.index = [5000 + i % 3 for i in range(len(customers))]
+    pd.testing.assert_frame_equal(bc_run(customers=customers), bc_result)
+
+
+def test_the_index_of_the_table_does_not_matter(bc_result):
+    table = bc_table()
+    table.index = [7] * len(table)
+    pd.testing.assert_frame_equal(bc_run(table=table), bc_result)
+
+
+def test_the_order_of_the_weekly_rows_does_not_matter(bc_result):
+    weekly = bc_weekly().sample(frac=1.0, random_state=1)
+    pd.testing.assert_frame_equal(bc_run(weekly=weekly), bc_result)
+
+
+def test_the_extra_columns_of_the_table_are_not_taken(bc_result):
+    assert "extra" not in bc_result.columns
+
+
+def test_same_inputs_give_the_same_report(bc_result):
+    pd.testing.assert_frame_equal(bc_run(), bc_result)
+
+
+def test_the_inputs_are_not_changed():
+    customers, table, weekly, weeks, levels = (bc_customers(), bc_table(), bc_weekly(),
+                                               bc_weeks(), bc_levels())
+    before = customers.copy(), table.copy(), weekly.copy(), weeks.copy(), levels.copy()
+    balance_coherence(customers, table, weekly, weeks, levels, BC_HORIZONS, BC_FACTOR)
+    pd.testing.assert_frame_equal(customers, before[0])
+    pd.testing.assert_frame_equal(table, before[1])
+    pd.testing.assert_frame_equal(weekly, before[2])
+    pd.testing.assert_frame_equal(weeks, before[3])
+    pd.testing.assert_series_equal(levels, before[4])
+
+
+def test_the_report_raises_no_warning(bc_result):
+    # Nothing-open companies included: a NaN by ratio_or_nan, not by a division.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        bc_run()
+        bc_one(-50.0, 10.0, 8.0)
+
+
+# --- the refusals ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [0, -1, -5])
+def test_balance_coherence_refuses_horizons_below_one(horizons):
+    bc_refused(f"horizons is {horizons}; horizons start at 1", horizons=horizons)
+
+
+@pytest.mark.parametrize("factor", [0, 0.0, -0.0, -1.5, -1e-12])
+def test_balance_coherence_refuses_a_factor_not_above_zero(factor):
+    bc_refused(f"factor is {factor}; it must be above 0", factor=factor)
+
+
+def test_balance_coherence_takes_a_very_small_factor():
+    assert bc_row(bc_run(factor=1e-12))["rows_over"] == 5
+
+
+def test_balance_coherence_refuses_an_h_above_horizons():
+    bc_refused("customer forecasts for h [2]; horizons is 1", horizons=1)
+
+
+def test_balance_coherence_refuses_an_h_below_one_and_sorts_the_list():
+    customers = bc_customers()
+    customers.loc[0, "h"] = 7
+    customers.loc[1, "h"] = 0
+    bc_refused("customer forecasts for h [0, 7]; horizons is 2", customers=customers)
+
+
+def test_balance_coherence_refuses_an_h_outside_even_at_a_dropped_origin():
+    customers = bc_customers()
+    customers.loc[customers["origin_week"] == 11, "h"] = 3
+    bc_refused("customer forecasts for h [3]; horizons is 2", customers=customers)
+
+
+def test_balance_coherence_refuses_a_repeated_key_origin_h():
+    customers = bc_customers()
+    repeated = pd.concat([customers, customers.iloc[[2]]], ignore_index=True)
+    bc_refused("1 customer forecasts are there twice "
+               "(first: {'key': 'A', 'origin_week': 10, 'h': 1})", customers=repeated)
+
+
+def test_balance_coherence_counts_every_repeat():
+    customers = bc_customers()
+    repeated = pd.concat([customers, customers.iloc[[2, 2, 5]]], ignore_index=True)
+    with pytest.raises(ValueError, match=r"^3 customer forecasts are there twice"):
+        bc_run(customers=repeated)
+
+
+def test_balance_coherence_refuses_a_repeat_even_at_a_dropped_origin():
+    customers = bc_customers()
+    at_11 = customers[customers["origin_week"] == 11].iloc[[0]]
+    with pytest.raises(ValueError, match=r"^1 customer forecasts are there twice"):
+        bc_run(customers=pd.concat([customers, at_11], ignore_index=True))
+
+
+def test_balance_coherence_the_same_key_at_another_origin_or_h_is_no_repeat(bc_result):
+    # A is at origins 9, 10, 11 and at h 1, 2: no refusal.
+    assert list(bc_result.columns) == COHERENCE_COLUMNS
+
+
+def test_balance_coherence_refuses_when_no_origin_is_complete():
+    bc_refused("no origin has data in all its target weeks",
+               weeks=make_weeks(14, missing={10, 11, 12}))
+
+
+def test_balance_coherence_refuses_a_calendar_that_ends_too_soon():
+    bc_refused("no origin has data in all its target weeks", weeks=make_weeks(5))
+
+
+def test_balance_coherence_refuses_an_empty_customer_table():
+    bc_refused("no origin has data in all its target weeks", customers=bc_customers().iloc[0:0])
+
+
+def test_balance_coherence_refuses_a_forecast_with_no_balance():
+    table = bc_table()
+    gone = (table["key"] == "A") & (table["origin_week"] == 9)
+    bc_refused("1 customer forecasts have no balance in the table "
+               "(first: {'key': 'A', 'origin_week': 9})", table=table[~gone])
+
+
+def test_balance_coherence_counts_every_forecast_with_no_balance():
+    # Per customer and origin, not per h: B and C at origin 10.
+    table = bc_table()
+    bc_refused("2 customer forecasts have no balance in the table "
+               "(first: {'key': 'B', 'origin_week': 10})",
+               table=table[~table["key"].isin(["B", "C"])])
+
+
+def test_a_balance_of_another_origin_does_not_serve():
+    # A has balances at origins 8 and 10, and none at 9.
+    table = bc_table()
+    table = table[~((table["key"] == "A") & (table["origin_week"] == 9))]
+    with pytest.raises(ValueError, match="have no balance"):
+        bc_run(table=table)
+
+
+def test_a_balance_only_at_a_later_h_does_not_serve():
+    # h = 1 is what the report reads; the decoy at h = 2 is not a fallback.
+    table = bc_table()
+    gone = (table["key"] == "B") & (table["origin_week"] == 10) & (table["h"] == 1)
+    bc_refused("1 customer forecasts have no balance in the table "
+               "(first: {'key': 'B', 'origin_week': 10})", table=table[~gone])
+
+
+def test_a_nan_balance_is_no_balance_not_nothing_open():
+    table = bc_table()
+    table.loc[(table["key"] == "C") & (table["origin_week"] == 10) & (table["h"] == 1),
+              "open_balance"] = np.nan
+    bc_refused("1 customer forecasts have no balance in the table "
+               "(first: {'key': 'C', 'origin_week': 10})", table=table)
+
+
+def test_balance_coherence_a_used_week_with_no_level_is_refused():
+    bc_refused("no price level for weeks [11]", levels=bc_levels().drop(11))
+
+
+def test_the_refusals_come_in_order():
+    customers = bc_customers()
+    twice = pd.concat([customers, customers.iloc[[2]]], ignore_index=True)
+    outside = twice.copy()
+    outside.loc[0, "h"] = 9
+    bc_refused("horizons is 0; horizons start at 1", customers=outside, horizons=0, factor=0)
+    bc_refused("factor is 0; it must be above 0", customers=outside, factor=0)
+    bc_refused("customer forecasts for h [9]; horizons is 2", customers=outside)
+    # h before the repeat; the repeat before the complete origins.
+    bc_refused("1 customer forecasts are there twice "
+               "(first: {'key': 'A', 'origin_week': 10, 'h': 1})", customers=twice,
+               weeks=make_weeks(5))
+    # The complete origins before the balances.
+    bc_refused("no origin has data in all its target weeks", weeks=make_weeks(5),
+               table=bc_table().iloc[0:0])
+
+
+# --- repeated rows that would count twice: pandas' merge checks refuse them ------------------
+
+def test_a_repeated_balance_row_fails_rather_than_counts_twice():
+    table = bc_table()
+    at_h_1 = table[(table["key"] == "B") & (table["origin_week"] == 10) & (table["h"] == 1)]
+    with pytest.raises(MergeError):
+        bc_run(table=pd.concat([table, at_h_1], ignore_index=True))
+
+
+def test_two_different_balances_for_one_customer_and_origin_fail():
+    table = bc_table()
+    at_h_1 = table[(table["key"] == "B") & (table["origin_week"] == 10)
+                   & (table["h"] == 1)].assign(open_balance=1.0)
+    with pytest.raises(MergeError):
+        bc_run(table=pd.concat([table, at_h_1], ignore_index=True))
+
+
+def test_a_repeated_balance_of_a_customer_nobody_forecast_fails_too():
+    # validate looks at the whole right-hand table, not only at the keys that match: Z has no
+    # forecast and still stops the report.
+    table = bc_table()
+    at_h_1 = table[(table["key"] == "Z") & (table["h"] == 1)]
+    with pytest.raises(MergeError):
+        bc_run(table=pd.concat([table, at_h_1], ignore_index=True))
+
+
+def test_a_repeated_row_at_a_later_h_is_not_read_at_all(bc_result):
+    table = bc_table()
+    later = table[(table["key"] == "B") & (table["origin_week"] == 10) & (table["h"] == 2)]
+    pd.testing.assert_frame_equal(bc_run(table=pd.concat([table, later], ignore_index=True)),
+                                  bc_result)
+
+
+def test_one_customer_under_two_companies_at_one_origin_fails():
+    # Summed per (key, company, origin): two rows for one balance, not a split of it.
+    customers = bc_customers()
+    customers.loc[(customers["key"] == "B") & (customers["h"] == 2), "company_code"] = "TR04"
+    with pytest.raises(MergeError):
+        bc_run(customers=customers)
+
+
+def test_a_repeated_key_week_of_the_weekly_table_fails():
+    weekly = bc_weekly()
+    with pytest.raises(MergeError):
+        bc_run(weekly=pd.concat([weekly, weekly.iloc[[0]]], ignore_index=True))
+
+
+# --- coherence_row called directly -----------------------------------------------------------
+
+def cr_rows(records):
+    """records: (expected, actual_real, open_balance)."""
+    return pd.DataFrame(records, columns=["expected", "actual_real", "open_balance"])
+
+
+def test_coherence_row_keys_are_the_columns_in_order():
+    found = coherence_row("TR02", cr_rows([(1.0, 2.0, 3.0)]), 1.5)
+    assert list(found) == COHERENCE_COLUMNS
+    assert found["company_code"] == "TR02"
+
+
+def test_coherence_row_by_hand():
+    found = coherence_row("X", cr_rows([(16.0, 1.0, 10.0), (1.0, 16.0, 10.0), (2.0, 3.0, 0.0),
+                                        (4.0, 5.0, -7.0)]), 1.5)
+    assert found == {"company_code": "X", "rows": 4, "forecast": 23.0, "actual": 25.0,
+                     "open_balance": 20.0, "forecast_share": 1.15, "actual_share": 1.25,
+                     "rows_with_balance": 2, "share_forecast_over": 0.5,
+                     "share_actual_over": 0.5, "rows_over": 1, "forecast_over": 16.0,
+                     "actual_over": 1.0, "rows_nothing_open": 2, "forecast_nothing_open": 6.0,
+                     "actual_nothing_open": 8.0}
+
+
+def test_coherence_row_values_are_plain_python_numbers():
+    found = coherence_row("X", cr_rows([(16.0, 1.0, 10.0), (2.0, 3.0, 0.0)]), 1.5)
+    for column, value in found.items():
+        if column == "company_code":
+            continue
+        assert type(value) in (int, float), (column, type(value))
+
+
+def test_coherence_row_on_no_rows_gives_zeros_and_nan():
+    found = coherence_row("X", cr_rows([]).astype("float64"), 1.5)
+    assert (found["rows"], found["forecast"], found["open_balance"]) == (0, 0.0, 0.0)
+    assert np.isnan(found["forecast_share"])
+    assert np.isnan(found["share_forecast_over"])
+
+
+# --- with the real rolling forecasts: the table's shape is what the report expects ---------------
+
+def test_balance_coherence_takes_the_real_rolling_forecasts(r_table, r_result):
+    # 1. rolling_forecasts' customers against its own training table (8 customers, h 1..5, 3
+    #    origins, index shuffled); no weekly cash, so every actual is a real 0.
+    found = balance_coherence(r_result.customers, r_table, make_weekly([]), make_weeks(60),
+                              make_levels(0, 60), 5, 1.5)
+    assert found["company_code"].tolist()[-1] == "ALL"
+    total = bc_row(found)
+    assert total["rows"] == 8 * len(R_ORIGINS)
+    # 2. The forecast is the customers' expected, and the balance the table's at h = 1, clipped.
+    assert total["forecast"] == pytest.approx(r_result.customers["expected"].sum())
+    at_1 = r_table[(r_table["h"] == 1) & r_table["origin_week"].isin(R_ORIGINS)]
+    assert total["open_balance"] == pytest.approx(at_1["open_balance"].clip(lower=0).sum())
+    assert total["actual"] == 0.0

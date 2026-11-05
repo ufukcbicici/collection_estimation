@@ -223,6 +223,8 @@ rule_doubtful_days = 90          # the financial rule (U14.4) leaves out invoice
 bootstrap_samples = 2000         # the paired bootstrap (U14.5c): resamples of the target
                                  # weeks (pooled) or of blocks of origins (5-week total)
 bootstrap_seed = 20261104        # makes the bootstrap repeatable
+coherence_factor = 1.5           # the balance check (U14.6) counts the customers whose 5-week
+                                 # cash is above this many times what they owe at the origin
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

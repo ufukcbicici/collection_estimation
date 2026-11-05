@@ -203,9 +203,11 @@ VALID = {
     # U14.4: rule_doubtful_days 60 (synthetic.toml has 90).
     # U14.5c: the paired bootstrap, 300 samples and seed 11 (synthetic.toml has 2000 and
     # 20261104; [joint_diagnostic] above has its own bootstrap_samples, 500).
+    # U14.6: the balance check's factor, 2.5 (synthetic.toml has 1.5).
     "evaluation": {"run": "true", "validation_origins": "[44, 37, 40]",
                    "test_origins": "[60, 57]", "rule_doubtful_days": "60",
-                   "with_model": "true", "bootstrap_samples": "300", "bootstrap_seed": "11"},
+                   "with_model": "true", "bootstrap_samples": "300", "bootstrap_seed": "11",
+                   "coherence_factor": "2.5"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -5358,14 +5360,15 @@ from collection_estimation.hurdle.settings import (  # noqa: E402
     EvaluationSettings, read_evaluation)
 
 EVALUATION = f"{FILE_NAME} [evaluation]"
-EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "rule_doubtful_days", "run",
-                   "test_origins", "validation_origins", "with_model"]
+EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "coherence_factor",
+                   "rule_doubtful_days", "run", "test_origins", "validation_origins",
+                   "with_model"]
 
 
 def evaluation_table(**changes):
     table = {"run": True, "validation_origins": [44, 37, 40], "test_origins": [60, 49],
              "rule_doubtful_days": 60, "with_model": True, "bootstrap_samples": 300,
-             "bootstrap_seed": 11}
+             "bootstrap_seed": 11, "coherence_factor": 2.5}
     table.update(changes)
     return table
 
@@ -5381,7 +5384,7 @@ def evaluation_error(horizons=5, **changes):
 def test_evaluation_settings_fields_in_order():
     assert [field.name for field in dataclasses.fields(EvaluationSettings)] == [
         "run", "with_model", "validation_origins", "test_origins", "rule_doubtful_days",
-        "bootstrap_samples", "bootstrap_seed"]
+        "bootstrap_samples", "bootstrap_seed", "coherence_factor"]
 
 
 def test_settings_has_an_evaluation_field_between_topups_and_debug():
@@ -5393,7 +5396,8 @@ def test_settings_has_an_evaluation_field_between_topups_and_debug():
 def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
     evaluation = load(tmp_path, repo).evaluation
     for attribute in ("run", "with_model", "validation_origins", "test_origins",
-                      "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed"):
+                      "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed",
+                      "coherence_factor"):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(evaluation, attribute, None)
     assert hash(evaluation) == hash(dataclasses.replace(evaluation))
@@ -5413,7 +5417,8 @@ def test_the_evaluation_section_is_read(tmp_path, repo):
     assert evaluation == EvaluationSettings(run=True, with_model=True,
                                             validation_origins=(37, 40, 44),
                                             test_origins=(57, 60), rule_doubtful_days=60,
-                                            bootstrap_samples=300, bootstrap_seed=11)
+                                            bootstrap_samples=300, bootstrap_seed=11,
+                                            coherence_factor=2.5)
 
 
 def test_the_origin_lists_are_tuples_of_ints(tmp_path, repo):
@@ -5514,7 +5519,7 @@ def test_the_overlap_check_does_not_use_the_diagnostic_origin(tmp_path, repo):
 def test_read_evaluation_by_hand():
     assert read_evaluation(evaluation_table(), 5, "here") == EvaluationSettings(
         run=True, with_model=True, validation_origins=(37, 40, 44), test_origins=(49, 60),
-        rule_doubtful_days=60, bootstrap_samples=300, bootstrap_seed=11)
+        rule_doubtful_days=60, bootstrap_samples=300, bootstrap_seed=11, coherence_factor=2.5)
 
 
 @pytest.mark.parametrize("validation, test, expected_validation, expected_test", [
@@ -5700,6 +5705,8 @@ def test_the_synthetic_evaluation_settings():
     # U14.5c (2026-11-04): the paired bootstrap, 2000 resamples, seeded.
     assert evaluation.bootstrap_samples == 2000
     assert evaluation.bootstrap_seed == 20261104
+    # U14.6 (2026-11-05): the balance check counts the customers above 1.5 x their balance.
+    assert evaluation.coherence_factor == 1.5
     # [joint_diagnostic]'s own bootstrap_samples is a different setting.
     assert type(settings.joint_diagnostic.bootstrap_samples) is int
 
@@ -5844,8 +5851,9 @@ def test_with_model_is_independent_of_run(tmp_path, repo):
 def test_with_model_missing_through_the_file_has_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, changes={("evaluation", "with_model"): REMOVE})
     assert message == (f"{EVALUATION}: missing ['with_model']; expected exactly "
-                       f"['bootstrap_samples', 'bootstrap_seed', 'rule_doubtful_days', 'run', "
-                       f"'test_origins', 'validation_origins', 'with_model']")
+                       f"['bootstrap_samples', 'bootstrap_seed', 'coherence_factor', "
+                       f"'rule_doubtful_days', 'run', 'test_origins', 'validation_origins', "
+                       f"'with_model']")
 
 
 def test_with_model_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
@@ -5919,8 +5927,9 @@ def test_the_synthetic_with_model_is_a_bool_whatever_its_value():
 # [joint_diagnostic] has a bootstrap_samples of its own (500 in VALID): the two never mix.
 # =============================================================================================
 
-BOOTSTRAP_EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "rule_doubtful_days", "run",
-                             "test_origins", "validation_origins", "with_model"]
+BOOTSTRAP_EVALUATION_KEYS = ["bootstrap_samples", "bootstrap_seed", "coherence_factor",
+                             "rule_doubtful_days", "run", "test_origins", "validation_origins",
+                             "with_model"]
 
 
 def test_bootstrap_settings_are_read_through_the_file(tmp_path, repo):
@@ -6094,3 +6103,124 @@ def test_the_bootstrap_settings_are_checked_after_the_origin_lists_and_run():
             == "here: run is 'yes', not true or false")
     assert (evaluation_error(with_model="no", bootstrap_seed=-1)
             == "here: with_model is 'no', not true or false")
+
+
+# =============================================================================================
+# U14.6: [evaluation] coherence_factor, the balance check's limit, a number above 0
+# (`positive_number_setting`). Required; read last. VALID holds 2.5.
+# =============================================================================================
+
+def test_coherence_factor_is_read_through_the_file(tmp_path, repo):
+    evaluation = load(tmp_path, repo).evaluation
+    assert evaluation.coherence_factor == 2.5
+    assert type(evaluation.coherence_factor) is float
+
+
+@pytest.mark.parametrize("text, expected", [("1.5", 1.5), ("2", 2.0), ("0.001", 0.001),
+                                            ("1e3", 1000.0)])
+def test_coherence_factor_good_values_through_the_file(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo, changes={("evaluation", "coherence_factor"): text}).evaluation
+    assert found.coherence_factor == expected
+    assert type(found.coherence_factor) is float
+
+
+def test_coherence_factor_missing_through_the_file_has_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "coherence_factor"): REMOVE})
+    assert message == (f"{EVALUATION}: missing ['coherence_factor']; expected exactly "
+                       f"{EVALUATION_KEYS}")
+
+
+def test_coherence_factor_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={
+        ("evaluation", "coherence_factor"): REMOVE, ("evaluation", "coherence_factr"): "1.5"})
+    assert message == (f"{EVALUATION}: missing ['coherence_factor']; unknown "
+                       f"['coherence_factr']; expected exactly {EVALUATION_KEYS}")
+
+
+def test_an_unknown_key_beside_coherence_factor_is_refused(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "coherence"): "1.5"})
+    assert message == (f"{EVALUATION}: unknown ['coherence']; expected exactly "
+                       f"{EVALUATION_KEYS}")
+
+
+def test_coherence_factor_in_another_section_is_unknown_there(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("topups", "coherence_factor"): "1.5"})
+    assert "[topups]" in message
+    assert "unknown ['coherence_factor']" in message
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("0.0", "0.0"), ("-1", "-1"),
+                                         ("-1.5", "-1.5"), ("true", "True"), ("false", "False"),
+                                         ('"1.5"', "'1.5'"), ("[1.5]", "[1.5]"), ("nan", "nan"),
+                                         ("inf", "inf"), ("-inf", "-inf")],
+                         ids=["zero", "zero-float", "negative", "negative-float", "true", "false",
+                              "text", "list", "nan", "inf", "minus-inf"])
+def test_a_bad_coherence_factor_through_the_file_has_the_exact_message(tmp_path, repo, text,
+                                                                       shown):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("evaluation", "coherence_factor"): text})
+    assert message == f"{EVALUATION}: coherence_factor is {shown}, not a number above 0"
+
+
+def test_a_bad_coherence_factor_is_refused_with_the_evaluation_switched_off(tmp_path, repo):
+    # A broken file fails on load, whichever steps run.
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "run"): "false",
+                                                          ("evaluation", "coherence_factor"): "0"})
+    assert message == f"{EVALUATION}: coherence_factor is 0, not a number above 0"
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1, -0.5, True, False, "1.5", None, [1.5],
+                                 float("inf"), float("-inf")],
+                         ids=["zero", "zero-float", "negative", "negative-float", "true", "false",
+                              "text", "none", "list", "inf", "minus-inf"])
+def test_read_evaluation_bad_coherence_factor_has_the_exact_message(bad):
+    assert (evaluation_error(coherence_factor=bad)
+            == f"here: coherence_factor is {bad!r}, not a number above 0")
+
+
+def test_read_evaluation_nan_coherence_factor_is_refused():
+    assert (evaluation_error(coherence_factor=float("nan"))
+            == "here: coherence_factor is nan, not a number above 0")
+
+
+@pytest.mark.parametrize("value", [1, 1.5, 0.001, 100])
+def test_read_evaluation_good_coherence_factor_is_a_float(value):
+    found = read_evaluation(evaluation_table(coherence_factor=value), 5, "here")
+    assert found.coherence_factor == value
+    assert type(found.coherence_factor) is float
+
+
+def test_read_evaluation_without_coherence_factor_raises_key_error():
+    table = evaluation_table()
+    del table["coherence_factor"]
+    with pytest.raises(KeyError):
+        read_evaluation(table, 5, "here")
+
+
+def test_coherence_factor_does_not_change_the_other_evaluation_fields():
+    a = read_evaluation(evaluation_table(coherence_factor=1.0), 5, "here")
+    b = read_evaluation(evaluation_table(coherence_factor=9.0), 5, "here")
+    assert dataclasses.replace(a, coherence_factor=9.0) == b
+    assert a != b
+
+
+def test_coherence_factor_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("evaluation", "coherence_factor"): "7.5"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "evaluation":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert a.evaluation != b.evaluation
+
+
+def test_coherence_factor_is_checked_after_the_other_evaluation_settings():
+    assert (evaluation_error(bootstrap_seed=-1, coherence_factor=0)
+            == "here: bootstrap_seed is -1, not a random seed (a whole number, 0 or more)")
+    assert (evaluation_error(validation_origins=[], coherence_factor=0)
+            == "here: validation_origins is empty")
+
+
+def test_the_synthetic_toml_has_a_usable_coherence_factor():
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.evaluation.coherence_factor > 0

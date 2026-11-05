@@ -26,6 +26,10 @@ for the total of the h weeks of each origin. Then, consolidated, whether one met
 more accurate than another or only luckier on these weeks (`paired_wape_bootstrap`). And where
 the hurdle model's bias comes from: its parts against their own actual cash (`component_bias`),
 and, for the known customers, how many pay against how much each pays (`payer_split`).
+
+U14.6, the balance check: the cash forecast for each customer over the h weeks against what it
+owes at the origin, with the same measures on the actual cash beside it (`balance_coherence`).
+A report only: it changes no forecast.
 """
 import time
 from dataclasses import asdict, dataclass
@@ -117,6 +121,12 @@ COMPONENT_COLUMNS = ["method", "company_code", "horizon", "part", "forecast", "a
 # The columns of the table `payer_split` returns, in order. Amounts in TRY of week 0.
 PAYER_COLUMNS = ["company_code", "horizon", "rows", "expected_payers", "actual_payers",
                  "p_ratio", "expected_per_payer", "actual_per_payer", "m_ratio", "pxm_ratio"]
+# The columns of the table `balance_coherence` returns, in order. Amounts in TRY of week 0.
+COHERENCE_COLUMNS = ["company_code", "rows", "forecast", "actual", "open_balance",
+                     "forecast_share", "actual_share", "rows_with_balance",
+                     "share_forecast_over", "share_actual_over", "rows_over", "forecast_over",
+                     "actual_over", "rows_nothing_open", "forecast_nothing_open",
+                     "actual_nothing_open"]
 # Two amounts this far apart (TRY) count as the same: rounding of sums, not a real gap.
 TIE_TOLERANCE = 0.01
 
@@ -1027,6 +1037,17 @@ def component_bias(rolled: Forecast | None, rule: RuleReference, actual: pd.Data
     return pd.DataFrame(found, columns=COMPONENT_COLUMNS)
 
 
+def with_receipts(rows: pd.DataFrame, weekly: pd.DataFrame, levels: pd.Series) -> pd.DataFrame:
+    """`rows` (with key and target_week) plus what each customer really paid in its target week:
+    gross_receipts, nominal, and actual_real, in TRY of week 0. A customer with no weekly row
+    paid 0. Refunds are not in it: they are a top-up."""
+    paid = weekly[["key", "week", "gross_receipts"]].rename(columns={"week": "target_week"})
+    rows = rows.merge(paid, on=["key", "target_week"], how="left", validate="many_to_one")
+    rows["gross_receipts"] = rows["gross_receipts"].fillna(0.0)
+    rows["actual_real"] = deflate(rows["gross_receipts"], rows["target_week"], levels)
+    return rows
+
+
 def payer_row(company: str, horizon: str, rows: pd.DataFrame) -> dict:
     """One row of `payer_split`: how many pay and how much each pays, forecast against actual.
 
@@ -1084,11 +1105,8 @@ def payer_split(customers: pd.DataFrame, weekly: pd.DataFrame, weeks: pd.DataFra
         raise ValueError("there are no customer forecasts in a week with data")
 
     # 2. What each customer really paid in its target week.
-    paid = weekly[["key", "week", "gross_receipts"]].rename(columns={"week": "target_week"})
-    rows = rows.merge(paid, on=["key", "target_week"], how="left", validate="many_to_one")
-    rows["gross_receipts"] = rows["gross_receipts"].fillna(0.0)
+    rows = with_receipts(rows, weekly, levels)
     rows["paid"] = rows["gross_receipts"] > 0
-    rows["actual_real"] = deflate(rows["gross_receipts"], rows["target_week"], levels)
 
     # 3. Per company and consolidated, each h and pooled.
     groups = [(company, rows[rows["company_code"] == company])
@@ -1102,3 +1120,106 @@ def payer_split(customers: pd.DataFrame, weekly: pd.DataFrame, weeks: pd.DataFra
                 found.append(payer_row(company, str(h), at_h))
         found.append(payer_row(company, POOLED, mine))
     return pd.DataFrame(found, columns=PAYER_COLUMNS)
+
+
+def coherence_row(company: str, rows: pd.DataFrame, factor: float) -> dict:
+    """One row of `balance_coherence`, from `rows`: one per customer and origin, with expected,
+    actual_real and open_balance."""
+    # 1. Customers who owe something, and customers with nothing open (or a credit).
+    with_balance = rows[rows["open_balance"] > 0]
+    nothing_open = rows[rows["open_balance"] <= 0]
+    balance = float(with_balance["open_balance"].sum())
+
+    # 2. Of those who owe something, whose forecast and whose actual cash is above the factor.
+    limit = factor * with_balance["open_balance"]
+    forecast_is_over = with_balance["expected"] > limit
+    actual_is_over = with_balance["actual_real"] > limit
+    over = with_balance[forecast_is_over]
+
+    forecast = float(rows["expected"].sum())
+    actual = float(rows["actual_real"].sum())
+    return {"company_code": company, "rows": len(rows),
+            "forecast": forecast, "actual": actual, "open_balance": balance,
+            "forecast_share": ratio_or_nan(forecast, balance),
+            "actual_share": ratio_or_nan(actual, balance),
+            "rows_with_balance": len(with_balance),
+            "share_forecast_over": ratio_or_nan(int(forecast_is_over.sum()), len(with_balance)),
+            "share_actual_over": ratio_or_nan(int(actual_is_over.sum()), len(with_balance)),
+            "rows_over": len(over),
+            "forecast_over": float(over["expected"].sum()),
+            "actual_over": float(over["actual_real"].sum()),
+            "rows_nothing_open": len(nothing_open),
+            "forecast_nothing_open": float(nothing_open["expected"].sum()),
+            "actual_nothing_open": float(nothing_open["actual_real"].sum())}
+
+
+def balance_coherence(customers: pd.DataFrame, table: pd.DataFrame, weekly: pd.DataFrame,
+                      weeks: pd.DataFrame, levels: pd.Series, horizons: int,
+                      factor: float) -> pd.DataFrame:
+    """Does the cash forecast for each customer over the `horizons` weeks fit what it owes at
+    the origin? A report only, in TRY of week 0.
+
+    The forecast may rightly be above the balance, since customers also pay invoices issued
+    after the origin. So each measure is also shown for the actual cash, for comparison.
+
+    `customers` is the `customers` of `rolling_forecasts`; `table` the training table, whose
+    open_balance is what the model saw (net of unapplied cash, deflated at the origin);
+    `weekly`, `weeks` and `levels` give the actual cash, as in `payer_split`. A balance of 0 or
+    below counts as nothing open, and adds 0 to the balance. Only origins with data in all
+    their target weeks are used, so that the forecast and the actual cash cover the same weeks.
+
+    One row per company (sorted) and "ALL"; columns `COHERENCE_COLUMNS`:
+      forecast_share, actual_share: forecast / balance and actual / balance, all customers
+      share_forecast_over, share_actual_over: of the customers with a balance, the share whose
+          forecast / actual cash is above `factor` x the balance
+      rows_over, forecast_over, actual_over: the customers whose forecast is above it
+      rows_nothing_open, forecast_nothing_open, actual_nothing_open: those with no balance
+
+    Raises ValueError if `horizons` or `factor` is not above 0, a row's h is not 1 to
+    `horizons`, a (key, origin, h) is there twice, no origin has data in all its target weeks,
+    or a forecast has no balance in `table`.
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    if factor <= 0:
+        raise ValueError(f"factor is {factor}; it must be above 0")
+    outside = sorted(set(customers["h"]) - set(range(1, horizons + 1)))
+    if outside:
+        raise ValueError(f"customer forecasts for h {outside}; horizons is {horizons}")
+    repeated = customers.duplicated(["key", "origin_week", "h"])
+    if repeated.any():
+        first = customers.loc[repeated, ["key", "origin_week", "h"]].iloc[0].to_dict()
+        raise ValueError(f"{int(repeated.sum())} customer forecasts are there twice "
+                         f"(first: {first})")
+
+    # 1. Only the origins with data in all their target weeks.
+    with_data = set(weeks.loc[~weeks["is_missing"], "week"])
+    rows = customers[customers["target_week"].isin(with_data)]
+    weeks_with_data = rows.groupby("origin_week")["target_week"].nunique()
+    complete = weeks_with_data[weeks_with_data == horizons].index
+    rows = rows[rows["origin_week"].isin(complete)]
+    if rows.empty:
+        raise ValueError("no origin has data in all its target weeks")
+
+    # 2. What each customer really paid in each target week.
+    rows = with_receipts(rows, weekly, levels)
+
+    # 3. The forecast and the actual cash over the weeks, per customer and origin.
+    by_customer = ["key", "company_code", "origin_week"]
+    summed = rows.groupby(by_customer, as_index=False)[["expected", "actual_real"]].sum()
+
+    # 4. What each customer owed at the origin (the same for every h, so h = 1 is enough).
+    balances = table.loc[table["h"] == 1, ["key", "origin_week", "open_balance"]]
+    summed = summed.merge(balances, on=["key", "origin_week"], how="left", validate="one_to_one")
+    no_balance = summed["open_balance"].isna()
+    if no_balance.any():
+        first = summed.loc[no_balance, ["key", "origin_week"]].iloc[0].to_dict()
+        raise ValueError(f"{int(no_balance.sum())} customer forecasts have no balance in the "
+                         f"table (first: {first})")
+
+    # 5. Per company and consolidated.
+    found = []
+    for company in sorted(set(summed["company_code"])):
+        found.append(coherence_row(company, summed[summed["company_code"] == company], factor))
+    found.append(coherence_row(CONSOLIDATED, summed, factor))
+    return pd.DataFrame(found, columns=COHERENCE_COLUMNS)

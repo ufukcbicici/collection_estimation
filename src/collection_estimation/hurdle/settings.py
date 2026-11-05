@@ -161,6 +161,8 @@ class EvaluationSettings:
                                            # this many days past due (doubtful)
     bootstrap_samples: int                 # the paired bootstrap's resamples (U14.5c)
     bootstrap_seed: int                    # makes the bootstrap repeatable (0 or more)
+    coherence_factor: float                # the balance check counts the customers above this
+                                           # many times their balance (U14.6)
 
 
 @dataclass(frozen=True)
@@ -268,7 +270,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                         "compare_last_origin", "compare_windows"}, f"{name} [topups]")
     evaluation = raw["evaluation"]
     check_keys(evaluation, {"run", "with_model", "validation_origins", "test_origins",
-                            "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed"},
+                            "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed",
+                            "coherence_factor"},
                f"{name} [evaluation]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
@@ -471,7 +474,9 @@ def read_evaluation(table: dict, horizons: int, where: str) -> EvaluationSetting
                               rule_doubtful_days=count_setting(table, "rule_doubtful_days",
                                                                where),
                               bootstrap_samples=count_setting(table, "bootstrap_samples", where),
-                              bootstrap_seed=seed_setting(table, "bootstrap_seed", where))
+                              bootstrap_seed=seed_setting(table, "bootstrap_seed", where),
+                              coherence_factor=positive_number_setting(table, "coherence_factor",
+                                                                       where))
 
 
 def read_collections_layout(table: dict, where: str) -> CollectionsLayout:

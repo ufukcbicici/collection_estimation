@@ -74,6 +74,7 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
     REFERENCES,
     RULE,
     actual_totals,
+    balance_coherence,
     component_bias,
     deflated_reference,
     evaluation_scores,
@@ -657,6 +658,11 @@ def main():
             split = payer_split(rolled.customers, weekly, weeks, levels,
                                 settings.receivables.horizons)
             show_payer_split(split, settings.receivables.horizons)
+            # U14.6: does each customer's forecast fit what it owes at the origin?
+            coherence = balance_coherence(rolled.customers, table, weekly, weeks, levels,
+                                          settings.receivables.horizons,
+                                          settings.evaluation.coherence_factor)
+            show_balance_coherence(coherence, settings.evaluation.coherence_factor)
 
     # Later steps follow as each unit is built.
 
@@ -1610,6 +1616,29 @@ def show_payer_split(split, horizons):
                                               "pxm_ratio": "p x m ratio"})
     print("        the same per company, all (origin, h):")
     print(per_company.set_index("company").round(3).to_string())
+
+
+def show_balance_coherence(coherence, factor):
+    """Step 17's balance check (U14.6), in TRY of week 0: the 5-week cash against the open
+    balance, forecast and actual, then the two groups the forecast overshoots."""
+    # 1. The shares, per company and consolidated.
+    columns = {"company_code": "company", "forecast_share": "forecast / balance",
+               "actual_share": "actual / balance",
+               "share_forecast_over": f"forecast > {factor:g}x",
+               "share_actual_over": f"actual > {factor:g}x"}
+    shares = coherence[list(columns)].rename(columns=columns).set_index("company")
+    print("        balance check (U14.6), each customer's cash over the weeks against what it "
+          "owes at the origin:")
+    print(shares.round(3).to_string())
+
+    # 2. The groups, consolidated.
+    total = coherence[coherence["company_code"] == CONSOLIDATED].iloc[0]
+    print(f"        above {factor:g}x the balance: {int(total['rows_over']):,} rows, forecast "
+          f"{total['forecast_over'] / 1e6:,.1f} M against actual "
+          f"{total['actual_over'] / 1e6:,.1f} M")
+    print(f"        nothing open: {int(total['rows_nothing_open']):,} rows, forecast "
+          f"{total['forecast_nothing_open'] / 1e6:,.1f} M against actual "
+          f"{total['actual_nothing_open'] / 1e6:,.1f} M")
 
 
 def show_actual_totals(actual, weekly, weeks):

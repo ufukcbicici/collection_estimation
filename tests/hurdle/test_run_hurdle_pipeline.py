@@ -5332,10 +5332,11 @@ def test_step_16_and_17_imports():
     # U14.3 added REFERENCES and deflated_reference to the one import of evaluate; U14.5
     # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
     # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap; U14.5d added
-    # KNOWN_CUSTOMERS, RULE, component_bias and payer_split.
+    # KNOWN_CUSTOMERS, RULE, component_bias and payer_split; U14.6 added balance_coherence.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
         ("HORIZON_TOTAL", None), ("HURDLE", None), ("KNOWN_CUSTOMERS", None), ("POOLED", None),
         ("REFERENCES", None), ("RULE", None), ("actual_totals", None),
+        ("balance_coherence", None),
         ("component_bias", None), ("deflated_reference", None), ("evaluation_scores", None),
         ("paired_wape_bootstrap", None), ("payer_split", None), ("rolling_fingerprint", None),
         ("rolling_forecasts", None), ("rule_reference", None), ("stack_forecasts", None)]
@@ -5412,6 +5413,11 @@ inspect.signature(script.component_bias).bind(None, "rule", "actual", "new_cash"
 inspect.signature(script.payer_split).bind("customers", "weekly", "weeks", "levels", 5)
 inspect.signature(script.show_component_bias).bind("bias", 5)
 inspect.signature(script.show_payer_split).bind("split", 5)
+# U14.6.
+assert script.balance_coherence is evaluate.balance_coherence
+inspect.signature(script.balance_coherence).bind("customers", "table", "weekly", "weeks",
+                                                 "levels", 5, 1.5)
+inspect.signature(script.show_balance_coherence).bind("coherence", 1.5)
 print("ok")
 """
 
@@ -6263,6 +6269,8 @@ STEP_17_FINGERPRINT = ["<fingerprint>", 1]
 STEP_17_HURDLE = "hurdle"
 STEP_17_OTHER_METHODS = ["deflated", "deflated_nolevel", "deflated_trend", "rule"]
 STEP_17_SAMPLES = 2000
+# U14.6: the fake [evaluation] coherence_factor.
+STEP_17_FACTOR = 1.75
 STEP_17_SEED = 7
 
 
@@ -6307,7 +6315,8 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         evaluation=SimpleNamespace(run=True, with_model=with_model,
                                    validation_origins=(33, 34, 35),
                                    bootstrap_samples=STEP_17_SAMPLES,
-                                   bootstrap_seed=STEP_17_SEED),
+                                   bootstrap_seed=STEP_17_SEED,
+                                   coherence_factor=STEP_17_FACTOR),
         receivables=SimpleNamespace(horizons=horizons),
         data=SimpleNamespace(cache_folder=cache_folder))
     namespace.update(
@@ -6336,7 +6345,10 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         component_bias=recorder("component_bias", "<bias>"),
         show_component_bias=recorder("show_component_bias", None),
         payer_split=recorder("payer_split", "<split>"),
-        show_payer_split=recorder("show_payer_split", None))
+        show_payer_split=recorder("show_payer_split", None),
+        # U14.6.
+        balance_coherence=recorder("balance_coherence", "<coherence>"),
+        show_balance_coherence=recorder("show_balance_coherence", None))
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
@@ -6358,7 +6370,8 @@ def test_step_17_with_model_true_calls_everything_in_order():
                                    "evaluation_scores", "show_evaluation_scores",
                                    "paired_wape_bootstrap", "show_paired_bootstrap",
                                    "component_bias", "show_component_bias",
-                                   "payer_split", "show_payer_split"]
+                                   "payer_split", "show_payer_split",
+                                   "balance_coherence", "show_balance_coherence"]
     assert SKIP_LINE not in printed
 
 
@@ -7302,7 +7315,11 @@ BIAS_PAYER_GUARD = "rolled is not None"
 BIAS_PAYER_STATEMENTS = [
     ("split = payer_split(rolled.customers, weekly, weeks, levels, "
      "settings.receivables.horizons)"),
-    "show_payer_split(split, settings.receivables.horizons)"]
+    "show_payer_split(split, settings.receivables.horizons)",
+    # U14.6: the balance check, right after the payer split, under the same guard.
+    ("coherence = balance_coherence(rolled.customers, table, weekly, weeks, levels, "
+     "settings.receivables.horizons, settings.evaluation.coherence_factor)"),
+    "show_balance_coherence(coherence, settings.evaluation.coherence_factor)"]
 
 
 def test_step_17_ends_with_the_bias_and_the_guarded_payer_split():
@@ -7384,8 +7401,9 @@ def test_the_bias_printouts_sit_right_before_show_actual_totals():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_actual_totals")
-    assert names[shown - 3:shown] == ["show_paired_bootstrap", "show_component_bias",
-                                      "show_payer_split"]
+    # U14.6 put show_balance_coherence after show_payer_split.
+    assert names[shown - 4:shown] == ["show_paired_bootstrap", "show_component_bias",
+                                      "show_payer_split", "show_balance_coherence"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7471,9 +7489,10 @@ def test_step_17_run_the_bias_comes_after_the_bootstraps_printout(with_model):
     assert names[start + 1:start + 3] == ["component_bias", "show_component_bias"]
 
 
-def test_step_17_run_the_payer_split_comes_last_with_its_printout():
+def test_step_17_run_the_payer_split_comes_after_the_bias_with_its_printout():
+    # U14.6's balance check now follows it; see the tests of the balance check.
     calls, _, _, _ = run_step_17(True)
-    assert [name for name, _, _ in calls][-2:] == ["payer_split", "show_payer_split"]
+    assert [name for name, _, _ in calls][-4:-2] == ["payer_split", "show_payer_split"]
 
 
 # show_component_bias on a hand-made table, horizons 2. Amounts in TRY, shown in millions:
@@ -7672,3 +7691,176 @@ def test_the_printout_of_the_rule_alone_has_only_the_rule(real_table_lines):
     second = real_table_lines[second_start:second_end]
     assert not any(line.startswith("hurdle") for line in second)
     assert second[-1] == "          rule (open invoices)  h1 0.571  h2 0.433"
+
+
+# Step 17, U14.6: the balance check, right after the payer split, only when the model ran. Wiring
+# on main()'s syntax tree, then step 17's block run with the fakes of run_step_17, then the exact
+# printout of show_balance_coherence on a hand-made table, in a separate process.
+
+COHERENCE_CALL_STATEMENT = BIAS_PAYER_STATEMENTS[2]
+COHERENCE_SHOW_STATEMENT = BIAS_PAYER_STATEMENTS[3]
+
+
+def test_step_17_the_guard_ends_with_the_balance_check():
+    guarded = [ast.unparse(node) for node in step_17_block().body[-1].body]
+    assert guarded[-2:] == [COHERENCE_CALL_STATEMENT, COHERENCE_SHOW_STATEMENT]
+    assert guarded[-3] == BIAS_PAYER_STATEMENTS[1]
+
+
+@pytest.mark.parametrize("name", ["balance_coherence", "show_balance_coherence"])
+def test_step_17_calls_each_coherence_function_once_in_main(name):
+    assert len(calls_to(main_tree(), name)) == 1, name
+    assert len(calls_to(step_17_block(), name)) == 1, name
+
+
+@pytest.mark.parametrize("name", ["balance_coherence", "show_balance_coherence"])
+def test_step_17_the_balance_check_is_only_inside_the_guard(name):
+    block = step_17_block()
+    assert ast.unparse(block.body[-1].test) == "rolled is not None"
+    assert len(calls_to(block.body[-1], name)) == 1
+    assert calls_to(with_model_if(block), name) == []
+
+
+def test_step_17_the_balance_check_calls_take_no_keywords():
+    block = step_17_block()
+    for name in ("balance_coherence", "show_balance_coherence"):
+        assert calls_to(block, name)[0].keywords == [], name
+
+
+def test_step_17_coherence_is_assigned_once():
+    assert len(assignments_to(step_17_block(), "coherence")) == 1
+
+
+def test_show_balance_coherence_is_a_module_level_function_before_show_actual_totals():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_balance_coherence"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["coherence", "factor"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+    assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
+    assert names.index("show_balance_coherence") + 1 == names.index("show_actual_totals")
+
+
+def test_step_17_run_the_balance_check_gets_its_arguments_in_order():
+    # The customers of the rolled forecasts, the training table, the weekly amounts, the
+    # calendar, the levels, the horizons, the factor.
+    calls, _, _, _ = run_step_17(True)
+    args, kwargs = by_name_of(calls)["balance_coherence"]
+    assert kwargs == {}
+    assert args == ("<rolled customers>", "<table>", "<weekly>", "<weeks>", "<levels>", 5,
+                    STEP_17_FACTOR)
+
+
+def test_step_17_run_the_printout_gets_the_table_and_the_factor():
+    calls, _, _, _ = run_step_17(True)
+    assert by_name_of(calls)["show_balance_coherence"] == (("<coherence>", STEP_17_FACTOR), {})
+
+
+def test_step_17_run_the_balance_check_comes_last_right_after_the_payer_split():
+    calls, _, _, _ = run_step_17(True)
+    assert [name for name, _, _ in calls][-4:] == ["payer_split", "show_payer_split",
+                                                   "balance_coherence",
+                                                   "show_balance_coherence"]
+
+
+def test_step_17_run_the_horizons_reach_the_balance_check():
+    calls, _, _, _ = run_step_17(True, horizons=3)
+    assert by_name_of(calls)["balance_coherence"][0][5] == 3
+
+
+@pytest.mark.parametrize("name", ["balance_coherence", "show_balance_coherence"])
+def test_step_17_run_without_the_model_there_is_no_balance_check(name):
+    calls, _, _, _ = run_step_17(False)
+    assert name not in [called for called, _, _ in calls]
+
+
+@pytest.mark.parametrize("name", ["balance_coherence", "show_balance_coherence"])
+def test_step_17_run_the_balance_check_reads_rolled_not_the_setting(name):
+    # with_model true, but load_with_cache gives None: `rolled` decides.
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: None)
+    assert name not in [called for called, _, _ in calls]
+
+
+def test_step_17_run_a_cached_model_gives_the_balance_check_its_customers():
+    cached = SimpleNamespace(customers="<cached customers>")
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: cached)
+    assert by_name_of(calls)["balance_coherence"][0][0] == "<cached customers>"
+
+
+# show_balance_coherence on a hand-made table, factor 1.5. TR04 has no balance (NaN shares).
+# ALL's groups: 1,234 rows, 1,560,000 and 520,000 TRY; 25,678 rows, 44,000,000 and 25,000,000.
+SHOW_COHERENCE = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import COHERENCE_COLUMNS
+
+no_ratio = float("nan")
+given = [
+    ("TR02", 6, 394.0, 420.0, 290.0, 394 / 290, 420 / 290, 4, 0.25, 0.5, 1, 7e6, 8e6, 2, 9e6, 1e6),
+    ("TR04", 2, 430.0, 520.0, 0.0, no_ratio, no_ratio, 0, no_ratio, no_ratio, 0, 0.0, 0.0, 2,
+     430.0, 520.0),
+    ("ALL", 26912, 824.0, 940.0, 290.0, 824 / 290, 940 / 290, 1234, 0.4, 0.6, 1234, 1.56e6,
+     5.2e5, 25678, 4.4e7, 2.5e7),
+]
+coherence = pd.DataFrame(given, columns=COHERENCE_COLUMNS)
+before = coherence.copy()
+script.show_balance_coherence(coherence, FACTOR)
+pd.testing.assert_frame_equal(coherence, before)
+print("ok")
+"""
+
+COHERENCE_PRINTOUT = [
+    "        balance check (U14.6), each customer's cash over the weeks against what it owes at "
+    "the origin:",
+    "         forecast / balance  actual / balance  forecast > 1.5x  actual > 1.5x",
+    "company                                                                      ",
+    "TR02                  1.359             1.448             0.25            0.5",
+    "TR04                    NaN               NaN              NaN            NaN",
+    "ALL                   2.841             3.241             0.40            0.6",
+    "        above 1.5x the balance: 1,234 rows, forecast 1.6 M against actual 0.5 M",
+    "        nothing open: 25,678 rows, forecast 44.0 M against actual 25.0 M",
+]
+
+
+def coherence_lines(factor):
+    result = run_code(SHOW_COHERENCE.replace("FACTOR", factor))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_balance_coherence_exact_printout():
+    assert coherence_lines("1.5") == COHERENCE_PRINTOUT
+
+
+def test_show_balance_coherence_a_whole_factor_prints_without_a_point():
+    lines = coherence_lines("2.0")
+    assert lines[1].split("  ")[-1].strip() == "actual > 2x"
+    assert lines[6].startswith("        above 2x the balance:")
+
+
+# The real function, end to end: its table is what the printout expects. Consolidated, from
+# test_evaluate's worked example: 824 / 490 = 1.682, 940 / 490 = 1.918; TR02 394 / 290 = 1.359.
+SHOW_REAL_COHERENCE = """
+import run_hurdle_pipeline as script
+from tests.hurdle.test_evaluate import bc_run
+
+script.show_balance_coherence(bc_run(), 1.5)
+print("ok")
+"""
+
+
+def test_the_printout_takes_the_real_table_of_the_worked_example():
+    result = run_code(SHOW_REAL_COHERENCE)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    assert lines[3].split() == ["TR02", "1.359", "1.448", "0.25", "0.5"]
+    assert lines[4].split() == ["TR04", "2.150", "2.600", "1.00", "1.0"]
+    assert lines[5].split() == ["ALL", "1.682", "1.918", "0.40", "0.6"]
+    assert lines[6] == "        above 1.5x the balance: 2 rows, forecast 0.0 M against actual 0.0 M"
+    assert lines[7] == "        nothing open: 3 rows, forecast 0.0 M against actual 0.0 M"
