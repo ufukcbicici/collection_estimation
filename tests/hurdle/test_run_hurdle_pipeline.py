@@ -5331,11 +5331,13 @@ def test_step_16_and_17_imports():
     assert len(evaluate_imports) == 1
     # U14.3 added REFERENCES and deflated_reference to the one import of evaluate; U14.5
     # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
-    # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap.
+    # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap; U14.5d added
+    # KNOWN_CUSTOMERS, RULE, component_bias and payer_split.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
-        ("HORIZON_TOTAL", None), ("HURDLE", None), ("POOLED", None), ("REFERENCES", None),
-        ("actual_totals", None), ("deflated_reference", None), ("evaluation_scores", None),
-        ("paired_wape_bootstrap", None), ("rolling_fingerprint", None),
+        ("HORIZON_TOTAL", None), ("HURDLE", None), ("KNOWN_CUSTOMERS", None), ("POOLED", None),
+        ("REFERENCES", None), ("RULE", None), ("actual_totals", None),
+        ("component_bias", None), ("deflated_reference", None), ("evaluation_scores", None),
+        ("paired_wape_bootstrap", None), ("payer_split", None), ("rolling_fingerprint", None),
         ("rolling_forecasts", None), ("rule_reference", None), ("stack_forecasts", None)]
     # The cache's one function, in an import of its own, right after evaluate's.
     cache_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
@@ -5400,6 +5402,16 @@ assert script.HURDLE is evaluate.HURDLE and script.HURDLE == "hurdle"
 assert script.paired_wape_bootstrap is evaluate.paired_wape_bootstrap
 inspect.signature(script.paired_wape_bootstrap).bind("forecasts", "actual", [], 5, 2000, 0)
 inspect.signature(script.show_paired_bootstrap).bind("bootstrap")
+# U14.5d.
+assert script.KNOWN_CUSTOMERS is evaluate.KNOWN_CUSTOMERS
+assert script.RULE is evaluate.RULE
+assert script.component_bias is evaluate.component_bias
+assert script.payer_split is evaluate.payer_split
+inspect.signature(script.component_bias).bind(None, "rule", "actual", "new_cash", "refunds",
+                                              "unidentified", "levels", 5)
+inspect.signature(script.payer_split).bind("customers", "weekly", "weeks", "levels", 5)
+inspect.signature(script.show_component_bias).bind("bias", 5)
+inspect.signature(script.show_payer_split).bind("split", 5)
 print("ok")
 """
 
@@ -5708,9 +5720,10 @@ def test_step_17_shows_the_deflated_reference_once_with_the_reference_rolled_and
 
 def test_step_17_ends_with_the_deflated_reference_and_its_printout():
     # U14.4 appended the financial rule's two statements after the reference's two,
-    # U14.5 the scores' three after those, and U14.5c the bootstrap's four after those.
+    # U14.5 the scores' three after those, U14.5c the bootstrap's four after those, and U14.5d
+    # the three of the bias and the payer split after those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-11:-9] == [
+    assert statements[-14:-12] == [
         "reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins, "
         "settings.receivables.horizons, week_zero)",
         "show_deflated_reference(reference, rolled, rolled_actual)"]
@@ -5731,9 +5744,9 @@ def test_step_17_is_still_the_last_step_after_the_deflated_reference():
     body = main_body()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
-    # Since U14.5c the deflated reference's printout is tenth from last, before the rule's two
-    # statements, the scores' three and the bootstrap's four.
-    assert ast.unparse(body[-1].body[-10]) == (
+    # Since U14.5d the deflated reference's printout is thirteenth from last, before the rule's
+    # two statements, the scores' three, the bootstrap's four and the three of the bias.
+    assert ast.unparse(body[-1].body[-13]) == (
         "show_deflated_reference(reference, rolled, rolled_actual)")
 
 
@@ -5909,10 +5922,10 @@ def test_step_17_shows_the_rule_reference_once_with_the_rule_and_the_actual():
 
 
 def test_step_17_ends_with_the_rule_reference_and_its_printout():
-    # Since U14.5 the scores' three statements follow the rule's two, and since U14.5c the
-    # bootstrap's four follow those.
+    # Since U14.5 the scores' three statements follow the rule's two, since U14.5c the
+    # bootstrap's four follow those, and since U14.5d the three of the bias those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-9:-7] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
+    assert statements[-12:-10] == [RULE_STATEMENT, SHOW_RULE_STATEMENT]
 
 
 def test_step_17_is_still_the_last_step_after_the_rule_reference():
@@ -5920,9 +5933,9 @@ def test_step_17_is_still_the_last_step_after_the_rule_reference():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    # Since U14.5c the rule's printout is eighth from last, before the scores' three and the
-    # bootstrap's four.
-    assert ast.unparse(body[-1].body[-8]) == SHOW_RULE_STATEMENT
+    # Since U14.5d the rule's printout is eleventh from last, before the scores' three, the
+    # bootstrap's four and the three of the bias.
+    assert ast.unparse(body[-1].body[-11]) == SHOW_RULE_STATEMENT
 
 
 def test_step_17_rule_reference_uses_the_same_origins_as_the_rolling_forecasts():
@@ -6132,10 +6145,12 @@ def with_model_if(block=None):
     return found[0]
 
 
-def test_step_17_has_one_with_model_branch_and_no_other_if():
+def test_step_17_has_one_with_model_branch_and_only_the_payer_split_guard_besides():
+    # U14.5d added the guard of payer_split, on `rolled` and not on the setting.
     ifs = [node for node in step_17_block().body if isinstance(node, ast.If)]
-    assert len(ifs) == 1
+    assert len(ifs) == 2
     assert ast.unparse(ifs[0].test) == "settings.evaluation.with_model"
+    assert ast.unparse(ifs[1].test) == "rolled is not None"
     assert "with_model" in ast.unparse(step_17_block())
     assert ast.unparse(main_tree()).count("settings.evaluation.with_model") == 1
 
@@ -6145,9 +6160,11 @@ def test_step_17_statement_order_with_the_with_model_branch():
     body = block.body
     shapes = [type(node).__name__ for node in body]
     # U14.5 appended stack_forecasts, evaluation_scores (two Assign) and the printout (Expr);
-    # U14.5c subject, pairs, the bootstrap (three Assign) and its printout (Expr).
+    # U14.5c subject, pairs, the bootstrap (three Assign) and its printout (Expr);
+    # U14.5d the bias (Assign), its printout (Expr) and the guarded payer split (If).
     assert shapes == ["Assign", "Expr", "Assign", "Assign", "If", "Assign", "Expr", "Assign",
-                      "Expr", "Assign", "Assign", "Expr", "Assign", "Assign", "Assign", "Expr"]
+                      "Expr", "Assign", "Assign", "Expr", "Assign", "Assign", "Assign", "Expr",
+                      "Assign", "Expr", "If"]
     assert ast.unparse(body[0]) == "origins = list(settings.evaluation.validation_origins)"
     assert ast.unparse(body[2]).startswith("rolled_actual = actual_totals(")
     assert ast.unparse(body[3]) == "rolled = None"
@@ -6165,6 +6182,9 @@ def test_step_17_statement_order_with_the_with_model_branch():
     assert ast.unparse(body[13]) == BOOT_PAIRS_STATEMENT
     assert ast.unparse(body[14]) == BOOT_CALL_STATEMENT
     assert ast.unparse(body[15]) == BOOT_SHOW_STATEMENT
+    assert ast.unparse(body[16]) == BIAS_CALL_STATEMENT
+    assert ast.unparse(body[17]) == BIAS_SHOW_STATEMENT
+    assert ast.unparse(body[18].test) == "rolled is not None"
 
 
 def test_step_17_with_model_branch_body_in_order():
@@ -6246,15 +6266,21 @@ STEP_17_SAMPLES = 2000
 STEP_17_SEED = 7
 
 
+def step_17_rolled(**fields):
+    """A fake of the rolling forecasts: since U14.5d step 17 reads their `customers`. A plain
+    namespace, so that the real cache can pickle it and two of them compare by their fields."""
+    return SimpleNamespace(customers="<rolled customers>", **fields)
+
+
 def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
-                rolled_result=None):
+                rolled_result=None, horizons=5):
     """Execute step 17's `if` with fake inputs and functions; return (calls, printed,
     rolled_result, actual_result).
 
     By default `load_with_cache` is a recorder that always misses: it records its call, then
     calls the fit function it was given (so rolling_forecasts is recorded right after it). A
     real `load_with_cache` (and a real `cache_folder`) can be passed instead; `rolled_result`
-    is what the fake rolling_forecasts returns (a fresh object() by default)."""
+    is what the fake rolling_forecasts returns (a fresh `step_17_rolled()` by default)."""
     calls, printed = [], []
 
     def recorder(name, result):
@@ -6274,7 +6300,7 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         methods = ([STEP_17_HURDLE] if rolled is not None else []) + STEP_17_OTHER_METHODS
         return {"method": [method for method in methods for _ in range(2)]}
 
-    rolled_result = object() if rolled_result is None else rolled_result
+    rolled_result = step_17_rolled() if rolled_result is None else rolled_result
     actual_result = object()
     namespace = {name: f"<{name}>" for name in STEP_17_NAMES}
     settings = SimpleNamespace(
@@ -6282,7 +6308,7 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
                                    validation_origins=(33, 34, 35),
                                    bootstrap_samples=STEP_17_SAMPLES,
                                    bootstrap_seed=STEP_17_SEED),
-        receivables=SimpleNamespace(horizons=5),
+        receivables=SimpleNamespace(horizons=horizons),
         data=SimpleNamespace(cache_folder=cache_folder))
     namespace.update(
         settings=settings, time=SimpleNamespace(perf_counter=lambda: 0.0),
@@ -6305,7 +6331,12 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         # U14.5c.
         HURDLE=STEP_17_HURDLE,
         paired_wape_bootstrap=recorder("paired_wape_bootstrap", "<bootstrap>"),
-        show_paired_bootstrap=recorder("show_paired_bootstrap", None))
+        show_paired_bootstrap=recorder("show_paired_bootstrap", None),
+        # U14.5d.
+        component_bias=recorder("component_bias", "<bias>"),
+        show_component_bias=recorder("show_component_bias", None),
+        payer_split=recorder("payer_split", "<split>"),
+        show_payer_split=recorder("show_payer_split", None))
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
@@ -6325,7 +6356,9 @@ def test_step_17_with_model_true_calls_everything_in_order():
                                    "show_deflated_reference", "rule_reference",
                                    "show_rule_reference", "stack_forecasts",
                                    "evaluation_scores", "show_evaluation_scores",
-                                   "paired_wape_bootstrap", "show_paired_bootstrap"]
+                                   "paired_wape_bootstrap", "show_paired_bootstrap",
+                                   "component_bias", "show_component_bias",
+                                   "payer_split", "show_payer_split"]
     assert SKIP_LINE not in printed
 
 
@@ -6335,7 +6368,8 @@ def test_step_17_with_model_false_does_not_call_rolling_forecasts():
                                    "show_deflated_reference", "rule_reference",
                                    "show_rule_reference", "stack_forecasts",
                                    "evaluation_scores", "show_evaluation_scores",
-                                   "paired_wape_bootstrap", "show_paired_bootstrap"]
+                                   "paired_wape_bootstrap", "show_paired_bootstrap",
+                                   "component_bias", "show_component_bias"]
     assert "block_feature_columns" not in [name for name, _, _ in calls]
 
 
@@ -6481,10 +6515,11 @@ EVAL_SHOW_STATEMENT = "show_evaluation_scores(scores, settings.receivables.horiz
 
 
 def test_step_17_has_the_three_score_statements_right_before_the_bootstrap():
-    # Since U14.5c the bootstrap's four statements follow the scores' three.
+    # Since U14.5c the bootstrap's four statements follow the scores' three, and since U14.5d
+    # the three of the bias and the payer split follow those.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-7:-4] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT,
-                                 EVAL_SHOW_STATEMENT]
+    assert statements[-10:-7] == [EVAL_STACK_STATEMENT, EVAL_SCORES_STATEMENT,
+                                  EVAL_SHOW_STATEMENT]
 
 
 def test_step_17_scores_come_right_after_show_rule_reference():
@@ -6499,8 +6534,9 @@ def test_step_17_is_still_the_last_step_after_the_scores():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    # Since U14.5c the scores' printout is fifth from last, before the bootstrap's four.
-    assert ast.unparse(body[-1].body[-5]) == EVAL_SHOW_STATEMENT
+    # Since U14.5d the scores' printout is eighth from last, before the bootstrap's four and
+    # the three of the bias and the payer split.
+    assert ast.unparse(body[-1].body[-8]) == EVAL_SHOW_STATEMENT
 
 
 @pytest.mark.parametrize("name", ["stack_forecasts", "evaluation_scores",
@@ -6593,8 +6629,10 @@ def test_step_17_each_score_function_runs_once(with_model):
     for name in ("stack_forecasts", "evaluation_scores", "show_evaluation_scores"):
         assert names.count(name) == 1, name
     # And they come in that order, right before the bootstrap's two calls (U14.5c).
-    assert names[-5:-2] == ["stack_forecasts", "evaluation_scores", "show_evaluation_scores"]
-    assert names[-2:] == ["paired_wape_bootstrap", "show_paired_bootstrap"]
+    start = names.index("stack_forecasts")
+    assert names[start:start + 5] == ["stack_forecasts", "evaluation_scores",
+                                      "show_evaluation_scores", "paired_wape_bootstrap",
+                                      "show_paired_bootstrap"]
 
 
 # show_evaluation_scores on a hand-made scores table, horizons 2, companies TR02, TR03 and ALL.
@@ -6890,7 +6928,7 @@ def test_step_17_run_the_fit_function_is_what_calls_rolling_forecasts():
 
 
 def test_step_17_run_the_result_of_load_with_cache_is_the_rolled_forecasts():
-    cached = object()
+    cached = step_17_rolled()
 
     def always_hit(*args, **kwargs):
         return cached
@@ -6924,7 +6962,7 @@ def real_cache_run(cache_folder, rolled_result):
 
 def test_step_17_with_a_prefilled_cache_does_not_call_rolling_forecasts(tmp_path, capsys):
     # 1. A cache written under the fingerprint step 17 will make.
-    cached = {"forecasts": [1.5, 2.5]}
+    cached = step_17_rolled(forecasts=[1.5, 2.5])
     step17_cache.load_with_cache(CACHED_ROLLING_NAME, STEP_17_FINGERPRINT, lambda: cached,
                                  tmp_path)
     capsys.readouterr()
@@ -6942,7 +6980,7 @@ def test_step_17_with_a_prefilled_cache_does_not_call_rolling_forecasts(tmp_path
 
 def test_step_17_with_an_empty_cache_fits_once_then_reads(tmp_path):
     # 1. No cache: the fit runs once and the cache files are written.
-    fitted = {"forecasts": [3.0]}
+    fitted = step_17_rolled(forecasts=[3.0])
     calls, _, _, _ = real_cache_run(tmp_path, rolled_result=fitted)
     assert [name for name, _, _ in calls].count("rolling_forecasts") == 1
     assert sorted(p.name for p in tmp_path.iterdir()) == [
@@ -6958,7 +6996,7 @@ def test_step_17_with_a_cache_under_another_fingerprint_fits_again(tmp_path):
     # A cache made from other inputs (another fingerprint) is not used.
     step17_cache.load_with_cache(CACHED_ROLLING_NAME, ["older inputs"], lambda: {"old": 1},
                                  tmp_path)
-    fitted = {"forecasts": [4.0]}
+    fitted = step_17_rolled(forecasts=[4.0])
     calls, _, _, _ = real_cache_run(tmp_path, rolled_result=fitted)
     by_name = by_name_of(calls)
     assert "rolling_forecasts" in by_name
@@ -6967,7 +7005,7 @@ def test_step_17_with_a_cache_under_another_fingerprint_fits_again(tmp_path):
 
 def test_step_17_the_cache_goes_to_the_settings_cache_folder(tmp_path):
     folder = tmp_path / "nested" / "cache"
-    real_cache_run(folder, rolled_result={"forecasts": [1.0]})
+    real_cache_run(folder, rolled_result=step_17_rolled(forecasts=[1.0]))
     assert (folder / f"{CACHED_ROLLING_NAME}.pkl").is_file()
     assert not (tmp_path / f"{CACHED_ROLLING_NAME}.pkl").exists()
 
@@ -6988,17 +7026,22 @@ BOOT_CALL_STATEMENT = ("bootstrap = paired_wape_bootstrap(forecasts, rolled_actu
 BOOT_SHOW_STATEMENT = "show_paired_bootstrap(bootstrap)"
 BOOT_STATEMENTS = [BOOT_SUBJECT_STATEMENT, BOOT_PAIRS_STATEMENT, BOOT_CALL_STATEMENT,
                    BOOT_SHOW_STATEMENT]
+# U14.5d: the three statements of the bias and the payer split follow the bootstrap's four.
+BIAS_CALL_STATEMENT = ("bias = component_bias(rolled, rule, rolled_actual, new_cash, refunds, "
+                       "unidentified, levels, settings.receivables.horizons)")
+BIAS_SHOW_STATEMENT = "show_component_bias(bias, settings.receivables.horizons)"
 
 
-def test_step_17_ends_with_the_four_bootstrap_statements():
+def test_step_17_has_the_four_bootstrap_statements_right_before_the_bias():
+    # Since U14.5d the three of the bias and the payer split follow them.
     statements = [ast.unparse(node) for node in step_17_block().body]
-    assert statements[-4:] == BOOT_STATEMENTS
+    assert statements[-7:-3] == BOOT_STATEMENTS
 
 
 def test_step_17_bootstrap_comes_right_after_show_evaluation_scores():
     statements = [ast.unparse(node) for node in step_17_block().body]
     shown = statements.index(EVAL_SHOW_STATEMENT)
-    assert statements[shown + 1:] == BOOT_STATEMENTS
+    assert statements[shown + 1:shown + 5] == BOOT_STATEMENTS
 
 
 def test_step_17_is_still_the_last_step_after_the_bootstrap():
@@ -7006,7 +7049,8 @@ def test_step_17_is_still_the_last_step_after_the_bootstrap():
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
-    assert ast.unparse(body[-1].body[-1]) == BOOT_SHOW_STATEMENT
+    # Since U14.5d the bootstrap's printout is fourth from last.
+    assert ast.unparse(body[-1].body[-4]) == BOOT_SHOW_STATEMENT
 
 
 @pytest.mark.parametrize("name", ["paired_wape_bootstrap", "show_paired_bootstrap"])
@@ -7063,12 +7107,13 @@ def test_show_paired_bootstrap_is_a_module_level_function_with_one_parameter():
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
 
 
-def test_show_paired_bootstrap_sits_between_show_evaluation_scores_and_show_actual_totals():
+def test_show_paired_bootstrap_sits_between_show_evaluation_scores_and_show_component_bias():
+    # Since U14.5d the two show functions of the bias come between it and show_actual_totals.
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_paired_bootstrap")
     assert names[shown - 1] == "show_evaluation_scores"
-    assert names[shown + 1] == "show_actual_totals"
+    assert names[shown + 1] == "show_component_bias"
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7111,7 +7156,7 @@ def test_step_17_run_the_printout_gets_the_bootstrap_table(with_model):
 
 def test_step_17_run_a_cached_model_is_still_the_subject():
     # rolled from the cache (not fitted) is not None: the hurdle is the subject.
-    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: object())
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: step_17_rolled())
     pairs = by_name_of(calls)["paired_wape_bootstrap"][0][2]
     assert {method for method, _ in pairs} == {"hurdle"}
 
@@ -7148,7 +7193,8 @@ def test_step_17_run_the_bootstrap_settings_follow_the_settings_object():
         **{name: recorder(name, f"<{name} result>") for name in (
             "actual_totals", "deflated_reference", "show_deflated_reference", "rule_reference",
             "show_rule_reference", "evaluation_scores", "show_evaluation_scores",
-            "paired_wape_bootstrap", "show_paired_bootstrap")})
+            "paired_wape_bootstrap", "show_paired_bootstrap", "component_bias",
+            "show_component_bias")})
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     # 2. The bootstrap got horizons 3, 13 samples and seed 0.
@@ -7245,3 +7291,384 @@ def test_show_paired_bootstrap_signs_and_percentages(bootstrap_lines):
     for text in ("+0.007", "-0.020", "-0.240", "+0.000", "[-0.012, +0.027]",
                  "[-0.300, -0.180]", "30%", "90%", "100%", " 0%"):
         assert text in joined, text
+
+
+# Step 17, U14.5d: where the bias comes from, right after the bootstrap's printout. Wiring on
+# main()'s syntax tree, then step 17's block run with the fakes of run_step_17, then the exact
+# printouts of show_component_bias and show_payer_split on hand-made tables, in a separate
+# process.
+
+BIAS_PAYER_GUARD = "rolled is not None"
+BIAS_PAYER_STATEMENTS = [
+    ("split = payer_split(rolled.customers, weekly, weeks, levels, "
+     "settings.receivables.horizons)"),
+    "show_payer_split(split, settings.receivables.horizons)"]
+
+
+def test_step_17_ends_with_the_bias_and_the_guarded_payer_split():
+    # 1. The last three statements of the block.
+    body = step_17_block().body
+    assert ast.unparse(body[-3]) == BIAS_CALL_STATEMENT
+    assert ast.unparse(body[-2]) == BIAS_SHOW_STATEMENT
+    assert isinstance(body[-1], ast.If)
+    # 2. The guard holds exactly the payer split and its printout, with no else.
+    assert ast.unparse(body[-1].test) == BIAS_PAYER_GUARD
+    assert [ast.unparse(node) for node in body[-1].body] == BIAS_PAYER_STATEMENTS
+    assert body[-1].orelse == []
+
+
+def test_step_17_the_bias_comes_right_after_the_bootstraps_printout():
+    statements = [ast.unparse(node) for node in step_17_block().body]
+    shown = statements.index(BOOT_SHOW_STATEMENT)
+    assert statements[shown + 1:shown + 3] == [BIAS_CALL_STATEMENT, BIAS_SHOW_STATEMENT]
+
+
+def test_step_17_is_still_the_last_step_after_the_bias():
+    body = main_body()
+    assert isinstance(body[-1], ast.If)
+    assert ast.unparse(body[-1].test) == "settings.evaluation.run"
+    assert body[-1].orelse == []
+    assert ast.unparse(body[-1].body[-1].test) == BIAS_PAYER_GUARD
+
+
+@pytest.mark.parametrize("name", ["component_bias", "show_component_bias", "payer_split",
+                                  "show_payer_split"])
+def test_step_17_calls_each_bias_function_once_in_main(name):
+    assert len(calls_to(main_tree(), name)) == 1, name
+    assert len(calls_to(step_17_block(), name)) == 1, name
+
+
+@pytest.mark.parametrize("name", ["component_bias", "show_component_bias"])
+def test_step_17_the_bias_is_outside_the_with_model_branch_and_the_guard(name):
+    # 1. Not in the one branch nor in the other.
+    block = step_17_block()
+    assert calls_to(with_model_if(block), name) == []
+    assert calls_to(block.body[-1], name) == []
+    # 2. So a direct statement of the block.
+    direct = [node for node in block.body if not isinstance(node, ast.If)
+              and calls_to(node, name)]
+    assert len(direct) == 1
+
+
+@pytest.mark.parametrize("name", ["payer_split", "show_payer_split"])
+def test_step_17_the_payer_split_is_only_inside_the_guard(name):
+    block = step_17_block()
+    assert calls_to(with_model_if(block), name) == []
+    assert len(calls_to(block.body[-1], name)) == 1
+
+
+def test_step_17_bias_calls_take_no_keywords():
+    block = step_17_block()
+    for name in ("component_bias", "show_component_bias", "payer_split", "show_payer_split"):
+        assert calls_to(block, name)[0].keywords == [], name
+
+
+def test_step_17_bias_and_split_are_assigned_once():
+    assert len(assignments_to(step_17_block(), "bias")) == 1
+    assert len(assignments_to(step_17_block(), "split")) == 1
+
+
+@pytest.mark.parametrize("name, parameters", [("show_component_bias", ["bias", "horizons"]),
+                                              ("show_payer_split", ["split", "horizons"])])
+def test_the_bias_printouts_are_module_level_functions(name, parameters):
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == name]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == parameters
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_the_bias_printouts_sit_right_before_show_actual_totals():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+    shown = names.index("show_actual_totals")
+    assert names[shown - 3:shown] == ["show_paired_bootstrap", "show_component_bias",
+                                      "show_payer_split"]
+
+
+# Running step 17's block with the fakes of run_step_17.
+
+def test_step_17_run_component_bias_gets_its_arguments_in_order():
+    # rolled, rule, the rolled actual, A, R, G, the levels, the settings' horizons.
+    calls, _, rolled, actual = run_step_17(True)
+    args, kwargs = by_name_of(calls)["component_bias"]
+    assert kwargs == {}
+    assert len(args) == 8
+    assert args[0] is rolled
+    assert args[1] == "<rule>"
+    assert args[2] is actual
+    assert args[3:] == ("<new_cash>", "<refunds>", "<unidentified>", "<levels>", 5)
+
+
+def test_step_17_run_payer_split_gets_its_arguments_in_order():
+    # The customers of the rolled forecasts, the weekly amounts, the calendar, the levels.
+    calls, _, _, _ = run_step_17(True)
+    args, kwargs = by_name_of(calls)["payer_split"]
+    assert kwargs == {}
+    assert args == ("<rolled customers>", "<weekly>", "<weeks>", "<levels>", 5)
+
+
+def test_step_17_run_the_printouts_get_the_tables_and_the_horizons():
+    calls, _, _, _ = run_step_17(True)
+    by_name = by_name_of(calls)
+    assert by_name["show_component_bias"] == (("<bias>", 5), {})
+    assert by_name["show_payer_split"] == (("<split>", 5), {})
+
+
+def test_step_17_run_the_horizons_follow_the_settings():
+    # 1. Another [receivables] horizons.
+    calls, _, _, _ = run_step_17(True, horizons=3)
+    by_name = by_name_of(calls)
+    # 2. All four calls get it.
+    assert by_name["component_bias"][0][-1] == 3
+    assert by_name["show_component_bias"][0][-1] == 3
+    assert by_name["payer_split"][0][-1] == 3
+    assert by_name["show_payer_split"][0][-1] == 3
+
+
+def test_step_17_run_without_the_model_the_bias_still_runs_and_the_payer_split_does_not():
+    # 1. with_model false.
+    calls, _, _, actual = run_step_17(False)
+    by_name = by_name_of(calls)
+    names = [name for name, _, _ in calls]
+    # 2. component_bias gets None for rolled and the rest as ever; its printout follows.
+    args, _ = by_name["component_bias"]
+    assert args[0] is None
+    assert args[1] == "<rule>"
+    assert args[2] is actual
+    assert args[3:] == ("<new_cash>", "<refunds>", "<unidentified>", "<levels>", 5)
+    assert by_name["show_component_bias"] == (("<bias>", 5), {})
+    # 3. No payer split: it needs the model's customer rows.
+    assert "payer_split" not in names
+    assert "show_payer_split" not in names
+    assert names[-2:] == ["component_bias", "show_component_bias"]
+
+
+def test_step_17_run_the_guard_reads_rolled_not_the_setting():
+    # with_model true, but load_with_cache gives None: `rolled` decides.
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: None)
+    names = [name for name, _, _ in calls]
+    assert "component_bias" in names
+    assert "payer_split" not in names
+
+
+def test_step_17_run_a_cached_model_gives_the_payer_split_its_customers():
+    # From the cache, not fitted: the customers of what the cache gave.
+    cached = SimpleNamespace(customers="<cached customers>")
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: cached)
+    by_name = by_name_of(calls)
+    assert by_name["payer_split"][0][0] == "<cached customers>"
+    assert by_name["component_bias"][0][0] is cached
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_step_17_run_the_bias_comes_after_the_bootstraps_printout(with_model):
+    calls, _, _, _ = run_step_17(with_model)
+    names = [name for name, _, _ in calls]
+    start = names.index("show_paired_bootstrap")
+    assert names[start + 1:start + 3] == ["component_bias", "show_component_bias"]
+
+
+def test_step_17_run_the_payer_split_comes_last_with_its_printout():
+    calls, _, _, _ = run_step_17(True)
+    assert [name for name, _, _ in calls][-2:] == ["payer_split", "show_payer_split"]
+
+
+# show_component_bias on a hand-made table, horizons 2. Amounts in TRY, shown in millions:
+#   hurdle, pooled: known 4.0 / 4.0, gap "+0.0", ratio 1.000
+#                   new 1.5 / 0.0, gap "+1.5", ratio NaN -> "nan"
+#                   refunds -0.25 -> "-0.2", -0.5, gap 0.25 -> "+0.2", ratio 0.500
+#                   price level 1234.5 -> "1,234.5", "1,000.0", gap "+234.5", 1.2345 -> "1.234"
+#   rule, pooled:   known 0.7 / 4.0, gap "-3.3", ratio 0.175
+#   per h:          hurdle 0.5 and 1.5; the rule has no h = 2 row, so "nan".
+# The TR02 rows hold 9000 million and must not be shown: only "ALL" is.
+SHOW_BIAS = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import COMPONENT_COLUMNS
+
+no_ratio = float("nan")
+given = [
+    ("hurdle", "ALL", "1", "known customers", 1000000.0, 2000000.0, -1000000.0, 0.5),
+    ("hurdle", "ALL", "2", "known customers", 3000000.0, 2000000.0, 1000000.0, 1.5),
+    ("hurdle", "ALL", "pooled", "known customers", 4000000.0, 4000000.0, 0.0, 1.0),
+    ("hurdle", "ALL", "1", "new customers", 8000000.0, 0.0, 8000000.0, no_ratio),
+    ("hurdle", "ALL", "pooled", "new customers", 1500000.0, 0.0, 1500000.0, no_ratio),
+    ("hurdle", "ALL", "pooled", "refunds", -250000.0, -500000.0, 250000.0, 0.5),
+    ("hurdle", "ALL", "pooled", "price level", 1234500000.0, 1000000000.0, 234500000.0, 1.2345),
+    ("hurdle", "TR02", "1", "known customers", 9e9, 9e9, 0.0, 7.0),
+    ("hurdle", "TR02", "pooled", "known customers", 9e9, 9e9, 0.0, 7.0),
+    ("rule", "ALL", "1", "known customers", 500000.0, 2000000.0, -1500000.0, 0.25),
+    ("rule", "ALL", "pooled", "known customers", 700000.0, 4000000.0, -3300000.0, 0.175),
+]
+bias = pd.DataFrame(given, columns=COMPONENT_COLUMNS)
+before = bias.copy()
+script.show_component_bias(bias, 2)
+pd.testing.assert_frame_equal(bias, before)
+print("ok")
+"""
+
+BIAS_PRINTOUT = [
+    "        bias per part (U14.5d), consolidated, all (origin, h), nominal, million TRY (the "
+    "price level row is part of the total's gap, not added to it):",
+    "                   part forecast   actual     gap  ratio",
+    "method                                                  ",
+    "hurdle  known customers      4.0      4.0    +0.0  1.000",
+    "hurdle    new customers      1.5      0.0    +1.5    nan",
+    "hurdle          refunds     -0.2     -0.5    +0.2  0.500",
+    "hurdle      price level  1,234.5  1,000.0  +234.5  1.234",
+    "rule    known customers      0.7      4.0    -3.3  0.175",
+    "        known customers, forecast / actual per h:",
+    "          hurdle                h1 0.500  h2 1.500",
+    "          rule (open invoices)  h1 0.250  h2 nan",
+]
+
+
+@pytest.fixture(scope="module")
+def bias_lines():
+    result = run_code(SHOW_BIAS)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_component_bias_exact_printout(bias_lines):
+    assert bias_lines == BIAS_PRINTOUT
+
+
+def test_show_component_bias_a_nan_ratio_is_printed_as_nan(bias_lines):
+    # An actual of 0: the gap is there, the ratio says so.
+    new_customers = [line for line in bias_lines if "new customers" in line]
+    assert len(new_customers) == 1
+    assert new_customers[0].split()[-2:] == ["+1.5", "nan"]
+
+
+def test_show_component_bias_shows_only_the_consolidated_rows(bias_lines):
+    # The TR02 rows hold 9000 million and a ratio of 7.
+    joined = "\n".join(bias_lines)
+    assert "9,000" not in joined
+    assert "7.000" not in joined
+
+
+def test_show_component_bias_a_horizon_without_a_row_is_nan(bias_lines):
+    assert bias_lines[-1].endswith("h1 0.250  h2 nan")
+
+
+def test_show_component_bias_names_the_rule_by_its_open_invoices(bias_lines):
+    assert bias_lines[-1].startswith("          rule (open invoices)")
+    assert bias_lines[-4].startswith("rule    known customers")
+
+
+# show_payer_split on a hand-made table, horizons 2. Consolidated, h = 2 has nobody expected
+# (NaN per payer and m ratio); TR04 had no payers at all (NaN ratios). The TR02 h = 1 row is
+# per company but not pooled, so it is in neither table; ALL's per-h rows are not in the second.
+SHOW_SPLIT = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.evaluate import PAYER_COLUMNS
+
+no_ratio = float("nan")
+given = [
+    ("TR02", "1", 4, 2.0, 3, 7.0, 60.0, 86.0, 7.0, 7.0),
+    ("TR02", "pooled", 6, 3.25, 5, 0.65, 55.3846, 74.0, 0.74844, 0.48649),
+    ("TR04", "pooled", 3, 2.0, 0, no_ratio, 25.0, no_ratio, no_ratio, no_ratio),
+    ("ALL", "1", 6, 3.0, 4, 0.75, 50.0, 70.0, 5 / 7, 150 / 280),
+    ("ALL", "2", 3, 0.0, 3, 0.0, no_ratio, 43.33333, no_ratio, 0.0),
+    ("ALL", "pooled", 9, 5.25, 7, 0.75, 43.80952, 58.57143, 0.74797, 0.56098),
+]
+split = pd.DataFrame(given, columns=PAYER_COLUMNS)
+before = split.copy()
+script.show_payer_split(split, 2)
+pd.testing.assert_frame_equal(split, before)
+print("ok")
+"""
+
+SPLIT_PRINTOUT = [
+    "        known customers, how many pay and how much each pays (real TRY; a ratio is "
+    "forecast / actual), consolidated:",
+    "         payers expected  payers actual  p ratio  per payer expected  per payer actual  "
+    "m ratio  p x m ratio",
+    "horizon" + " " * 101,
+    "1                   3.00              4     0.75               50.00            70.000    "
+    "0.714        0.536",
+    "2                   0.00              3     0.00                 NaN            43.333      "
+    "NaN        0.000",
+    "pooled              5.25              7     0.75               43.81            58.571    "
+    "0.748        0.561",
+    "        the same per company, all (origin, h):",
+    "         p ratio  m ratio  p x m ratio",
+    "company                               ",
+    "TR02        0.65    0.748        0.486",
+    "TR04         NaN      NaN          NaN",
+]
+
+
+@pytest.fixture(scope="module")
+def split_lines():
+    result = run_code(SHOW_SPLIT)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_payer_split_exact_printout(split_lines):
+    assert split_lines == SPLIT_PRINTOUT
+
+
+def test_show_payer_split_nan_ratios_are_printed_as_nan(split_lines):
+    assert split_lines[-1].split() == ["TR04", "NaN", "NaN", "NaN"]
+
+
+def test_show_payer_split_per_company_rows_are_the_pooled_ones_without_all(split_lines):
+    # 1. The second table has TR02 and TR04, once each; ALL is the first table.
+    second = split_lines[split_lines.index("        the same per company, all (origin, h):") + 3:]
+    assert [line.split()[0] for line in second] == ["TR02", "TR04"]
+    # 2. The TR02 h = 1 row, with its ratio of 7, is nowhere.
+    assert "7.0" not in "\n".join(split_lines)
+
+
+# The real functions, end to end: their tables are what the printouts expect.
+SHOW_REAL_TABLES = """
+import run_hurdle_pipeline as script
+from tests.hurdle.test_evaluate import cb_run, ps_run
+
+script.show_component_bias(cb_run(), 2)
+script.show_component_bias(cb_run(rolled=None), 2)
+script.show_payer_split(ps_run(), 2)
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def real_table_lines():
+    result = run_code(SHOW_REAL_TABLES)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_the_printouts_take_the_real_tables_of_the_worked_examples(real_table_lines):
+    # 1. Consolidated known customers per h, forecast / actual, from test_evaluate's worked
+    #    example: 2320 / 3277 = 0.708 and 5000 / 5329 = 0.938; the rule 1870 / 3277 = 0.571 and
+    #    2310 / 5329 = 0.433.
+    assert "          hurdle                h1 0.708  h2 0.938" in real_table_lines
+    assert "          rule (open invoices)  h1 0.571  h2 0.433" in real_table_lines
+    # 2. The payer split's pooled rows: TR02 p 0.65; TR04 1.00 and 1.25; ALL's p 0.75.
+    assert real_table_lines[-2].split() == ["TR02", "0.65", "0.748", "0.486"]
+    assert real_table_lines[-1].split() == ["TR04", "1.00", "1.250", "1.250"]
+
+
+def test_the_printout_of_the_rule_alone_has_only_the_rule(real_table_lines):
+    # Without the model: the table's one row and the one line per h come from the rule.
+    second_start = [i for i, line in enumerate(real_table_lines)
+                    if line.startswith("        bias per part")][1]
+    second_end = [i for i, line in enumerate(real_table_lines)
+                  if line.startswith("        known customers, how many")][0]
+    second = real_table_lines[second_start:second_end]
+    assert not any(line.startswith("hurdle") for line in second)
+    assert second[-1] == "          rule (open invoices)  h1 0.571  h2 0.433"

@@ -5198,3 +5198,1542 @@ def test_bootstrap_refusal_order_scored_rows_then_no_consolidated_then_actual():
     with pytest.raises(ValueError) as error:
         bs_run(actual=zero_week)
     assert str(error.value) == "every consolidated actual must be above 0 for a WAPE"
+
+
+# =============================================================================================
+# U14.5d, `part_actuals`, `part_rows`, `component_bias`: where the bias comes from, each part of
+# the forecast against its own actual cash. `payer_row`, `payer_split`: for the known customers,
+# how many pay against how much each pays.
+#
+# Every table is hand-made and every expected number is worked out by hand below. The worked
+# example of `component_bias` has two companies, origins 10 and 11, h = 1, 2:
+#
+#   (origin, h, target)   projected level   published level of the target week
+#   (10, 1, 11)           2.0               2.5
+#   (10, 2, 12)           3.0               3.5
+#   (11, 1, 12)           4.0               3.5
+#   (11, 2, 13)           5.0               4.5
+#
+# So week 12 is reached from two origins, at two different projected levels but one published
+# level. A wrong level, or an A read by target week instead of by (origin, h), shows.
+# =============================================================================================
+
+import warnings  # noqa: E402
+
+from pandas.errors import MergeError  # noqa: E402
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    ADDING_PARTS, COMPONENT_COLUMNS, KNOWN_CUSTOMERS, NEW_CUSTOMERS, PART_TOTAL, PAYER_COLUMNS,
+    PRICE_LEVEL, REFUND_PART, TIE_TOLERANCE, UNIDENTIFIED, component_bias, part_actuals,
+    part_rows, payer_row, payer_split, ratio_or_nan)
+from collection_estimation.hurdle.forecast import CUSTOMER_COLUMNS, TOTAL_COLUMNS  # noqa: E402
+
+CB_KEYS = ["company_code", "origin_week", "h", "target_week"]
+CB_PAIRS = [(10, 1, 11), (10, 2, 12), (11, 1, 12), (11, 2, 13)]
+CB_COMPANIES = ["TR02", "TR04"]
+CB_HORIZONS = 2
+CB_PROJECTED = {(10, 11): 2.0, (10, 12): 3.0, (11, 12): 4.0, (11, 13): 5.0}
+CB_PUBLISHED = {11: 2.5, 12: 3.5, 13: 4.5}
+
+# All the actual cash, by company and target week.
+CB_CASH = {"TR02": {11: 1000.0, 12: 2000.0, 13: 3000.0},
+           "TR04": {11: 100.0, 12: 200.0, 13: 300.0}}
+# Table A, by company, origin and h: 0 at h = 1 in this example.
+CB_NEW = {"TR02": {(10, 1): 0.0, (10, 2): 50.0, (11, 1): 0.0, (11, 2): 70.0},
+          "TR04": {(10, 1): 0.0, (10, 2): 5.0, (11, 1): 0.0, (11, 2): 7.0}}
+# Table G, by company and target week: TR04 has none at all.
+CB_UNIDENTIFIED = {"TR02": {11: 10.0, 12: 20.0, 13: 30.0}, "TR04": {11: 0.0, 12: 0.0, 13: 0.0}}
+# Table R, by company and target week: negative.
+CB_REFUNDS = {"TR02": {11: -1.0, 12: -2.0, 13: -3.0}, "TR04": {11: -4.0, 12: 0.0, 13: -6.0}}
+
+# What is left, by hand: actual - A - G - R.
+#   TR02 (10,1,11): 1000 -  0 - 10 + 1 =  991     TR04 (10,1,11): 100 - 0 - 0 + 4 = 104
+#   TR02 (10,2,12): 2000 - 50 - 20 + 2 = 1932     TR04 (10,2,12): 200 - 5 - 0 + 0 = 195
+#   TR02 (11,1,12): 2000 -  0 - 20 + 2 = 1982     TR04 (11,1,12): 200 - 0 - 0 + 0 = 200
+#   TR02 (11,2,13): 3000 - 70 - 30 + 3 = 2903     TR04 (11,2,13): 300 - 7 - 0 + 6 = 299
+CB_KNOWN = {"TR02": {(10, 1): 991.0, (10, 2): 1932.0, (11, 1): 1982.0, (11, 2): 2903.0},
+            "TR04": {(10, 1): 104.0, (10, 2): 195.0, (11, 1): 200.0, (11, 2): 299.0}}
+
+# The forecast's parts in TRY of week 0: (customers, new customers, unidentified, refunds), in
+# the order of CB_PAIRS. "ALL" is the two companies added up.
+CB_REAL_PARTS = {
+    "TR02": [(400.0, 1.0, 2.0, -1.0), (500.0, 10.0, 5.0, -2.0),
+             (300.0, 1.0, 5.0, -1.0), (600.0, 10.0, 5.0, -3.0)],
+    "TR04": [(40.0, 1.0, 0.0, -1.0), (50.0, 2.0, 0.0, -1.0),
+             (60.0, 1.0, 0.0, -2.0), (70.0, 2.0, 0.0, -2.0)],
+    "ALL": [(440.0, 2.0, 2.0, -2.0), (550.0, 12.0, 5.0, -3.0),
+            (360.0, 2.0, 5.0, -3.0), (670.0, 12.0, 5.0, -5.0)],
+}
+# The rule's open invoices (nominal), in the order of CB_PAIRS.
+CB_RULE_INVOICES = {"TR02": [900.0, 1000.0, 800.0, 1100.0], "TR04": [90.0, 100.0, 80.0, 110.0],
+                    "ALL": [990.0, 1100.0, 880.0, 1210.0]}
+
+# Every number component_bias must give: (company, horizon) -> (forecast, actual, gap, ratio),
+# None where the actual is 0 and so the ratio is NaN. Worked out from the tables above:
+#   TR02 known, h1: 400 x 2 + 300 x 4 = 2000 against 991 + 1982 = 2973.
+#   TR02 total, h1: 402 x 2 + 305 x 4 = 2024 against 1000 + 2000 = 3000.
+#   TR02 price level, h1: 2024 against 402 x 2.5 + 305 x 3.5 = 1005 + 1067.5 = 2072.5.
+#   TR02 h2 price level: 513 x 3.5 + 612 x 4.5 = 1795.5 + 2754 = 4549.5.
+#   TR04 h1 price level: 40 x 2.5 + 59 x 3.5 = 306.5; h2: 51 x 3.5 + 70 x 4.5 = 493.5.
+#   ALL  h1 price level: 442 x 2.5 + 364 x 3.5 = 2379; h2: 564 x 3.5 + 682 x 4.5 = 5043.
+CB_EXPECTED = {
+    KNOWN_CUSTOMERS: {
+        ("TR02", "1"): (2000.0, 2973.0, -973.0, 2000 / 2973),
+        ("TR02", "2"): (4500.0, 4835.0, -335.0, 4500 / 4835),
+        ("TR02", "pooled"): (6500.0, 7808.0, -1308.0, 6500 / 7808),
+        ("TR04", "1"): (320.0, 304.0, 16.0, 320 / 304),
+        ("TR04", "2"): (500.0, 494.0, 6.0, 500 / 494),
+        ("TR04", "pooled"): (820.0, 798.0, 22.0, 820 / 798),
+        ("ALL", "1"): (2320.0, 3277.0, -957.0, 2320 / 3277),
+        ("ALL", "2"): (5000.0, 5329.0, -329.0, 5000 / 5329),
+        ("ALL", "pooled"): (7320.0, 8606.0, -1286.0, 7320 / 8606),
+    },
+    NEW_CUSTOMERS: {
+        ("TR02", "1"): (6.0, 0.0, 6.0, None),
+        ("TR02", "2"): (80.0, 120.0, -40.0, 80 / 120),
+        ("TR02", "pooled"): (86.0, 120.0, -34.0, 86 / 120),
+        ("TR04", "1"): (6.0, 0.0, 6.0, None),
+        ("TR04", "2"): (16.0, 12.0, 4.0, 16 / 12),
+        ("TR04", "pooled"): (22.0, 12.0, 10.0, 22 / 12),
+        ("ALL", "1"): (12.0, 0.0, 12.0, None),
+        ("ALL", "2"): (96.0, 132.0, -36.0, 96 / 132),
+        ("ALL", "pooled"): (108.0, 132.0, -24.0, 108 / 132),
+    },
+    UNIDENTIFIED: {
+        ("TR02", "1"): (24.0, 30.0, -6.0, 0.8),
+        ("TR02", "2"): (40.0, 50.0, -10.0, 0.8),
+        ("TR02", "pooled"): (64.0, 80.0, -16.0, 0.8),
+        ("TR04", "1"): (0.0, 0.0, 0.0, None),
+        ("TR04", "2"): (0.0, 0.0, 0.0, None),
+        ("TR04", "pooled"): (0.0, 0.0, 0.0, None),
+        ("ALL", "1"): (24.0, 30.0, -6.0, 0.8),
+        ("ALL", "2"): (40.0, 50.0, -10.0, 0.8),
+        ("ALL", "pooled"): (64.0, 80.0, -16.0, 0.8),
+    },
+    REFUND_PART: {
+        ("TR02", "1"): (-6.0, -3.0, -3.0, 2.0),
+        ("TR02", "2"): (-21.0, -5.0, -16.0, 4.2),
+        ("TR02", "pooled"): (-27.0, -8.0, -19.0, 27 / 8),
+        ("TR04", "1"): (-10.0, -4.0, -6.0, 2.5),
+        ("TR04", "2"): (-13.0, -6.0, -7.0, 13 / 6),
+        ("TR04", "pooled"): (-23.0, -10.0, -13.0, 2.3),
+        ("ALL", "1"): (-16.0, -7.0, -9.0, 16 / 7),
+        ("ALL", "2"): (-34.0, -11.0, -23.0, 34 / 11),
+        ("ALL", "pooled"): (-50.0, -18.0, -32.0, 50 / 18),
+    },
+    PART_TOTAL: {
+        ("TR02", "1"): (2024.0, 3000.0, -976.0, 2024 / 3000),
+        ("TR02", "2"): (4599.0, 5000.0, -401.0, 4599 / 5000),
+        ("TR02", "pooled"): (6623.0, 8000.0, -1377.0, 6623 / 8000),
+        ("TR04", "1"): (316.0, 300.0, 16.0, 316 / 300),
+        ("TR04", "2"): (503.0, 500.0, 3.0, 503 / 500),
+        ("TR04", "pooled"): (819.0, 800.0, 19.0, 819 / 800),
+        ("ALL", "1"): (2340.0, 3300.0, -960.0, 2340 / 3300),
+        ("ALL", "2"): (5102.0, 5500.0, -398.0, 5102 / 5500),
+        ("ALL", "pooled"): (7442.0, 8800.0, -1358.0, 7442 / 8800),
+    },
+    PRICE_LEVEL: {
+        ("TR02", "1"): (2024.0, 2072.5, -48.5, 2024 / 2072.5),
+        ("TR02", "2"): (4599.0, 4549.5, 49.5, 4599 / 4549.5),
+        ("TR02", "pooled"): (6623.0, 6622.0, 1.0, 6623 / 6622),
+        ("TR04", "1"): (316.0, 306.5, 9.5, 316 / 306.5),
+        ("TR04", "2"): (503.0, 493.5, 9.5, 503 / 493.5),
+        ("TR04", "pooled"): (819.0, 800.0, 19.0, 819 / 800),
+        ("ALL", "1"): (2340.0, 2379.0, -39.0, 2340 / 2379),
+        ("ALL", "2"): (5102.0, 5043.0, 59.0, 5102 / 5043),
+        ("ALL", "pooled"): (7442.0, 7422.0, 20.0, 7442 / 7422),
+    },
+}
+# The rule's open invoices against the same known customers' cash.
+CB_EXPECTED_RULE = {
+    ("TR02", "1"): (1700.0, 2973.0, -1273.0, 1700 / 2973),
+    ("TR02", "2"): (2100.0, 4835.0, -2735.0, 2100 / 4835),
+    ("TR02", "pooled"): (3800.0, 7808.0, -4008.0, 3800 / 7808),
+    ("TR04", "1"): (170.0, 304.0, -134.0, 170 / 304),
+    ("TR04", "2"): (210.0, 494.0, -284.0, 210 / 494),
+    ("TR04", "pooled"): (380.0, 798.0, -418.0, 380 / 798),
+    ("ALL", "1"): (1870.0, 3277.0, -1407.0, 1870 / 3277),
+    ("ALL", "2"): (2310.0, 5329.0, -3019.0, 2310 / 5329),
+    ("ALL", "pooled"): (4180.0, 8606.0, -4426.0, 4180 / 8606),
+}
+CB_ORDER_COMPANIES = ["TR02", "TR04", "ALL"]
+CB_ORDER_HORIZONS = ["1", "2", "pooled"]
+CB_PARTS_IN_ORDER = [KNOWN_CUSTOMERS, NEW_CUSTOMERS, UNIDENTIFIED, REFUND_PART, PART_TOTAL,
+                     PRICE_LEVEL]
+
+
+# --- builders --------------------------------------------------------------------------------
+
+def cb_actual():
+    """The rows of `actual_totals` for the worked example, ALL included; actual_real a decoy."""
+    records = []
+    for origin, h, target in CB_PAIRS:
+        for company in CB_COMPANIES:
+            records.append((company, origin, h, target, CB_CASH[company][target], -1.0))
+        consolidated_cash = sum(CB_CASH[company][target] for company in CB_COMPANIES)
+        records.append((CONSOLIDATED, origin, h, target, consolidated_cash, -1.0))
+    return pd.DataFrame(records, columns=ACTUAL_COLUMNS)
+
+
+def cb_new_cash():
+    """Table A, with its target_week as side_tables.new_customer_cash gives it."""
+    records = [(company, origin, h, target, CB_NEW[company][(origin, h)])
+               for company in CB_COMPANIES for origin, h, target in CB_PAIRS]
+    return pd.DataFrame(records, columns=["company_code", "origin_week", "h", "target_week",
+                                          "new_customer_cash"])
+
+
+def cb_by_week(amounts, column):
+    records = [(company, week, amount) for company, by_week in amounts.items()
+               for week, amount in by_week.items()]
+    return pd.DataFrame(records, columns=["company_code", "week", column])
+
+
+def cb_refunds():
+    return cb_by_week(CB_REFUNDS, "refunds")
+
+
+def cb_unidentified():
+    return cb_by_week(CB_UNIDENTIFIED, "unidentified_cash")
+
+
+def cb_levels():
+    return pd.Series(CB_PUBLISHED)
+
+
+def cb_rolled(real_parts=None, projected=None):
+    """A Forecast whose `totals` have the real parts, the projected level of each row, their
+    sum as real_total and real_total x level as total."""
+    real_parts = CB_REAL_PARTS if real_parts is None else real_parts
+    projected = CB_PROJECTED if projected is None else projected
+    records = []
+    for company, parts in real_parts.items():
+        for (origin, h, target), (customers, new, unidentified, refund) in zip(CB_PAIRS, parts):
+            real_total = customers + new + unidentified + refund
+            projected_level = projected[(origin, target)]
+            records.append((company, origin, h, target, customers, new, unidentified, refund,
+                            real_total, projected_level, real_total * projected_level, False))
+    return Forecast(totals=pd.DataFrame(records, columns=TOTAL_COLUMNS),
+                    customers=pd.DataFrame(columns=CUSTOMER_COLUMNS))
+
+
+def cb_rule(invoices=None):
+    """A RuleReference whose `forecast` is a decoy: the part is `invoice_cash`."""
+    invoices = CB_RULE_INVOICES if invoices is None else invoices
+    records = []
+    for company, amounts in invoices.items():
+        for (origin, h, target), amount in zip(CB_PAIRS, amounts):
+            records.append({"company_code": company, "origin_week": origin, "h": h,
+                            "target_week": target, "invoice_cash": amount, "late_cash": 7.0,
+                            "fallback_delay_cash": 8.0, "topup_cash": 9.0, "price_level": -3.0,
+                            "forecast": -1234.0})
+    return RuleReference(totals=pd.DataFrame(records),
+                         invoices=pd.DataFrame({"key": ["K0"]}))
+
+
+def cb_run(**changes):
+    """component_bias on the worked example, with some arguments replaced."""
+    arguments = dict(rolled=cb_rolled(), rule=cb_rule(), actual=cb_actual(),
+                     new_cash=cb_new_cash(), refunds=cb_refunds(),
+                     unidentified=cb_unidentified(), levels=cb_levels(), horizons=CB_HORIZONS)
+    arguments.update(changes)
+    return component_bias(**arguments)
+
+
+def cb_parts_run(**changes):
+    """part_actuals on the worked example, with some tables replaced."""
+    arguments = dict(actual=cb_actual(), new_cash=cb_new_cash(), refunds=cb_refunds(),
+                     unidentified=cb_unidentified())
+    arguments.update(changes)
+    return part_actuals(**arguments)
+
+
+def cb_part_row(found, company, origin, h):
+    selected = found[(found["company_code"] == company) & (found["origin_week"] == origin)
+                     & (found["h"] == h)]
+    assert len(selected) == 1, (company, origin, h, len(selected))
+    return selected.iloc[0]
+
+
+def cb_bias_row(bias, method, part, company, horizon):
+    selected = bias[(bias["method"] == method) & (bias["part"] == part)
+                    & (bias["company_code"] == company) & (bias["horizon"] == horizon)]
+    assert len(selected) == 1, (method, part, company, horizon, len(selected))
+    return selected.iloc[0]
+
+
+def cb_assert_numbers(found, expected):
+    """expected: (forecast, actual, gap, ratio), ratio None for NaN."""
+    made, came, gap, ratio = expected
+    assert found["forecast"] == pytest.approx(made)
+    assert found["actual"] == pytest.approx(came)
+    assert found["gap"] == pytest.approx(gap)
+    if ratio is None:
+        assert np.isnan(found["ratio"])
+    else:
+        assert found["ratio"] == pytest.approx(ratio)
+
+
+def cb_refused(expected_message, **changes):
+    """component_bias must refuse with exactly this message."""
+    with pytest.raises(ValueError) as error:
+        cb_run(**changes)
+    assert str(error.value) == expected_message
+
+
+def cb_totals_edited(column, company, origin, h, change):
+    """The worked example's Forecast, with `change` added to one row's `column`."""
+    rolled = cb_rolled()
+    chosen = ((rolled.totals["company_code"] == company)
+              & (rolled.totals["origin_week"] == origin) & (rolled.totals["h"] == h))
+    assert chosen.sum() == 1
+    rolled.totals.loc[chosen, column] += change
+    return rolled
+
+
+# --- constants -------------------------------------------------------------------------------
+
+def test_component_bias_part_names():
+    assert KNOWN_CUSTOMERS == "known customers"
+    assert NEW_CUSTOMERS == "new customers"
+    assert UNIDENTIFIED == "unidentified"
+    assert REFUND_PART == "refunds"
+    assert PART_TOTAL == "total"
+    assert PRICE_LEVEL == "price level"
+
+
+def test_adding_parts_map_each_part_to_its_column_of_the_totals_in_order():
+    assert list(ADDING_PARTS.items()) == [(KNOWN_CUSTOMERS, "customers"),
+                                          (NEW_CUSTOMERS, "new_customer_cash"),
+                                          (UNIDENTIFIED, "unidentified_cash"),
+                                          (REFUND_PART, "refunds")]
+
+
+def test_price_level_and_total_are_not_adding_parts():
+    assert PRICE_LEVEL not in ADDING_PARTS
+    assert PART_TOTAL not in ADDING_PARTS
+
+
+def test_component_columns():
+    assert COMPONENT_COLUMNS == ["method", "company_code", "horizon", "part", "forecast",
+                                 "actual", "gap", "ratio"]
+
+
+def test_payer_columns():
+    assert PAYER_COLUMNS == ["company_code", "horizon", "rows", "expected_payers",
+                             "actual_payers", "p_ratio", "expected_per_payer",
+                             "actual_per_payer", "m_ratio", "pxm_ratio"]
+
+
+def test_tie_tolerance_is_one_kurus():
+    assert TIE_TOLERANCE == 0.01
+
+
+# --- ratio_or_nan ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("top, bottom, expected", [
+    (6.0, 3.0, 2.0), (0.0, 3.0, 0.0), (-6.0, 3.0, -2.0), (-6.0, -3.0, 2.0), (1, 4, 0.25)])
+def test_ratio_or_nan_divides(top, bottom, expected):
+    assert ratio_or_nan(top, bottom) == expected
+
+
+@pytest.mark.parametrize("top, bottom", [(1.0, 0.0), (0.0, 0.0), (-1.0, 0.0), (1.0, -0.0),
+                                         (1.0, 0), (float("nan"), 0.0), (1.0, float("nan")),
+                                         (float("nan"), 2.0)])
+def test_ratio_or_nan_is_nan_without_a_bottom_or_a_top(top, bottom):
+    assert np.isnan(ratio_or_nan(top, bottom))
+
+
+def test_ratio_or_nan_gives_a_plain_float_from_numpy_numbers():
+    assert type(ratio_or_nan(np.float64(1.0), np.int64(2))) is float
+
+
+# --- part_actuals ----------------------------------------------------------------------------
+
+def test_part_actuals_columns_and_row_order():
+    # 1. The keys, then the amounts; the companies' rows as they came, then ALL by origin and h.
+    found = cb_parts_run()
+    assert list(found.columns) == CB_KEYS + ["actual", "actual_new", "actual_unidentified",
+                                             "actual_refunds", "actual_known"]
+    companies_first = [(company, origin, h, target) for origin, h, target in CB_PAIRS
+                       for company in CB_COMPANIES]
+    consolidated_last = [(CONSOLIDATED, origin, h, target) for origin, h, target in CB_PAIRS]
+    assert list(found[CB_KEYS].itertuples(index=False, name=None)) == (companies_first
+                                                                       + consolidated_last)
+
+
+def test_part_actuals_a_is_read_by_origin_and_h_not_by_target_week():
+    # Week 12 is reached from (10, 2) and from (11, 1): one target week, two different A.
+    found = cb_parts_run()
+    assert cb_part_row(found, "TR02", 10, 2)["actual_new"] == 50.0
+    assert cb_part_row(found, "TR02", 11, 1)["actual_new"] == 0.0
+
+
+@pytest.mark.parametrize("origin, h", [(10, 2), (11, 1)])
+def test_part_actuals_g_and_r_are_read_by_target_week(origin, h):
+    # Week 12 from either origin: the same G and R.
+    found = cb_parts_run()
+    assert cb_part_row(found, "TR02", origin, h)["actual_unidentified"] == 20.0
+    assert cb_part_row(found, "TR02", origin, h)["actual_refunds"] == -2.0
+
+
+@pytest.mark.parametrize("company", CB_COMPANIES)
+@pytest.mark.parametrize("origin, h, target", CB_PAIRS)
+def test_part_actuals_known_is_what_is_left(company, origin, h, target):
+    # By hand in the table above: actual - A - G - R, with R negative so it adds.
+    found = cb_part_row(cb_parts_run(), company, origin, h)
+    assert found["target_week"] == target
+    assert found["actual"] == CB_CASH[company][target]
+    assert found["actual_known"] == pytest.approx(CB_KNOWN[company][(origin, h)])
+
+
+@pytest.mark.parametrize("origin, h, new, unidentified, refund, known", [
+    (10, 1, 0.0, 10.0, -5.0, 991.0 + 104.0),
+    (10, 2, 55.0, 20.0, -2.0, 1932.0 + 195.0),
+    (11, 1, 0.0, 20.0, -2.0, 1982.0 + 200.0),
+    (11, 2, 77.0, 30.0, -9.0, 2903.0 + 299.0)])
+def test_part_actuals_all_is_the_sum_of_the_companies(origin, h, new, unidentified, refund, known):
+    consolidated = cb_part_row(cb_parts_run(), CONSOLIDATED, origin, h)
+    assert consolidated["actual_new"] == pytest.approx(new)
+    assert consolidated["actual_unidentified"] == pytest.approx(unidentified)
+    assert consolidated["actual_refunds"] == pytest.approx(refund)
+    assert consolidated["actual_known"] == pytest.approx(known)
+
+
+def test_part_actuals_all_is_not_read_from_the_all_rows_of_the_actual():
+    # 1. The ALL rows of `actual` hold rubbish.
+    actual = cb_actual()
+    actual.loc[actual["company_code"] == CONSOLIDATED, "actual"] = -999999.0
+    # 2. ALL is still the companies added up: week 11 from origin 10 is 1000 + 100.
+    consolidated = cb_part_row(cb_parts_run(actual=actual), CONSOLIDATED, 10, 1)
+    assert consolidated["actual"] == 1100.0
+
+
+def test_part_actuals_the_parts_add_up_to_the_actual_in_every_row():
+    found = cb_parts_run()
+    added_up = (found["actual_known"] + found["actual_new"] + found["actual_unidentified"]
+                + found["actual_refunds"])
+    assert added_up.to_numpy() == pytest.approx(found["actual"].to_numpy())
+
+
+def test_part_actuals_company_code_is_plain_object():
+    assert cb_parts_run()["company_code"].dtype == object
+
+
+def test_part_actuals_inputs_unchanged():
+    # 1. Copies of every table.
+    actual, new_cash, refunds, unidentified = (cb_actual(), cb_new_cash(), cb_refunds(),
+                                               cb_unidentified())
+    copies = [table.copy() for table in (actual, new_cash, refunds, unidentified)]
+    # 2. Called, and each table is as it was.
+    part_actuals(actual, new_cash, refunds, unidentified)
+    for table, copied in zip((actual, new_cash, refunds, unidentified), copies):
+        pd.testing.assert_frame_equal(table, copied)
+
+
+# Refusals: a missing amount must not land in the known customers' cash.
+
+CB_FIRST_10_2 = "{'company_code': 'TR02', 'origin_week': 10, 'h': 2, 'target_week': 12}"
+
+
+def test_part_actuals_refuses_a_missing_a_row():
+    # 1. A has no row for TR02 at (10, 2).
+    new_cash = cb_new_cash()
+    new_cash = new_cash[~((new_cash["company_code"] == "TR02") & (new_cash["origin_week"] == 10)
+                          & (new_cash["h"] == 2))]
+    # 2. Refused, not counted as known cash.
+    with pytest.raises(ValueError) as error:
+        cb_parts_run(new_cash=new_cash)
+    assert str(error.value) == ("the side tables have no row for 1 rows of the actual cash "
+                                f"(first: {CB_FIRST_10_2})")
+
+
+def test_part_actuals_refuses_a_missing_g_row_and_counts_every_row_it_touches():
+    # 1. G has no row for TR02 in week 12, which (10, 2) and (11, 1) both target.
+    unidentified = cb_unidentified()
+    unidentified = unidentified[~((unidentified["company_code"] == "TR02")
+                                  & (unidentified["week"] == 12))]
+    # 2. Two rows of the actual are short of it.
+    with pytest.raises(ValueError) as error:
+        cb_parts_run(unidentified=unidentified)
+    assert str(error.value) == ("the side tables have no row for 2 rows of the actual cash "
+                                f"(first: {CB_FIRST_10_2})")
+
+
+def test_part_actuals_refuses_a_missing_r_row():
+    # R has no row for TR04 in week 13, targeted only by (11, 2).
+    refunds = cb_refunds()
+    refunds = refunds[~((refunds["company_code"] == "TR04") & (refunds["week"] == 13))]
+    with pytest.raises(ValueError) as error:
+        cb_parts_run(refunds=refunds)
+    assert str(error.value) == (
+        "the side tables have no row for 1 rows of the actual cash "
+        "(first: {'company_code': 'TR04', 'origin_week': 11, 'h': 2, 'target_week': 13})")
+
+
+def test_part_actuals_refuses_a_company_with_no_side_rows_at_all():
+    # 1. Table A lacks TR04: its four rows have nothing.
+    new_cash = cb_new_cash()
+    with pytest.raises(ValueError) as error:
+        cb_parts_run(new_cash=new_cash[new_cash["company_code"] != "TR04"])
+    # 2. The message counts the four rows and names the first.
+    assert str(error.value) == (
+        "the side tables have no row for 4 rows of the actual cash "
+        "(first: {'company_code': 'TR04', 'origin_week': 10, 'h': 1, 'target_week': 11})")
+
+
+def test_part_actuals_treats_a_nan_amount_like_a_missing_row():
+    # The row is there, its amount is not.
+    new_cash = cb_new_cash()
+    new_cash.loc[(new_cash["company_code"] == "TR02") & (new_cash["origin_week"] == 10)
+                 & (new_cash["h"] == 2), "new_customer_cash"] = float("nan")
+    with pytest.raises(ValueError) as error:
+        cb_parts_run(new_cash=new_cash)
+    assert str(error.value) == ("the side tables have no row for 1 rows of the actual cash "
+                                f"(first: {CB_FIRST_10_2})")
+
+
+def test_part_actuals_a_real_zero_in_a_side_table_is_not_missing():
+    # TR04's G is 0.0 in every week and TR04's R is 0.0 in week 12: no refusal, known unchanged.
+    found = cb_part_row(cb_parts_run(), "TR04", 11, 1)
+    assert found["actual_unidentified"] == 0.0
+    assert found["actual_refunds"] == 0.0
+    assert found["actual_known"] == 200.0
+
+
+def test_part_actuals_ignores_side_rows_outside_the_actual():
+    # 1. Side rows for a week, an origin and a company the actual does not have.
+    new_cash = pd.concat([cb_new_cash(), pd.DataFrame(
+        [("TR02", 10, 3, 13, 5555.0), ("TR99", 10, 1, 11, 5555.0)],
+        columns=cb_new_cash().columns)], ignore_index=True)
+    refunds = pd.concat([cb_refunds(), pd.DataFrame(
+        [("TR02", 99, -5555.0), ("TR99", 11, -5555.0)], columns=cb_refunds().columns)],
+        ignore_index=True)
+    unidentified = pd.concat([cb_unidentified(), pd.DataFrame(
+        [("TR02", 99, 5555.0), ("TR99", 11, 5555.0)], columns=cb_unidentified().columns)],
+        ignore_index=True)
+    # 2. Same result as without them.
+    found = cb_parts_run(new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+    pd.testing.assert_frame_equal(found, cb_parts_run())
+
+
+@pytest.mark.parametrize("table_name", ["new_cash", "refunds", "unidentified"])
+def test_part_actuals_a_repeated_side_row_is_refused_not_counted_twice(table_name):
+    # 1. Each side table with its first row twice.
+    tables = {"new_cash": cb_new_cash(), "refunds": cb_refunds(),
+              "unidentified": cb_unidentified()}
+    table = tables[table_name]
+    # 2. pandas' merge check refuses it (a repeat would double the rows of the actual).
+    with pytest.raises(MergeError):
+        cb_parts_run(**{table_name: pd.concat([table, table.iloc[[0]]], ignore_index=True)})
+
+
+def test_part_actuals_the_order_of_the_side_rows_does_not_matter():
+    # Side tables reversed: the same amounts on the same rows.
+    found = cb_parts_run(new_cash=cb_new_cash().iloc[::-1], refunds=cb_refunds().iloc[::-1],
+                         unidentified=cb_unidentified().iloc[::-1])
+    pd.testing.assert_frame_equal(found, cb_parts_run())
+
+
+# --- part_rows -------------------------------------------------------------------------------
+
+def cb_small_rows():
+    """Two companies, h 1 and 2; TR04 has only h = 2."""
+    return pd.DataFrame({"company_code": ["TR02", "TR02", "TR04"], "h": [1, 2, 2],
+                         "made": [10.0, 20.0, 5.0], "came": [4.0, 0.0, 0.0]})
+
+
+def test_part_rows_exact_rows():
+    # 1. TR02 h1 10/4; h2 20/0 so no ratio; pooled 30/4. TR04 has no h = 1, so no such row.
+    found = part_rows("a method", "a part", cb_small_rows(), "made", "came", 2)
+    # 2. NaN replaced by None so that the rows compare.
+    cleaned = [{name: (None if isinstance(value, float) and np.isnan(value) else value)
+                for name, value in made_row.items()} for made_row in found]
+    assert cleaned == [
+        {"method": "a method", "company_code": "TR02", "horizon": "1", "part": "a part",
+         "forecast": 10.0, "actual": 4.0, "gap": 6.0, "ratio": 2.5},
+        {"method": "a method", "company_code": "TR02", "horizon": "2", "part": "a part",
+         "forecast": 20.0, "actual": 0.0, "gap": 20.0, "ratio": None},
+        {"method": "a method", "company_code": "TR02", "horizon": "pooled", "part": "a part",
+         "forecast": 30.0, "actual": 4.0, "gap": 26.0, "ratio": 7.5},
+        {"method": "a method", "company_code": "TR04", "horizon": "2", "part": "a part",
+         "forecast": 5.0, "actual": 0.0, "gap": 5.0, "ratio": None},
+        {"method": "a method", "company_code": "TR04", "horizon": "pooled", "part": "a part",
+         "forecast": 5.0, "actual": 0.0, "gap": 5.0, "ratio": None},
+    ]
+
+
+def test_part_rows_keeps_the_companies_in_the_order_they_come():
+    found = part_rows("m", "p", cb_small_rows().iloc[::-1], "made", "came", 2)
+    assert found[0]["company_code"] == "TR04"
+
+
+def test_part_rows_empty_gives_no_rows():
+    assert part_rows("m", "p", cb_small_rows().iloc[0:0], "made", "came", 2) == []
+
+
+# --- component_bias: the exact numbers -------------------------------------------------------
+
+CB_EVERY_CASE = [(part, company, horizon) for part in CB_PARTS_IN_ORDER
+                 for company in CB_ORDER_COMPANIES for horizon in CB_ORDER_HORIZONS]
+
+
+@pytest.fixture(scope="module")
+def cb_bias():
+    return cb_run()
+
+
+@pytest.mark.parametrize("part, company, horizon", CB_EVERY_CASE)
+def test_component_bias_hurdle_exact_numbers(cb_bias, part, company, horizon):
+    found = cb_bias_row(cb_bias, HURDLE, part, company, horizon)
+    cb_assert_numbers(found, CB_EXPECTED[part][(company, horizon)])
+
+
+@pytest.mark.parametrize("company", CB_ORDER_COMPANIES)
+@pytest.mark.parametrize("horizon", CB_ORDER_HORIZONS)
+def test_component_bias_rule_exact_numbers(cb_bias, company, horizon):
+    found = cb_bias_row(cb_bias, RULE, KNOWN_CUSTOMERS, company, horizon)
+    cb_assert_numbers(found, CB_EXPECTED_RULE[(company, horizon)])
+
+
+@pytest.mark.parametrize("company", CB_ORDER_COMPANIES)
+@pytest.mark.parametrize("horizon", CB_ORDER_HORIZONS)
+def test_component_bias_the_four_gaps_add_up_to_the_total_gap(cb_bias, company, horizon):
+    # 1. The gaps of the four adding parts.
+    gaps = [cb_bias_row(cb_bias, HURDLE, part, company, horizon)["gap"] for part in ADDING_PARTS]
+    # 2. Their sum is the total's gap; the price level's is NOT part of the sum.
+    total = cb_bias_row(cb_bias, HURDLE, PART_TOTAL, company, horizon)
+    assert sum(gaps) == pytest.approx(total["gap"])
+
+
+@pytest.mark.parametrize("company", CB_ORDER_COMPANIES)
+@pytest.mark.parametrize("horizon", CB_ORDER_HORIZONS)
+def test_component_bias_the_forecasts_and_actuals_add_up_too(cb_bias, company, horizon):
+    made = [cb_bias_row(cb_bias, HURDLE, part, company, horizon)["forecast"]
+            for part in ADDING_PARTS]
+    came = [cb_bias_row(cb_bias, HURDLE, part, company, horizon)["actual"]
+            for part in ADDING_PARTS]
+    total = cb_bias_row(cb_bias, HURDLE, PART_TOTAL, company, horizon)
+    assert sum(made) == pytest.approx(total["forecast"])
+    assert sum(came) == pytest.approx(total["actual"])
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_component_bias_gaps_add_up_on_random_tables(seed):
+    # 1. Random parts, levels and cash; the adding-up holds whatever the amounts are.
+    generator = np.random.default_rng(seed)
+
+    def random_parts():
+        return [tuple(float(value) for value in generator.uniform(-500.0, 500.0, size=4))
+                for _ in CB_PAIRS]
+
+    by_company = {company: random_parts() for company in CB_COMPANIES}
+    by_company["ALL"] = [tuple(a + b for a, b in zip(first, second)) for first, second in
+                         zip(by_company["TR02"], by_company["TR04"])]
+    projected = {key: float(generator.uniform(1.0, 9.0)) for key in CB_PROJECTED}
+    actual = cb_actual()
+    actual["actual"] = generator.uniform(0.0, 5000.0, size=len(actual))
+    # 2. The sum of the four gaps is the total's gap in every row of the result.
+    bias = cb_run(rolled=cb_rolled(by_company, projected), actual=actual)
+    for company in CB_ORDER_COMPANIES:
+        for horizon in CB_ORDER_HORIZONS:
+            gaps = [cb_bias_row(bias, HURDLE, part, company, horizon)["gap"]
+                    for part in ADDING_PARTS]
+            total = cb_bias_row(bias, HURDLE, PART_TOTAL, company, horizon)["gap"]
+            assert sum(gaps) == pytest.approx(total)
+
+
+def test_component_bias_nominal_uses_the_projected_level_of_each_row(cb_bias):
+    # TR02 known, h = 1: 400 x 2 (origin 10) + 300 x 4 (origin 11) = 2000. At the published
+    # levels it would be 400 x 2.5 + 300 x 3.5 = 2050.
+    assert cb_bias_row(cb_bias, HURDLE, KNOWN_CUSTOMERS, "TR02", "1")["forecast"] == 2000.0
+
+
+def test_component_bias_price_level_forecast_is_the_total(cb_bias):
+    for company in CB_ORDER_COMPANIES:
+        for horizon in CB_ORDER_HORIZONS:
+            price = cb_bias_row(cb_bias, HURDLE, PRICE_LEVEL, company, horizon)
+            total = cb_bias_row(cb_bias, HURDLE, PART_TOTAL, company, horizon)
+            assert price["forecast"] == total["forecast"]
+
+
+def test_component_bias_price_level_actual_is_real_total_at_the_published_level(cb_bias):
+    # TR02, h = 1: 402 x 2.5 + 305 x 3.5 = 1005 + 1067.5. Not any part of the actual cash.
+    found = cb_bias_row(cb_bias, HURDLE, PRICE_LEVEL, "TR02", "1")
+    assert found["actual"] == pytest.approx(402 * 2.5 + 305 * 3.5)
+
+
+def test_component_bias_price_level_does_not_depend_on_the_actual_cash():
+    # 1. All the actual cash doubled.
+    actual = cb_actual()
+    actual["actual"] = actual["actual"] * 2
+    bias = cb_run(actual=actual)
+    # 2. The price level row is what it was; the total's actual has doubled.
+    found = cb_bias_row(bias, HURDLE, PRICE_LEVEL, "TR02", "1")
+    cb_assert_numbers(found, CB_EXPECTED[PRICE_LEVEL][("TR02", "1")])
+    assert cb_bias_row(bias, HURDLE, PART_TOTAL, "TR02", "1")["actual"] == 6000.0
+
+
+def test_component_bias_price_level_gap_is_zero_when_projected_equals_published():
+    # Each row's projected level is the published level of its target week.
+    projected = {(10, 11): 2.5, (10, 12): 3.5, (11, 12): 3.5, (11, 13): 4.5}
+    bias = cb_run(rolled=cb_rolled(projected=projected))
+    gaps = bias.loc[bias["part"] == PRICE_LEVEL, "gap"].to_numpy()
+    assert gaps == pytest.approx(np.zeros(9))
+
+
+def test_component_bias_the_price_level_gap_is_only_part_of_the_total_gap(cb_bias):
+    # -48.5 of -976 for TR02 at h = 1.
+    price = cb_bias_row(cb_bias, HURDLE, PRICE_LEVEL, "TR02", "1")["gap"]
+    total = cb_bias_row(cb_bias, HURDLE, PART_TOTAL, "TR02", "1")["gap"]
+    assert price == pytest.approx(-48.5)
+    assert total == pytest.approx(-976.0)
+
+
+def test_component_bias_refunds_keep_their_negative_sign(cb_bias):
+    refund_rows = cb_bias[cb_bias["part"] == REFUND_PART]
+    assert (refund_rows["forecast"] < 0).all()
+    assert (refund_rows["actual"] < 0).all()
+    # Too many refunds forecast: the gap is negative, and it lowers the total.
+    assert (refund_rows["gap"] < 0).all()
+    # Two negatives: the ratio stays positive.
+    assert (refund_rows["ratio"] > 0).all()
+
+
+def test_component_bias_ratio_is_nan_where_g_is_all_zero_and_the_gap_stays():
+    # 1. TR04's G is 0 in every week, but 1 of it is forecast at (10, 1): 2 at level 2.
+    parts = {company: list(values) for company, values in CB_REAL_PARTS.items()}
+    parts["TR04"][0] = (40.0, 1.0, 1.0, -1.0)
+    parts["ALL"][0] = (440.0, 2.0, 3.0, -2.0)
+    found = cb_bias_row(cb_run(rolled=cb_rolled(parts)), HURDLE, UNIDENTIFIED, "TR04", "1")
+    # 2. No ratio, but the gap is there.
+    assert np.isnan(found["ratio"])
+    assert found["gap"] == 2.0
+
+
+def test_component_bias_ratio_is_nan_for_new_customers_at_h_1_and_the_gap_stays(cb_bias):
+    # 2 + 4 forecast against an A of 0 at h = 1, for each company.
+    found = cb_bias_row(cb_bias, HURDLE, NEW_CUSTOMERS, "TR02", "1")
+    assert found["actual"] == 0.0
+    assert np.isnan(found["ratio"])
+    assert found["gap"] == 6.0
+    # h = 2 and pooled have an actual, so a ratio.
+    assert not np.isnan(cb_bias_row(cb_bias, HURDLE, NEW_CUSTOMERS, "TR02", "2")["ratio"])
+    assert not np.isnan(cb_bias_row(cb_bias, HURDLE, NEW_CUSTOMERS, "TR02", "pooled")["ratio"])
+
+
+def test_component_bias_no_ratio_is_infinite(cb_bias):
+    assert not np.isinf(cb_bias["ratio"].to_numpy()).any()
+
+
+# --- component_bias: rolled None, the rule, the order ----------------------------------------
+
+def test_component_bias_without_the_model_gives_only_the_rule_rows():
+    # 1. No hurdle model.
+    bias = cb_run(rolled=None)
+    # 2. One part of one method, three companies, three horizons.
+    assert set(bias["method"]) == {RULE}
+    assert set(bias["part"]) == {KNOWN_CUSTOMERS}
+    assert len(bias) == 9
+    assert list(bias.columns) == COMPONENT_COLUMNS
+    # 3. The same rows as with the model.
+    with_model = cb_run()
+    expected = with_model[with_model["method"] == RULE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(bias.reset_index(drop=True), expected)
+
+
+def test_component_bias_without_the_model_does_not_read_the_levels():
+    # Only the hurdle's price level row needs them.
+    bias = cb_run(rolled=None, levels=pd.Series(dtype="float64"))
+    assert len(bias) == 9
+
+
+def test_component_bias_the_rule_part_is_invoice_cash_not_the_rules_forecast(cb_bias):
+    # The rule's `forecast` is -1234 in every row of the builder.
+    rule_rows = cb_bias[cb_bias["method"] == RULE]
+    assert (rule_rows["forecast"] > 0).all()
+
+
+def test_component_bias_the_rule_is_compared_with_the_known_customers_cash(cb_bias):
+    # Not all the actual cash: the same actual as the hurdle's known customers' row.
+    for company in CB_ORDER_COMPANIES:
+        for horizon in CB_ORDER_HORIZONS:
+            rule_row = cb_bias_row(cb_bias, RULE, KNOWN_CUSTOMERS, company, horizon)
+            hurdle_row = cb_bias_row(cb_bias, HURDLE, KNOWN_CUSTOMERS, company, horizon)
+            assert rule_row["actual"] == hurdle_row["actual"]
+
+
+def test_component_bias_all_of_the_rule_is_its_own_all_rows():
+    # An ALL row of the rule that is not the sum of its companies: read as it is.
+    invoices = dict(CB_RULE_INVOICES)
+    invoices["ALL"] = [1.0, 2.0, 3.0, 4.0]
+    bias = cb_run(rolled=None, rule=cb_rule(invoices))
+    assert cb_bias_row(bias, RULE, KNOWN_CUSTOMERS, "ALL", "pooled")["forecast"] == 10.0
+
+
+def test_component_bias_all_of_the_hurdle_is_its_own_all_rows():
+    # The ALL rows of the totals are read, not the companies added up: raise one ALL row's
+    # customers and its total together (level 2 at (10, 1), so +1 real is +2 nominal).
+    rolled = cb_totals_edited("customers", "ALL", 10, 1, 1.0)
+    chosen = ((rolled.totals["company_code"] == "ALL") & (rolled.totals["origin_week"] == 10)
+              & (rolled.totals["h"] == 1))
+    rolled.totals.loc[chosen, "total"] += 2.0
+    bias = cb_run(rolled=rolled)
+    assert cb_bias_row(bias, HURDLE, KNOWN_CUSTOMERS, "ALL", "1")["forecast"] == 2322.0
+    assert cb_bias_row(bias, HURDLE, KNOWN_CUSTOMERS, "TR02", "1")["forecast"] == 2000.0
+
+
+def test_component_bias_column_order(cb_bias):
+    assert list(cb_bias.columns) == COMPONENT_COLUMNS
+
+
+def test_component_bias_row_order(cb_bias):
+    # The hurdle's parts in order, each by company (TR02, TR04, ALL) and horizon; then the rule.
+    expected = [(HURDLE, company, horizon, part) for part in CB_PARTS_IN_ORDER
+                for company in CB_ORDER_COMPANIES for horizon in CB_ORDER_HORIZONS]
+    expected += [(RULE, company, horizon, KNOWN_CUSTOMERS) for company in CB_ORDER_COMPANIES
+                 for horizon in CB_ORDER_HORIZONS]
+    columns = ["method", "company_code", "horizon", "part"]
+    assert list(cb_bias[columns].itertuples(index=False, name=None)) == expected
+
+
+def test_component_bias_the_horizon_column_is_text(cb_bias):
+    assert all(isinstance(value, str) for value in cb_bias["horizon"])
+
+
+def test_component_bias_weeks_without_actual_are_absent():
+    # 1. Week 13 has no data: the actual has no row for (11, 2, 13). The forecast does, and its
+    #    side rows and published level are there too; none of it may count.
+    actual = cb_actual()
+    actual = actual[actual["target_week"] != 13]
+    bias = cb_run(actual=actual)
+    # 2. TR02's known customers at h = 2 are only (10, 2, 12): 500 x 3 against 1932.
+    found = cb_bias_row(bias, HURDLE, KNOWN_CUSTOMERS, "TR02", "2")
+    cb_assert_numbers(found, (1500.0, 1932.0, -432.0, 1500 / 1932))
+    # 3. Pooled: 2000 + 1500 against 2973 + 1932.
+    found = cb_bias_row(bias, HURDLE, KNOWN_CUSTOMERS, "TR02", "pooled")
+    cb_assert_numbers(found, (3500.0, 4905.0, -1405.0, 3500 / 4905))
+    # 4. The rule's too: 1000 against 1932.
+    found = cb_bias_row(bias, RULE, KNOWN_CUSTOMERS, "TR02", "2")
+    cb_assert_numbers(found, (1000.0, 1932.0, -932.0, 1000 / 1932))
+
+
+def test_component_bias_an_h_without_any_row_has_no_row_in_the_result():
+    # Only h = 1 in the actual, horizons even 5: no row for h = 2, pooled is h = 1's.
+    actual = cb_actual()
+    bias = cb_run(actual=actual[actual["h"] == 1], horizons=5)
+    assert set(bias["horizon"]) == {"1", "pooled"}
+    one = cb_bias_row(bias, HURDLE, PART_TOTAL, "TR02", "1")
+    pooled = cb_bias_row(bias, HURDLE, PART_TOTAL, "TR02", "pooled")
+    assert one["forecast"] == pooled["forecast"] == 2024.0
+    assert one["actual"] == pooled["actual"] == 3000.0
+
+
+def test_component_bias_row_order_of_the_inputs_does_not_matter(cb_bias):
+    # Every table reversed except the actual, which sets the order of the result.
+    rolled = cb_rolled()
+    rule = cb_rule()
+    bias = cb_run(rolled=Forecast(totals=rolled.totals.iloc[::-1], customers=rolled.customers),
+                  rule=RuleReference(totals=rule.totals.iloc[::-1], invoices=rule.invoices),
+                  new_cash=cb_new_cash().iloc[::-1], refunds=cb_refunds().iloc[::-1],
+                  unidentified=cb_unidentified().iloc[::-1], levels=cb_levels().iloc[::-1])
+    pd.testing.assert_frame_equal(bias, cb_bias)
+
+
+def test_component_bias_forecasts_beyond_the_actual_are_ignored():
+    # 1. Forecast and rule rows for week 14, past the actual, with no published level.
+    rolled = cb_rolled()
+    extra_total = rolled.totals.iloc[[0]].assign(origin_week=11, h=3, target_week=14)
+    rule = cb_rule()
+    extra_rule = rule.totals.iloc[[0]].assign(origin_week=11, h=3, target_week=14)
+    # 2. The result is the same as without them.
+    bias = cb_run(
+        rolled=Forecast(totals=pd.concat([rolled.totals, extra_total], ignore_index=True),
+                        customers=rolled.customers),
+        rule=RuleReference(totals=pd.concat([rule.totals, extra_rule], ignore_index=True),
+                           invoices=rule.invoices))
+    pd.testing.assert_frame_equal(bias, cb_run())
+
+
+def test_component_bias_inputs_unchanged():
+    # 1. The inputs, and a copy of each table in them.
+    rolled, rule, actual, new_cash, refunds, unidentified, levels = (
+        cb_rolled(), cb_rule(), cb_actual(), cb_new_cash(), cb_refunds(), cb_unidentified(),
+        cb_levels())
+    frames = [rolled.totals, rolled.customers, rule.totals, rule.invoices, actual, new_cash,
+              refunds, unidentified]
+    copies = [frame.copy() for frame in frames]
+    levels_copy = levels.copy()
+    # 2. Called, and each is as it was.
+    component_bias(rolled, rule, actual, new_cash, refunds, unidentified, levels, CB_HORIZONS)
+    for frame, copied in zip(frames, copies):
+        pd.testing.assert_frame_equal(frame, copied)
+    pd.testing.assert_series_equal(levels, levels_copy)
+
+
+def test_component_bias_works_on_the_real_actual_totals():
+    # 1. actual_totals on a small weekly table: week 11 has TR02 100 and TR04 10 less a refund
+    #    of 3; week 12 is missing.
+    weekly = make_weekly([("K1", "TR02", "C1", 11, 100.0, 0.0),
+                          ("K2", "TR04", "C2", 11, 10.0, -3.0),
+                          ("K1", "TR02", "C1", 12, 777.0, 0.0)])
+    actual = actual_totals(weekly, make_weeks(13, missing={12}), make_levels(), CB_COMPANIES,
+                           [10], 2)
+    # 2. Only h = 1 has data; its parts are zero but for R of TR04 in week 11.
+    new_cash = pd.DataFrame([("TR02", 10, 1, 11, 0.0), ("TR04", 10, 1, 11, 0.0)],
+                            columns=["company_code", "origin_week", "h", "target_week",
+                                     "new_customer_cash"])
+    refunds = pd.DataFrame([("TR02", 11, 0.0), ("TR04", 11, -3.0)],
+                           columns=["company_code", "week", "refunds"])
+    unidentified = pd.DataFrame([("TR02", 11, 0.0), ("TR04", 11, 0.0)],
+                                columns=["company_code", "week", "unidentified_cash"])
+    rule = RuleReference(totals=pd.DataFrame(
+        [("TR02", 10, 1, 11, 80.0), ("TR04", 10, 1, 11, 5.0), ("ALL", 10, 1, 11, 85.0)],
+        columns=CB_KEYS + ["invoice_cash"]), invoices=pd.DataFrame())
+    # 3. The known customers' cash is the gross receipts: 100 and 10, 110 together.
+    bias = component_bias(None, rule, actual, new_cash, refunds, unidentified, make_levels(), 2)
+    cb_assert_numbers(cb_bias_row(bias, RULE, KNOWN_CUSTOMERS, "TR04", "1"),
+                      (5.0, 10.0, -5.0, 0.5))
+    cb_assert_numbers(cb_bias_row(bias, RULE, KNOWN_CUSTOMERS, "ALL", "pooled"),
+                      (85.0, 110.0, -25.0, 85 / 110))
+
+
+# --- component_bias: the refusals ------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [0, -1])
+def test_component_bias_refuses_horizons_below_one(horizons):
+    cb_refused(f"horizons is {horizons}; horizons start at 1", horizons=horizons)
+
+
+def test_component_bias_refuses_horizons_below_one_before_anything_else():
+    # Nothing else is looked at: every table is None.
+    with pytest.raises(ValueError) as error:
+        component_bias(None, None, None, None, None, None, None, 0)
+    assert str(error.value) == "horizons is 0; horizons start at 1"
+
+
+def test_component_bias_refuses_an_h_above_horizons():
+    cb_refused("the actual cash has rows for h [2]; horizons is 1", horizons=1)
+
+
+def test_component_bias_refuses_an_h_below_one_and_sorts_the_list():
+    # 1. Two rows of the actual with h 0 and 7.
+    actual = cb_actual()
+    actual.loc[0, "h"] = 7
+    actual.loc[1, "h"] = 0
+    # 2. Both named, sorted.
+    cb_refused("the actual cash has rows for h [0, 7]; horizons is 2", actual=actual)
+
+
+def test_component_bias_refuses_a_row_with_no_hurdle_forecast():
+    # 1. The Forecast has no row for TR02 at (10, 2).
+    rolled = cb_rolled()
+    kept = ~((rolled.totals["company_code"] == "TR02") & (rolled.totals["origin_week"] == 10)
+             & (rolled.totals["h"] == 2))
+    rolled = Forecast(totals=rolled.totals[kept], customers=rolled.customers)
+    # 2. Refused, with the count and the first row.
+    cb_refused("the hurdle model has no forecast for 1 rows of the actual cash "
+               f"(first: {CB_FIRST_10_2})", rolled=rolled)
+
+
+def test_component_bias_refuses_a_nan_total_as_no_forecast():
+    rolled = cb_totals_edited("total", "TR02", 10, 2, float("nan"))
+    cb_refused("the hurdle model has no forecast for 1 rows of the actual cash "
+               f"(first: {CB_FIRST_10_2})", rolled=rolled)
+
+
+def test_component_bias_refuses_a_row_with_no_rule_forecast():
+    # 1. The rule has no row for TR02 at (10, 2).
+    rule = cb_rule()
+    kept = ~((rule.totals["company_code"] == "TR02") & (rule.totals["origin_week"] == 10)
+             & (rule.totals["h"] == 2))
+    rule = RuleReference(totals=rule.totals[kept], invoices=rule.invoices)
+    # 2. Refused, with or without the hurdle model.
+    expected = ("the financial rule has no forecast for 1 rows of the actual cash "
+                f"(first: {CB_FIRST_10_2})")
+    cb_refused(expected, rule=rule)
+    cb_refused(expected, rule=rule, rolled=None)
+
+
+def test_component_bias_refuses_a_nan_invoice_cash_as_no_forecast():
+    rule = cb_rule()
+    rule.totals.loc[(rule.totals["company_code"] == "ALL") & (rule.totals["origin_week"] == 11)
+                    & (rule.totals["h"] == 2), "invoice_cash"] = float("nan")
+    cb_refused("the financial rule has no forecast for 1 rows of the actual cash "
+               "(first: {'company_code': 'ALL', 'origin_week': 11, 'h': 2, 'target_week': 13})",
+               rule=rule)
+
+
+def test_component_bias_refuses_a_side_table_gap_with_its_message():
+    new_cash = cb_new_cash()
+    cb_refused("the side tables have no row for 4 rows of the actual cash "
+               "(first: {'company_code': 'TR04', 'origin_week': 10, 'h': 1, 'target_week': 11})",
+               new_cash=new_cash[new_cash["company_code"] != "TR04"])
+
+
+CB_NOT_ADDING_UP = ("the parts do not add up to the total in 1 rows "
+                    "(first: {'company_code': 'TR02', 'origin_week': 10, 'h': 1, "
+                    "'target_week': 11})")
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_component_bias_a_difference_just_within_the_tolerance_is_let_through(sign):
+    # 1. The total of one row a shade less than TIE_TOLERANCE off its parts.
+    rolled = cb_totals_edited("total", "TR02", 10, 1, sign * TIE_TOLERANCE * 0.99)
+    # 2. No refusal; and the total's row holds the total as it was given.
+    found = cb_bias_row(cb_run(rolled=rolled), HURDLE, PART_TOTAL, "TR02", "1")
+    assert found["forecast"] == pytest.approx(2024.0 + sign * TIE_TOLERANCE * 0.99)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_component_bias_a_difference_just_beyond_the_tolerance_is_refused(sign):
+    rolled = cb_totals_edited("total", "TR02", 10, 1, sign * TIE_TOLERANCE * 1.01)
+    cb_refused(CB_NOT_ADDING_UP, rolled=rolled)
+
+
+def test_component_bias_the_parts_must_add_up_row_by_row_not_in_sum():
+    # Two rows off in opposite directions: their sum is right, each row is wrong.
+    rolled = cb_totals_edited("total", "TR02", 10, 1, 5.0)
+    chosen = ((rolled.totals["company_code"] == "TR02") & (rolled.totals["origin_week"] == 11)
+              & (rolled.totals["h"] == 1))
+    rolled.totals.loc[chosen, "total"] -= 5.0
+    cb_refused("the parts do not add up to the total in 2 rows "
+               "(first: {'company_code': 'TR02', 'origin_week': 10, 'h': 1, "
+               "'target_week': 11})", rolled=rolled)
+
+
+@pytest.mark.parametrize("column", ["customers", "new_customer_cash", "unidentified_cash",
+                                    "refunds", "price_level"])
+def test_component_bias_any_column_off_breaks_the_adding_up(column):
+    # One real part or the level of one row moved; total unchanged.
+    cb_refused(CB_NOT_ADDING_UP, rolled=cb_totals_edited(column, "TR02", 10, 1, 1.0))
+
+
+def test_component_bias_real_total_is_not_part_of_the_adding_up():
+    # real_total only feeds the price level's actual: moving it moves that, nothing else.
+    bias = cb_run(rolled=cb_totals_edited("real_total", "TR02", 10, 1, 10.0))
+    # +10 real at week 11's published 2.5 is +25.
+    found = cb_bias_row(bias, HURDLE, PRICE_LEVEL, "TR02", "1")
+    assert found["actual"] == pytest.approx(2072.5 + 25.0)
+    cb_assert_numbers(cb_bias_row(bias, HURDLE, PART_TOTAL, "TR02", "1"),
+                      CB_EXPECTED[PART_TOTAL][("TR02", "1")])
+
+
+def test_component_bias_refuses_a_target_week_with_no_published_level():
+    cb_refused("no published price level for weeks [13]", levels=cb_levels().drop(13))
+
+
+def test_component_bias_names_every_week_with_no_published_level_sorted():
+    cb_refused("no published price level for weeks [11, 13]", levels=cb_levels().drop([13, 11]))
+
+
+def test_component_bias_a_nan_published_level_counts_as_none():
+    levels = cb_levels()
+    levels[12] = float("nan")
+    cb_refused("no published price level for weeks [12]", levels=levels)
+
+
+def test_component_bias_a_week_without_actual_needs_no_published_level():
+    # Week 13 has neither a level nor a row in the actual: no refusal.
+    actual = cb_actual()
+    bias = cb_run(actual=actual[actual["target_week"] != 13], levels=cb_levels().drop(13))
+    assert not bias.empty
+
+
+def test_component_bias_refusal_order_h_then_side_tables_then_hurdle():
+    # 1. An h outside and a side table short: the h comes first.
+    actual = cb_actual()
+    actual.loc[0, "h"] = 7
+    new_cash = cb_new_cash()
+    no_tr04_new_cash = new_cash[new_cash["company_code"] != "TR04"]
+    cb_refused("the actual cash has rows for h [7]; horizons is 2", actual=actual,
+               new_cash=no_tr04_new_cash)
+    # 2. A side table short and no forecast: the side table comes first.
+    rolled = cb_rolled()
+    no_tr04_rolled = Forecast(totals=rolled.totals[rolled.totals["company_code"] != "TR04"],
+                              customers=rolled.customers)
+    with pytest.raises(ValueError, match="^the side tables have no row"):
+        cb_run(new_cash=no_tr04_new_cash, rolled=no_tr04_rolled)
+
+
+def test_component_bias_refusal_order_hurdle_then_adding_up_then_level_then_rule():
+    # 1. All of them wrong at once: no hurdle forecast first.
+    rolled = cb_totals_edited("customers", "TR02", 10, 1, 1.0)
+    without_row = Forecast(
+        totals=rolled.totals[~((rolled.totals["company_code"] == "TR04")
+                               & (rolled.totals["origin_week"] == 11))],
+        customers=rolled.customers)
+    rule = cb_rule()
+    no_rule = RuleReference(totals=rule.totals.iloc[1:], invoices=rule.invoices)
+    no_level = cb_levels().drop(13)
+    with pytest.raises(ValueError, match="^the hurdle model has no forecast"):
+        cb_run(rolled=without_row, rule=no_rule, levels=no_level)
+    # 2. Then the parts not adding up.
+    with pytest.raises(ValueError, match="^the parts do not add up"):
+        cb_run(rolled=rolled, rule=no_rule, levels=no_level)
+    # 3. Then the published level.
+    with pytest.raises(ValueError, match="^no published price level"):
+        cb_run(rule=no_rule, levels=no_level)
+    # 4. Then the rule.
+    with pytest.raises(ValueError, match="^the financial rule has no forecast"):
+        cb_run(rule=no_rule)
+
+
+@pytest.mark.parametrize("repeated", ["rolled", "rule"])
+def test_component_bias_a_repeated_forecast_row_is_refused(repeated):
+    # A row twice would add its amount twice; pandas' merge check refuses it.
+    rolled, rule = cb_rolled(), cb_rule()
+    if repeated == "rolled":
+        rolled = Forecast(totals=pd.concat([rolled.totals, rolled.totals.iloc[[0]]],
+                                           ignore_index=True), customers=rolled.customers)
+    else:
+        rule = RuleReference(totals=pd.concat([rule.totals, rule.totals.iloc[[0]]],
+                                              ignore_index=True), invoices=rule.invoices)
+    with pytest.raises(MergeError):
+        cb_run(rolled=rolled, rule=rule)
+
+
+# --- payer_row -------------------------------------------------------------------------------
+
+def ps_row_table(p, expected, paid, actual_real):
+    return pd.DataFrame({"p": p, "expected": expected, "paid": paid, "actual_real": actual_real})
+
+
+def test_payer_row_exact_numbers():
+    # 1. p 0.5 + 0.5 = 1 expected against 2 who paid; 30 expected against 80 that came:
+    #    per payer 30 against 40.
+    found = payer_row("TR02", "1", ps_row_table([0.5, 0.5, 0.0], [10.0, 20.0, 0.0],
+                                                [True, True, False], [30.0, 50.0, 0.0]))
+    # 2. p ratio 1 / 2, m ratio 30 / 40, p x m ratio 30 / 80 = 1 / 2 x 3 / 4.
+    assert found == {"company_code": "TR02", "horizon": "1", "rows": 3,
+                     "expected_payers": 1.0, "actual_payers": 2, "p_ratio": 0.5,
+                     "expected_per_payer": 30.0, "actual_per_payer": 40.0, "m_ratio": 0.75,
+                     "pxm_ratio": 0.375}
+
+
+def test_payer_row_the_counts_are_plain_ints():
+    found = payer_row("A", "1", ps_row_table([0.5], [1.0], [True], [1.0]))
+    assert type(found["actual_payers"]) is int
+    assert type(found["rows"]) is int
+
+
+def test_payer_row_nobody_paid_gives_nan_not_infinity():
+    # 1. Nobody paid: nothing to divide by in p, in the actual per payer and in p x m.
+    found = payer_row("A", "1", ps_row_table([0.5], [10.0], [False], [0.0]))
+    # 2. What can be computed is there.
+    assert found["expected_payers"] == 0.5
+    assert found["expected_per_payer"] == 20.0
+    assert found["actual_payers"] == 0
+    # 3. The ratios are NaN.
+    for name in ("p_ratio", "actual_per_payer", "m_ratio", "pxm_ratio"):
+        assert np.isnan(found[name]), name
+
+
+def test_payer_row_nobody_expected_gives_a_zero_p_ratio_and_no_m_ratio():
+    # p is 0 in every row, one customer paid all the same.
+    found = payer_row("A", "1", ps_row_table([0.0], [0.0], [True], [5.0]))
+    assert found["p_ratio"] == 0.0
+    assert np.isnan(found["expected_per_payer"])
+    assert np.isnan(found["m_ratio"])
+    assert found["pxm_ratio"] == 0.0
+
+
+def test_payer_row_on_no_rows_gives_nans():
+    found = payer_row("A", "1", ps_row_table([], [], [], []))
+    assert found["rows"] == 0
+    assert found["expected_payers"] == 0.0
+    for name in ("p_ratio", "expected_per_payer", "actual_per_payer", "m_ratio", "pxm_ratio"):
+        assert np.isnan(found[name]), name
+
+
+# --- payer_split: the worked example ---------------------------------------------------------
+#
+# Horizons 2; published levels: week 11 2.0, week 12 4.0, week 13 5.0, and week 13 has no data.
+#
+#   key company  origin h target   p     m   p x m   gross   real paid?
+#   A   TR02     10     1 11       0.5   100 50      300     150  yes
+#   B   TR02     10     1 11       0.25  40  10      (none)  0    no: no weekly row
+#   C   TR04     10     1 11       0.5   20  10      0       0    no: refund only
+#   A   TR02     10     2 12       0.5   60  30      400     100  yes
+#   B   TR02     10     2 12       0.75  40  30      40      10   yes
+#   C   TR04     10     2 12       1.0   20  20      80      20   yes
+#   A   TR02     11     1 12       1.0   50  50      400     100  yes
+#   B   TR02     11     1 12       0.25  40  10      40      10   yes
+#   C   TR04     11     1 12       0.5   40  20      80      20   yes
+#   A   TR02     11     2 13  left out: week 13 has no data, whatever the weekly amounts say.
+#
+# TR02 h1: p 2 / 3 payers; p x m 120, per payer 60; real 260, per payer 260 / 3.
+# TR02 h2: p 1.25 / 2; p x m 60, per payer 48; real 110, per payer 55.
+# TR04 h1: p 1 / 1; p x m 30, per payer 30; real 20, per payer 20.
+# TR04 h2: p 1 / 1; p x m 20, per payer 20; real 20, per payer 20.
+# ALL  h1: p 3 / 4; p x m 150, per payer 50; real 280, per payer 70.
+# ALL  h2: p 2.25 / 3; p x m 80, per payer 80 / 2.25; real 130, per payer 130 / 3.
+
+PS_HORIZONS = 2
+PS_ROWS = [("A", "TR02", 10, 1, 11, 0.5, 100.0), ("B", "TR02", 10, 1, 11, 0.25, 40.0),
+           ("C", "TR04", 10, 1, 11, 0.5, 20.0), ("A", "TR02", 10, 2, 12, 0.5, 60.0),
+           ("B", "TR02", 10, 2, 12, 0.75, 40.0), ("C", "TR04", 10, 2, 12, 1.0, 20.0),
+           ("A", "TR02", 11, 1, 12, 1.0, 50.0), ("B", "TR02", 11, 1, 12, 0.25, 40.0),
+           ("C", "TR04", 11, 1, 12, 0.5, 40.0), ("A", "TR02", 11, 2, 13, 0.9, 1000.0)]
+PS_LEVELS = {11: 2.0, 12: 4.0, 13: 5.0}
+
+# (company, horizon) -> rows, expected payers, actual payers, p ratio, expected per payer,
+# actual per payer, m ratio, p x m ratio.
+PS_EXPECTED = {
+    ("TR02", "1"): (4, 2.0, 3, 2 / 3, 60.0, 260 / 3, 180 / 260, 120 / 260),
+    ("TR02", "2"): (2, 1.25, 2, 0.625, 48.0, 55.0, 48 / 55, 60 / 110),
+    ("TR02", "pooled"): (6, 3.25, 5, 0.65, 180 / 3.25, 74.0, (180 / 3.25) / 74, 180 / 370),
+    ("TR04", "1"): (2, 1.0, 1, 1.0, 30.0, 20.0, 1.5, 1.5),
+    ("TR04", "2"): (1, 1.0, 1, 1.0, 20.0, 20.0, 1.0, 1.0),
+    ("TR04", "pooled"): (3, 2.0, 2, 1.0, 25.0, 20.0, 1.25, 1.25),
+    ("ALL", "1"): (6, 3.0, 4, 0.75, 50.0, 70.0, 5 / 7, 150 / 280),
+    ("ALL", "2"): (3, 2.25, 3, 0.75, 80 / 2.25, 130 / 3, (80 / 2.25) / (130 / 3), 80 / 130),
+    ("ALL", "pooled"): (9, 5.25, 7, 0.75, 230 / 5.25, 410 / 7, (230 / 5.25) / (410 / 7),
+                        230 / 410),
+}
+PS_ORDER = [("TR02", "1"), ("TR02", "2"), ("TR02", "pooled"), ("TR04", "1"), ("TR04", "2"),
+            ("TR04", "pooled"), ("ALL", "1"), ("ALL", "2"), ("ALL", "pooled")]
+
+
+def ps_customers(records=None):
+    """records: (key, company_code, origin_week, h, target_week, p, m); expected is p x m."""
+    records = PS_ROWS if records is None else records
+    frame = pd.DataFrame(records, columns=["key", "company_code", "origin_week", "h",
+                                           "target_week", "p", "m"])
+    frame["customer_id"] = frame["key"].str.lower()
+    frame["expected"] = frame["p"] * frame["m"]
+    return frame[CUSTOMER_COLUMNS]
+
+
+def ps_weekly():
+    """B has no row in week 11; C's row there is a refund only; week 13 has a decoy; other keys
+    and other weeks would show if they were read."""
+    return make_weekly([("A", "TR02", "a", 11, 300.0, 0.0),
+                        ("C", "TR04", "c", 11, 0.0, -5.0),
+                        ("A", "TR02", "a", 12, 400.0, -7.0),
+                        ("B", "TR02", "b", 12, 40.0, 0.0),
+                        ("C", "TR04", "c", 12, 80.0, 0.0),
+                        ("A", "TR02", "a", 13, 99999.0, 0.0),
+                        ("A", "TR02", "a", 10, 88888.0, 0.0),
+                        ("B", "TR02", "b", 14, 77777.0, 0.0),
+                        ("not known", "TR02", None, 11, 66666.0, 0.0)])
+
+
+def ps_weeks():
+    return make_weeks(14, missing={13})
+
+
+def ps_levels():
+    return pd.Series(PS_LEVELS)
+
+
+def ps_run(**changes):
+    arguments = dict(customers=ps_customers(), weekly=ps_weekly(), weeks=ps_weeks(),
+                     levels=ps_levels(), horizons=PS_HORIZONS)
+    arguments.update(changes)
+    return payer_split(**arguments)
+
+
+def ps_row(split, company, horizon):
+    selected = split[(split["company_code"] == company) & (split["horizon"] == horizon)]
+    assert len(selected) == 1, (company, horizon, len(selected))
+    return selected.iloc[0]
+
+
+def ps_refused(expected_message, **changes):
+    with pytest.raises(ValueError) as error:
+        ps_run(**changes)
+    assert str(error.value) == expected_message
+
+
+@pytest.fixture(scope="module")
+def ps_split():
+    return ps_run()
+
+
+@pytest.mark.parametrize("company, horizon", PS_ORDER)
+def test_payer_split_exact_numbers(ps_split, company, horizon):
+    found = ps_row(ps_split, company, horizon)
+    rows_count, expected_payers, actual_payers, p_ratio, expected_each, actual_each, m_ratio, \
+        pxm_ratio = PS_EXPECTED[(company, horizon)]
+    assert found["rows"] == rows_count
+    assert found["expected_payers"] == pytest.approx(expected_payers)
+    assert found["actual_payers"] == actual_payers
+    assert found["p_ratio"] == pytest.approx(p_ratio)
+    assert found["expected_per_payer"] == pytest.approx(expected_each)
+    assert found["actual_per_payer"] == pytest.approx(actual_each)
+    assert found["m_ratio"] == pytest.approx(m_ratio)
+    assert found["pxm_ratio"] == pytest.approx(pxm_ratio)
+
+
+@pytest.mark.parametrize("company, horizon", PS_ORDER)
+def test_payer_split_p_ratio_times_m_ratio_is_pxm_ratio(ps_split, company, horizon):
+    found = ps_row(ps_split, company, horizon)
+    assert found["p_ratio"] * found["m_ratio"] == pytest.approx(found["pxm_ratio"])
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_payer_split_the_identity_holds_on_random_tables(seed):
+    # 1. Random p, m and receipts for 40 customers, all in week 11; about half pay, and the
+    #    first of each company always does.
+    generator = np.random.default_rng(seed)
+    records = [(f"K{i}", "TR02" if i % 2 else "TR04", 10, 1, 11,
+                float(generator.uniform(0.01, 1.0)), float(generator.uniform(1.0, 500.0)))
+               for i in range(40)]
+    weekly_rows = [(f"K{i}", "TR02" if i % 2 else "TR04", f"k{i}", 11,
+                    float(generator.uniform(1.0, 900.0)), 0.0)
+                   for i in range(40) if generator.random() < 0.5 or i < 2]
+    # 2. The identity in every row of the result.
+    split = ps_run(customers=ps_customers(records), weekly=make_weekly(weekly_rows), horizons=1)
+    products = split["p_ratio"] * split["m_ratio"]
+    assert products.to_numpy() == pytest.approx(split["pxm_ratio"].to_numpy())
+
+
+def test_payer_split_columns_and_row_order(ps_split):
+    assert list(ps_split.columns) == PAYER_COLUMNS
+    assert list(zip(ps_split["company_code"], ps_split["horizon"])) == PS_ORDER
+
+
+def test_payer_split_companies_are_sorted_whatever_order_they_come_in():
+    # TR04 first in the customers: TR02 still first in the result, ALL last.
+    split = ps_run(customers=ps_customers().iloc[::-1])
+    assert list(zip(split["company_code"], split["horizon"])) == PS_ORDER
+
+
+def test_payer_split_customer_order_and_index_do_not_matter(ps_split):
+    # The rows reversed, on an index that is nothing like a range.
+    customers = ps_customers().iloc[::-1]
+    customers.index = range(1000, 1000 + 10 * len(customers), 10)
+    pd.testing.assert_frame_equal(ps_run(customers=customers), ps_split)
+
+
+def test_payer_split_a_customer_with_no_weekly_row_paid_zero_and_is_still_in_the_rows():
+    # 1. Only customer B at (10, 1, 11): week 11 has data, B has no weekly row there.
+    split = ps_run(customers=ps_customers([("B", "TR02", 10, 1, 11, 0.25, 40.0)]))
+    found = ps_row(split, "TR02", "1")
+    # 2. In the rows and in the expected payers, not among those who paid.
+    assert found["rows"] == 1
+    assert found["expected_payers"] == 0.25
+    assert found["actual_payers"] == 0
+
+
+def test_payer_split_a_refund_only_key_week_is_not_a_payer():
+    # C's row in week 11 has gross receipts 0 and refunds -5.
+    split = ps_run(customers=ps_customers([("C", "TR04", 10, 1, 11, 0.5, 20.0)]))
+    found = ps_row(split, "TR04", "1")
+    assert found["rows"] == 1
+    assert found["actual_payers"] == 0
+    assert np.isnan(found["actual_per_payer"])
+
+
+def test_payer_split_refunds_are_not_in_the_receipts():
+    # A's -7 refund in week 12 does not touch the 400 of gross receipts: 400 / 4 = 100.
+    split = ps_run(customers=ps_customers([("A", "TR02", 10, 2, 12, 0.5, 60.0)]))
+    assert ps_row(split, "TR02", "2")["actual_per_payer"] == 100.0
+
+
+def test_payer_split_only_the_target_week_of_each_key_is_read():
+    # Other weeks of A (10, 13) and an unknown key in week 11 hold decoys of tens of thousands.
+    split = ps_run(customers=ps_customers([("A", "TR02", 10, 1, 11, 0.5, 100.0)]))
+    assert ps_row(split, "TR02", "1")["actual_per_payer"] == 150.0
+
+
+def test_payer_split_receipts_are_deflated_by_the_target_weeks_level():
+    # 300 in week 11 at level 2, not at the origin's week or at week 12's level.
+    split = ps_run(customers=ps_customers([("A", "TR02", 10, 1, 11, 0.5, 100.0)]),
+                   levels=pd.Series({10: 10.0, 11: 2.0, 12: 7.0, 13: 1.0}))
+    assert ps_row(split, "TR02", "1")["actual_per_payer"] == 150.0
+
+
+def test_payer_split_expected_is_not_deflated_again():
+    # p x m is already in TRY of week 0: 0.5 x 100 = 50, per expected payer 100, at any level.
+    split = ps_run(customers=ps_customers([("A", "TR02", 10, 1, 11, 0.5, 100.0)]),
+                   levels=pd.Series({11: 50.0}))
+    assert ps_row(split, "TR02", "1")["expected_per_payer"] == 100.0
+
+
+def test_payer_split_uses_the_expected_column_not_p_times_m():
+    # A decoy m: `expected` says 50, p x m would say 4.
+    customers = ps_customers([("A", "TR02", 10, 1, 11, 0.5, 100.0)])
+    customers["m"] = 8.0
+    split = ps_run(customers=customers)
+    assert ps_row(split, "TR02", "1")["expected_per_payer"] == 100.0
+
+
+def test_payer_split_a_missing_target_week_is_left_out_not_nobody_paid(ps_split):
+    # 1. The result equals the one without the row for the missing week 13.
+    without = ps_run(customers=ps_customers(PS_ROWS[:-1]))
+    pd.testing.assert_frame_equal(without, ps_split)
+    # 2. Its p of 0.9 is not in the expected payers; had it counted as nobody paid, it would be.
+    assert ps_row(ps_split, "TR02", "2")["expected_payers"] == 1.25
+
+
+def test_payer_split_a_target_week_past_the_calendar_is_left_out(ps_split):
+    # Week 15 is past the calendar: no data, no level either, and no refusal.
+    customers = ps_customers(PS_ROWS + [("A", "TR02", 13, 2, 15, 0.9, 1000.0)])
+    pd.testing.assert_frame_equal(ps_run(customers=customers), ps_split)
+
+
+def test_payer_split_a_missing_week_needs_no_published_level(ps_split):
+    # Week 13 is left out before the deflation, so its level is not asked for.
+    pd.testing.assert_frame_equal(ps_run(levels=ps_levels().drop(13)), ps_split)
+
+
+def test_payer_split_no_payers_gives_nan_not_infinity_or_an_exception():
+    # 1. Nobody in week 11 paid, in either company, with warnings turned into errors.
+    customers = ps_customers([("B", "TR02", 10, 1, 11, 0.25, 40.0),
+                              ("C", "TR04", 10, 1, 11, 0.5, 20.0)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        split = ps_run(customers=customers)
+    # 2. NaN in every row of the result.
+    for name in ("p_ratio", "actual_per_payer", "m_ratio", "pxm_ratio"):
+        assert split[name].isna().all(), name
+    assert not np.isinf(split.select_dtypes("number").to_numpy(dtype="float64")).any()
+    assert (split["actual_payers"] == 0).all()
+
+
+def test_payer_split_an_h_without_rows_has_no_row_but_the_pooled_one():
+    # Only h = 2 rows, horizons 3: no row for h = 1 or 3, in any company.
+    customers = ps_customers([record for record in PS_ROWS if record[3] == 2])
+    split = ps_run(customers=customers, horizons=3)
+    assert set(split["horizon"]) == {"2", "pooled"}
+    two = ps_row(split, "ALL", "2")
+    pooled = ps_row(split, "ALL", "pooled")
+    assert two["rows"] == pooled["rows"] == 3
+    assert two["expected_payers"] == pooled["expected_payers"]
+
+
+def test_payer_split_a_company_without_rows_at_some_h_keeps_the_others():
+    # TR04 has only h = 1, TR02 both.
+    customers = ps_customers([record for record in PS_ROWS
+                              if record[1] == "TR02" or record[3] == 1])
+    split = ps_run(customers=customers)
+    assert list(zip(split["company_code"], split["horizon"])) == [
+        ("TR02", "1"), ("TR02", "2"), ("TR02", "pooled"), ("TR04", "1"), ("TR04", "pooled"),
+        ("ALL", "1"), ("ALL", "2"), ("ALL", "pooled")]
+
+
+def test_payer_split_all_counts_every_company(ps_split):
+    # ALL's counts are the companies added up, in each horizon.
+    for horizon in ("1", "2", "pooled"):
+        first = ps_row(ps_split, "TR02", horizon)
+        second = ps_row(ps_split, "TR04", horizon)
+        consolidated = ps_row(ps_split, "ALL", horizon)
+        assert consolidated["rows"] == first["rows"] + second["rows"]
+        assert consolidated["actual_payers"] == first["actual_payers"] + second["actual_payers"]
+        assert consolidated["expected_payers"] == pytest.approx(
+            first["expected_payers"] + second["expected_payers"])
+
+
+def test_payer_split_the_same_key_week_serves_two_origins(ps_split):
+    # A's 400 in week 12 counts at (10, 2) and at (11, 1): once per forecast of it.
+    assert ps_row(ps_split, "TR02", "1")["actual_payers"] == 3
+    assert ps_row(ps_split, "TR02", "2")["actual_payers"] == 2
+
+
+def test_payer_split_the_counts_are_whole_numbers(ps_split):
+    assert ps_split["actual_payers"].dtype.kind == "i"
+    assert ps_split["rows"].dtype.kind == "i"
+
+
+def test_payer_split_inputs_unchanged():
+    # 1. The inputs and a copy of each.
+    customers, weekly, weeks, levels = ps_customers(), ps_weekly(), ps_weeks(), ps_levels()
+    frames = [customers, weekly, weeks]
+    copies = [frame.copy() for frame in frames]
+    levels_copy = levels.copy()
+    # 2. Called, and each is as it was.
+    payer_split(customers, weekly, weeks, levels, PS_HORIZONS)
+    for frame, copied in zip(frames, copies):
+        pd.testing.assert_frame_equal(frame, copied)
+    pd.testing.assert_series_equal(levels, levels_copy)
+
+
+# --- payer_split: the refusals ---------------------------------------------------------------
+
+@pytest.mark.parametrize("horizons", [0, -1])
+def test_payer_split_refuses_horizons_below_one(horizons):
+    ps_refused(f"horizons is {horizons}; horizons start at 1", horizons=horizons)
+
+
+def test_payer_split_refuses_an_h_above_horizons():
+    ps_refused("customer forecasts for h [2]; horizons is 1", horizons=1)
+
+
+def test_payer_split_refuses_an_h_below_one_and_sorts_the_list():
+    customers = ps_customers()
+    customers.loc[0, "h"] = 9
+    customers.loc[1, "h"] = 0
+    ps_refused("customer forecasts for h [0, 9]; horizons is 2", customers=customers)
+
+
+def test_payer_split_refuses_an_h_outside_even_in_a_week_without_data():
+    # The checks read every row, before the weeks without data are left out.
+    customers = ps_customers(PS_ROWS[:-1] + [("A", "TR02", 11, 3, 13, 0.9, 1000.0)])
+    ps_refused("customer forecasts for h [3]; horizons is 2", customers=customers)
+
+
+def test_payer_split_refuses_a_repeated_key_origin_h():
+    # 1. The third row of the table, twice.
+    customers = ps_customers(PS_ROWS + [PS_ROWS[2]])
+    # 2. Named by its key, origin and h.
+    ps_refused("1 customer forecasts are there twice "
+               "(first: {'key': 'C', 'origin_week': 10, 'h': 1})", customers=customers)
+
+
+def test_payer_split_counts_every_repeat():
+    customers = ps_customers(PS_ROWS + [PS_ROWS[0], PS_ROWS[0], PS_ROWS[1]])
+    ps_refused("3 customer forecasts are there twice "
+               "(first: {'key': 'A', 'origin_week': 10, 'h': 1})", customers=customers)
+
+
+def test_payer_split_refuses_no_rows_in_a_week_with_data():
+    # Every row is in week 13, which has no data.
+    customers = ps_customers([("A", "TR02", 11, 2, 13, 0.9, 1000.0)])
+    ps_refused("there are no customer forecasts in a week with data", customers=customers)
+
+
+def test_payer_split_refuses_an_empty_customer_table():
+    ps_refused("there are no customer forecasts in a week with data",
+               customers=ps_customers([]))
+
+
+def test_payer_split_refuses_a_week_with_data_and_no_level():
+    # As `deflate` does.
+    ps_refused("no price level for weeks [11]", levels=ps_levels().drop(11))
+
+
+def test_payer_split_refusal_order():
+    # Horizons first, then the h outside, then the repeat, and only then no rows with data.
+    repeated = ps_customers([("A", "TR02", 11, 2, 13, 0.9, 1000.0)] * 2)
+    ps_refused("horizons is 0; horizons start at 1", customers=repeated, horizons=0)
+    ps_refused("customer forecasts for h [2]; horizons is 1", customers=repeated, horizons=1)
+    ps_refused("1 customer forecasts are there twice "
+               "(first: {'key': 'A', 'origin_week': 11, 'h': 2})", customers=repeated)
+
+
+def test_payer_split_the_same_key_at_another_origin_or_h_is_no_repeat(ps_split):
+    # The worked example has A at (10, 1), (10, 2), (11, 1), (11, 2): no refusal.
+    assert ps_row(ps_split, "ALL", "pooled")["rows"] == 9
+
+
+def test_payer_split_a_repeated_key_week_of_the_weekly_table_is_refused():
+    # Receipts twice would count the customer twice; pandas' merge check refuses it.
+    weekly = ps_weekly()
+    with pytest.raises(MergeError):
+        ps_run(weekly=pd.concat([weekly, weekly.iloc[[0]]], ignore_index=True))
+
+
+# --- component_bias: the shape of what is not there ------------------------------------------
+
+def test_component_bias_an_empty_actual_gives_an_empty_table_with_the_columns():
+    bias = cb_run(actual=cb_actual().iloc[0:0])
+    assert bias.empty
+    assert list(bias.columns) == COMPONENT_COLUMNS
+
+
+def test_component_bias_a_repeated_row_of_the_actual_is_refused():
+    actual = cb_actual()
+    with pytest.raises(MergeError):
+        cb_run(actual=pd.concat([actual, actual.iloc[[0]]], ignore_index=True))

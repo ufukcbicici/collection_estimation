@@ -69,12 +69,16 @@ from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa
 from collection_estimation.hurdle.evaluate import (  # noqa: E402
     HORIZON_TOTAL,
     HURDLE,
+    KNOWN_CUSTOMERS,
     POOLED,
     REFERENCES,
+    RULE,
     actual_totals,
+    component_bias,
     deflated_reference,
     evaluation_scores,
     paired_wape_bootstrap,
+    payer_split,
     rolling_fingerprint,
     rolling_forecasts,
     rule_reference,
@@ -644,6 +648,15 @@ def main():
                                           settings.evaluation.bootstrap_samples,
                                           settings.evaluation.bootstrap_seed)
         show_paired_bootstrap(bootstrap)
+        # U14.5d: where the bias comes from, part by part; and for the known customers, how
+        # many pay against how much each pays (needs the model's customer rows).
+        bias = component_bias(rolled, rule, rolled_actual, new_cash, refunds, unidentified,
+                              levels, settings.receivables.horizons)
+        show_component_bias(bias, settings.receivables.horizons)
+        if rolled is not None:
+            split = payer_split(rolled.customers, weekly, weeks, levels,
+                                settings.receivables.horizons)
+            show_payer_split(split, settings.receivables.horizons)
 
     # Later steps follow as each unit is built.
 
@@ -1544,6 +1557,59 @@ def show_paired_bootstrap(bootstrap):
                       "90% interval": f"[{row['low']:+.3f}, {row['high']:+.3f}]",
                       "first better in": f"{row['share_better']:.0%}"})
     print(pd.DataFrame(lines).set_index("pair").to_string())
+
+
+def show_component_bias(bias, horizons):
+    """Step 17's bias per part (U14.5d), consolidated: each part over all (origin, h), then
+    the known customers' forecast / actual per h."""
+    consolidated = bias[bias["company_code"] == CONSOLIDATED]
+
+    # 1. Each part over all (origin, h).
+    pooled = consolidated[consolidated["horizon"] == POOLED]
+    lines = []
+    for _, row in pooled.iterrows():
+        lines.append({"method": row["method"], "part": row["part"],
+                      "forecast": f"{row['forecast'] / 1e6:,.1f}",
+                      "actual": f"{row['actual'] / 1e6:,.1f}",
+                      "gap": f"{row['gap'] / 1e6:+,.1f}",
+                      "ratio": f"{row['ratio']:.3f}"})
+    print("        bias per part (U14.5d), consolidated, all (origin, h), nominal, million TRY "
+          "(the price level row is part of the total's gap, not added to it):")
+    print(pd.DataFrame(lines).set_index("method").to_string())
+
+    # 2. The known customers per h.
+    known = consolidated[consolidated["part"] == KNOWN_CUSTOMERS]
+    print("        known customers, forecast / actual per h:")
+    for method in dict.fromkeys(known["method"]):
+        ratios = known[known["method"] == method].set_index("horizon")["ratio"]
+        shown = "  ".join(f"h{h} {ratios.get(str(h), float('nan')):.3f}"
+                          for h in range(1, horizons + 1))
+        name = "rule (open invoices)" if method == RULE else method
+        print(f"          {name:<21} {shown}")
+
+
+def show_payer_split(split, horizons):
+    """Step 17's split of the known customers' bias (U14.5d), in TRY of week 0: how many pay
+    (p ratio, stage 1) against how much each pays (m ratio, stage 2), consolidated per h,
+    then per company over all h."""
+    columns = {"horizon": "horizon", "expected_payers": "payers expected",
+               "actual_payers": "payers actual", "p_ratio": "p ratio",
+               "expected_per_payer": "per payer expected",
+               "actual_per_payer": "per payer actual", "m_ratio": "m ratio",
+               "pxm_ratio": "p x m ratio"}
+    consolidated = split[split["company_code"] == CONSOLIDATED]
+    table = consolidated[list(columns)].rename(columns=columns).set_index("horizon")
+    print("        known customers, how many pay and how much each pays (real TRY; a ratio "
+          "is forecast / actual), consolidated:")
+    print(table.round(3).to_string())
+
+    pooled = split[(split["horizon"] == POOLED) & (split["company_code"] != CONSOLIDATED)]
+    per_company = pooled[["company_code", "p_ratio", "m_ratio", "pxm_ratio"]]
+    per_company = per_company.rename(columns={"company_code": "company", "p_ratio": "p ratio",
+                                              "m_ratio": "m ratio",
+                                              "pxm_ratio": "p x m ratio"})
+    print("        the same per company, all (origin, h):")
+    print(per_company.set_index("company").round(3).to_string())
 
 
 def show_actual_totals(actual, weekly, weeks):

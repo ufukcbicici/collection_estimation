@@ -23,7 +23,9 @@ U14.5, the scores: every method's forecasts in one long table (`stack_forecasts`
 method and company the error against the actual cash (`evaluation_scores`): WAPE, bias, the
 mean absolute error in TRY, and MAPE for the consolidated rows; per h, pooled over all h, and
 for the total of the h weeks of each origin. Then, consolidated, whether one method is really
-more accurate than another or only luckier on these weeks (`paired_wape_bootstrap`).
+more accurate than another or only luckier on these weeks (`paired_wape_bootstrap`). And where
+the hurdle model's bias comes from: its parts against their own actual cash (`component_bias`),
+and, for the known customers, how many pay against how much each pays (`payer_split`).
 """
 import time
 from dataclasses import asdict, dataclass
@@ -97,6 +99,26 @@ SCORE_COLUMNS = ["method", "company_code", "horizon", "rows", "forecast", "actua
 # the 5% and 95% points of the difference over the resamples (a 90% interval).
 BOOTSTRAP_COLUMNS = ["method", "against", "horizon", "rows", "wape", "wape_against",
                      "difference", "low", "high", "share_better", "samples"]
+
+# The rows of the table `component_bias` returns (the `part` column).
+KNOWN_CUSTOMERS = "known customers"  # p x m against the cash of the customers known at T
+NEW_CUSTOMERS = "new customers"      # top-up A
+UNIDENTIFIED = "unidentified"        # top-up G
+REFUND_PART = "refunds"              # top-up R (negative amounts)
+PART_TOTAL = "total"                 # the four parts added up
+PRICE_LEVEL = "price level"          # of the total's gap, what the projected price level adds
+# The four parts whose gaps add up to the gap of PART_TOTAL: part -> its column in the totals.
+ADDING_PARTS = {KNOWN_CUSTOMERS: "customers", NEW_CUSTOMERS: "new_customer_cash",
+                UNIDENTIFIED: "unidentified_cash", REFUND_PART: "refunds"}
+# The columns of the table `component_bias` returns, in order. Nominal TRY; gap = forecast -
+# actual; ratio = forecast / actual, NaN if the actual is 0.
+COMPONENT_COLUMNS = ["method", "company_code", "horizon", "part", "forecast", "actual", "gap",
+                     "ratio"]
+# The columns of the table `payer_split` returns, in order. Amounts in TRY of week 0.
+PAYER_COLUMNS = ["company_code", "horizon", "rows", "expected_payers", "actual_payers",
+                 "p_ratio", "expected_per_payer", "actual_per_payer", "m_ratio", "pxm_ratio"]
+# Two amounts this far apart (TRY) count as the same: rounding of sums, not a real gap.
+TIE_TOLERANCE = 0.01
 
 
 def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
@@ -845,3 +867,238 @@ def paired_wape_bootstrap(forecasts: pd.DataFrame, actual: pd.DataFrame,
             complete["actual"].to_numpy(), origin_weights, samples, seed))
 
     return pd.DataFrame(results, columns=BOOTSTRAP_COLUMNS)
+
+
+def ratio_or_nan(top: float, bottom: float) -> float:
+    """top / bottom, NaN if bottom is 0 (no ratio, rather than 0 or an infinite one)."""
+    if bottom == 0:
+        return float("nan")
+    return float(top) / float(bottom)
+
+
+def part_actuals(actual: pd.DataFrame, new_cash: pd.DataFrame, refunds: pd.DataFrame,
+                 unidentified: pd.DataFrame) -> pd.DataFrame:
+    """Each row of `actual` (from `actual_totals`) with the actual cash split into the model's
+    parts, nominal TRY: actual_new (table A, of its origin and h), actual_unidentified (table
+    G, of its target week), actual_refunds (table R, of its target week, negative) and
+    actual_known, what is left: the cash of the customers known at the origin
+    (`side_tables.check_side_tables` proves these add up). "ALL" is the companies added up.
+
+    Raises ValueError if a side table has no row for a row of `actual`.
+    """
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    rows = actual.loc[actual["company_code"] != CONSOLIDATED, keys + ["actual"]]
+
+    # 1. The side tables beside the actual cash: A by origin and h, G and R by target week.
+    table_a = new_cash[["company_code", "origin_week", "h", "new_customer_cash"]]
+    rows = rows.merge(table_a, on=["company_code", "origin_week", "h"], how="left",
+                      validate="one_to_one")
+    table_g = unidentified.rename(columns={"week": "target_week"})
+    rows = rows.merge(table_g[["company_code", "target_week", "unidentified_cash"]],
+                      on=["company_code", "target_week"], how="left", validate="many_to_one")
+    table_r = refunds.rename(columns={"week": "target_week"})
+    rows = rows.merge(table_r[["company_code", "target_week", "refunds"]],
+                      on=["company_code", "target_week"], how="left", validate="many_to_one")
+    rows = rows.rename(columns={"new_customer_cash": "actual_new",
+                                "unidentified_cash": "actual_unidentified",
+                                "refunds": "actual_refunds"})
+
+    # 2. No row may be missing: a missing amount would land in the known customers' cash.
+    side_columns = ["actual_new", "actual_unidentified", "actual_refunds"]
+    missing = rows[side_columns].isna().any(axis=1)
+    if missing.any():
+        first = rows.loc[missing, keys].iloc[0].to_dict()
+        raise ValueError(f"the side tables have no row for {int(missing.sum())} rows of the "
+                         f"actual cash (first: {first})")
+
+    # 3. The known customers' cash is what is left.
+    rows["actual_known"] = (rows["actual"] - rows["actual_new"] - rows["actual_unidentified"]
+                            - rows["actual_refunds"])
+
+    # 4. "ALL": the companies added up.
+    amounts = ["actual"] + side_columns + ["actual_known"]
+    consolidated = rows.groupby(["origin_week", "h", "target_week"], as_index=False)[amounts].sum()
+    consolidated["company_code"] = CONSOLIDATED
+    found = pd.concat([rows, consolidated], ignore_index=True)
+    found["company_code"] = found["company_code"].astype(object)
+    return found
+
+
+def part_rows(method: str, part: str, rows: pd.DataFrame, forecast: str, actual: str,
+              horizons: int) -> list[dict]:
+    """The rows of `component_bias` for one method and part: per company in `rows`, for each
+    h and pooled over all h, the sums of its columns `forecast` and `actual`."""
+    found = []
+    for company, mine in rows.groupby("company_code", sort=False):
+        groups = [(str(h), mine[mine["h"] == h]) for h in range(1, horizons + 1)]
+        groups.append((POOLED, mine))
+        for horizon, group in groups:
+            if group.empty:
+                continue
+            made = float(group[forecast].sum())
+            came = float(group[actual].sum())
+            found.append({"method": method, "company_code": company, "horizon": horizon,
+                          "part": part, "forecast": made, "actual": came, "gap": made - came,
+                          "ratio": ratio_or_nan(made, came)})
+    return found
+
+
+def component_bias(rolled: Forecast | None, rule: RuleReference, actual: pd.DataFrame,
+                   new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+                   levels: pd.Series, horizons: int) -> pd.DataFrame:
+    """Where the bias comes from: each part of a forecast against its own actual cash, nominal
+    TRY, per company and consolidated, for each h and POOLED, over the rows of `actual` (from
+    `actual_totals`, so only weeks with data).
+
+    The hurdle model (`rolled`, left out if None), with `part`:
+      - KNOWN_CUSTOMERS, NEW_CUSTOMERS, UNIDENTIFIED, REFUND_PART: the part x the price level
+        projected at the origin, against its actual (`part_actuals`). Their gaps add up to
+        the gap of PART_TOTAL. Refunds are negative, so a ratio below 1 there means too few
+        refunds forecast, which lifts the total; the gap shows the direction.
+      - PART_TOTAL: the total against all the actual cash.
+      - PRICE_LEVEL: not one more part but how much of the total's gap comes from the
+        projection: the real total at the projected level (forecast) against the same real
+        total at the published level of the target week (actual, from `levels`).
+    The financial rule (`rule`): only KNOWN_CUSTOMERS, its `invoice_cash` against the same
+    actual; a rough comparison, since known customers also pay invoices issued after the
+    origin. Its top-ups are the hurdle model's.
+
+    Columns `COMPONENT_COLUMNS`: the hurdle model's parts in the order above, then the rule.
+    Raises ValueError if `horizons` is below 1, a row of `actual` has an h outside 1 to
+    `horizons`, or no forecast, or no published level, or the gaps of the four parts do not
+    add up to the total's gap, and as `part_actuals` does.
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    outside = sorted(set(actual["h"]) - set(range(1, horizons + 1)))
+    if outside:
+        raise ValueError(f"the actual cash has rows for h {outside}; horizons is {horizons}")
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    actuals = part_actuals(actual, new_cash, refunds, unidentified)
+    found = []
+
+    # 1. The hurdle model's parts, if it ran.
+    if rolled is not None:
+        rows = actuals.merge(rolled.totals, on=keys, how="left", validate="one_to_one")
+        if rows["total"].isna().any():
+            first = rows.loc[rows["total"].isna(), keys].iloc[0].to_dict()
+            raise ValueError(f"the hurdle model has no forecast for "
+                             f"{int(rows['total'].isna().sum())} rows of the actual cash "
+                             f"(first: {first})")
+
+        # Each part in nominal TRY, at the price level projected at the origin.
+        for column in ADDING_PARTS.values():
+            rows[f"nominal_{column}"] = rows[column] * rows["price_level"]
+
+        # The gaps of the four parts must add up to the total's gap.
+        forecast_columns = [f"nominal_{column}" for column in ADDING_PARTS.values()]
+        difference = (rows[forecast_columns].sum(axis=1) - rows["total"]).abs()
+        if (difference > TIE_TOLERANCE).any():
+            first = rows.loc[difference > TIE_TOLERANCE, keys].iloc[0].to_dict()
+            raise ValueError(f"the parts do not add up to the total in "
+                             f"{int((difference > TIE_TOLERANCE).sum())} rows (first: {first})")
+
+        # The same real total at the published level of the target week.
+        published = rows["target_week"].map(levels)
+        if published.isna().any():
+            weeks_without = sorted(set(rows.loc[published.isna(), "target_week"]))
+            raise ValueError(f"no published price level for weeks {weeks_without}")
+        rows["total_at_published"] = rows["real_total"] * published
+
+        actual_columns = {KNOWN_CUSTOMERS: "actual_known", NEW_CUSTOMERS: "actual_new",
+                          UNIDENTIFIED: "actual_unidentified", REFUND_PART: "actual_refunds"}
+        for part, column in ADDING_PARTS.items():
+            found.extend(part_rows(HURDLE, part, rows, f"nominal_{column}",
+                                   actual_columns[part], horizons))
+        found.extend(part_rows(HURDLE, PART_TOTAL, rows, "total", "actual", horizons))
+        found.extend(part_rows(HURDLE, PRICE_LEVEL, rows, "total", "total_at_published",
+                               horizons))
+
+    # 2. The financial rule's open invoices against the same known customers' cash.
+    rows = actuals.merge(rule.totals[keys + ["invoice_cash"]], on=keys, how="left",
+                         validate="one_to_one")
+    if rows["invoice_cash"].isna().any():
+        first = rows.loc[rows["invoice_cash"].isna(), keys].iloc[0].to_dict()
+        raise ValueError(f"the financial rule has no forecast for "
+                         f"{int(rows['invoice_cash'].isna().sum())} rows of the actual cash "
+                         f"(first: {first})")
+    found.extend(part_rows(RULE, KNOWN_CUSTOMERS, rows, "invoice_cash", "actual_known", horizons))
+
+    return pd.DataFrame(found, columns=COMPONENT_COLUMNS)
+
+
+def payer_row(company: str, horizon: str, rows: pd.DataFrame) -> dict:
+    """One row of `payer_split`: how many pay and how much each pays, forecast against actual.
+
+    p_ratio = sum of p / customers who paid. m_ratio = (sum of p x m / sum of p) / (cash /
+    customers who paid). Their product is pxm_ratio = sum of p x m / cash. Each is NaN if what
+    it divides by is 0.
+    """
+    expected_payers = float(rows["p"].sum())
+    expected_cash = float(rows["expected"].sum())
+    actual_payers = int(rows["paid"].sum())
+    actual_cash = float(rows["actual_real"].sum())
+    expected_per_payer = ratio_or_nan(expected_cash, expected_payers)
+    actual_per_payer = ratio_or_nan(actual_cash, actual_payers)
+    return {"company_code": company, "horizon": horizon, "rows": len(rows),
+            "expected_payers": expected_payers, "actual_payers": actual_payers,
+            "p_ratio": ratio_or_nan(expected_payers, actual_payers),
+            "expected_per_payer": expected_per_payer, "actual_per_payer": actual_per_payer,
+            "m_ratio": ratio_or_nan(expected_per_payer, actual_per_payer),
+            "pxm_ratio": ratio_or_nan(expected_cash, actual_cash)}
+
+
+def payer_split(customers: pd.DataFrame, weekly: pd.DataFrame, weeks: pd.DataFrame,
+                levels: pd.Series, horizons: int) -> pd.DataFrame:
+    """Is the known customers' bias in stage 1 or stage 2? Over the customer forecasts
+    (`customers`, the `customers` of `rolling_forecasts`) whose target week has data, in TRY
+    of week 0, so that the price projection cannot enter: how many customers were expected
+    to pay against how many did (p_ratio), and how much per payer against how much each
+    paid (m_ratio). See `payer_row`.
+
+    A customer paid if its gross receipts (`weekly`, from `series.weekly_amounts`) in the
+    target week are above 0; a customer with no weekly row paid 0, a real 0 in a week with
+    data (`weeks`, the week calendar). Refunds are not in it: they are a top-up. The receipts
+    are divided by the target week's published level (`levels`).
+
+    One row per company (sorted) and "ALL", for each h and POOLED; columns `PAYER_COLUMNS`.
+    Raises ValueError if `horizons` is below 1, there are no customer rows in a week with
+    data, a row's h is not 1 to `horizons`, a (key, origin, h) is there twice, and as
+    `deflate` does for a week with no price level.
+    """
+    if horizons < 1:
+        raise ValueError(f"horizons is {horizons}; horizons start at 1")
+    outside = sorted(set(customers["h"]) - set(range(1, horizons + 1)))
+    if outside:
+        raise ValueError(f"customer forecasts for h {outside}; horizons is {horizons}")
+    repeated = customers.duplicated(["key", "origin_week", "h"])
+    if repeated.any():
+        first = customers.loc[repeated, ["key", "origin_week", "h"]].iloc[0].to_dict()
+        raise ValueError(f"{int(repeated.sum())} customer forecasts are there twice "
+                         f"(first: {first})")
+
+    # 1. Only the target weeks with data: a week without data is not a week nobody paid.
+    with_data = set(weeks.loc[~weeks["is_missing"], "week"])
+    rows = customers[customers["target_week"].isin(with_data)]
+    if rows.empty:
+        raise ValueError("there are no customer forecasts in a week with data")
+
+    # 2. What each customer really paid in its target week.
+    paid = weekly[["key", "week", "gross_receipts"]].rename(columns={"week": "target_week"})
+    rows = rows.merge(paid, on=["key", "target_week"], how="left", validate="many_to_one")
+    rows["gross_receipts"] = rows["gross_receipts"].fillna(0.0)
+    rows["paid"] = rows["gross_receipts"] > 0
+    rows["actual_real"] = deflate(rows["gross_receipts"], rows["target_week"], levels)
+
+    # 3. Per company and consolidated, each h and pooled.
+    groups = [(company, rows[rows["company_code"] == company])
+              for company in sorted(set(rows["company_code"]))]
+    groups.append((CONSOLIDATED, rows))
+    found = []
+    for company, mine in groups:
+        for h in range(1, horizons + 1):
+            at_h = mine[mine["h"] == h]
+            if not at_h.empty:
+                found.append(payer_row(company, str(h), at_h))
+        found.append(payer_row(company, POOLED, mine))
+    return pd.DataFrame(found, columns=PAYER_COLUMNS)
