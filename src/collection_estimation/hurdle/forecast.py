@@ -12,6 +12,11 @@ new customers A, unidentified cash G, refunds R, negative), deflated; then times
 level projected at T (U13.1), in nominal TRY. Plus the consolidated rows, company "ALL".
 
 U13.4, `forecast`: the steps above in one call, the one path every forecast takes.
+
+U16.1, each stage on its own (`stage1_predictions`, `stage2_predictions`): the fit and
+prediction of one stage with one setting, which `customer_forecasts` calls. Stage 2 depends on
+stage 1's settings only through `company_as_feature`, so the settings grid (U16) can fit each
+stage-1 and each stage-2 setting once and pair them afterwards.
 """
 from dataclasses import dataclass
 from datetime import date
@@ -62,24 +67,10 @@ def customer_forecasts(table: pd.DataFrame, origin: int, settings,
         raise ValueError(f"the table has no rows at origin week {origin}")
     stage1, stage2 = settings.stage1, settings.stage2
 
-    # Stage 1, "will it pay?", on every row known at T.
-    columns1 = feature_columns(block_columns, stage1.feature_blocks)
-    stage1_model = fit_stage1(
-        stage1_features(train_rows, columns1, companies, stage1.company_as_feature),
-        train_rows["paid"], stage1)
-    p = predict_paid(stage1_model, stage1_features(forecast_rows, columns1, companies,
-                                                   stage1.company_as_feature))
-
-    # Stage 2, "how much, if it pays?", on the rows known at T that paid; m = s x exposure.
-    columns2 = feature_columns(block_columns, stage2.feature_blocks)
-    paid_rows = train_rows[train_rows["paid"].astype(bool)]
-    stage2_model = fit_stage2(
-        stage1_features(paid_rows, columns2, companies, stage1.company_as_feature),
-        paid_rows["amount_deflated"], exposure(train_rows, paid_rows, stage2), stage2)
-    m = predict_amount(stage2_model,
-                       stage1_features(forecast_rows, columns2, companies,
-                                       stage1.company_as_feature),
-                       exposure(train_rows, forecast_rows, stage2))
+    # Stage 1, "will it pay?", and stage 2, "how much, if it pays?".
+    p = stage1_predictions(train_rows, forecast_rows, stage1, block_columns, companies)
+    m = stage2_predictions(train_rows, forecast_rows, stage2, block_columns, companies,
+                           stage1.company_as_feature)
 
     forecasts = forecast_rows[CUSTOMER_COLUMNS[:6]].assign(p=p, m=m, expected=p * m)
     for column in ("p", "m", "expected"):
@@ -92,6 +83,42 @@ def customer_forecasts(table: pd.DataFrame, origin: int, settings,
                          f"cannot pay a negative amount ([stage2] loss {stage2.loss!r}; "
                          f"'poisson' and 'gamma' never predict one)")
     return forecasts
+
+
+def stage1_predictions(train_rows: pd.DataFrame, forecast_rows: pd.DataFrame, stage1,
+                       block_columns: dict[str, list[str]], companies: list[str]) -> pd.Series:
+    """p for each of `forecast_rows` (same index): stage 1, "will it pay?", with the settings
+    `stage1` (a `[stage1]`), fitted on every one of `train_rows`.
+
+    `block_columns` and `companies` are `customer_forecasts`'. Nothing is checked here:
+    `customer_forecasts` refuses a p that is not a number, and the settings grid (U16) marks
+    such a setting as not eligible instead of stopping.
+    """
+    columns = feature_columns(block_columns, stage1.feature_blocks)
+    train_x = stage1_features(train_rows, columns, companies, stage1.company_as_feature)
+    model = fit_stage1(train_x, train_rows["paid"], stage1)
+    forecast_x = stage1_features(forecast_rows, columns, companies, stage1.company_as_feature)
+    return predict_paid(model, forecast_x)
+
+
+def stage2_predictions(train_rows: pd.DataFrame, forecast_rows: pd.DataFrame, stage2,
+                       block_columns: dict[str, list[str]], companies: list[str],
+                       company_as_feature: bool) -> pd.Series:
+    """m for each of `forecast_rows` (same index): stage 2, "how much, if it pays?", with the
+    settings `stage2` (a `[stage2]`), fitted on the `train_rows` that paid; m = s x exposure,
+    the exposure learned from `train_rows`.
+
+    `company_as_feature` is `[stage1] company_as_feature`: the only stage-1 setting stage 2
+    reads. Nothing is checked here, as in `stage1_predictions`.
+    """
+    columns = feature_columns(block_columns, stage2.feature_blocks)
+    paid_rows = train_rows[train_rows["paid"].astype(bool)]
+    paid_x = stage1_features(paid_rows, columns, companies, company_as_feature)
+    paid_exposure = exposure(train_rows, paid_rows, stage2)
+    model = fit_stage2(paid_x, paid_rows["amount_deflated"], paid_exposure, stage2)
+    forecast_x = stage1_features(forecast_rows, columns, companies, company_as_feature)
+    forecast_exposure = exposure(train_rows, forecast_rows, stage2)
+    return predict_amount(model, forecast_x, forecast_exposure)
 
 
 def _check_pairs(what: str, found: set, wanted: set) -> None:

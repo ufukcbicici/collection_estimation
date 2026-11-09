@@ -5324,8 +5324,10 @@ def test_step_16_and_17_imports():
     forecast_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.forecast"]
     assert len(forecast_imports) == 1
+    # U16.1 added stage1_predictions and stage2_predictions (step 18).
     assert [(a.name, a.asname) for a in forecast_imports[0].names] == [
-        ("CONSOLIDATED", None), ("forecast", None)]
+        ("CONSOLIDATED", None), ("forecast", None), ("stage1_predictions", None),
+        ("stage2_predictions", None)]
     evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.evaluate"]
     assert len(evaluate_imports) == 1
@@ -5445,11 +5447,19 @@ def test_step_16_and_17_names_are_the_modules_functions():
 
 
 def test_step_17_is_the_last_statement_of_main_behind_its_run_switch():
+    # Since U16.1 only step 18's statements follow step 17's `if`; none of them an `if`.
     body = main_body()
-    last = body[-1]
-    assert isinstance(last, ast.If) and ast.unparse(last.test) == "settings.evaluation.run"
-    assert last.orelse == []
-    assert index_of_if(body, "settings.evaluation.run") == len(body) - 1
+    at = index_of_if(body, "settings.evaluation.run")
+    block = body[at]
+    assert block.orelse == []
+    assert [ast.unparse(node) for node in body[at + 1:]] == STEP_18_STATEMENTS
+    assert len(main_through_step_17()) == at + 1
+
+
+def main_through_step_17():
+    """main()'s statements up to and including step 17's `if` (step 18 follows it)."""
+    body = main_body()
+    return body[:index_of_if(body, "settings.evaluation.run") + 1]
 
 
 def test_step_17_uses_the_validation_origins_only():
@@ -5763,7 +5773,8 @@ def test_step_17_deflated_reference_uses_the_same_origins_as_the_rolling_forecas
 
 
 def test_step_17_is_still_the_last_step_after_the_deflated_reference():
-    body = main_body()
+    # Since U16.1 step 18 follows step 17's `if`: main() up to that `if`.
+    body = main_through_step_17()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     # Since U14.5d the deflated reference's printout is thirteenth from last, before the rule's
@@ -5951,7 +5962,8 @@ def test_step_17_ends_with_the_rule_reference_and_its_printout():
 
 
 def test_step_17_is_still_the_last_step_after_the_rule_reference():
-    body = main_body()
+    # Since U16.1 step 18 follows step 17's `if`: main() up to that `if`.
+    body = main_through_step_17()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
@@ -6571,7 +6583,8 @@ def test_step_17_scores_come_right_after_show_rule_reference():
 
 
 def test_step_17_is_still_the_last_step_after_the_scores():
-    body = main_body()
+    # Since U16.1 step 18 follows step 17's `if`: main() up to that `if`.
+    body = main_through_step_17()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
@@ -7086,7 +7099,8 @@ def test_step_17_bootstrap_comes_right_after_show_evaluation_scores():
 
 
 def test_step_17_is_still_the_last_step_after_the_bootstrap():
-    body = main_body()
+    # Since U16.1 step 18 follows step 17's `if`: main() up to that `if`.
+    body = main_through_step_17()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
@@ -7375,7 +7389,8 @@ def test_step_17_the_bias_comes_right_after_the_bootstraps_printout():
 
 
 def test_step_17_is_still_the_last_step_after_the_bias():
-    body = main_body()
+    # Since U16.1 step 18 follows step 17's `if`: main() up to that `if`.
+    body = main_through_step_17()
     assert isinstance(body[-1], ast.If)
     assert ast.unparse(body[-1].test) == "settings.evaluation.run"
     assert body[-1].orelse == []
@@ -7435,10 +7450,12 @@ def test_the_bias_printouts_sit_right_before_show_actual_totals():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_actual_totals")
-    # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that.
-    assert names[shown - 6:shown] == ["show_paired_bootstrap", "show_component_bias",
+    # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that;
+    # U16.1 show_stage_predictions (step 18) after those.
+    assert names[shown - 7:shown] == ["show_paired_bootstrap", "show_component_bias",
                                       "show_payer_split", "show_balance_coherence",
-                                      "show_calibration_reliability", "show_calibration_choice"]
+                                      "show_calibration_reliability", "show_calibration_choice",
+                                      "show_stage_predictions"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7779,8 +7796,8 @@ def test_show_balance_coherence_is_a_module_level_function_before_show_actual_to
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
-    # U15 put its two printouts between it and show_actual_totals.
-    assert names.index("show_balance_coherence") + 3 == names.index("show_actual_totals")
+    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more.
+    assert names.index("show_balance_coherence") + 4 == names.index("show_actual_totals")
 
 
 def test_step_17_run_the_balance_check_gets_its_arguments_in_order():
@@ -8181,3 +8198,282 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
     assert lines[15].startswith("        paired bootstrap (U14.5c), consolidated, 50 resamples")
     assert lines[-4:-1] == [FROZEN_LINE, "          p, none: unchanged",
                             "          m, scale: common factor 3.337"]
+
+
+# Step 18, U16.1: each stage fitted on its own at the demo origin, after step 17's `if` and
+# outside it, compared with step 16's p and m. Wiring on main()'s syntax tree, then step 18's
+# statements run with fakes, then the exact printouts of show_stage_predictions, in a separate
+# process.
+STEP_18_STATEMENTS = [
+    "print(f'Step 18: settings grid (U16); for now each stage fitted on its own at origin "
+    "{origin}')",
+    "started = time.perf_counter()",
+    "p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1, "
+    "block_feature_columns(history, calendar, owed), companies)",
+    "p_seconds = time.perf_counter() - started",
+    "started = time.perf_counter()",
+    "m_alone = stage2_predictions(train_rows, forecast_rows, settings.stage2, "
+    "block_feature_columns(history, calendar, owed), companies, "
+    "settings.stage1.company_as_feature)",
+    "m_seconds = time.perf_counter() - started",
+    "show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)",
+]
+
+
+def step_18_body():
+    """main()'s statements after step 17's `if`: step 18."""
+    body = main_body()
+    return body[index_of_if(body, "settings.evaluation.run") + 1:]
+
+
+def test_step_18_statements_in_order_right_after_step_17_and_last_in_main():
+    assert [ast.unparse(node) for node in step_18_body()] == STEP_18_STATEMENTS
+
+
+def test_step_18_is_outside_step_17_and_every_other_if():
+    # Each of its names is called only at main()'s top level, after step 17's `if`.
+    for name in ("stage1_predictions", "stage2_predictions", "show_stage_predictions"):
+        assert len(calls_to(main_tree(), name)) == 1, name
+        assert calls_in(step_18_body(), name), name
+        assert calls_to(step_17_block(), name) == [], name
+    assert not any(isinstance(node, ast.If) for node in step_18_body())
+
+
+def test_step_18_calls_take_no_keywords():
+    for name in ("stage1_predictions", "stage2_predictions", "show_stage_predictions"):
+        assert calls_in(step_18_body(), name)[0].keywords == [], name
+
+
+def test_step_18_stage2_gets_stage1s_company_setting_and_its_own_settings():
+    stage1 = calls_in(step_18_body(), "stage1_predictions")[0]
+    stage2 = calls_in(step_18_body(), "stage2_predictions")[0]
+    assert ast.unparse(stage1.args[2]) == "settings.stage1"
+    assert ast.unparse(stage2.args[2]) == "settings.stage2"
+    assert ast.unparse(stage2.args[5]) == "settings.stage1.company_as_feature"
+    # Stage 2 sees no other stage-1 setting.
+    assert ast.unparse(stage2).count("settings.stage1") == 1
+
+
+def test_step_18_uses_step_12s_rows_step_16s_result_and_the_demo_origin():
+    # The names it reads are assigned once in main(), so they are step 12's and step 16's.
+    tree = main_tree()
+    for name in ("train_rows", "forecast_rows", "result", "origin", "companies"):
+        assert len(assignments_to(tree, name)) == 1, name
+    assert ast.unparse(assignments_to(tree, "origin")[0].value) == "settings.debug.demo_origin"
+    assert ast.unparse(assignments_to(tree, "train_rows")[0].value) == (
+        "rows_known_at(table, origin)")
+    assert ast.unparse(assignments_to(tree, "forecast_rows")[0].value) == (
+        "rows_at_origin(table, origin)")
+    for name in ("p_alone", "m_alone", "p_seconds", "m_seconds"):
+        assert len(assignments_to(tree, name)) == 1, name
+
+
+def test_step_18_block_columns_are_step_16s():
+    # The same feature blocks step 16's forecast gets.
+    step_16 = calls_in(step_16_body(), "forecast")[0]
+    blocks_16 = keywords_of(step_16)["block_columns"]
+    for name in ("stage1_predictions", "stage2_predictions"):
+        call = calls_in(step_18_body(), name)[0]
+        assert ast.unparse(call.args[3]) == blocks_16, name
+        assert [ast.unparse(a) for a in call.args[:2]] == ["train_rows", "forecast_rows"]
+        assert ast.unparse(call.args[4]) == "companies"
+
+
+def test_show_stage_predictions_is_a_module_level_function_with_five_parameters():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_stage_predictions"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["p", "m", "p_seconds", "m_seconds",
+                                                   "customers"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+
+
+def test_module_docstring_lists_step_18_after_the_forecast_line():
+    lines = ast.get_docstring(ast.parse(SCRIPT.read_text(encoding="utf-8"))).splitlines()
+    step_lines = [line for line in lines if re.match(r"^\s+\d+\s{2}", line)]
+    assert step_lines[-2] == ("   13  forecast, evaluation, calibration                    "
+                              "       (U13-U15)")
+    assert step_lines[-1] == ("   18  settings grid                                        "
+                              "       (U16)  <- in progress")
+
+
+def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25)):
+    """Run step 18's statements with fake inputs and functions; return (calls, printed)."""
+    calls, printed = [], []
+    clock = iter(ticks)
+
+    def recorder(name, result):
+        def call(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return result
+        return call
+
+    settings = SimpleNamespace(stage1=SimpleNamespace(company_as_feature=company_as_feature),
+                               stage2="<stage2 settings>")
+    stage1_settings = settings.stage1
+    namespace = {
+        "settings": settings, "origin": 37, "train_rows": "<train rows>",
+        "forecast_rows": "<forecast rows>", "history": "<history>", "calendar": "<calendar>",
+        "owed": "<owed>", "companies": "<companies>",
+        "result": SimpleNamespace(customers="<customers>", totals="<totals>"),
+        "time": SimpleNamespace(perf_counter=lambda: next(clock)),
+        "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        "block_feature_columns": recorder("block_feature_columns", "<blocks>"),
+        "stage1_predictions": recorder("stage1_predictions", "<p>"),
+        "stage2_predictions": recorder("stage2_predictions", "<m>"),
+        "show_stage_predictions": recorder("show_stage_predictions", None),
+    }
+    module = ast.Module(body=step_18_body(), type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
+    assert namespace["settings"].stage1 is stage1_settings
+    return calls, printed
+
+
+def test_step_18_run_calls_in_order():
+    calls, _ = run_step_18()
+    assert [name for name, _, _ in calls] == [
+        "block_feature_columns", "stage1_predictions", "block_feature_columns",
+        "stage2_predictions", "show_stage_predictions"]
+
+
+def test_step_18_run_prints_the_header_with_the_origin_once():
+    _, printed = run_step_18()
+    assert printed == ["Step 18: settings grid (U16); for now each stage fitted on its own at "
+                       "origin 37"]
+
+
+def test_step_18_run_arguments_of_each_stage():
+    calls, _ = run_step_18(company_as_feature=False)
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert by_name["block_feature_columns"] == (("<history>", "<calendar>", "<owed>"), {})
+    args1, kwargs1 = by_name["stage1_predictions"]
+    assert kwargs1 == {}
+    assert args1[:2] == ("<train rows>", "<forecast rows>")
+    assert args1[2].company_as_feature is False   # settings.stage1 itself
+    assert args1[3:] == ("<blocks>", "<companies>")
+    assert by_name["stage2_predictions"] == (
+        ("<train rows>", "<forecast rows>", "<stage2 settings>", "<blocks>", "<companies>",
+         False), {})
+
+
+def test_step_18_run_company_flag_follows_the_stage1_setting():
+    calls, _ = run_step_18(company_as_feature=True)
+    stage2 = [args for name, args, _ in calls if name == "stage2_predictions"]
+    assert stage2[0][5] is True
+
+
+def test_step_18_run_each_stage_is_timed_on_its_own():
+    # Clock ticks 1.0, 3.5 around stage 1 and 10.0, 17.25 around stage 2.
+    calls, _ = run_step_18()
+    shown = [args for name, args, _ in calls if name == "show_stage_predictions"]
+    assert shown == [("<p>", "<m>", 2.5, 7.25, "<customers>")]
+
+
+SHOW_STAGES = """
+import numpy as np
+import pandas as pd
+import run_hurdle_pipeline as script
+
+
+def base():
+    n = 1500
+    index = pd.Index(5000 + np.arange(n)[::-1])
+    p = pd.Series(np.full(n, 0.25), index=index, name="p")
+    p.iloc[0] = 0.85
+    m = pd.Series(np.full(n, 800000.0), index=index, name="m")
+    m.iloc[0] = 35367890.0
+    customers = pd.DataFrame({"key": "k", "p": p.to_numpy(), "m": m.to_numpy(),
+                              "expected": (p * m).to_numpy()}, index=index.copy())
+    return p, m, customers
+
+
+def next_up(series, row):
+    series = series.copy()
+    series.iloc[row] = np.nextafter(series.iloc[row], np.inf)
+    return series
+
+
+def variant(name):
+    p, m, customers = base()
+    if name == "p one ulp off":
+        p = next_up(p, 700)
+    elif name == "m one ulp off":
+        m = next_up(m, 3)
+    elif name == "both off":
+        p, m = next_up(p, 1), next_up(m, 2)
+    elif name == "customers index shifted":
+        customers.index = customers.index + 1
+    elif name == "customers index reordered":
+        customers = customers.iloc[::-1]
+        customers.index = p.index
+    elif name == "same values other order":
+        p, m = p.iloc[::-1], m.iloc[::-1]
+    elif name == "p index differs only":
+        p = p.set_axis(p.index + 10000)
+    elif name == "customers one row short":
+        customers = customers.iloc[:-1]
+    return p, m, customers
+
+
+for name in ["equal", "p one ulp off", "m one ulp off", "both off", "customers index shifted",
+             "customers index reordered", "same values other order", "p index differs only",
+             "customers one row short"]:
+    p, m, customers = variant(name)
+    before = (p.copy(), m.copy(), customers.copy())
+    print("== " + name)
+    script.show_stage_predictions(p, m, 12.4, 3.6, customers)
+    pd.testing.assert_series_equal(p, before[0])
+    pd.testing.assert_series_equal(m, before[1])
+    pd.testing.assert_frame_equal(customers, before[2])
+print("ok")
+"""
+
+STAGES_HEAD = [
+    "        stage 1 alone: 1,500 rows, mean p 0.2504, 12 s",
+    "        stage 2 alone: 1,500 rows, sum of m 1,234.6 M (TRY of week 0), 4 s",
+]
+SAME_LINE = "        the same as step 16, row by row: p {}, m {}"
+
+
+@pytest.fixture(scope="module")
+def stage_printouts():
+    result = run_code(SHOW_STAGES)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    printed, name = {}, None
+    for line in lines[:-1]:
+        if line.startswith("== "):
+            name = line[3:]
+            printed[name] = []
+        else:
+            printed[name].append(line)
+    return printed
+
+
+def test_show_stage_predictions_exact_printout_when_equal(stage_printouts):
+    assert stage_printouts["equal"] == STAGES_HEAD + [SAME_LINE.format("yes", "yes")]
+
+
+@pytest.mark.parametrize("name,p,m", [
+    ("p one ulp off", "NO", "yes"),
+    ("m one ulp off", "yes", "NO"),
+    ("both off", "NO", "NO"),
+    ("customers index shifted", "NO", "NO"),
+    ("customers index reordered", "NO", "NO"),
+    ("p index differs only", "NO", "NO"),
+    ("customers one row short", "NO", "NO"),
+])
+def test_show_stage_predictions_exact_printout_when_different(stage_printouts, name, p, m):
+    # Exact, row by row: one ulp is a difference, and any other index (labels, order or
+    # length, of p or of m) is "NO" for both, without raising.
+    assert stage_printouts[name] == STAGES_HEAD + [SAME_LINE.format(p, m)]
+
+
+def test_show_stage_predictions_same_values_in_another_order_is_not_the_same(stage_printouts):
+    # Reversed p and m against customers in the original order: the index differs.
+    lines = stage_printouts["same values other order"]
+    assert lines[2] == SAME_LINE.format("NO", "NO")
+    # The size and the sums do not depend on the order.
+    assert lines[:2] == STAGES_HEAD

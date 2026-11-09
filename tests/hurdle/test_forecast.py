@@ -23,7 +23,7 @@ import pytest
 from collection_estimation.hurdle import forecast as forecast_module
 from collection_estimation.hurdle.forecast import (
     CONSOLIDATED, CUSTOMER_COLUMNS, TOTAL_COLUMNS, _check_pairs, customer_forecasts,
-    forecast_totals)
+    forecast_totals, stage1_predictions, stage2_predictions)
 from collection_estimation.hurdle.prices import projected_levels
 from collection_estimation.hurdle.topups import TOPUP_COLUMNS
 from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings, Stage2Settings
@@ -2143,3 +2143,462 @@ def test_forecast_does_not_change_its_inputs(table):
     pd.testing.assert_series_equal(kwargs["levels"], copies["levels"])
     assert kwargs["block_columns"] == copies["block_columns"]
     assert kwargs["companies"] == F_COMPANIES
+
+
+# =========================================================================================
+# U16.1: each stage on its own, `stage1_predictions` and `stage2_predictions`
+#
+# The fit and prediction `customer_forecasts` used to do inline, moved out so the settings grid
+# (U16) can fit each stage-1 and each stage-2 setting once and pair them afterwards. They must
+# give exactly customer_forecasts' p and m, depend on nothing but their own arguments (stage 2
+# on stage 1's settings only through company_as_feature), and check nothing: a NaN, infinite
+# or negative prediction is returned, for the grid's gates to judge.
+# =========================================================================================
+
+def stage_rows(table, origin=ORIGIN):
+    """customer_forecasts' two row sets at `origin`: the known rows and the rows at T."""
+    return rows_known_at(table, origin), rows_at_origin(table, origin)
+
+
+def p_alone(table, settings=None, origin=ORIGIN, block_columns=BLOCK_COLUMNS,
+            companies=COMPANIES):
+    settings = settings or make_settings()
+    train, at = stage_rows(table, origin)
+    return stage1_predictions(train, at, settings.stage1, block_columns, companies)
+
+
+def m_alone(table, settings=None, origin=ORIGIN, block_columns=BLOCK_COLUMNS,
+            companies=COMPANIES):
+    settings = settings or make_settings()
+    train, at = stage_rows(table, origin)
+    return stage2_predictions(train, at, settings.stage2, block_columns, companies,
+                              settings.stage1.company_as_feature)
+
+
+# Settings pairs on which each stage alone must reproduce customer_forecasts exactly.
+ALONE_CASES = {
+    "default": make_settings(),
+    "no company": make_settings(stage1_settings(company_as_feature=False)),
+    "own blocks": make_settings(stage1_settings(blocks=("history",)),
+                                stage2_settings(blocks=("calendar", "receivables"))),
+    "gamma": make_settings(stage2=stage2_settings(loss="gamma", max_iter=4)),
+    "open balance median": make_settings(stage2=stage2_settings(scale="open balance")),
+    "open balance mean": make_settings(stage2=stage2_settings(scale="open balance",
+                                                              balance_floor="mean")),
+    "open balance own mean": make_settings(
+        stage1_settings(company_as_feature=False),
+        stage2_settings(scale="open balance", balance_floor="own mean")),
+    "no blocks": make_settings(stage1_settings(blocks=()), stage2_settings(blocks=())),
+}
+
+
+# --- the same p and m as customer_forecasts --------------------------------------------------
+
+@pytest.mark.parametrize("case", list(ALONE_CASES))
+def test_alone_p_and_m_equal_customer_forecasts_exactly(table, case):
+    settings = ALONE_CASES[case]
+    got = run(table, ORIGIN, settings)
+    pd.testing.assert_series_equal(p_alone(table, settings), got["p"], check_exact=True)
+    pd.testing.assert_series_equal(m_alone(table, settings), got["m"], check_exact=True)
+
+
+@pytest.mark.parametrize("origin", [5, 12, 23, 30])
+def test_alone_p_and_m_equal_customer_forecasts_at_other_origins(table, origin):
+    # 30 is the last origin: every row at T is unlabelled ("future").
+    got = run(table, origin)
+    pd.testing.assert_series_equal(p_alone(table, origin=origin), got["p"], check_exact=True)
+    pd.testing.assert_series_equal(m_alone(table, origin=origin), got["m"], check_exact=True)
+
+
+@pytest.mark.parametrize("case", ["default", "own blocks", "open balance own mean"])
+def test_alone_p_and_m_equal_the_steps_called_by_hand(table, case):
+    settings = ALONE_CASES[case]
+    p, m, _, _ = by_hand(table, ORIGIN, settings)
+    np.testing.assert_array_equal(p_alone(table, settings).to_numpy(), p.to_numpy())
+    np.testing.assert_array_equal(m_alone(table, settings).to_numpy(), m.to_numpy())
+
+
+def test_customer_forecasts_calls_each_stage_function_once_with_its_arguments(table,
+                                                                              monkeypatch):
+    calls = []
+    real1, real2 = forecast_module.stage1_predictions, forecast_module.stage2_predictions
+
+    def spy1(*args, **kwargs):
+        calls.append(("stage1", args, kwargs))
+        return real1(*args, **kwargs)
+
+    def spy2(*args, **kwargs):
+        calls.append(("stage2", args, kwargs))
+        return real2(*args, **kwargs)
+
+    monkeypatch.setattr(forecast_module, "stage1_predictions", spy1)
+    monkeypatch.setattr(forecast_module, "stage2_predictions", spy2)
+    settings = make_settings(stage1_settings(company_as_feature=False), stage2_settings())
+    blocks, companies = dict(BLOCK_COLUMNS), list(COMPANIES)
+    customer_forecasts(table, ORIGIN, settings, blocks, companies)
+    assert [name for name, _, _ in calls] == ["stage1", "stage2"]
+    train, at = stage_rows(table)
+    (_, args1, kwargs1), (_, args2, kwargs2) = calls
+    assert kwargs1 == {} and kwargs2 == {}
+    assert len(args1) == 5 and len(args2) == 6
+    for args in (args1, args2):
+        pd.testing.assert_frame_equal(args[0], train)
+        pd.testing.assert_frame_equal(args[1], at)
+        assert args[3] is blocks and args[4] is companies
+    assert args1[2] is settings.stage1
+    assert args2[2] is settings.stage2
+    assert args2[5] is False
+
+
+# --- what they return ------------------------------------------------------------------------
+
+def test_alone_return_series_named_p_and_m_with_the_forecast_rows_index(table):
+    train, at = stage_rows(table)
+    settings = make_settings()
+    p = stage1_predictions(train, at, settings.stage1, BLOCK_COLUMNS, COMPANIES)
+    m = stage2_predictions(train, at, settings.stage2, BLOCK_COLUMNS, COMPANIES, True)
+    for series, name in ((p, "p"), (m, "m")):
+        assert isinstance(series, pd.Series)
+        assert series.name == name
+        assert series.dtype == np.float64
+        # The same labels in the same order, not a fresh RangeIndex.
+        assert series.index.equals(at.index)
+        assert not isinstance(series.index, pd.RangeIndex)
+    assert len(p) == 8 * HORIZONS
+    assert ((p > 0) & (p < 1)).all()
+    assert (m > 0).all()
+
+
+def test_alone_follow_the_forecast_rows_order_and_subset(table):
+    # Any rows to predict, in any order: the result follows them label by label.
+    train, at = stage_rows(table)
+    settings = make_settings()
+    full_p = stage1_predictions(train, at, settings.stage1, BLOCK_COLUMNS, COMPANIES)
+    full_m = stage2_predictions(train, at, settings.stage2, BLOCK_COLUMNS, COMPANIES, True)
+    some = at.iloc[::-3]
+    p = stage1_predictions(train, some, settings.stage1, BLOCK_COLUMNS, COMPANIES)
+    m = stage2_predictions(train, some, settings.stage2, BLOCK_COLUMNS, COMPANIES, True)
+    assert p.index.equals(some.index) and m.index.equals(some.index)
+    np.testing.assert_array_equal(p.to_numpy(), full_p.loc[some.index].to_numpy())
+    np.testing.assert_array_equal(m.to_numpy(), full_m.loc[some.index].to_numpy())
+
+
+def test_alone_are_deterministic(table):
+    pd.testing.assert_series_equal(p_alone(table), p_alone(table), check_exact=True)
+    pd.testing.assert_series_equal(m_alone(table), m_alone(table), check_exact=True)
+
+
+def test_alone_need_no_labels_on_the_forecast_rows(table):
+    train, at = stage_rows(table)
+    blank = at.copy()
+    blank[["amount", "amount_deflated"]] = np.nan
+    blank["paid"] = np.nan
+    blank["label_status"] = "future"
+    settings = make_settings()
+    pd.testing.assert_series_equal(
+        stage1_predictions(train, blank, settings.stage1, BLOCK_COLUMNS, COMPANIES),
+        p_alone(table), check_exact=True)
+    pd.testing.assert_series_equal(
+        stage2_predictions(train, blank, settings.stage2, BLOCK_COLUMNS, COMPANIES, True),
+        m_alone(table), check_exact=True)
+
+
+@pytest.mark.parametrize("case", ["default", "open balance own mean"])
+def test_alone_do_not_change_their_inputs(table, case):
+    settings = ALONE_CASES[case]
+    train, at = stage_rows(table)
+    train_before, at_before = train.copy(), at.copy()
+    blocks = {name: list(columns) for name, columns in BLOCK_COLUMNS.items()}
+    companies = list(COMPANIES)
+    stage1_predictions(train, at, settings.stage1, blocks, companies)
+    stage2_predictions(train, at, settings.stage2, blocks, companies,
+                       settings.stage1.company_as_feature)
+    pd.testing.assert_frame_equal(train, train_before)
+    pd.testing.assert_frame_equal(at, at_before)
+    assert blocks == BLOCK_COLUMNS and companies == COMPANIES
+    assert settings == ALONE_CASES[case]
+
+
+def test_alone_results_are_not_views_of_the_rows(table):
+    train, at = stage_rows(table)
+    at_before = at.copy()
+    settings = make_settings()
+    p = stage1_predictions(train, at, settings.stage1, BLOCK_COLUMNS, COMPANIES)
+    m = stage2_predictions(train, at, settings.stage2, BLOCK_COLUMNS, COMPANIES, True)
+    p[:] = -1.0
+    m[:] = -1.0
+    pd.testing.assert_frame_equal(at, at_before)
+
+
+# --- grid independence: stage 2 reads stage 1's settings only through company_as_feature ----
+
+def test_signatures_stage2_takes_no_stage1_settings():
+    import inspect
+    assert list(inspect.signature(stage1_predictions).parameters) == [
+        "train_rows", "forecast_rows", "stage1", "block_columns", "companies"]
+    assert list(inspect.signature(stage2_predictions).parameters) == [
+        "train_rows", "forecast_rows", "stage2", "block_columns", "companies",
+        "company_as_feature"]
+
+
+# Stage-1 settings that differ in everything but company_as_feature (True).
+OTHER_STAGE1 = [
+    stage1_settings(),
+    stage1_settings(max_iter=3),
+    dataclasses.replace(stage1_settings(), learning_rate=0.5, max_leaf_nodes=3),
+    dataclasses.replace(stage1_settings(blocks=("calendar",), seed=99), min_samples_leaf=20,
+                        baseline_c=0.01),
+]
+
+
+def test_stage2_m_is_the_same_for_stage1_settings_that_differ_except_company(table):
+    # Through customer_forecasts, the path every forecast takes: p moves, m does not.
+    results = [run(table, ORIGIN, make_settings(s1)) for s1 in OTHER_STAGE1]
+    alone = m_alone(table)
+    for got in results:
+        pd.testing.assert_series_equal(got["m"], alone, check_exact=True)
+    # Premise: those stage-1 settings really are different fits.
+    assert len({tuple(got["p"].to_numpy()) for got in results}) == len(OTHER_STAGE1)
+
+
+def test_stage2_m_moves_with_company_as_feature(table):
+    train, at = stage_rows(table)
+    s2 = stage2_settings()
+    with_company = stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+    without = stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, False)
+    assert not np.array_equal(with_company.to_numpy(), without.to_numpy())
+    got = run(table, ORIGIN, make_settings(stage1_settings(company_as_feature=False), s2))
+    pd.testing.assert_series_equal(got["m"], without, check_exact=True)
+
+
+def test_stage2_company_flag_decides_the_company_column(table, monkeypatch):
+    seen = []
+    real2 = forecast_module.fit_stage2
+
+    def spy2(x, amount, exp, settings):
+        seen.append(list(x.columns))
+        return real2(x, amount, exp, settings)
+
+    monkeypatch.setattr(forecast_module, "fit_stage2", spy2)
+    train, at = stage_rows(table)
+    for flag in (True, False):
+        stage2_predictions(train, at, stage2_settings(), BLOCK_COLUMNS, COMPANIES, flag)
+    assert seen[0][-1] == "company_code"
+    assert "company_code" not in seen[1]
+
+
+def test_stage1_p_is_the_same_for_any_stage2_setting(table):
+    alone = p_alone(table)
+    for s2 in (stage2_settings(loss="gamma", max_iter=3),
+               stage2_settings(blocks=("history",), scale="open balance"),
+               stage2_settings(loss="squared_error", seed=7)):
+        got = run(table, ORIGIN, make_settings(stage2=s2))
+        pd.testing.assert_series_equal(got["p"], alone, check_exact=True)
+
+
+GRID_STAGE1 = [stage1_settings(), stage1_settings(max_iter=4),
+               stage1_settings(blocks=("history", "calendar"), company_as_feature=False)]
+GRID_STAGE2 = [stage2_settings(), stage2_settings(loss="gamma", max_iter=5),
+               stage2_settings(scale="open balance", balance_floor="own mean")]
+
+
+def test_fitting_each_stage_once_and_pairing_equals_every_customer_forecast(table):
+    # The grid's plan: p per stage-1 setting, m per (stage-2 setting, company flag), paired.
+    train, at = stage_rows(table)
+    ps = [stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES) for s1 in GRID_STAGE1]
+    ms = {(j, flag): stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, flag)
+          for j, s2 in enumerate(GRID_STAGE2) for flag in (True, False)}
+    for i, s1 in enumerate(GRID_STAGE1):
+        for j, s2 in enumerate(GRID_STAGE2):
+            got = run(table, ORIGIN, make_settings(s1, s2))
+            m = ms[(j, s1.company_as_feature)]
+            pd.testing.assert_series_equal(got["p"], ps[i], check_exact=True)
+            pd.testing.assert_series_equal(got["m"], m, check_exact=True)
+            pd.testing.assert_series_equal(got["expected"], (ps[i] * m).rename("expected"),
+                                           check_exact=True)
+
+
+def test_shared_rows_reused_for_many_settings_equal_fresh_copies(table):
+    train, at = stage_rows(table)
+    train_before, at_before = train.copy(), at.copy()
+    shared = ([stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES)
+               for s1 in GRID_STAGE1]
+              + [stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, flag)
+                 for s2 in GRID_STAGE2 for flag in (True, False)])
+    fresh = ([stage1_predictions(train_before.copy(), at_before.copy(), s1, BLOCK_COLUMNS,
+                                 COMPANIES) for s1 in GRID_STAGE1]
+             + [stage2_predictions(train_before.copy(), at_before.copy(), s2, BLOCK_COLUMNS,
+                                   COMPANIES, flag)
+                for s2 in GRID_STAGE2 for flag in (True, False)])
+    assert len(shared) == len(fresh) == 9
+    for a, b in zip(shared, fresh):
+        pd.testing.assert_series_equal(a, b, check_exact=True)
+    pd.testing.assert_frame_equal(train, train_before)
+    pd.testing.assert_frame_equal(at, at_before)
+
+
+def test_shared_rows_order_of_the_settings_does_not_matter(table):
+    train, at = stage_rows(table)
+    forward = [stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+               for s2 in GRID_STAGE2]
+    backward = [stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+                for s2 in reversed(GRID_STAGE2)][::-1]
+    for a, b in zip(forward, backward):
+        pd.testing.assert_series_equal(a, b, check_exact=True)
+    forward = [stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES) for s1 in GRID_STAGE1]
+    backward = [stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES)
+                for s1 in reversed(GRID_STAGE1)][::-1]
+    for a, b in zip(forward, backward):
+        pd.testing.assert_series_equal(a, b, check_exact=True)
+
+
+# --- they check nothing: a bad prediction is returned, customer_forecasts refuses it -------
+
+@pytest.mark.parametrize("bad", [nan, inf, -inf, 1.5, -0.5])
+def test_stage1_alone_returns_a_bad_p_where_customer_forecasts_raises(table, monkeypatch, bad):
+    def values(index):
+        v = np.full(len(index), 0.5)
+        v[:3] = bad
+        return v
+    monkeypatch.setattr(forecast_module, "predict_paid", fake_series(values))
+    p = p_alone(table)
+    np.testing.assert_array_equal(p.to_numpy()[:3], [bad] * 3)
+    assert (p.to_numpy()[3:] == 0.5).all()
+    if not np.isfinite(bad):
+        with pytest.raises(ValueError, match="p is NaN or infinite in 3 rows"):
+            run(table)
+
+
+@pytest.mark.parametrize("bad,message", [(nan, "m is NaN or infinite in 2 rows"),
+                                         (inf, "m is NaN or infinite in 2 rows"),
+                                         (-7.0, "m is below 0 in 2 rows")])
+def test_stage2_alone_returns_a_bad_m_where_customer_forecasts_raises(table, monkeypatch, bad,
+                                                                      message):
+    def values(index):
+        v = np.full(len(index), 100.0)
+        v[-2:] = bad
+        return v
+    monkeypatch.setattr(forecast_module, "predict_amount", fake_series(values))
+    m = m_alone(table)
+    np.testing.assert_array_equal(m.to_numpy()[-2:], [bad] * 2)
+    assert (m.to_numpy()[:-2] == 100.0).all()
+    with pytest.raises(ValueError, match=message):
+        run(table)
+
+
+def test_stage2_alone_returns_a_real_squared_error_m_below_zero():
+    # No monkeypatch: the squared-error fit really goes below 0, and only customer_forecasts
+    # refuses it.
+    table, settings = squared_error_case()
+    _, m_hand, _, _ = by_hand(table, ORIGIN, settings)
+    m = m_alone(table, settings)
+    assert (m < 0).any()
+    np.testing.assert_array_equal(m.to_numpy(), m_hand.to_numpy())
+    with pytest.raises(ValueError, match="m is below 0"):
+        run(table, ORIGIN, settings)
+
+
+def test_alone_fit_errors_still_propagate(table):
+    # Checking nothing is about the predictions; a fit that cannot run still raises.
+    changed = table.copy()
+    known = changed["label_status"] == "labelled"
+    changed.loc[known, "paid"] = True
+    changed.loc[known, "amount_deflated"] = 100.0
+    with pytest.raises(ValueError, match="the classifier needs both outcomes"):
+        p_alone(changed)
+    with pytest.raises(ValueError, match="unknown feature blocks"):
+        m_alone(table, make_settings(stage2=stage2_settings(blocks=("nope",))))
+    with pytest.raises(ValueError, match="stage 2 loss 'tweedie'"):
+        m_alone(table, make_settings(stage2=stage2_settings(loss="tweedie")))
+
+
+# --- what each stage is fitted on ----------------------------------------------------------
+
+def test_stage1_alone_is_fitted_on_every_training_row(table, monkeypatch):
+    seen = {}
+    real1 = forecast_module.fit_stage1
+
+    def spy1(x, paid, settings):
+        seen.update(x=x, paid=paid, settings=settings)
+        return real1(x, paid, settings)
+
+    monkeypatch.setattr(forecast_module, "fit_stage1", spy1)
+    train, at = stage_rows(table)
+    s1 = stage1_settings()
+    stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES)
+    assert seen["x"].index.equals(train.index)
+    pd.testing.assert_series_equal(seen["paid"], train["paid"])
+    assert seen["settings"] is s1
+    # Premise: the training rows hold both outcomes.
+    assert set(train["paid"]) == {True, False}
+
+
+def test_stage2_alone_is_fitted_on_the_paid_training_rows_only(table, monkeypatch):
+    seen = {}
+    real2 = forecast_module.fit_stage2
+
+    def spy2(x, amount, exp, settings):
+        seen.update(x=x, amount=amount, exposure=exp, settings=settings)
+        return real2(x, amount, exp, settings)
+
+    monkeypatch.setattr(forecast_module, "fit_stage2", spy2)
+    train, at = stage_rows(table)
+    s2 = stage2_settings(scale="open balance")
+    stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+    paid = train[train["paid"].astype(bool)]
+    assert 0 < len(paid) < len(train)
+    assert seen["x"].index.equals(paid.index)
+    pd.testing.assert_series_equal(seen["amount"], paid["amount_deflated"])
+    assert (seen["amount"] > 0).all()
+    assert seen["exposure"].index.equals(paid.index)
+    pd.testing.assert_series_equal(seen["exposure"], exposure(train, paid, s2))
+    assert seen["settings"] is s2
+
+
+def test_stage2_alone_learns_both_exposures_from_all_training_rows(table, monkeypatch):
+    calls = []
+    real = forecast_module.exposure
+
+    def spy(train_rows, rows, settings):
+        calls.append((train_rows, rows, settings))
+        return real(train_rows, rows, settings)
+
+    monkeypatch.setattr(forecast_module, "exposure", spy)
+    train, at = stage_rows(table)
+    s2 = stage2_settings(scale="open balance", balance_floor="own mean")
+    stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+    assert len(calls) == 2
+    paid_index = train.index[train["paid"].astype(bool)]
+    (train1, rows1, s_1), (train2, rows2, s_2) = calls
+    # Both learned from every known row (as documented), not from the paid ones alone. Today
+    # exposure reads only the paid rows of its first argument, so passing the paid rows would
+    # give the same m: this spy is what pins the documented call.
+    assert train1 is train and train2 is train
+    assert rows1.index.equals(paid_index)
+    assert rows2 is at
+    assert s_1 is s2 and s_2 is s2
+
+
+def test_stage2_alone_m_is_s_times_the_forecast_rows_exposure(table):
+    train, at = stage_rows(table)
+    s2 = stage2_settings(scale="open balance")
+    m = stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
+    _, _, _, model2 = by_hand(table, ORIGIN, make_settings(stage2=s2))
+    x2 = stage1_features(at, feature_columns(BLOCK_COLUMNS, FEATURE_BLOCKS), COMPANIES, True)
+    e = exposure(train, at, s2)
+    assert (e != 1.0).any()
+    np.testing.assert_array_equal(m.to_numpy(), model2.predict(x2) * e.to_numpy())
+
+
+def test_alone_only_the_rows_given_are_learned_from(table):
+    # The functions take the rows as given: no rows_known_at inside. Training on fewer rows
+    # (an earlier origin's) changes the fit.
+    train, at = stage_rows(table)
+    early = rows_known_at(table, 12)
+    s1, s2 = stage1_settings(), stage2_settings()
+    assert not np.array_equal(
+        stage1_predictions(early, at, s1, BLOCK_COLUMNS, COMPANIES).to_numpy(),
+        stage1_predictions(train, at, s1, BLOCK_COLUMNS, COMPANIES).to_numpy())
+    assert not np.array_equal(
+        stage2_predictions(early, at, s2, BLOCK_COLUMNS, COMPANIES, True).to_numpy(),
+        stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True).to_numpy())

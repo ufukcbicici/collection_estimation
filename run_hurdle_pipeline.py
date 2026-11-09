@@ -19,6 +19,7 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
    11  features        history, calendar, receivables (U6, U7, U9c)   <- in progress
    12  models          stage 1, stage 2, top-ups                   (U10-U12)
    13  forecast, evaluation, calibration                           (U13-U15)
+   18  settings grid                                               (U16)  <- in progress
 
 The settings (data paths, company codes, ...) are in settings/synthetic.toml. To run on
 other data (e.g. the real EY files), write another settings file and point the environment
@@ -66,7 +67,12 @@ from collection_estimation.hurdle.features_history import (  # noqa: E402
 )
 from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
-from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
+from collection_estimation.hurdle.forecast import (  # noqa: E402
+    CONSOLIDATED,
+    forecast,
+    stage1_predictions,
+    stage2_predictions,
+)
 from collection_estimation.hurdle.evaluate import (  # noqa: E402
     HORIZON_TOTAL,
     HURDLE,
@@ -678,6 +684,22 @@ def main():
             # U16 uses it on the test.
             choice = choose_calibration(rolled, weekly, weeks, levels, rolled_actual, settings)
             show_calibration_choice(choice, settings.calibration.min_gain)
+
+    # Step 18: the settings grid (U16). Built unit by unit; for now (U16.1), stage 1 and stage
+    # 2 fitted each on its own at the forecast week of steps 12-16, with the [stage1] and
+    # [stage2] settings: they must give step 16's p and m exactly.
+    print(f"Step 18: settings grid (U16); for now each stage fitted on its own at origin "
+          f"{origin}")
+    started = time.perf_counter()
+    p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1,
+                                 block_feature_columns(history, calendar, owed), companies)
+    p_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    m_alone = stage2_predictions(train_rows, forecast_rows, settings.stage2,
+                                 block_feature_columns(history, calendar, owed), companies,
+                                 settings.stage1.company_as_feature)
+    m_seconds = time.perf_counter() - started
+    show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)
 
     # Later steps follow as each unit is built.
 
@@ -1708,6 +1730,19 @@ def show_calibration_choice(choice, min_gain):
         shown = ", ".join(f"{math.exp(log_m):,.0f}: {factor:.3f}" for log_m, factor
                           in zip(m_correction.log_m, m_correction.factors))
         print(f"            factor at m = {shown}")
+
+
+def show_stage_predictions(p, m, p_seconds, m_seconds, customers):
+    """Step 18's stages fitted each on its own (U16.1): their size and time, and whether they
+    equal step 16's p and m (`customers`, from `forecast`) exactly, row by row."""
+    print(f"        stage 1 alone: {len(p):,} rows, mean p {p.mean():.4f}, {p_seconds:.0f} s")
+    print(f"        stage 2 alone: {len(m):,} rows, sum of m {m.sum() / 1e6:,.1f} M (TRY of "
+          f"week 0), {m_seconds:.0f} s")
+    same_rows = p.index.equals(customers.index) and m.index.equals(customers.index)
+    same_p = same_rows and bool((p.to_numpy() == customers["p"].to_numpy()).all())
+    same_m = same_rows and bool((m.to_numpy() == customers["m"].to_numpy()).all())
+    print(f"        the same as step 16, row by row: p {'yes' if same_p else 'NO'}, m "
+          f"{'yes' if same_m else 'NO'}")
 
 
 def show_actual_totals(actual, weekly, weeks):
