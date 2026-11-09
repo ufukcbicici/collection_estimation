@@ -27,6 +27,7 @@ from collection_estimation.hurdle.read_ledger import (
 from collection_estimation.hurdle.settings import (
     FORMAT_SAMPLE_DATES,
     CalendarSettings,
+    CalibrationSettings,
     CollectionsLayout,
     CompanySettings,
     DataSettings,
@@ -208,6 +209,9 @@ VALID = {
                    "test_origins": "[60, 57]", "rule_doubtful_days": "60",
                    "with_model": "true", "bootstrap_samples": "300", "bootstrap_seed": "11",
                    "coherence_factor": "2.5"},
+    # U15: the calibration. Values differ from synthetic.toml's on purpose (150 and 0.02 against
+    # 200 and 0.005).
+    "calibration": {"company_shrink_rows": "150", "min_gain": "0.02"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -341,7 +345,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
                                        "collections_layout", "ledger_layout", "receivables",
                                        "history", "calendar", "stage1", "stage2",
                                        "diagnostic", "joint_diagnostic", "topups",
-                                       "debug"])
+                                       "calibration", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
     settings = load(tmp_path, repo)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -374,6 +378,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("diagnostic", "reference_window"), ("diagnostic", "reference_prior_weeks"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
+    ("calibration", "company_shrink_rows"), ("calibration", "min_gain"),
 ])
 def test_every_section_is_frozen(tmp_path, repo, part, attribute):
     section = getattr(load(tmp_path, repo), part)
@@ -507,6 +512,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("diagnostic", "reference_window"), ("diagnostic", "reference_prior_weeks"),
     ("diagnostic", "importance_repeats"), ("diagnostic", "output_folder"),
     ("debug", "demo_origin"),
+    ("calibration", "company_shrink_rows"), ("calibration", "min_gain"),
 ])
 def test_a_missing_setting_raises(tmp_path, repo, section, key):
     message = raises_naming(tmp_path, repo, f"[{section}]", key,
@@ -2227,7 +2233,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     with pytest.raises(ValueError) as error:
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
-        f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -2735,7 +2741,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     with pytest.raises(ValueError) as error:
         load(tmp_path, repo, drop_section="diagnostic")
     assert str(error.value) == (
-        f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -3468,7 +3474,7 @@ def test_stage2_settings_is_frozen_and_hashable():
 def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="stage2")
     assert message == (
-        f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -4136,7 +4142,7 @@ def test_the_joint_diagnostic_does_not_change_the_other_sections(tmp_path, repo)
 def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic")
     assert message == (
-        f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -4638,7 +4644,7 @@ def test_the_calendar_does_not_change_the_other_sections(tmp_path, repo):
 def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="calendar")
     assert message == (
-        f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -4895,7 +4901,7 @@ def test_the_topups_do_not_change_the_other_sections(tmp_path, repo):
 def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="topups")
     assert message == (
-        f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'collections_layout', "
+        f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
@@ -5390,7 +5396,8 @@ def test_evaluation_settings_fields_in_order():
 def test_settings_has_an_evaluation_field_between_topups_and_debug():
     names = [field.name for field in dataclasses.fields(Settings)]
     assert names.index("topups") + 1 == names.index("evaluation")
-    assert names.index("evaluation") + 1 == names.index("debug")
+    # U15 put calibration between evaluation and debug.
+    assert names.index("evaluation") + 2 == names.index("debug")
 
 
 def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
@@ -5448,7 +5455,7 @@ def test_the_evaluation_does_not_change_the_other_sections(tmp_path, repo):
 def test_a_missing_evaluation_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="evaluation")
     assert message == (
-        f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', "
+        f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
         f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', 'stage2', "
         f"'topups']")
@@ -6224,3 +6231,135 @@ def test_coherence_factor_is_checked_after_the_other_evaluation_settings():
 def test_the_synthetic_toml_has_a_usable_coherence_factor():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
     assert settings.evaluation.coherence_factor > 0
+
+
+# =============================================================================================
+# U15: [calibration], company_shrink_rows (`count_setting`) and min_gain
+# (`positive_number_setting`). Required. VALID holds 150 and 0.02.
+# =============================================================================================
+
+CALIBRATION = f"{FILE_NAME} [calibration]"
+CALIBRATION_KEYS = ["company_shrink_rows", "min_gain"]
+
+
+def test_the_calibration_section_is_read(tmp_path, repo):
+    calibration = load(tmp_path, repo).calibration
+    assert calibration == CalibrationSettings(company_shrink_rows=150, min_gain=0.02)
+    assert type(calibration.company_shrink_rows) is int
+    assert type(calibration.min_gain) is float
+
+
+def test_calibration_settings_has_exactly_two_fields_and_settings_holds_it_before_debug():
+    assert [f.name for f in dataclasses.fields(CalibrationSettings)] == CALIBRATION_KEYS
+    names = [f.name for f in dataclasses.fields(Settings)]
+    assert names.index("calibration") == names.index("evaluation") + 1
+    assert names.index("debug") == names.index("calibration") + 1
+
+
+@pytest.mark.parametrize("text, expected", [("1", 1), ("200", 200), ("100000", 100000)])
+def test_company_shrink_rows_good_values(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo, changes={("calibration", "company_shrink_rows"): text})
+    assert found.calibration.company_shrink_rows == expected
+    assert type(found.calibration.company_shrink_rows) is int
+
+
+@pytest.mark.parametrize("text, expected", [("0.005", 0.005), ("1", 1.0), ("1e-4", 0.0001),
+                                            ("0.5", 0.5), ("2.5", 2.5)])
+def test_min_gain_good_values(tmp_path, repo, text, expected):
+    found = load(tmp_path, repo, changes={("calibration", "min_gain"): text})
+    assert found.calibration.min_gain == expected
+    assert type(found.calibration.min_gain) is float
+
+
+def test_a_missing_calibration_section_is_named(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="calibration")
+    assert message.startswith(f"{FILE_NAME}: missing ['calibration']; expected exactly ")
+
+
+@pytest.mark.parametrize("key", CALIBRATION_KEYS)
+def test_a_missing_calibration_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message_from(tmp_path, repo, changes={("calibration", key): REMOVE})
+    assert message == f"{CALIBRATION}: missing [{key!r}]; expected exactly {CALIBRATION_KEYS}"
+
+
+def test_a_calibration_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("calibration", "min_gain"): REMOVE,
+                                                          ("calibration", "min_gian"): "0.1"})
+    assert message == (f"{CALIBRATION}: missing ['min_gain']; unknown ['min_gian']; "
+                       f"expected exactly {CALIBRATION_KEYS}")
+
+
+def test_an_unknown_calibration_key_is_refused(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, changes={("calibration", "groups"): "10"})
+    assert message == f"{CALIBRATION}: unknown ['groups']; expected exactly {CALIBRATION_KEYS}"
+
+
+@pytest.mark.parametrize("key, text", [("company_shrink_rows", "200"), ("min_gain", "0.1")])
+def test_a_calibration_key_in_the_evaluation_section_is_unknown_there(tmp_path, repo, key, text):
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", key): text})
+    assert f"unknown [{key!r}]" in message
+    assert message.startswith(f"{EVALUATION}: ")
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("1.5", "1.5"),
+                                         ("200.0", "200.0"), ("true", "True"), ("false", "False"),
+                                         ('"200"', "'200'"), ("[200]", "[200]"), ("nan", "nan"),
+                                         ("inf", "inf")],
+                         ids=["zero", "negative", "fraction", "whole-float", "true", "false",
+                              "text", "list", "nan", "inf"])
+def test_a_bad_company_shrink_rows_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message_from(tmp_path, repo,
+                                 changes={("calibration", "company_shrink_rows"): text})
+    assert message == (f"{CALIBRATION}: company_shrink_rows is {shown}, not a whole number of 1 "
+                       f"or more")
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("0.0", "0.0"), ("-1", "-1"),
+                                         ("-0.005", "-0.005"), ("true", "True"),
+                                         ('"0.005"', "'0.005'"), ("[0.005]", "[0.005]"),
+                                         ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf")],
+                         ids=["zero", "zero-float", "negative", "negative-float", "true", "text",
+                              "list", "nan", "inf", "minus-inf"])
+def test_a_bad_min_gain_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message_from(tmp_path, repo, changes={("calibration", "min_gain"): text})
+    assert message == f"{CALIBRATION}: min_gain is {shown}, not a number above 0"
+
+
+def test_a_bad_calibration_is_refused_with_the_evaluation_switched_off(tmp_path, repo):
+    # A broken file fails on load, whichever steps run.
+    message = exact_message_from(tmp_path, repo, changes={("evaluation", "run"): "false",
+                                                          ("calibration", "min_gain"): "0"})
+    assert message == f"{CALIBRATION}: min_gain is 0, not a number above 0"
+
+
+def test_the_two_calibration_keys_do_not_depend_on_each_other(tmp_path, repo):
+    a = load(tmp_path, repo).calibration
+    b = load(tmp_path, repo, changes={("calibration", "min_gain"): "0.7"}).calibration
+    c = load(tmp_path, repo, changes={("calibration", "company_shrink_rows"): "7"}).calibration
+    assert dataclasses.replace(a, min_gain=0.7) == b
+    assert dataclasses.replace(a, company_shrink_rows=7) == c
+
+
+def test_the_calibration_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("calibration", "company_shrink_rows"): "7",
+                                      ("calibration", "min_gain"): "0.7"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "calibration":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert a.calibration != b.calibration
+
+
+def test_the_synthetic_toml_holds_the_calibration_settings():
+    calibration = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).calibration
+    assert calibration == CalibrationSettings(company_shrink_rows=200, min_gain=0.005)
+
+
+def test_real_settings_hold_every_field_choose_calibration_reads(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    assert settings.receivables.horizons == 5
+    assert settings.calibration.company_shrink_rows == 150
+    assert settings.calibration.min_gain == 0.02
+    assert settings.diagnostic.calibration_groups == 4
+    assert settings.evaluation.bootstrap_samples == 300
+    assert settings.evaluation.bootstrap_seed == 11

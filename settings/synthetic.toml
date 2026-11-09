@@ -226,6 +226,14 @@ bootstrap_seed = 20261104        # makes the bootstrap repeatable
 coherence_factor = 1.5           # the balance check (U14.6) counts the customers whose 5-week
                                  # cash is above this many times what they owe at the origin
 
+[calibration]
+# The calibration of p and m (U15, pipeline step 17).
+company_shrink_rows = 200        # `per company`: each company's factor is pulled towards the
+                                 # common one, which counts as this many paid rows
+min_gain = 0.005                 # the pairs of corrections at most this much WAPE above the
+                                 # lowest are kept; of those, the one that learns the fewest
+                                 # numbers wins
+
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints
 sample_week = 30                # the week step 7 shows in detail (week 0 starts 2025-06-02)

@@ -25,6 +25,7 @@ other data (e.g. the real EY files), write another settings file and point the e
 variable HURDLE_SETTINGS to it; nothing in the code needs to change.
 """
 import itertools
+import math
 import os
 import sys
 import time
@@ -84,6 +85,10 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
     rolling_forecasts,
     rule_reference,
     stack_forecasts,
+)
+from collection_estimation.hurdle.calibrate import (  # noqa: E402
+    calibration_reliability,
+    choose_calibration,
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.keys import add_keys  # noqa: E402
@@ -663,6 +668,16 @@ def main():
                                           settings.receivables.horizons,
                                           settings.evaluation.coherence_factor)
             show_balance_coherence(coherence, settings.evaluation.coherence_factor)
+            # U15.1: how far p and m were from what happened on these origins.
+            reliability = calibration_reliability(rolled.customers, weekly, weeks, levels,
+                                                  settings.diagnostic.calibration_groups)
+            show_calibration_reliability(reliability)
+            # U15.4: every pair of corrections learned on the first part of these weeks and
+            # judged on the later origins; the chosen pair learned again on all of them. It is
+            # not applied here: scored on the weeks it learned from, it would look too good.
+            # U16 uses it on the test.
+            choice = choose_calibration(rolled, weekly, weeks, levels, rolled_actual, settings)
+            show_calibration_choice(choice, settings.calibration.min_gain)
 
     # Later steps follow as each unit is built.
 
@@ -1639,6 +1654,60 @@ def show_balance_coherence(coherence, factor):
     print(f"        nothing open: {int(total['rows_nothing_open']):,} rows, forecast "
           f"{total['forecast_nothing_open'] / 1e6:,.1f} M against actual "
           f"{total['actual_nothing_open'] / 1e6:,.1f} M")
+
+
+def show_calibration_reliability(reliability):
+    """Step 17's reliability of the rolling forecasts (U15.1): p against the share that paid,
+    all h together and then each h, and m against what was paid."""
+    # 1. p, all h together.
+    pooled = reliability.p[reliability.p["horizon"] == POOLED].drop(columns="horizon")
+    print("        stage 1 reliability, all rolling forecast rows in equal groups by p, all h "
+          "(calibrated: mean_p near share_paid in every group):")
+    print(pooled.round(4).to_string(index=False))
+
+    # 2. p, each h: one column per h, each cell "mean p / share paid".
+    by_h = reliability.p[reliability.p["horizon"] != POOLED].copy()
+    by_h["shown"] = [f"{mean_p:.4f} / {share:.4f}"
+                     for mean_p, share in zip(by_h["mean_p"], by_h["share_paid"])]
+    print("        the same per h, each cell mean p / share paid:")
+    print(by_h.pivot(index="group", columns="horizon", values="shown").to_string())
+
+    # 3. m.
+    show_amount_reliability(reliability.m)
+
+
+def show_calibration_choice(choice, min_gain):
+    """Step 17's choice of corrections (U15.4): every pair on the judged origins, the winner,
+    how sure it is against no correction, and the numbers kept."""
+    # 1. Every pair; only wape decides.
+    print(f"        corrections learned on target weeks up to {choice.split_week}, judged at "
+          f"origins {choice.judged_origins[0]}-{choice.judged_origins[-1]} (only wape decides; "
+          f"min_gain {min_gain}):")
+    shown = choice.candidates.drop(columns="candidate")
+    print(shown.round(4).to_string(index=False))
+    print(f"        chosen: {choice.winner}")
+
+    # 2. How sure, if a correction won.
+    if choice.bootstrap.empty:
+        print("        no correction chosen, so nothing to compare it with")
+    else:
+        show_paired_bootstrap(choice.bootstrap)
+
+    # 3. The numbers kept.
+    print("        the chosen corrections, learned on all these rows and frozen for the test:")
+    p_correction, m_correction = choice.p_correction, choice.m_correction
+    shown = ", ".join(f"h {name}: slope {a:.3f}, intercept {b:.3f}"
+                      for name, (a, b) in p_correction.maps.items())
+    print(f"          p, {p_correction.kind}: {shown or 'unchanged'}")
+    print(f"          m, {m_correction.kind}: common factor {m_correction.common:.3f}")
+    if m_correction.per_company:
+        shown = ", ".join(f"{company} {factor:.3f}"
+                          for company, factor in m_correction.per_company.items())
+        print(f"            {shown}")
+    if m_correction.factors:
+        shown = ", ".join(f"{math.exp(log_m):,.0f}: {factor:.3f}" for log_m, factor
+                          in zip(m_correction.log_m, m_correction.factors))
+        print(f"            factor at m = {shown}")
 
 
 def show_actual_totals(actual, weekly, weeks):

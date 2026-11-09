@@ -166,6 +166,14 @@ class EvaluationSettings:
 
 
 @dataclass(frozen=True)
+class CalibrationSettings:
+    """The calibration of p and m (U15, `calibrate.py`)."""
+    company_shrink_rows: int    # `per company`: how many paid rows the common factor counts as
+    min_gain: float             # the pairs at most this much WAPE above the lowest are kept;
+                                # of those, the one that learns the fewest numbers wins
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -208,6 +216,7 @@ class Settings:
     joint_diagnostic: JointDiagnosticSettings
     topups: TopupSettings
     evaluation: EvaluationSettings
+    calibration: CalibrationSettings
     debug: DebugSettings
 
 
@@ -224,7 +233,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
                      "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                     "topups", "evaluation", "debug"},
+                     "topups", "evaluation", "calibration", "debug"},
                name)
 
     data = raw["data"]
@@ -273,6 +282,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                             "rule_doubtful_days", "bootstrap_samples", "bootstrap_seed",
                             "coherence_factor"},
                f"{name} [evaluation]")
+    calibration = raw["calibration"]
+    check_keys(calibration, {"company_shrink_rows", "min_gain"}, f"{name} [calibration]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -386,6 +397,11 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         evaluation=read_evaluation(evaluation,
                                    count_setting(receivables, "horizons", f"{name} [receivables]"),
                                    f"{name} [evaluation]"),
+        calibration=CalibrationSettings(
+            company_shrink_rows=count_setting(calibration, "company_shrink_rows",
+                                              f"{name} [calibration]"),
+            min_gain=positive_number_setting(calibration, "min_gain", f"{name} [calibration]"),
+        ),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),

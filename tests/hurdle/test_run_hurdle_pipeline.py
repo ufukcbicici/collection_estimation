@@ -5345,7 +5345,14 @@ def test_step_16_and_17_imports():
                      and node.module == "collection_estimation.hurdle.cache"]
     assert len(cache_imports) == 1
     assert [(a.name, a.asname) for a in cache_imports[0].names] == [("load_with_cache", None)]
-    assert module.body.index(cache_imports[0]) == module.body.index(evaluate_imports[0]) + 1
+    # U15 put the import of calibrate between them.
+    assert module.body.index(cache_imports[0]) == module.body.index(evaluate_imports[0]) + 2
+    calibrate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+                         and node.module == "collection_estimation.hurdle.calibrate"]
+    assert len(calibrate_imports) == 1
+    assert [(a.name, a.asname) for a in calibrate_imports[0].names] == [
+        ("calibration_reliability", None), ("choose_calibration", None)]
+    assert module.body.index(calibrate_imports[0]) == module.body.index(evaluate_imports[0]) + 1
 
 
 STEP_16_17_NAMES = """
@@ -5418,6 +5425,15 @@ assert script.balance_coherence is evaluate.balance_coherence
 inspect.signature(script.balance_coherence).bind("customers", "table", "weekly", "weeks",
                                                  "levels", 5, 1.5)
 inspect.signature(script.show_balance_coherence).bind("coherence", 1.5)
+# U15.
+from collection_estimation.hurdle import calibrate
+assert script.calibration_reliability is calibrate.calibration_reliability
+assert script.choose_calibration is calibrate.choose_calibration
+inspect.signature(script.calibration_reliability).bind("customers", "weekly", "weeks", "levels", 10)
+inspect.signature(script.choose_calibration).bind("rolled", "weekly", "weeks", "levels", "actual",
+                                                  "settings")
+inspect.signature(script.show_calibration_reliability).bind("reliability")
+inspect.signature(script.show_calibration_choice).bind("choice", 0.005)
 print("ok")
 """
 
@@ -6272,6 +6288,9 @@ STEP_17_SAMPLES = 2000
 # U14.6: the fake [evaluation] coherence_factor.
 STEP_17_FACTOR = 1.75
 STEP_17_SEED = 7
+# U15: the fake [diagnostic] calibration_groups and [calibration] min_gain.
+STEP_17_GROUPS = 12
+STEP_17_MIN_GAIN = 0.0125
 
 
 def step_17_rolled(**fields):
@@ -6318,6 +6337,8 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
                                    bootstrap_seed=STEP_17_SEED,
                                    coherence_factor=STEP_17_FACTOR),
         receivables=SimpleNamespace(horizons=horizons),
+        diagnostic=SimpleNamespace(calibration_groups=STEP_17_GROUPS),
+        calibration=SimpleNamespace(min_gain=STEP_17_MIN_GAIN),
         data=SimpleNamespace(cache_folder=cache_folder))
     namespace.update(
         settings=settings, time=SimpleNamespace(perf_counter=lambda: 0.0),
@@ -6348,7 +6369,12 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         show_payer_split=recorder("show_payer_split", None),
         # U14.6.
         balance_coherence=recorder("balance_coherence", "<coherence>"),
-        show_balance_coherence=recorder("show_balance_coherence", None))
+        show_balance_coherence=recorder("show_balance_coherence", None),
+        # U15.
+        calibration_reliability=recorder("calibration_reliability", "<reliability>"),
+        show_calibration_reliability=recorder("show_calibration_reliability", None),
+        choose_calibration=recorder("choose_calibration", "<choice>"),
+        show_calibration_choice=recorder("show_calibration_choice", None))
     module = ast.Module(body=[step_17_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
@@ -6371,7 +6397,9 @@ def test_step_17_with_model_true_calls_everything_in_order():
                                    "paired_wape_bootstrap", "show_paired_bootstrap",
                                    "component_bias", "show_component_bias",
                                    "payer_split", "show_payer_split",
-                                   "balance_coherence", "show_balance_coherence"]
+                                   "balance_coherence", "show_balance_coherence",
+                                   "calibration_reliability", "show_calibration_reliability",
+                                   "choose_calibration", "show_calibration_choice"]
     assert SKIP_LINE not in printed
 
 
@@ -7319,7 +7347,13 @@ BIAS_PAYER_STATEMENTS = [
     # U14.6: the balance check, right after the payer split, under the same guard.
     ("coherence = balance_coherence(rolled.customers, table, weekly, weeks, levels, "
      "settings.receivables.horizons, settings.evaluation.coherence_factor)"),
-    "show_balance_coherence(coherence, settings.evaluation.coherence_factor)"]
+    "show_balance_coherence(coherence, settings.evaluation.coherence_factor)",
+    # U15: the reliability and the choice, last, under the same guard.
+    ("reliability = calibration_reliability(rolled.customers, weekly, weeks, levels, "
+     "settings.diagnostic.calibration_groups)"),
+    "show_calibration_reliability(reliability)",
+    "choice = choose_calibration(rolled, weekly, weeks, levels, rolled_actual, settings)",
+    "show_calibration_choice(choice, settings.calibration.min_gain)"]
 
 
 def test_step_17_ends_with_the_bias_and_the_guarded_payer_split():
@@ -7401,9 +7435,10 @@ def test_the_bias_printouts_sit_right_before_show_actual_totals():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_actual_totals")
-    # U14.6 put show_balance_coherence after show_payer_split.
-    assert names[shown - 4:shown] == ["show_paired_bootstrap", "show_component_bias",
-                                      "show_payer_split", "show_balance_coherence"]
+    # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that.
+    assert names[shown - 6:shown] == ["show_paired_bootstrap", "show_component_bias",
+                                      "show_payer_split", "show_balance_coherence",
+                                      "show_calibration_reliability", "show_calibration_choice"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7490,9 +7525,11 @@ def test_step_17_run_the_bias_comes_after_the_bootstraps_printout(with_model):
 
 
 def test_step_17_run_the_payer_split_comes_after_the_bias_with_its_printout():
-    # U14.6's balance check now follows it; see the tests of the balance check.
+    # U14.6's balance check and U15's calibration now follow it; see their tests.
     calls, _, _, _ = run_step_17(True)
-    assert [name for name, _, _ in calls][-4:-2] == ["payer_split", "show_payer_split"]
+    names = [name for name, _, _ in calls]
+    start = names.index("show_component_bias")
+    assert names[start + 1:start + 3] == ["payer_split", "show_payer_split"]
 
 
 # show_component_bias on a hand-made table, horizons 2. Amounts in TRY, shown in millions:
@@ -7701,10 +7738,11 @@ COHERENCE_CALL_STATEMENT = BIAS_PAYER_STATEMENTS[2]
 COHERENCE_SHOW_STATEMENT = BIAS_PAYER_STATEMENTS[3]
 
 
-def test_step_17_the_guard_ends_with_the_balance_check():
+def test_step_17_the_guard_has_the_balance_check_right_after_the_payer_split():
+    # U15's calibration now ends the guard; see its tests.
     guarded = [ast.unparse(node) for node in step_17_block().body[-1].body]
-    assert guarded[-2:] == [COHERENCE_CALL_STATEMENT, COHERENCE_SHOW_STATEMENT]
-    assert guarded[-3] == BIAS_PAYER_STATEMENTS[1]
+    start = guarded.index(BIAS_PAYER_STATEMENTS[1])
+    assert guarded[start + 1:start + 3] == [COHERENCE_CALL_STATEMENT, COHERENCE_SHOW_STATEMENT]
 
 
 @pytest.mark.parametrize("name", ["balance_coherence", "show_balance_coherence"])
@@ -7741,7 +7779,8 @@ def test_show_balance_coherence_is_a_module_level_function_before_show_actual_to
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
-    assert names.index("show_balance_coherence") + 1 == names.index("show_actual_totals")
+    # U15 put its two printouts between it and show_actual_totals.
+    assert names.index("show_balance_coherence") + 3 == names.index("show_actual_totals")
 
 
 def test_step_17_run_the_balance_check_gets_its_arguments_in_order():
@@ -7759,11 +7798,13 @@ def test_step_17_run_the_printout_gets_the_table_and_the_factor():
     assert by_name_of(calls)["show_balance_coherence"] == (("<coherence>", STEP_17_FACTOR), {})
 
 
-def test_step_17_run_the_balance_check_comes_last_right_after_the_payer_split():
+def test_step_17_run_the_balance_check_comes_right_after_the_payer_split():
+    # U15's calibration now comes last; see its tests.
     calls, _, _, _ = run_step_17(True)
-    assert [name for name, _, _ in calls][-4:] == ["payer_split", "show_payer_split",
-                                                   "balance_coherence",
-                                                   "show_balance_coherence"]
+    names = [name for name, _, _ in calls]
+    start = names.index("payer_split")
+    assert names[start:start + 4] == ["payer_split", "show_payer_split", "balance_coherence",
+                                      "show_balance_coherence"]
 
 
 def test_step_17_run_the_horizons_reach_the_balance_check():
@@ -7864,3 +7905,279 @@ def test_the_printout_takes_the_real_table_of_the_worked_example():
     assert lines[5].split() == ["ALL", "1.682", "1.918", "0.40", "0.6"]
     assert lines[6] == "        above 1.5x the balance: 2 rows, forecast 0.0 M against actual 0.0 M"
     assert lines[7] == "        nothing open: 3 rows, forecast 0.0 M against actual 0.0 M"
+
+
+# Step 17, U15: the reliability and the choice of corrections, after the balance check, only when
+# the model ran. Wiring on main()'s syntax tree, then step 17's block run with the fakes of
+# run_step_17, then the exact printouts, in a separate process.
+
+CALIBRATION_STATEMENTS = BIAS_PAYER_STATEMENTS[4:]
+CALIBRATION_NAMES = ["calibration_reliability", "show_calibration_reliability",
+                     "choose_calibration", "show_calibration_choice"]
+
+
+def test_step_17_the_guard_ends_with_the_calibration_right_after_the_balance_check():
+    guarded = [ast.unparse(node) for node in step_17_block().body[-1].body]
+    assert guarded[-4:] == CALIBRATION_STATEMENTS
+    assert guarded[-6:-4] == [COHERENCE_CALL_STATEMENT, COHERENCE_SHOW_STATEMENT]
+
+
+@pytest.mark.parametrize("name", CALIBRATION_NAMES)
+def test_step_17_calls_each_calibration_function_once_in_main(name):
+    assert len(calls_to(main_tree(), name)) == 1, name
+    assert len(calls_to(step_17_block(), name)) == 1, name
+
+
+@pytest.mark.parametrize("name", CALIBRATION_NAMES)
+def test_step_17_the_calibration_is_only_inside_the_guard(name):
+    block = step_17_block()
+    assert ast.unparse(block.body[-1].test) == "rolled is not None"
+    assert len(calls_to(block.body[-1], name)) == 1
+    assert calls_to(with_model_if(block), name) == []
+
+
+def test_step_17_the_calibration_calls_take_no_keywords():
+    block = step_17_block()
+    for name in CALIBRATION_NAMES:
+        assert calls_to(block, name)[0].keywords == [], name
+
+
+@pytest.mark.parametrize("name", ["reliability", "choice"])
+def test_step_17_the_calibration_results_are_assigned_once(name):
+    assert len(assignments_to(step_17_block(), name)) == 1
+
+
+def test_step_17_applies_no_correction_to_the_forecasts_it_learned_from():
+    # The corrections are not applied in step 17: scored on the weeks it learned from, the
+    # chosen pair would look too good.
+    assert calls_to(main_tree(), "corrected_forecast") == []
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    names = [alias.name for node in module.body if isinstance(node, ast.ImportFrom)
+             for alias in node.names]
+    assert "corrected_forecast" not in names
+
+
+@pytest.mark.parametrize("name, parameters", [("show_calibration_reliability", ["reliability"]),
+                                              ("show_calibration_choice", ["choice", "min_gain"])])
+def test_the_calibration_printouts_are_module_level_functions(name, parameters):
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == name]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == parameters
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_step_17_run_the_calibration_comes_last_right_after_the_balance_check():
+    calls, _, _, _ = run_step_17(True)
+    assert [name for name, _, _ in calls][-6:] == ["balance_coherence", "show_balance_coherence",
+                                                   *CALIBRATION_NAMES]
+
+
+def test_step_17_run_the_reliability_gets_its_arguments_in_order():
+    # The customers of the rolled forecasts, the weekly amounts, the calendar, the levels, the
+    # groups of [diagnostic].
+    calls, _, _, _ = run_step_17(True)
+    assert by_name_of(calls)["calibration_reliability"] == (
+        ("<rolled customers>", "<weekly>", "<weeks>", "<levels>", STEP_17_GROUPS), {})
+
+
+def test_step_17_run_the_choice_gets_the_rolled_forecasts_their_actual_and_the_settings():
+    calls, _, rolled, actual = run_step_17(True)
+    args, kwargs = by_name_of(calls)["choose_calibration"]
+    assert kwargs == {}
+    assert len(args) == 6
+    assert args[0] is rolled
+    assert args[1:4] == ("<weekly>", "<weeks>", "<levels>")
+    assert args[4] is actual
+    assert args[5].calibration.min_gain == STEP_17_MIN_GAIN
+
+
+def test_step_17_run_the_printouts_get_the_results():
+    calls, _, _, _ = run_step_17(True)
+    by_name = by_name_of(calls)
+    assert by_name["show_calibration_reliability"] == (("<reliability>",), {})
+    assert by_name["show_calibration_choice"] == (("<choice>", STEP_17_MIN_GAIN), {})
+
+
+@pytest.mark.parametrize("name", CALIBRATION_NAMES)
+def test_step_17_run_without_the_model_there_is_no_calibration(name):
+    calls, _, _, _ = run_step_17(False)
+    assert name not in [called for called, _, _ in calls]
+
+
+def test_step_17_run_a_cached_model_gives_the_calibration_its_forecasts():
+    cached = SimpleNamespace(customers="<cached customers>")
+    calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: cached)
+    by_name = by_name_of(calls)
+    assert by_name["calibration_reliability"][0][0] == "<cached customers>"
+    assert by_name["choose_calibration"][0][0] is cached
+
+
+# show_calibration_reliability on the real function's table: the small world of test_calibrate,
+# whose numbers are worked out there. p: 0.25 and 0.65 at h 1, 0.25 and 0.7 at h 2.
+SHOW_RELIABILITY = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.calibrate import calibration_reliability
+from tests.hurdle.test_calibrate import reliability_case
+
+reliability = calibration_reliability(*reliability_case(), groups=2)
+before = reliability.p.copy(), reliability.m.copy()
+script.show_calibration_reliability(reliability)
+pd.testing.assert_frame_equal(reliability.p, before[0])
+pd.testing.assert_frame_equal(reliability.m, before[1])
+print("ok")
+"""
+
+RELIABILITY_PRINTOUT = [
+    "        stage 1 reliability, all rolling forecast rows in equal groups by p, all h "
+    "(calibrated: mean_p near share_paid in every group):",
+    " group  p_low  p_high  mean_p  share_paid  rows",
+    "     1    0.1     0.4   0.250        0.25     4",
+    "     2    0.5     0.9   0.675        0.75     4",
+    "        the same per h, each cell mean p / share paid:",
+    "horizon                1                2",
+    "group                                    ",
+    "1        0.2500 / 0.5000  0.2500 / 0.0000",
+    "2        0.6500 / 0.5000  0.7000 / 1.0000",
+    "        stage 2 reliability, paid forecast rows in equal groups by m (calibrated: ratio = "
+    "mean actual / mean m near 1 in every group):",
+    " group  m_low  m_high  mean_m  mean_actual  ratio  rows",
+    "     1    5.0    20.0    12.0         20.0  1.600     2",
+    "     2   90.0   150.0   120.0        200.0  1.667     2",
+]
+
+
+def test_show_calibration_reliability_exact_printout():
+    result = run_code(SHOW_RELIABILITY)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == RELIABILITY_PRINTOUT + ["ok"]
+
+
+# show_calibration_choice on hand-made choices. A table of two pairs is enough: the printout
+# does not depend on how many there are.
+SHOW_CHOICE = """
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
+                                                    MCorrection, PCorrection)
+from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
+
+candidates = pd.DataFrame(
+    [("p none, m none", "none", "none", 0, 0.17034, 0.11119, -0.05, 0.22221),
+     ("p none, m scale", "none", "scale", 1, 0.16301, 0.10008, 0.01, 0.21004)],
+    columns=CANDIDATE_COLUMNS)
+bootstrap = pd.DataFrame(
+    [("p none, m scale", "p none, m none", "pooled", 20, 0.163, 0.17, -0.007, -0.012, -0.002,
+      0.98, 2000)], columns=BOOTSTRAP_COLUMNS)
+empty = bootstrap.iloc[:0]
+choices = {
+    "none": (PCorrection("none"), MCorrection("none"), empty),
+    "scale": (PCorrection("none"), MCorrection("scale", 1.0434), bootstrap),
+    "company": (PCorrection("one map", {"all": (1.1, -0.2)}),
+                MCorrection("per company", 1.05, per_company={"TR02": 1.1, "TR04": 0.9}),
+                bootstrap),
+    "size": (PCorrection("per h", {1: (1.0, 0.1), 2: (0.95, -0.05)}),
+             MCorrection("by size", 1.05, log_m=(0.0, 6.907755278982137),
+                         factors=(1.5, 0.75)), bootstrap),
+}
+p_correction, m_correction, shown_bootstrap = choices["WHICH"]
+choice = CalibrationChoice(p_correction=p_correction, m_correction=m_correction, split_week=41,
+                           judged_origins=[41, 42, 43, 44], candidates=candidates,
+                           winner="WINNER", bootstrap=shown_bootstrap)
+before = candidates.copy()
+script.show_calibration_choice(choice, 0.005)
+pd.testing.assert_frame_equal(candidates, before)
+print("ok")
+"""
+
+CHOICE_TABLE = [
+    "        corrections learned on target weeks up to 41, judged at origins 41-44 (only wape "
+    "decides; min_gain 0.005):",
+    "   p     m  numbers_learned   wape  total_wape  bias  company_wape",
+    "none  none                0 0.1703      0.1112 -0.05        0.2222",
+    "none scale                1 0.1630      0.1001  0.01        0.2100",
+]
+CHOICE_BOOTSTRAP_LINE = (
+    "        paired bootstrap (U14.5c), consolidated, 2000 resamples; difference = WAPE of the "
+    "first - WAPE of the second (below 0: the first is better):")
+FROZEN_LINE = ("        the chosen corrections, learned on all these rows and frozen for the "
+               "test:")
+
+
+def choice_lines(which, winner):
+    code = SHOW_CHOICE.replace("WHICH", which).replace("WINNER", winner)
+    result = run_code(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_calibration_choice_no_correction_exact_printout():
+    assert choice_lines("none", "p none, m none") == CHOICE_TABLE + [
+        "        chosen: p none, m none",
+        "        no correction chosen, so nothing to compare it with",
+        FROZEN_LINE,
+        "          p, none: unchanged",
+        "          m, none: common factor 1.000"]
+
+
+def test_show_calibration_choice_scale_shows_the_bootstrap_and_the_factor():
+    lines = choice_lines("scale", "p none, m scale")
+    assert lines[:5] == CHOICE_TABLE + ["        chosen: p none, m scale"]
+    assert lines[5] == CHOICE_BOOTSTRAP_LINE
+    assert not any("no correction chosen" in line for line in lines)
+    joined = "\n".join(lines[6:-3])
+    for text in ("p none, m scale vs p none, m none", "pooled", "0.163", "0.170", "-0.007",
+                 "[-0.012, -0.002]", "98%"):
+        assert text in joined, text
+    assert lines[-3:] == [FROZEN_LINE, "          p, none: unchanged",
+                          "          m, scale: common factor 1.043"]
+
+
+def test_show_calibration_choice_per_company_shows_each_company():
+    lines = choice_lines("company", "p one map, m per company")
+    assert lines[-4:] == [FROZEN_LINE,
+                          "          p, one map: h all: slope 1.100, intercept -0.200",
+                          "          m, per company: common factor 1.050",
+                          "            TR02 1.100, TR04 0.900"]
+
+
+def test_show_calibration_choice_by_size_shows_the_factor_at_each_m():
+    # log m 0 is m = 1; 6.9077... is m = 1,000.
+    lines = choice_lines("size", "p per h, m by size")
+    assert lines[-4:] == [FROZEN_LINE,
+                          "          p, per h: h 1: slope 1.000, intercept 0.100, "
+                          "h 2: slope 0.950, intercept -0.050",
+                          "          m, by size: common factor 1.050",
+                          "            factor at m = 1: 1.500, 1,000: 0.750"]
+
+
+# The real function, end to end: its choice is what the printout expects. By hand in
+# test_calibrate: no correction 0.856; `scale` 0.714; frozen `scale` 30700 / 9200 = 3.337.
+SHOW_REAL_CHOICE = """
+import run_hurdle_pipeline as script
+from tests.hurdle.test_calibrate import choose, validation_case
+
+script.show_calibration_choice(choose(validation_case(), min_gain=0.06), 0.06)
+print("ok")
+"""
+
+
+def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
+    result = run_code(SHOW_REAL_CHOICE)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    assert lines[0] == ("        corrections learned on target weeks up to 15, judged at origins "
+                        "15-17 (only wape decides; min_gain 0.06):")
+    # The table: a header and the twelve pairs; p none, m none and p none, m scale first.
+    assert lines[2].split()[:4] == ["none", "none", "0", "0.8559"]
+    assert lines[3].split()[:4] == ["none", "scale", "1", "0.7136"]
+    assert lines[14] == "        chosen: p none, m scale"
+    assert lines[15].startswith("        paired bootstrap (U14.5c), consolidated, 50 resamples")
+    assert lines[-4:-1] == [FROZEN_LINE, "          p, none: unchanged",
+                            "          m, scale: common factor 3.337"]
