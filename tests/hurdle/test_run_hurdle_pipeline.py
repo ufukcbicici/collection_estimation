@@ -5447,12 +5447,15 @@ def test_step_16_and_17_names_are_the_modules_functions():
 
 
 def test_step_17_is_the_last_statement_of_main_behind_its_run_switch():
-    # Since U16.1 only step 18's statements follow step 17's `if`; none of them an `if`.
+    # Since U16.1 only step 18 follows step 17's `if`; since U16.2 step 18 is one `if` of its
+    # own, on [grid] run.
     body = main_body()
     at = index_of_if(body, "settings.evaluation.run")
     block = body[at]
     assert block.orelse == []
-    assert [ast.unparse(node) for node in body[at + 1:]] == STEP_18_STATEMENTS
+    assert len(body[at + 1:]) == 1
+    assert ast.unparse(body[at + 1].test) == "settings.grid.run"
+    assert [ast.unparse(node) for node in body[at + 1].body] == STEP_18_STATEMENTS
     assert len(main_through_step_17()) == at + 1
 
 
@@ -7451,11 +7454,11 @@ def test_the_bias_printouts_sit_right_before_show_actual_totals():
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_actual_totals")
     # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that;
-    # U16.1 show_stage_predictions (step 18) after those.
-    assert names[shown - 7:shown] == ["show_paired_bootstrap", "show_component_bias",
+    # U16.1 show_stage_predictions (step 18) after those; U16.2 show_grid_candidates after it.
+    assert names[shown - 8:shown] == ["show_paired_bootstrap", "show_component_bias",
                                       "show_payer_split", "show_balance_coherence",
                                       "show_calibration_reliability", "show_calibration_choice",
-                                      "show_stage_predictions"]
+                                      "show_stage_predictions", "show_grid_candidates"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7796,8 +7799,9 @@ def test_show_balance_coherence_is_a_module_level_function_before_show_actual_to
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
-    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more.
-    assert names.index("show_balance_coherence") + 4 == names.index("show_actual_totals")
+    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more,
+    # U16.2 show_grid_candidates one more.
+    assert names.index("show_balance_coherence") + 5 == names.index("show_actual_totals")
 
 
 def test_step_17_run_the_balance_check_gets_its_arguments_in_order():
@@ -8201,12 +8205,13 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
 
 
 # Step 18, U16.1: each stage fitted on its own at the demo origin, after step 17's `if` and
-# outside it, compared with step 16's p and m. Wiring on main()'s syntax tree, then step 18's
-# statements run with fakes, then the exact printouts of show_stage_predictions, in a separate
-# process.
+# outside it, compared with step 16's p and m. U16.2: the whole step behind its own switch,
+# [grid] run, and ending with the settings the grid tries (show_grid_candidates). Wiring on
+# main()'s syntax tree, then step 18's `if` run with fakes, then the exact printouts of
+# show_stage_predictions (in a separate process) and of show_grid_candidates (in this one,
+# the function alone).
 STEP_18_STATEMENTS = [
-    "print(f'Step 18: settings grid (U16); for now each stage fitted on its own at origin "
-    "{origin}')",
+    "print(f'Step 18: settings grid (U16); each stage fitted on its own at origin {origin}')",
     "started = time.perf_counter()",
     "p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1, "
     "block_feature_columns(history, calendar, owed), companies)",
@@ -8217,22 +8222,47 @@ STEP_18_STATEMENTS = [
     "settings.stage1.company_as_feature)",
     "m_seconds = time.perf_counter() - started",
     "show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)",
+    "show_grid_candidates(grid_candidates(settings), "
+    "len(settings.evaluation.validation_origins), p_seconds, m_seconds)",
 ]
+STEP_18_NAMES = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
+                 "grid_candidates", "show_grid_candidates")
+
+
+def step_18_block():
+    """main()'s one statement after step 17's `if`: step 18's `if settings.grid.run:`."""
+    body = main_body()
+    after = body[index_of_if(body, "settings.evaluation.run") + 1:]
+    assert len(after) == 1, [ast.unparse(node) for node in after]
+    return after[0]
 
 
 def step_18_body():
-    """main()'s statements after step 17's `if`: step 18."""
-    body = main_body()
-    return body[index_of_if(body, "settings.evaluation.run") + 1:]
+    """The statements inside step 18's `if`."""
+    return step_18_block().body
 
 
-def test_step_18_statements_in_order_right_after_step_17_and_last_in_main():
+def test_step_18_is_one_if_on_grid_run_right_after_step_17_and_last_in_main():
+    block = step_18_block()
+    assert isinstance(block, ast.If)
+    assert ast.unparse(block.test) == "settings.grid.run"
+    assert block.orelse == []
+    assert ast.unparse(main_body()[-1]) == ast.unparse(block)
+
+
+def test_step_18_statements_in_order_inside_its_if():
     assert [ast.unparse(node) for node in step_18_body()] == STEP_18_STATEMENTS
 
 
-def test_step_18_is_outside_step_17_and_every_other_if():
-    # Each of its names is called only at main()'s top level, after step 17's `if`.
-    for name in ("stage1_predictions", "stage2_predictions", "show_stage_predictions"):
+def test_step_18_switch_is_read_once_in_main():
+    # [grid] run gates step 18 only; nothing else in main() reads it.
+    assert main_source().count("settings.grid.run") == 1
+    assert index_of_if(main_body(), "settings.grid.run") == len(main_body()) - 1
+
+
+def test_step_18_is_outside_step_17_and_has_no_if_of_its_own():
+    # Each of its names is called only inside step 18's `if`, after step 17's.
+    for name in STEP_18_NAMES:
         assert len(calls_to(main_tree(), name)) == 1, name
         assert calls_in(step_18_body(), name), name
         assert calls_to(step_17_block(), name) == [], name
@@ -8240,8 +8270,66 @@ def test_step_18_is_outside_step_17_and_every_other_if():
 
 
 def test_step_18_calls_take_no_keywords():
-    for name in ("stage1_predictions", "stage2_predictions", "show_stage_predictions"):
+    for name in STEP_18_NAMES:
         assert calls_in(step_18_body(), name)[0].keywords == [], name
+
+
+def test_step_18_grid_candidates_get_the_whole_settings():
+    call = calls_in(step_18_body(), "grid_candidates")[0]
+    assert [ast.unparse(a) for a in call.args] == ["settings"]
+
+
+def test_step_18_show_grid_candidates_gets_the_validation_origin_count_and_both_times():
+    call = calls_in(step_18_body(), "show_grid_candidates")[0]
+    assert [ast.unparse(a) for a in call.args] == [
+        "grid_candidates(settings)", "len(settings.evaluation.validation_origins)", "p_seconds",
+        "m_seconds"]
+    # The test origins stay unread until the v1 test.
+    assert "test_origins" not in ast.unparse(call)
+
+
+def test_step_18_shows_the_candidates_last_after_the_stage_check():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    assert statements[-2].startswith("show_stage_predictions(")
+    assert statements[-1].startswith("show_grid_candidates(")
+
+
+def test_grid_candidates_is_imported_once_from_the_grid_module():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+               and node.module == "collection_estimation.hurdle.grid"]
+    assert len(imports) == 1
+    assert [(a.name, a.asname) for a in imports[0].names] == [("grid_candidates", None)]
+
+
+def test_show_grid_candidates_is_a_module_level_function_with_four_parameters():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_grid_candidates"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["candidates", "origins", "p_seconds",
+                                                   "m_seconds"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+    assert names.index("show_grid_candidates") == names.index("show_stage_predictions") + 1
+
+
+GRID_NAMES = """
+import inspect
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import grid
+assert script.grid_candidates is grid.grid_candidates
+inspect.signature(script.grid_candidates).bind("settings")
+inspect.signature(script.show_grid_candidates).bind("candidates", 3, 1.0, 2.0)
+print("ok")
+"""
+
+
+def test_step_18_grid_names_are_the_modules_functions():
+    result = run_code(GRID_NAMES)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
 
 
 def test_step_18_stage2_gets_stage1s_company_setting_and_its_own_settings():
@@ -8298,8 +8386,9 @@ def test_module_docstring_lists_step_18_after_the_forecast_line():
                               "       (U16)  <- in progress")
 
 
-def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25)):
-    """Run step 18's statements with fake inputs and functions; return (calls, printed)."""
+def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25), run=True,
+                validation_origins=(37, 40, 44)):
+    """Run step 18's `if` with fake inputs and functions; return (calls, printed)."""
     calls, printed = [], []
     clock = iter(ticks)
 
@@ -8310,7 +8399,10 @@ def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25)):
         return call
 
     settings = SimpleNamespace(stage1=SimpleNamespace(company_as_feature=company_as_feature),
-                               stage2="<stage2 settings>")
+                               stage2="<stage2 settings>", grid=SimpleNamespace(run=run),
+                               evaluation=SimpleNamespace(
+                                   validation_origins=validation_origins,
+                                   test_origins="<never read>"))
     stage1_settings = settings.stage1
     namespace = {
         "settings": settings, "origin": 37, "train_rows": "<train rows>",
@@ -8323,8 +8415,10 @@ def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25)):
         "stage1_predictions": recorder("stage1_predictions", "<p>"),
         "stage2_predictions": recorder("stage2_predictions", "<m>"),
         "show_stage_predictions": recorder("show_stage_predictions", None),
+        "grid_candidates": recorder("grid_candidates", "<candidates>"),
+        "show_grid_candidates": recorder("show_grid_candidates", None),
     }
-    module = ast.Module(body=step_18_body(), type_ignores=[])
+    module = ast.Module(body=[step_18_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
     assert namespace["settings"].stage1 is stage1_settings
     return calls, printed
@@ -8334,13 +8428,19 @@ def test_step_18_run_calls_in_order():
     calls, _ = run_step_18()
     assert [name for name, _, _ in calls] == [
         "block_feature_columns", "stage1_predictions", "block_feature_columns",
-        "stage2_predictions", "show_stage_predictions"]
+        "stage2_predictions", "show_stage_predictions", "grid_candidates",
+        "show_grid_candidates"]
+
+
+def test_step_18_run_with_the_grid_switched_off_does_nothing():
+    # No fit, no printout, and the clock is never read.
+    calls, printed = run_step_18(run=False, ticks=())
+    assert calls == [] and printed == []
 
 
 def test_step_18_run_prints_the_header_with_the_origin_once():
     _, printed = run_step_18()
-    assert printed == ["Step 18: settings grid (U16); for now each stage fitted on its own at "
-                       "origin 37"]
+    assert printed == ["Step 18: settings grid (U16); each stage fitted on its own at origin 37"]
 
 
 def test_step_18_run_arguments_of_each_stage():
@@ -8368,6 +8468,173 @@ def test_step_18_run_each_stage_is_timed_on_its_own():
     calls, _ = run_step_18()
     shown = [args for name, args, _ in calls if name == "show_stage_predictions"]
     assert shown == [("<p>", "<m>", 2.5, 7.25, "<customers>")]
+
+
+def test_step_18_run_grid_candidates_get_the_settings_themselves():
+    calls, _ = run_step_18()
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_candidates"]
+    assert len(found) == 1
+    (settings,), kwargs = found[0]
+    assert kwargs == {}
+    assert settings.grid.run is True and settings.stage2 == "<stage2 settings>"
+
+
+@pytest.mark.parametrize("origins, count", [((37, 40, 44), 3), ((40,), 1),
+                                            (tuple(range(20, 45)), 25)])
+def test_step_18_run_shows_the_candidates_with_the_origin_count_and_both_times(origins, count):
+    calls, _ = run_step_18(validation_origins=origins)
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_candidates"]
+    assert shown == [(("<candidates>", count, 2.5, 7.25), {})]
+
+
+# show_grid_candidates, the function alone: compiled from the script's source, so the script
+# itself (which reconfigures sys.stdout) is not imported into this process.
+
+def grid_printer():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == "show_grid_candidates"]
+    assert len(found) == 1
+    namespace = {}
+    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_candidates>", "exec"),
+         namespace)
+    return namespace["show_grid_candidates"]
+
+
+def printed_grid(capsys, candidates, origins, p_seconds, m_seconds):
+    capsys.readouterr()
+    grid_printer()(candidates, origins, p_seconds, m_seconds)
+    return capsys.readouterr().out.splitlines()
+
+
+def test_show_grid_candidates_exact_printout_of_the_worked_example(capsys):
+    from collection_estimation.hurdle.grid import grid_candidates
+    from tests.hurdle.test_grid import make
+    lines = printed_grid(capsys, grid_candidates(make()), 3, 60.0, 15.0)
+    assert lines == [
+        "        stage 1: 4 settings",
+        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
+        "          1: max_iter 300, learning_rate 0.01, max_leaf_nodes 31",
+        "          2: max_iter 900, learning_rate 0.01, max_leaf_nodes 31",
+        "          3: max_iter 900, learning_rate 0.05, max_leaf_nodes 31",
+        "        stage 2: 4 settings",
+        "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
+        "scale open balance, balance_floor own mean   <- current",
+        "          1: loss poisson, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
+        "scale open balance, balance_floor own mean",
+        "          2: loss gamma, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
+        "scale open balance, balance_floor own mean",
+        "          3: loss gamma, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
+        "scale open balance, balance_floor own mean",
+        "        top-ups: 2 settings",
+        "          0: mean of 13 weeks   <- current",
+        "          1: mean of 8 weeks",
+        # 4 x 4 x 2 = 32 pairs; 3 x (4 x 60 + 4 x 15) s = 900 s = 15 min.
+        "        32 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
+        "validation origins: about 15 min",
+    ]
+
+
+def test_show_grid_candidates_shows_a_ridge_and_a_scale_none_floor_as_a_dash(capsys):
+    import dataclasses
+    from collection_estimation.hurdle.grid import grid_candidates
+    from tests.hurdle.test_grid import STAGE2, TOPUPS, make
+    ridge = dataclasses.replace(TOPUPS, method="ridge")
+    stage2 = dataclasses.replace(STAGE2, scale="none")
+    candidates = grid_candidates(make(stage2=stage2, topups=ridge, topup_windows=(13,),
+                                      stage1_max_iter=(300,), stage1_learning_rate=(0.05,),
+                                      stage2_loss=("poisson",), stage2_learning_rate=(0.05,)))
+    lines = printed_grid(capsys, candidates, 1, 6.0, 6.0)
+    assert lines == [
+        "        stage 1: 1 settings",
+        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
+        "        stage 2: 2 settings",
+        "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
+        "scale none, balance_floor -   <- current",
+        "          1: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
+        "scale open balance, balance_floor own mean",
+        "        top-ups: 2 settings",
+        "          0: ridge with the level   <- current",
+        "          1: mean of 13 weeks",
+        "        4 combinations to score; per origin 1 stage-1 and 2 stage-2 fits; 1 "
+        "validation origins: about 0 min",
+    ]
+
+
+def test_show_grid_candidates_top_up_lines_with_both_ridges(capsys):
+    # The synthetic.toml shape: current mean 13, means 8 and 13, both ridges: 4 top-ups.
+    from collection_estimation.hurdle.grid import grid_candidates
+    from tests.hurdle.test_grid import make
+    candidates = grid_candidates(make(topup_windows=(8, 13), topup_ridge_with_level=(True, False)))
+    lines = printed_grid(capsys, candidates, 3, 60.0, 15.0)
+    start = lines.index("        top-ups: 4 settings")
+    assert lines[start:] == [
+        "        top-ups: 4 settings",
+        "          0: mean of 13 weeks   <- current",
+        "          1: mean of 8 weeks",
+        "          2: ridge with the level",
+        "          3: ridge without the level",
+        # 4 x 4 x 4 = 64 pairs; the ridges add combinations but no fit: still 15 min.
+        "        64 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
+        "validation origins: about 15 min",
+    ]
+
+
+@pytest.mark.parametrize("with_level, text", [(True, "ridge with the level"),
+                                              (False, "ridge without the level")])
+def test_show_grid_candidates_a_current_ridge_line(capsys, with_level, text):
+    candidates = SimpleNamespace(
+        stage1=[SimpleNamespace(params={"k": 0})], stage2=[SimpleNamespace(params={"k": 0})],
+        topups=[SimpleNamespace(method="ridge", window=8, with_level=with_level),
+                SimpleNamespace(method="ridge", window=8, with_level=not with_level)])
+    lines = printed_grid(capsys, candidates, 1, 1.0, 1.0)
+    other = "ridge without the level" if with_level else "ridge with the level"
+    assert lines[-3:-1] == [f"          0: {text}   <- current", f"          1: {other}"]
+    # The ridge's window is not shown.
+    assert not any("8 weeks" in line for line in lines)
+
+
+def fake_candidates(n1, n2, n3):
+    """GridCandidates-like lists of the given sizes (only what the printout reads)."""
+    stage = [SimpleNamespace(params={"k": i}) for i in range(max(n1, n2))]
+    topups = [SimpleNamespace(method="mean", window=i + 1) for i in range(n3)]
+    return SimpleNamespace(stage1=stage[:n1], stage2=stage[:n2], topups=topups)
+
+
+@pytest.mark.parametrize("n1, n2, n3, origins, p, m, combos, minutes", [
+    (1, 1, 1, 1, 60.0, 60.0, 1, "2"),
+    (4, 8, 2, 12, 75.0, 30.0, 64, "108"),      # 12 x (300 + 240) = 6480 s
+    (2, 3, 4, 5, 0.0, 0.0, 24, "0"),
+    (5, 1, 3, 2, 600.0, 1.0, 15, "100"),       # 2 x (3000 + 1) = 6002 s = 100.03 min
+])
+def test_show_grid_candidates_counts_and_time(capsys, n1, n2, n3, origins, p, m, combos,
+                                              minutes):
+    last = printed_grid(capsys, fake_candidates(n1, n2, n3), origins, p, m)[-1]
+    assert last == (f"        {combos} combinations to score; per origin {n1} stage-1 and {n2} "
+                    f"stage-2 fits; {origins} validation origins: about {minutes} min")
+
+
+def test_show_grid_candidates_time_counts_fits_not_combinations(capsys):
+    # The top-ups cost no fit: more of them change the combinations, not the minutes.
+    a = printed_grid(capsys, fake_candidates(2, 2, 1), 3, 30.0, 30.0)[-1]
+    b = printed_grid(capsys, fake_candidates(2, 2, 6), 3, 30.0, 30.0)[-1]
+    assert a.endswith("about 6 min") and b.endswith("about 6 min")
+    assert "4 combinations" in a and "24 combinations" in b
+
+
+def test_show_grid_candidates_marks_only_slot_0_in_each_list(capsys):
+    lines = printed_grid(capsys, fake_candidates(3, 2, 4), 1, 1.0, 1.0)
+    marked = [line for line in lines if line.endswith("   <- current")]
+    assert marked == ["          0: k 0   <- current", "          0: k 0   <- current",
+                      "          0: mean of 1 weeks   <- current"]
+
+
+def test_show_grid_candidates_returns_none_and_changes_nothing(capsys):
+    candidates = fake_candidates(2, 2, 2)
+    before = (list(candidates.stage1), list(candidates.stage2), list(candidates.topups))
+    capsys.readouterr()
+    assert grid_printer()(candidates, 2, 1.0, 1.0) is None
+    assert (candidates.stage1, candidates.stage2, candidates.topups) == before
 
 
 SHOW_STAGES = """

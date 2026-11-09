@@ -174,6 +174,33 @@ class CalibrationSettings:
 
 
 @dataclass(frozen=True)
+class GridSettings:
+    """The settings grid (U16, `grid.py`): the whole model's settings chosen over the
+    [evaluation] validation origins. The stage grids and gates have the names of the
+    [joint_diagnostic] ones, so `stage1_grid` and `stage2_grid` read either."""
+    run: bool                                 # run pipeline step 18 (long; grows with the grids)
+    run_test: bool                            # also the v1 test on the [evaluation] test origins
+    stage1_max_iter: tuple[int, ...]          # stage 1's grid (HGB classifier, no class weights)
+    stage1_learning_rate: tuple[float, ...]   # each below GRID_LEARNING_RATE_LIMIT
+    stage1_max_leaf_nodes: tuple[int, ...]
+    stage2_loss: tuple[str, ...]              # stage 2's grid; GRID_STAGE2_LOSSES only
+    stage2_max_iter: tuple[int, ...]
+    stage2_learning_rate: tuple[float, ...]   # each below GRID_LEARNING_RATE_LIMIT
+    stage2_max_leaf_nodes: tuple[int, ...]
+    stage2_scale: tuple[str, ...]             # STAGE2_SCALES to try
+    stage2_balance_floor: tuple[str, ...]     # BALANCE_FLOORS to try (under "open balance" only)
+    stage1_log_loss_tolerance: float          # the gates, as in [joint_diagnostic]
+    stage1_slope_band: tuple[float, float]
+    stage2_skill_tolerance: float
+    stage2_ratio_band: tuple[float, float]
+    topup_windows: tuple[int, ...]            # the trailing means of the top-ups to try
+    topup_ridge_with_level: tuple[bool, ...]  # the ridges of the top-ups to try: with and/or
+                                              # without the recent level; empty = no ridge
+    min_gain: float                           # how much WAPE a pair must beat the current
+                                              # settings by to replace them
+
+
+@dataclass(frozen=True)
 class DebugSettings:
     """Settings that only change what is printed."""
     one_day: date         # the day whose payment lines step 2 prints
@@ -217,6 +244,7 @@ class Settings:
     topups: TopupSettings
     evaluation: EvaluationSettings
     calibration: CalibrationSettings
+    grid: GridSettings
     debug: DebugSettings
 
 
@@ -233,7 +261,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
                      "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                     "topups", "evaluation", "calibration", "debug"},
+                     "topups", "evaluation", "calibration", "grid", "debug"},
                name)
 
     data = raw["data"]
@@ -284,6 +312,13 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                f"{name} [evaluation]")
     calibration = raw["calibration"]
     check_keys(calibration, {"company_shrink_rows", "min_gain"}, f"{name} [calibration]")
+    grid = raw["grid"]
+    check_keys(grid, {"run", "run_test", "stage1_max_iter", "stage1_learning_rate",
+                      "stage1_max_leaf_nodes", "stage2_loss", "stage2_max_iter",
+                      "stage2_learning_rate", "stage2_max_leaf_nodes", "stage2_scale",
+                      "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
+                      "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
+                      "topup_ridge_with_level", "min_gain"}, f"{name} [grid]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -402,6 +437,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                               f"{name} [calibration]"),
             min_gain=positive_number_setting(calibration, "min_gain", f"{name} [calibration]"),
         ),
+        grid=read_grid(grid, f"{name} [grid]"),
         debug=DebugSettings(
             one_day=date_setting(debug, "one_day", f"{name} [debug]"),
             sample_week=week_setting(debug, "sample_week", f"{name} [debug]"),
@@ -437,6 +473,40 @@ def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiag
         selection_metric=choice_setting(table, "selection_metric", where, TOTAL_METRICS),
         bootstrap_samples=count_setting(table, "bootstrap_samples", where),
         output_folder=path_setting(table, "output_folder", repo_root, where),
+    )
+
+
+def read_grid(table: dict, where: str) -> GridSettings:
+    """The [grid] section, checked. Refused, as settings known to fail: a stage-2 loss outside
+    GRID_STAGE2_LOSSES and a learning rate of GRID_LEARNING_RATE_LIMIT or more."""
+    def one_of(choices):
+        return lambda item_table, key, item_where: choice_setting(item_table, key, item_where,
+                                                                  choices)
+    return GridSettings(
+        run=bool_setting(table, "run", where),
+        run_test=bool_setting(table, "run_test", where),
+        stage1_max_iter=grid_setting(table, "stage1_max_iter", where, count_setting),
+        stage1_learning_rate=grid_setting(table, "stage1_learning_rate", where,
+                                          grid_rate_setting),
+        stage1_max_leaf_nodes=grid_setting(table, "stage1_max_leaf_nodes", where,
+                                           leaf_count_setting),
+        stage2_loss=grid_setting(table, "stage2_loss", where, one_of(GRID_STAGE2_LOSSES)),
+        stage2_max_iter=grid_setting(table, "stage2_max_iter", where, count_setting),
+        stage2_learning_rate=grid_setting(table, "stage2_learning_rate", where,
+                                          grid_rate_setting),
+        stage2_max_leaf_nodes=grid_setting(table, "stage2_max_leaf_nodes", where,
+                                           leaf_count_setting),
+        stage2_scale=grid_setting(table, "stage2_scale", where, one_of(STAGE2_SCALES)),
+        stage2_balance_floor=grid_setting(table, "stage2_balance_floor", where,
+                                          one_of(BALANCE_FLOORS)),
+        stage1_log_loss_tolerance=positive_number_setting(table, "stage1_log_loss_tolerance",
+                                                          where),
+        stage1_slope_band=band_setting(table, "stage1_slope_band", where),
+        stage2_skill_tolerance=positive_number_setting(table, "stage2_skill_tolerance", where),
+        stage2_ratio_band=band_setting(table, "stage2_ratio_band", where),
+        topup_windows=window_list_setting(table, "topup_windows", where),
+        topup_ridge_with_level=bool_list_setting(table, "topup_ridge_with_level", where),
+        min_gain=positive_number_setting(table, "min_gain", where),
     )
 
 
@@ -738,6 +808,20 @@ def bool_setting(table: dict, key: str, where: str) -> bool:
     return value
 
 
+def bool_list_setting(table: dict, key: str, where: str) -> tuple[bool, ...]:
+    """A list of different yes/no values (true and/or false, no quotes), in the order given;
+    may be empty."""
+    value = table[key]
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} is {value!r}, not a list of true / false")
+    for item in value:
+        if not isinstance(item, bool):
+            raise ValueError(f"{where}: {key} holds {item!r}, not true or false")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{where}: {key} lists a value more than once: {value}")
+    return tuple(value)
+
+
 def window_list_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
     """A non-empty list of different window lengths in weeks (whole numbers, 1 or more),
     returned sorted from shortest to longest."""
@@ -888,6 +972,23 @@ STAGE2_SCALES = ("none", "open balance")
 # The floor of E under "open balance": the median or mean paid training amount, or the
 # customer's own mean payment.
 BALANCE_FLOORS = ("median", "mean", "own mean")
+
+
+# The stage-2 losses the settings grid may try: "squared_error" can predict below 0, which the
+# m gate would refuse only after its fits were paid for.
+GRID_STAGE2_LOSSES = ("poisson", "gamma")
+# The settings grid's learning rates must be below this: 0.5 did badly in the diagnostics.
+GRID_LEARNING_RATE_LIMIT = 0.5
+
+
+def grid_rate_setting(table: dict, key: str, where: str) -> float:
+    """A learning rate of the settings grid: a rate (`rate_setting`) below
+    GRID_LEARNING_RATE_LIMIT."""
+    value = rate_setting(table, key, where)
+    if value >= GRID_LEARNING_RATE_LIMIT:
+        raise ValueError(f"{where}: {key} is {value!r}; the grid's learning rates must be "
+                         f"below {GRID_LEARNING_RATE_LIMIT}")
+    return value
 
 
 def choice_setting(table: dict, key: str, where: str, choices: tuple[str, ...]) -> str:

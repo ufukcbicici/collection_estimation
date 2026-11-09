@@ -68,6 +68,14 @@ from collection_estimation.hurdle.settings import (
     bool_setting,
     window_list_setting,
 )
+from collection_estimation.hurdle.settings import (  # U16.2
+    GRID_LEARNING_RATE_LIMIT,
+    GRID_STAGE2_LOSSES,
+    GridSettings,
+    bool_list_setting,
+    grid_rate_setting,
+    read_grid,
+)
 from tests.hurdle.workbooks import SYNTHETIC_LAYOUT, SYNTHETIC_LEDGER_LAYOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -212,6 +220,19 @@ VALID = {
     # U15: the calibration. Values differ from synthetic.toml's on purpose (150 and 0.02 against
     # 200 and 0.005).
     "calibration": {"company_shrink_rows": "150", "min_gain": "0.02"},
+    # U16.2: the settings grid. Values differ from synthetic.toml's on purpose (run false,
+    # run_test true, unsorted grids, topup_windows [13, 4] unsorted, min_gain 0.01), and from
+    # [joint_diagnostic]'s and [calibration]'s, so a test can tell which section was read.
+    "grid": {"run": "false", "run_test": "true", "stage1_max_iter": "[900, 100]",
+             "stage1_learning_rate": "[0.2, 0.05]", "stage1_max_leaf_nodes": "[15, 63]",
+             "stage2_loss": '["gamma"]', "stage2_max_iter": "[600]",
+             "stage2_learning_rate": "[0.1, 0.01]", "stage2_max_leaf_nodes": "[31, 15]",
+             "stage2_scale": '["none", "open balance"]',
+             "stage2_balance_floor": '["median", "mean"]',
+             "stage1_log_loss_tolerance": "0.3", "stage1_slope_band": "[0.6, 1.6]",
+             "stage2_skill_tolerance": "0.04", "stage2_ratio_band": "[0.85, 1.15]",
+             "topup_windows": "[13, 4]", "topup_ridge_with_level": "[false, true]",
+             "min_gain": "0.01"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -2234,7 +2255,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="stage1")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -2742,7 +2763,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
         load(tmp_path, repo, drop_section="diagnostic")
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -3475,7 +3496,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="stage2")
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', 'ledger_layout', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
         f"'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4143,7 +4164,7 @@ def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, r
     message = exact_message_from(tmp_path, repo, drop_section="joint_diagnostic")
     assert message == (
         f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4645,7 +4666,7 @@ def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="calendar")
     assert message == (
         f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -4902,7 +4923,7 @@ def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="topups")
     assert message == (
         f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'calibration', 'collections_layout', "
-        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'history', 'joint_diagnostic', "
+        f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
         f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
 
 
@@ -5396,8 +5417,8 @@ def test_evaluation_settings_fields_in_order():
 def test_settings_has_an_evaluation_field_between_topups_and_debug():
     names = [field.name for field in dataclasses.fields(Settings)]
     assert names.index("topups") + 1 == names.index("evaluation")
-    # U15 put calibration between evaluation and debug.
-    assert names.index("evaluation") + 2 == names.index("debug")
+    # U15 put calibration between evaluation and debug, U16.2 grid after calibration.
+    assert names.index("evaluation") + 3 == names.index("debug")
 
 
 def test_evaluation_settings_is_frozen_and_hashable(tmp_path, repo):
@@ -5456,7 +5477,7 @@ def test_a_missing_evaluation_section_raises_the_exact_message(tmp_path, repo):
     message = exact_message_from(tmp_path, repo, drop_section="evaluation")
     assert message == (
         f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', 'calibration', "
-        f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
+        f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', "
         f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', 'stage2', "
         f"'topups']")
 
@@ -6253,7 +6274,9 @@ def test_calibration_settings_has_exactly_two_fields_and_settings_holds_it_befor
     assert [f.name for f in dataclasses.fields(CalibrationSettings)] == CALIBRATION_KEYS
     names = [f.name for f in dataclasses.fields(Settings)]
     assert names.index("calibration") == names.index("evaluation") + 1
-    assert names.index("debug") == names.index("calibration") + 1
+    # Since U16.2 [grid] sits between [calibration] and [debug].
+    assert names.index("grid") == names.index("calibration") + 1
+    assert names.index("debug") == names.index("grid") + 1
 
 
 @pytest.mark.parametrize("text, expected", [("1", 1), ("200", 200), ("100000", 100000)])
@@ -6363,3 +6386,631 @@ def test_real_settings_hold_every_field_choose_calibration_reads(tmp_path, repo)
     assert settings.diagnostic.calibration_groups == 4
     assert settings.evaluation.bootstrap_samples == 300
     assert settings.evaluation.bootstrap_seed == 11
+
+
+# =============================================================================================
+# U16.2: [grid], read by `read_grid` into `GridSettings`. Required. The stage grids use
+# `grid_setting` (non-empty, no repeats); the learning rates `grid_rate_setting` (a rate below
+# GRID_LEARNING_RATE_LIMIT); stage2_loss GRID_STAGE2_LOSSES only; topup_windows
+# `window_list_setting` (sorted); tolerances and min_gain `positive_number_setting`; bands
+# `band_setting`. VALID's values are listed in GRID_READ below.
+# =============================================================================================
+
+GRID_SECTION = f"{FILE_NAME} [grid]"
+GRID_SECTION_KEYS = sorted([
+    "run", "run_test", "stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
+    "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
+    "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
+    "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows", "topup_ridge_with_level",
+    "min_gain"])
+GRID_STAGE_KEYS = ["stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
+                   "stage2_loss", "stage2_max_iter", "stage2_learning_rate",
+                   "stage2_max_leaf_nodes", "stage2_scale", "stage2_balance_floor"]
+GRID_READ = GridSettings(
+    run=False, run_test=True, stage1_max_iter=(900, 100), stage1_learning_rate=(0.2, 0.05),
+    stage1_max_leaf_nodes=(15, 63), stage2_loss=("gamma",), stage2_max_iter=(600,),
+    stage2_learning_rate=(0.1, 0.01), stage2_max_leaf_nodes=(31, 15),
+    stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "mean"),
+    stage1_log_loss_tolerance=0.3, stage1_slope_band=(0.6, 1.6), stage2_skill_tolerance=0.04,
+    stage2_ratio_band=(0.85, 1.15), topup_windows=(4, 13), topup_ridge_with_level=(False, True),
+    min_gain=0.01)
+
+
+def grid_error(tmp_path, repo, changes):
+    return exact_message(tmp_path, repo, {("grid", key): value for key, value in changes.items()})
+
+
+def grid_table(**changes):
+    """A valid [grid] table as tomllib gives it, for read_grid on its own."""
+    table = {"run": True, "run_test": False, "stage1_max_iter": [300, 900],
+             "stage1_learning_rate": [0.01, 0.05], "stage1_max_leaf_nodes": [63],
+             "stage2_loss": ["poisson", "gamma"], "stage2_max_iter": [300],
+             "stage2_learning_rate": [0.05, 0.1], "stage2_max_leaf_nodes": [31],
+             "stage2_scale": ["open balance"], "stage2_balance_floor": ["own mean"],
+             "stage1_log_loss_tolerance": 0.1, "stage1_slope_band": [0.8, 1.25],
+             "stage2_skill_tolerance": 0.05, "stage2_ratio_band": [0.9, 1.1],
+             "topup_windows": [8, 13], "topup_ridge_with_level": [True, False],
+             "min_gain": 0.005}
+    table.update(changes)
+    return table
+
+
+def read_grid_error(**changes):
+    with pytest.raises(ValueError) as error:
+        read_grid(grid_table(**changes), "here")
+    return str(error.value)
+
+
+# --- constants and the dataclass ---------------------------------------------------------
+
+def test_grid_constants():
+    assert GRID_STAGE2_LOSSES == ("poisson", "gamma")
+    assert GRID_LEARNING_RATE_LIMIT == 0.5
+    assert "squared_error" in STAGE2_LOSSES and "squared_error" not in GRID_STAGE2_LOSSES
+
+
+def test_grid_settings_fields_are_in_the_documented_order():
+    assert [f.name for f in dataclasses.fields(GridSettings)] == [
+        "run", "run_test", "stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
+        "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
+        "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance",
+        "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
+        "topup_ridge_with_level",
+        "min_gain"]
+
+
+def test_grid_settings_has_every_stage_grid_and_gate_name_of_the_joint_diagnostic():
+    # stage1_grid and stage2_grid read the [grid] values by the [joint_diagnostic] names.
+    joint = {f.name for f in dataclasses.fields(JointDiagnosticSettings)}
+    grid = {f.name for f in dataclasses.fields(GridSettings)}
+    for name in GRID_STAGE_KEYS + ["stage1_log_loss_tolerance", "stage1_slope_band",
+                                   "stage2_skill_tolerance", "stage2_ratio_band"]:
+        assert name in joint and name in grid, name
+
+
+def test_settings_holds_grid_between_calibration_and_debug():
+    names = [f.name for f in dataclasses.fields(Settings)]
+    assert names[-3:] == ["calibration", "grid", "debug"]
+
+
+# --- happy path ----------------------------------------------------------------------------
+
+def test_the_grid_section_is_read(tmp_path, repo):
+    grid = load(tmp_path, repo).grid
+    assert isinstance(grid, GridSettings)
+    assert grid == GRID_READ
+
+
+def test_the_grid_values_have_the_right_python_types(tmp_path, repo):
+    grid = load(tmp_path, repo).grid
+    assert grid.run is False and grid.run_test is True
+    for name, item_type in (("stage1_max_iter", int), ("stage1_learning_rate", float),
+                            ("stage1_max_leaf_nodes", int), ("stage2_loss", str),
+                            ("stage2_max_iter", int), ("stage2_learning_rate", float),
+                            ("stage2_max_leaf_nodes", int), ("stage2_scale", str),
+                            ("stage2_balance_floor", str), ("topup_windows", int)):
+        value = getattr(grid, name)
+        assert type(value) is tuple, name
+        assert all(type(item) is item_type for item in value), (name, value)
+    for name in ("stage1_log_loss_tolerance", "stage2_skill_tolerance", "min_gain"):
+        assert type(getattr(grid, name)) is float, name
+    for name in ("stage1_slope_band", "stage2_ratio_band"):
+        band = getattr(grid, name)
+        assert type(band) is tuple and len(band) == 2
+        assert all(type(end) is float for end in band), name
+
+
+def test_grid_settings_is_frozen_and_hashable(tmp_path, repo):
+    grid = load(tmp_path, repo).grid
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        grid.run = True
+    assert hash(grid) == hash(dataclasses.replace(grid))
+
+
+def test_settings_grid_attribute_is_frozen(tmp_path, repo):
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(load(tmp_path, repo), "grid", None)
+
+
+def test_the_stage_grids_keep_the_order_given(tmp_path, repo):
+    grid = load(tmp_path, repo, changes={
+        ("grid", "stage1_max_iter"): "[900, 100, 300]",
+        ("grid", "stage2_scale"): '["open balance", "none"]',
+        ("grid", "stage2_balance_floor"): '["own mean", "mean", "median"]'}).grid
+    assert grid.stage1_max_iter == (900, 100, 300)
+    assert grid.stage2_scale == ("open balance", "none")
+    assert grid.stage2_balance_floor == ("own mean", "mean", "median")
+
+
+def test_topup_windows_are_returned_sorted(tmp_path, repo):
+    grid = load(tmp_path, repo, changes={("grid", "topup_windows"): "[52, 4, 13, 8]"}).grid
+    assert grid.topup_windows == (4, 8, 13, 52)
+
+
+@pytest.mark.parametrize("text, expected", [("[1]", (1,)), ("[13]", (13,)), ("[8, 13]", (8, 13))])
+def test_topup_windows_good_values(tmp_path, repo, text, expected):
+    grid = load(tmp_path, repo, changes={("grid", "topup_windows"): text}).grid
+    assert grid.topup_windows == expected
+
+
+@pytest.mark.parametrize("key", ["run", "run_test"])
+@pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
+def test_run_and_run_test_accept_true_and_false(tmp_path, repo, key, text, expected):
+    assert getattr(load(tmp_path, repo, changes={("grid", key): text}).grid, key) is expected
+
+
+def test_both_grid_losses_are_accepted(tmp_path, repo):
+    grid = load(tmp_path, repo, changes={("grid", "stage2_loss"): '["poisson", "gamma"]'}).grid
+    assert grid.stage2_loss == GRID_STAGE2_LOSSES
+
+
+def test_every_scale_and_floor_is_accepted(tmp_path, repo):
+    grid = load(tmp_path, repo, changes={
+        ("grid", "stage2_scale"): '["none", "open balance"]',
+        ("grid", "stage2_balance_floor"): '["median", "mean", "own mean"]'}).grid
+    assert grid.stage2_scale == STAGE2_SCALES
+    assert grid.stage2_balance_floor == BALANCE_FLOORS
+
+
+@pytest.mark.parametrize("key", ["stage1_learning_rate", "stage2_learning_rate"])
+@pytest.mark.parametrize("text, expected", [("[0.49]", (0.49,)), ("[0.4999999]", (0.4999999,)),
+                                            ("[0.001, 0.2]", (0.001, 0.2))])
+def test_learning_rates_below_the_limit_are_accepted(tmp_path, repo, key, text, expected):
+    assert getattr(load(tmp_path, repo, changes={("grid", key): text}).grid, key) == expected
+
+
+@pytest.mark.parametrize("key", ["stage1_log_loss_tolerance", "stage2_skill_tolerance",
+                                 "min_gain"])
+@pytest.mark.parametrize("text, expected", [("1e-6", 1e-6), ("2", 2.0), ("0.5", 0.5)])
+def test_tolerances_and_min_gain_good_values(tmp_path, repo, key, text, expected):
+    value = getattr(load(tmp_path, repo, changes={("grid", key): text}).grid, key)
+    assert value == expected and type(value) is float
+
+
+def test_the_grid_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("grid", "run"): "true", ("grid", "min_gain"): "0.2",
+                                      ("grid", "stage2_loss"): '["poisson"]'})
+    for field in dataclasses.fields(Settings):
+        if field.name != "grid":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert a.grid != b.grid
+
+
+def test_the_joint_diagnostic_grid_does_not_feed_the_settings_grid(tmp_path, repo):
+    a = load(tmp_path, repo).grid
+    b = load(tmp_path, repo, changes={("joint_diagnostic", "stage1_max_iter"): "[7]",
+                                      ("joint_diagnostic", "stage2_loss"): '["squared_error"]'})
+    assert b.grid == a
+    assert b.joint_diagnostic.stage2_loss == ("squared_error",)
+
+
+def test_the_calibration_min_gain_is_not_the_grid_min_gain(tmp_path, repo):
+    settings = load(tmp_path, repo, changes={("calibration", "min_gain"): "0.3"})
+    assert settings.calibration.min_gain == 0.3
+    assert settings.grid.min_gain == 0.01
+
+
+# --- strictness: section and keys --------------------------------------------------------
+
+def test_a_missing_grid_section_is_named(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="grid")
+    assert message == (
+        f"{FILE_NAME}: missing ['grid']; expected exactly ['calendar', 'calibration', "
+        f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
+        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', "
+        f"'stage2', 'topups']")
+
+
+def test_a_grid_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="grid", top="grid = 5")
+    assert message == f"{GRID_SECTION} is 5, not a section"
+
+
+def test_an_empty_grid_section_names_every_setting(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {key: REMOVE for key in VALID["grid"]})
+    assert message == (f"{GRID_SECTION}: missing {GRID_SECTION_KEYS}; expected exactly "
+                       f"{GRID_SECTION_KEYS}")
+
+
+@pytest.mark.parametrize("key", GRID_SECTION_KEYS)
+def test_a_missing_grid_key_has_the_exact_message(tmp_path, repo, key):
+    message = grid_error(tmp_path, repo, {key: REMOVE})
+    assert message == f"{GRID_SECTION}: missing [{key!r}]; expected exactly {GRID_SECTION_KEYS}"
+
+
+@pytest.mark.parametrize("key, value", [("surprise", "1"), ("selection_metric", '"wape"'),
+                                        ("bootstrap_samples", "500"), ("output_folder", '"x"'),
+                                        ("origins", "[40]"), ("company_shrink_rows", "200")])
+def test_an_unknown_grid_key_is_refused(tmp_path, repo, key, value):
+    message = grid_error(tmp_path, repo, {key: value})
+    assert message == f"{GRID_SECTION}: unknown [{key!r}]; expected exactly {GRID_SECTION_KEYS}"
+
+
+def test_a_grid_typo_names_the_missing_and_the_unknown_key(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"topup_windows": REMOVE, "topup_window": "[8]"})
+    assert message == (f"{GRID_SECTION}: missing ['topup_windows']; unknown ['topup_window']; "
+                       f"expected exactly {GRID_SECTION_KEYS}")
+
+
+@pytest.mark.parametrize("key, value", [("run_test", "false"), ("topup_windows", "[8]")])
+def test_a_grid_key_in_another_section_is_unknown_there(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("joint_diagnostic", key): value})
+    assert message.startswith(f"{JOINT}: unknown [{key!r}]")
+
+
+def test_a_bad_grid_is_refused_with_the_grid_switched_off(tmp_path, repo):
+    # A broken file fails on load whatever run says.
+    message = grid_error(tmp_path, repo, {"run": "false", "stage2_loss": '["squared_error"]'})
+    assert message.startswith(f"{GRID_SECTION} stage2_loss item:")
+
+
+# --- run, run_test -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["run", "run_test"])
+@pytest.mark.parametrize("text, shown", [("1", "1"), ("0", "0"), ('"true"', "'true'"),
+                                         ("[true]", "[True]")])
+def test_a_non_bool_run_or_run_test_has_the_exact_message(tmp_path, repo, key, text, shown):
+    assert grid_error(tmp_path, repo, {key: text}) == (
+        f"{GRID_SECTION}: {key} is {shown}, not true or false")
+
+
+# --- stage grids: shape --------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", GRID_STAGE_KEYS)
+@pytest.mark.parametrize("text, shown", [("[]", "[]"), ("5", "5"), ('"gamma"', "'gamma'")])
+def test_a_grid_that_is_not_a_non_empty_list_has_the_exact_message(tmp_path, repo, key, text,
+                                                                   shown):
+    assert grid_error(tmp_path, repo, {key: text}) == (
+        f"{GRID_SECTION}: {key} is {shown}, not a non-empty list of values to try")
+
+
+@pytest.mark.parametrize("key, text, shown", [
+    ("stage1_max_iter", "[300, 300]", "[300, 300]"),
+    ("stage1_learning_rate", "[0.1, 0.1]", "[0.1, 0.1]"),
+    ("stage1_max_leaf_nodes", "[31, 15, 31]", "[31, 15, 31]"),
+    ("stage2_loss", '["gamma", "gamma"]', "['gamma', 'gamma']"),
+    ("stage2_max_iter", "[1, 1]", "[1, 1]"),
+    ("stage2_learning_rate", "[0.2, 0.2]", "[0.2, 0.2]"),
+    ("stage2_max_leaf_nodes", "[2, 2]", "[2, 2]"),
+    ("stage2_scale", '["none", "none"]', "['none', 'none']"),
+    ("stage2_balance_floor", '["mean", "median", "mean"]', "['mean', 'median', 'mean']"),
+])
+def test_a_grid_with_a_repeat_has_the_exact_message(tmp_path, repo, key, text, shown):
+    assert grid_error(tmp_path, repo, {key: text}) == (
+        f"{GRID_SECTION}: {key} lists a value more than once: {shown}")
+
+
+@pytest.mark.parametrize("key", ["stage1_learning_rate", "stage2_learning_rate"])
+def test_a_rate_written_twice_in_two_spellings_is_a_repeat(tmp_path, repo, key):
+    # 0.25 and 0.250 are one float.
+    message = grid_error(tmp_path, repo, {key: "[0.25, 0.250]"})
+    assert message == f"{GRID_SECTION}: {key} lists a value more than once: [0.25, 0.25]"
+
+
+# --- stage grids: items ------------------------------------------------------------------
+
+@pytest.mark.parametrize("key, item, shown, reason", [
+    ("stage1_max_iter", "0", "0", "not a whole number of 1 or more"),
+    ("stage1_max_iter", "1.5", "1.5", "not a whole number of 1 or more"),
+    ("stage1_max_iter", "true", "True", "not a whole number of 1 or more"),
+    ("stage2_max_iter", "-3", "-3", "not a whole number of 1 or more"),
+    ("stage1_learning_rate", "0", "0", "not a number above 0 and at most 1"),
+    ("stage1_learning_rate", "-0.1", "-0.1", "not a number above 0 and at most 1"),
+    ("stage1_learning_rate", "1.5", "1.5", "not a number above 0 and at most 1"),
+    ("stage2_learning_rate", '"0.1"', "'0.1'", "not a number above 0 and at most 1"),
+    ("stage2_learning_rate", "true", "True", "not a number above 0 and at most 1"),
+    ("stage1_max_leaf_nodes", "1", "1", "not a whole number of 2 or more"),
+    ("stage2_max_leaf_nodes", "31.0", "31.0", "not a whole number of 2 or more"),
+    ("stage2_loss", '"tweedie"', "'tweedie'", "not one of ['poisson', 'gamma']"),
+    ("stage2_loss", '"Poisson"', "'Poisson'", "not one of ['poisson', 'gamma']"),
+    ("stage2_scale", '"open_balance"', "'open_balance'", "not one of ['none', 'open balance']"),
+    ("stage2_scale", "1", "1", "not one of ['none', 'open balance']"),
+    ("stage2_balance_floor", '"average"', "'average'",
+     "not one of ['median', 'mean', 'own mean']"),
+    ("stage2_balance_floor", '"own_mean"', "'own_mean'",
+     "not one of ['median', 'mean', 'own mean']"),
+])
+def test_a_bad_grid_item_has_the_exact_message(tmp_path, repo, key, item, shown, reason):
+    good = {"stage1_max_iter": "100", "stage2_max_iter": "100", "stage1_learning_rate": "0.1",
+            "stage2_learning_rate": "0.1", "stage1_max_leaf_nodes": "15",
+            "stage2_max_leaf_nodes": "15", "stage2_loss": '"gamma"', "stage2_scale": '"none"',
+            "stage2_balance_floor": '"mean"'}[key]
+    message = grid_error(tmp_path, repo, {key: f"[{good}, {item}]"})
+    assert message == f"{GRID_SECTION} {key} item: {key} is {shown}, {reason}"
+
+
+@pytest.mark.parametrize("text", ['["squared_error"]', '["poisson", "squared_error"]',
+                                  '["squared_error", "gamma"]'])
+def test_squared_error_is_refused_in_the_stage2_grid(tmp_path, repo, text):
+    assert grid_error(tmp_path, repo, {"stage2_loss": text}) == (
+        f"{GRID_SECTION} stage2_loss item: stage2_loss is 'squared_error', not one of "
+        f"['poisson', 'gamma']")
+
+
+@pytest.mark.parametrize("key", ["stage1_learning_rate", "stage2_learning_rate"])
+@pytest.mark.parametrize("item, shown", [("0.5", "0.5"), ("0.75", "0.75"), ("1", "1.0"),
+                                         ("1.0", "1.0"), ("0.50000001", "0.50000001")])
+def test_a_learning_rate_of_half_or_more_is_refused_in_each_stage_grid(tmp_path, repo, key,
+                                                                       item, shown):
+    message = grid_error(tmp_path, repo, {key: f"[0.1, {item}]"})
+    assert message == (f"{GRID_SECTION} {key} item: {key} is {shown}; the grid's learning "
+                       f"rates must be below 0.5")
+
+
+@pytest.mark.parametrize("key", ["stage1_learning_rate", "stage2_learning_rate"])
+def test_a_learning_rate_above_one_gets_the_rate_message_not_the_limit_one(tmp_path, repo, key):
+    message = grid_error(tmp_path, repo, {key: "[2]"})
+    assert message == f"{GRID_SECTION} {key} item: {key} is 2, not a number above 0 and at most 1"
+
+
+def test_the_stage1_setting_itself_may_still_be_half(tmp_path, repo):
+    # The limit is the grid's only: [stage1] learning_rate keeps rate_setting's range.
+    settings = load(tmp_path, repo, changes={("stage1", "learning_rate"): "0.5"})
+    assert settings.stage1.learning_rate == 0.5
+
+
+def test_the_joint_diagnostic_may_still_try_half_and_squared_error(tmp_path, repo):
+    joint = load(tmp_path, repo, changes={
+        ("joint_diagnostic", "stage1_learning_rate"): "[0.5]",
+        ("joint_diagnostic", "stage2_loss"): '["squared_error"]'}).joint_diagnostic
+    assert joint.stage1_learning_rate == (0.5,) and joint.stage2_loss == ("squared_error",)
+
+
+def test_a_floor_grid_is_checked_even_if_open_balance_is_not_tried_in_the_grid(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"stage2_scale": '["none"]',
+                                          "stage2_balance_floor": '["average"]'})
+    assert message.startswith(f"{GRID_SECTION} stage2_balance_floor item:")
+
+
+# --- topup_windows -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("text, message_end", [
+    ("[]", "topup_windows is [], not a non-empty list of window lengths"),
+    ("8", "topup_windows is 8, not a non-empty list of window lengths"),
+    ('"8"', "topup_windows is '8', not a non-empty list of window lengths"),
+    ("[0]", "topup_windows holds 0, not a window length (1 or more)"),
+    ("[8, -1]", "topup_windows holds -1, not a window length (1 or more)"),
+    ("[8.5]", "topup_windows holds 8.5, not a window length (1 or more)"),
+    ("[8.0]", "topup_windows holds 8.0, not a window length (1 or more)"),
+    ("[true]", "topup_windows holds True, not a window length (1 or more)"),
+    ('["8"]', "topup_windows holds '8', not a window length (1 or more)"),
+    ("[13, 8, 13]", "topup_windows lists [13] more than once"),
+], ids=["empty", "number", "text", "zero", "negative", "fraction", "whole-float", "bool",
+        "text-item", "repeat"])
+def test_a_bad_topup_windows_has_the_exact_message(tmp_path, repo, text, message_end):
+    assert grid_error(tmp_path, repo, {"topup_windows": text}) == (
+        f"{GRID_SECTION}: {message_end}")
+
+
+# --- tolerances and min_gain -------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["stage1_log_loss_tolerance", "stage2_skill_tolerance",
+                                 "min_gain"])
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("0.0", "0.0"), ("-0.005", "-0.005"),
+                                         ("-1", "-1"), ("true", "True"), ('"0.1"', "'0.1'"),
+                                         ("[0.1]", "[0.1]"), ("nan", "nan"), ("inf", "inf"),
+                                         ("-inf", "-inf")],
+                         ids=["zero", "zero-float", "negative-float", "negative", "bool", "text",
+                              "list", "nan", "inf", "minus-inf"])
+def test_a_non_positive_or_bad_number_has_the_exact_message(tmp_path, repo, key, text, shown):
+    assert grid_error(tmp_path, repo, {key: text}) == (
+        f"{GRID_SECTION}: {key} is {shown}, not a number above 0")
+
+
+# --- bands -------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["stage1_slope_band", "stage2_ratio_band"])
+@pytest.mark.parametrize("text, message_end", [
+    ("[1.0]", "is [1.0], not a band [low, high]"),
+    ("[0.5, 1.0, 1.5]", "is [0.5, 1.0, 1.5], not a band [low, high]"),
+    ("[]", "is [], not a band [low, high]"),
+    ("1.0", "is 1.0, not a band [low, high]"),
+    ("[1.2, 0.8]", "is [1.2, 0.8]; low must be below high"),
+    ("[1.0, 1.0]", "is [1.0, 1.0]; low must be below high"),
+    ("[0, 1.2]", "is 0, not a number above 0"),
+    ("[-0.5, 1.2]", "is -0.5, not a number above 0"),
+    ("[0.8, inf]", "is inf, not a number above 0"),
+    ('[0.8, "1.2"]', "is '1.2', not a number above 0"),
+], ids=["one", "three", "empty", "number", "reversed", "equal", "zero", "negative", "inf",
+        "text"])
+def test_a_bad_band_has_the_exact_message(tmp_path, repo, key, text, message_end):
+    assert grid_error(tmp_path, repo, {key: text}) == f"{GRID_SECTION}: {key} {message_end}"
+
+
+@pytest.mark.parametrize("key", ["stage1_slope_band", "stage2_ratio_band"])
+def test_a_band_of_whole_numbers_is_read_as_floats(tmp_path, repo, key):
+    band = getattr(load(tmp_path, repo, changes={("grid", key): "[1, 2]"}).grid, key)
+    assert band == (1.0, 2.0) and all(type(end) is float for end in band)
+
+
+# --- read_grid and grid_rate_setting on their own ----------------------------------------
+
+def test_read_grid_by_hand():
+    assert read_grid(grid_table(), "here") == GridSettings(
+        run=True, run_test=False, stage1_max_iter=(300, 900),
+        stage1_learning_rate=(0.01, 0.05), stage1_max_leaf_nodes=(63,),
+        stage2_loss=("poisson", "gamma"), stage2_max_iter=(300,),
+        stage2_learning_rate=(0.05, 0.1), stage2_max_leaf_nodes=(31,),
+        stage2_scale=("open balance",), stage2_balance_floor=("own mean",),
+        stage1_log_loss_tolerance=0.1, stage1_slope_band=(0.8, 1.25),
+        stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1), topup_windows=(8, 13),
+        topup_ridge_with_level=(True, False),
+        min_gain=0.005)
+
+
+def test_read_grid_uses_where_in_its_messages():
+    assert read_grid_error(stage2_loss=["squared_error"]) == (
+        "here stage2_loss item: stage2_loss is 'squared_error', not one of ['poisson', 'gamma']")
+    assert read_grid_error(stage1_learning_rate=[0.5]) == (
+        "here stage1_learning_rate item: stage1_learning_rate is 0.5; the grid's learning "
+        "rates must be below 0.5")
+    assert read_grid_error(min_gain=0) == "here: min_gain is 0, not a number above 0"
+    assert read_grid_error(run="yes") == "here: run is 'yes', not true or false"
+
+
+def test_read_grid_does_not_change_its_table():
+    table = grid_table(topup_windows=[13, 8])
+    before = {key: list(value) if isinstance(value, list) else value
+              for key, value in table.items()}
+    assert read_grid(table, "here").topup_windows == (8, 13)
+    assert table == before
+
+
+def test_read_grid_without_a_key_raises_key_error():
+    # check_keys runs in load_settings; read_grid on its own just reads.
+    table = grid_table()
+    del table["min_gain"]
+    with pytest.raises(KeyError):
+        read_grid(table, "here")
+
+
+def test_read_grid_checks_run_before_the_grids():
+    assert read_grid_error(run=1, stage2_loss=["squared_error"]) == (
+        "here: run is 1, not true or false")
+
+
+@pytest.mark.parametrize("value", [0.001, 0.1, 0.25, 0.49, 0.4999999999])
+def test_grid_rate_setting_accepts_rates_below_the_limit(value):
+    found = grid_rate_setting({"r": value}, "r", "here")
+    assert found == value and type(found) is float
+
+
+def test_grid_rate_setting_shows_a_whole_number_as_the_float_it_read():
+    with pytest.raises(ValueError) as error:
+        grid_rate_setting({"r": 1}, "r", "here")
+    assert str(error.value) == "here: r is 1.0; the grid's learning rates must be below 0.5"
+
+
+@pytest.mark.parametrize("value", [0.5, 0.6, 0.9999, 1.0])
+def test_grid_rate_setting_refuses_the_limit_and_above(value):
+    with pytest.raises(ValueError) as error:
+        grid_rate_setting({"r": value}, "r", "here")
+    assert str(error.value) == (f"here: r is {value!r}; the grid's learning rates must be "
+                                f"below 0.5")
+
+
+@pytest.mark.parametrize("value, shown", [(0, "0"), (-0.1, "-0.1"), (1.5, "1.5"),
+                                          (True, "True"), ("0.1", "'0.1'"), (None, "None")])
+def test_grid_rate_setting_refuses_what_rate_setting_refuses(value, shown):
+    with pytest.raises(ValueError) as error:
+        grid_rate_setting({"r": value}, "r", "here")
+    assert str(error.value) == f"here: r is {shown}, not a number above 0 and at most 1"
+
+
+# --- the synthetic settings ----------------------------------------------------------------
+
+def test_the_synthetic_toml_has_a_readable_grid_section():
+    # Read, never written: the values in it are the user's to change.
+    grid = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).grid
+    assert isinstance(grid, GridSettings)
+    assert set(grid.stage2_loss) <= set(GRID_STAGE2_LOSSES)
+    assert all(rate < GRID_LEARNING_RATE_LIMIT
+               for rate in grid.stage1_learning_rate + grid.stage2_learning_rate)
+    assert grid.topup_windows == tuple(sorted(grid.topup_windows))
+    assert grid.min_gain > 0
+
+
+# --- topup_ridge_with_level (`bool_list_setting`): the ridges of the top-ups the grid tries ---
+
+def test_topup_ridge_with_level_is_read_as_a_tuple_of_bools_in_file_order(tmp_path, repo):
+    value = load(tmp_path, repo).grid.topup_ridge_with_level
+    assert value == (False, True)
+    assert type(value) is tuple and all(type(item) is bool for item in value)
+
+
+@pytest.mark.parametrize("text, expected", [("[]", ()), ("[true]", (True,)),
+                                            ("[false]", (False,)), ("[true, false]", (True, False)),
+                                            ("[false, true]", (False, True))],
+                         ids=["empty", "true", "false", "both", "both-reversed"])
+def test_topup_ridge_with_level_good_values(tmp_path, repo, text, expected):
+    grid = load(tmp_path, repo, changes={("grid", "topup_ridge_with_level"): text}).grid
+    assert grid.topup_ridge_with_level == expected
+
+
+def test_topup_ridge_with_level_sits_between_topup_windows_and_min_gain():
+    names = [f.name for f in dataclasses.fields(GridSettings)]
+    assert names.index("topup_ridge_with_level") == names.index("topup_windows") + 1
+    assert names.index("min_gain") == names.index("topup_ridge_with_level") + 1
+
+
+def test_a_missing_topup_ridge_with_level_has_the_exact_message(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"topup_ridge_with_level": REMOVE})
+    assert message == (f"{GRID_SECTION}: missing ['topup_ridge_with_level']; expected exactly "
+                       f"{GRID_SECTION_KEYS}")
+    assert "topup_ridge_with_level" in GRID_SECTION_KEYS
+
+
+@pytest.mark.parametrize("text, shown", [("true", "True"), ("false", "False"), ("1", "1"),
+                                         ('"true"', "'true'"), ("{ a = true }", "{'a': True}")],
+                         ids=["true", "false", "int", "text", "table"])
+def test_a_topup_ridge_with_level_that_is_not_a_list_has_the_exact_message(tmp_path, repo, text,
+                                                                           shown):
+    assert grid_error(tmp_path, repo, {"topup_ridge_with_level": text}) == (
+        f"{GRID_SECTION}: topup_ridge_with_level is {shown}, not a list of true / false")
+
+
+@pytest.mark.parametrize("text, shown", [("[1]", "1"), ("[0]", "0"), ("[true, 0]", "0"),
+                                         ('["true"]', "'true'"), ("[1.0]", "1.0"),
+                                         ("[[true]]", "[True]")],
+                         ids=["one", "zero", "zero-after-true", "text", "float", "nested"])
+def test_a_non_bool_item_in_topup_ridge_with_level_has_the_exact_message(tmp_path, repo, text,
+                                                                         shown):
+    assert grid_error(tmp_path, repo, {"topup_ridge_with_level": text}) == (
+        f"{GRID_SECTION}: topup_ridge_with_level holds {shown}, not true or false")
+
+
+@pytest.mark.parametrize("text, shown", [("[true, true]", "[True, True]"),
+                                         ("[false, true, false]", "[False, True, False]")])
+def test_a_repeat_in_topup_ridge_with_level_has_the_exact_message(tmp_path, repo, text, shown):
+    assert grid_error(tmp_path, repo, {"topup_ridge_with_level": text}) == (
+        f"{GRID_SECTION}: topup_ridge_with_level lists a value more than once: {shown}")
+
+
+def test_topup_ridge_with_level_does_not_change_the_other_grid_fields(tmp_path, repo):
+    a = load(tmp_path, repo).grid
+    b = load(tmp_path, repo, changes={("grid", "topup_ridge_with_level"): "[]"}).grid
+    assert dataclasses.replace(a, topup_ridge_with_level=()) == b
+
+
+def test_bool_list_setting_direct_calls():
+    assert bool_list_setting({"k": []}, "k", "here") == ()
+    assert bool_list_setting({"k": [True, False]}, "k", "here") == (True, False)
+    assert bool_list_setting({"k": [False]}, "k", "here") == (False,)
+    for value, message in (
+            (True, "here: k is True, not a list of true / false"),
+            ((True,), "here: k is (True,), not a list of true / false"),
+            ([1], "here: k holds 1, not true or false"),
+            ([True, 1], "here: k holds 1, not true or false"),   # 1 == True, still refused
+            ([0, False], "here: k holds 0, not true or false"),
+            ([None], "here: k holds None, not true or false"),
+            ([True, True], "here: k lists a value more than once: [True, True]")):
+        with pytest.raises(ValueError) as error:
+            bool_list_setting({"k": value}, "k", "here")
+        assert str(error.value) == message, value
+
+
+def test_bool_list_setting_checks_the_items_before_the_repeats():
+    # [1, 1] is reported as a non-bool, not as a repeat.
+    with pytest.raises(ValueError) as error:
+        bool_list_setting({"k": [1, 1]}, "k", "here")
+    assert str(error.value) == "here: k holds 1, not true or false"
+
+
+def test_bool_list_setting_does_not_change_its_input():
+    value = [False, True]
+    assert bool_list_setting({"k": value}, "k", "here") == (False, True)
+    assert value == [False, True]
+
+
+def test_read_grid_reads_topup_ridge_with_level_and_names_where():
+    assert read_grid(grid_table(topup_ridge_with_level=[]), "here").topup_ridge_with_level == ()
+    assert read_grid_error(topup_ridge_with_level=[True, True]) == (
+        "here: topup_ridge_with_level lists a value more than once: [True, True]")
+
+
+def test_the_synthetic_toml_grid_tries_both_ridges():
+    # Read, never written.
+    grid = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).grid
+    assert all(type(item) is bool for item in grid.topup_ridge_with_level)
+    assert len(set(grid.topup_ridge_with_level)) == len(grid.topup_ridge_with_level)

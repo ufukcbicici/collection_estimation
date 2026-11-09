@@ -108,6 +108,7 @@ from collection_estimation.hurdle.benchmark import (  # noqa: E402
     benchmark_forecasts,
     cash_totals,
 )
+from collection_estimation.hurdle.grid import grid_candidates  # noqa: E402
 from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
     paired_bootstrap,
     score_pairs,
@@ -685,21 +686,24 @@ def main():
             choice = choose_calibration(rolled, weekly, weeks, levels, rolled_actual, settings)
             show_calibration_choice(choice, settings.calibration.min_gain)
 
-    # Step 18: the settings grid (U16). Built unit by unit; for now (U16.1), stage 1 and stage
-    # 2 fitted each on its own at the forecast week of steps 12-16, with the [stage1] and
-    # [stage2] settings: they must give step 16's p and m exactly.
-    print(f"Step 18: settings grid (U16); for now each stage fitted on its own at origin "
-          f"{origin}")
-    started = time.perf_counter()
-    p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1,
-                                 block_feature_columns(history, calendar, owed), companies)
-    p_seconds = time.perf_counter() - started
-    started = time.perf_counter()
-    m_alone = stage2_predictions(train_rows, forecast_rows, settings.stage2,
-                                 block_feature_columns(history, calendar, owed), companies,
-                                 settings.stage1.company_as_feature)
-    m_seconds = time.perf_counter() - started
-    show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)
+    # Step 18: the settings grid (U16). Built unit by unit. U16.1: stage 1 and stage 2 fitted
+    # each on its own at the forecast week of steps 12-16, with the [stage1] and [stage2]
+    # settings: they must give step 16's p and m exactly. U16.2: the settings to try, and
+    # (from the two fits' times) about how long the grid will take.
+    if settings.grid.run:
+        print(f"Step 18: settings grid (U16); each stage fitted on its own at origin {origin}")
+        started = time.perf_counter()
+        p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1,
+                                     block_feature_columns(history, calendar, owed), companies)
+        p_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        m_alone = stage2_predictions(train_rows, forecast_rows, settings.stage2,
+                                     block_feature_columns(history, calendar, owed), companies,
+                                     settings.stage1.company_as_feature)
+        m_seconds = time.perf_counter() - started
+        show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)
+        show_grid_candidates(grid_candidates(settings),
+                             len(settings.evaluation.validation_origins), p_seconds, m_seconds)
 
     # Later steps follow as each unit is built.
 
@@ -1743,6 +1747,28 @@ def show_stage_predictions(p, m, p_seconds, m_seconds, customers):
     same_m = same_rows and bool((m.to_numpy() == customers["m"].to_numpy()).all())
     print(f"        the same as step 16, row by row: p {'yes' if same_p else 'NO'}, m "
           f"{'yes' if same_m else 'NO'}")
+
+
+def show_grid_candidates(candidates, origins, p_seconds, m_seconds):
+    """Step 18's settings to try (U16.2), the current ones marked, and about how long the grid
+    takes on `origins` origins at the measured time of one fit per stage."""
+    for stage, listed in (("stage 1", candidates.stage1), ("stage 2", candidates.stage2)):
+        print(f"        {stage}: {len(listed)} settings")
+        for i, candidate in enumerate(listed):
+            values = ", ".join(f"{key} {value}" for key, value in candidate.params.items())
+            print(f"          {i}: {values}{'   <- current' if i == 0 else ''}")
+    print(f"        top-ups: {len(candidates.topups)} settings")
+    for i, topups in enumerate(candidates.topups):
+        if topups.method == "mean":
+            method = f"mean of {topups.window} weeks"
+        else:
+            method = f"ridge {'with' if topups.with_level else 'without'} the level"
+        print(f"          {i}: {method}{'   <- current' if i == 0 else ''}")
+    pairs = len(candidates.stage1) * len(candidates.stage2) * len(candidates.topups)
+    seconds = origins * (len(candidates.stage1) * p_seconds + len(candidates.stage2) * m_seconds)
+    print(f"        {pairs} combinations to score; per origin {len(candidates.stage1)} stage-1 "
+          f"and {len(candidates.stage2)} stage-2 fits; {origins} validation origins: about "
+          f"{seconds / 60:.0f} min")
 
 
 def show_actual_totals(actual, weekly, weeks):
