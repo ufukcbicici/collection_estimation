@@ -7798,3 +7798,398 @@ def test_balance_coherence_takes_the_real_rolling_forecasts(r_table, r_result):
     at_1 = r_table[(r_table["h"] == 1) & r_table["origin_week"].isin(R_ORIGINS)]
     assert total["open_balance"] == pytest.approx(at_1["open_balance"].clip(lower=0).sum())
     assert total["actual"] == 0.0
+
+
+# =============================================================================================
+# U16.3: `check_forecast_origins`, the origin checks `rolling_forecasts` made at its top, moved
+# into their own function (and shared with `grid.grid_predictions`), unchanged. Tested on
+# the small training table of test_forecast.py (origins 0..30, h 1..5). Nothing is fitted.
+# =============================================================================================
+
+from collection_estimation.hurdle.evaluate import check_forecast_origins  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def c_table():
+    return make_table()
+
+
+def check(table, origins=R_ORIGINS, companies=None, horizons=5):
+    return check_forecast_origins(table, origins, list(F_COMPANIES) if companies is None
+                                  else companies, horizons)
+
+
+def check_message(table, **kwargs):
+    with pytest.raises(ValueError) as error:
+        check(table, **kwargs)
+    return str(error.value)
+
+
+# --- the result ---------------------------------------------------------------------------
+
+def test_check_returns_the_origins_as_a_list(c_table):
+    found = check(c_table, origins=[18, 22, 26])
+    assert type(found) is list
+    assert found == [18, 22, 26]
+
+
+@pytest.mark.parametrize("given", [[26, 18, 22], [22, 22, 18, 26, 18], (26, 22, 18),
+                                   {18, 22, 26}], ids=["unsorted", "repeated", "tuple", "set"])
+def test_check_sorts_and_deduplicates(c_table, given):
+    assert check(c_table, origins=given) == [18, 22, 26]
+
+
+def test_check_a_single_origin(c_table):
+    assert check(c_table, origins=[0]) == [0]
+
+
+def test_check_every_origin_of_the_table(c_table):
+    assert check(c_table, origins=list(range(30, -1, -1))) == list(range(31))
+
+
+def test_check_does_not_change_its_inputs(c_table):
+    table = c_table.copy()
+    origins, companies = [22, 18, 22], list(F_COMPANIES)
+    check(table, origins=origins, companies=companies)
+    pd.testing.assert_frame_equal(table, c_table)
+    assert origins == [22, 18, 22] and companies == list(F_COMPANIES)
+
+
+def test_check_returns_a_new_list_not_the_argument(c_table):
+    origins = [18, 22]
+    found = check(c_table, origins=origins)
+    assert found == origins and found is not origins
+
+
+def test_check_companies_not_in_the_table_pass(c_table):
+    # Only "ALL" is refused here; whether a company has rows is not this check's business.
+    assert check(c_table, companies=["TR02", "TR04", "TR99"]) == R_ORIGINS
+    assert check(c_table, companies=[]) == R_ORIGINS
+
+
+def test_check_a_float_h_column_that_matches_passes(c_table):
+    table = c_table.copy()
+    table["h"] = table["h"].astype("float64")
+    assert check(table) == R_ORIGINS
+
+
+def test_check_a_mismatch_at_an_origin_not_asked_for_passes(c_table):
+    table = c_table[~((c_table["origin_week"] == 10) & (c_table["h"] == 5))]
+    assert check(table) == R_ORIGINS
+
+
+def test_check_a_duplicate_label_is_refused_even_outside_the_origins(c_table):
+    at_zero = np.flatnonzero(c_table["origin_week"].to_numpy() == 0)
+    table = with_label_repeated(c_table, [(at_zero[0], at_zero[1])])
+    assert "more than once" in check_message(table)
+
+
+@pytest.mark.parametrize("horizons", [1, 3])
+def test_check_a_table_cut_to_the_horizons_passes(c_table, horizons):
+    table = c_table[c_table["h"] <= horizons]
+    assert check(table, horizons=horizons) == R_ORIGINS
+
+
+# --- the messages ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("origins", [[], (), set()], ids=["list", "tuple", "set"])
+def test_check_no_origins_exact_message(c_table, origins):
+    assert check_message(c_table, origins=origins) == "there are no origins to forecast at"
+
+
+def test_check_duplicate_index_exact_message(c_table):
+    table = with_label_repeated(c_table, [(0, 1), (2, 3)])
+    first = [int(c_table.index[0]), int(c_table.index[2])]
+    assert check_message(table) == (f"the table's index holds 2 labels more than once "
+                                    f"(first: {first}); the customer rows are joined by index")
+
+
+def test_check_duplicate_index_message_shows_at_most_five_labels(c_table):
+    table = with_label_repeated(c_table, [(2 * i, 2 * i + 1) for i in range(7)])
+    message = check_message(table)
+    assert message.startswith("the table's index holds 7 labels more than once (first: [")
+    assert len(message.split("(first: [")[1].split("]")[0].split(", ")) == 5
+
+
+def test_check_a_label_three_times_counts_once(c_table):
+    table = with_label_repeated(c_table, [(0, 1), (0, 2)])
+    assert check_message(table).startswith("the table's index holds 1 labels more than once")
+
+
+@pytest.mark.parametrize("companies", [["TR02", "ALL"], ["ALL"], [CONSOLIDATED, "TR04"]])
+def test_check_all_in_companies_exact_message(c_table, companies):
+    assert check_message(c_table, companies=companies) == (
+        "'ALL' is the code of the consolidated rows; it cannot be a company")
+
+
+def test_check_lowercase_all_is_a_company_like_any_other(c_table):
+    assert check(c_table, companies=["TR02", "all"]) == R_ORIGINS
+
+
+@pytest.mark.parametrize("origins, missing", [([99], 99), ([18, 99, 22], 99),
+                                              ([120, 99, 18], 99), ([-1, 18], -1),
+                                              ([31], 31)])
+def test_check_origin_with_no_rows_exact_message(c_table, origins, missing):
+    assert check_message(c_table, origins=origins) == (
+        f"the table has no rows at origin week {missing}")
+
+
+def test_check_an_origin_dropped_from_the_table_between_good_ones(c_table):
+    table = c_table[c_table["origin_week"] != 22]
+    assert check_message(table, origins=[18, 22, 26]) == (
+        "the table has no rows at origin week 22")
+
+
+@pytest.mark.parametrize("horizons", [3, 4, 6])
+def test_check_horizons_unlike_the_table_exact_message(c_table, horizons):
+    assert check_message(c_table, horizons=horizons) == (
+        f"the table's rows at origin week 18 are for h [1, 2, 3, 4, 5], but [receivables] "
+        f"horizons is {horizons}")
+
+
+def test_check_only_the_last_origin_missing_an_h(c_table):
+    table = c_table[~((c_table["origin_week"] == 26) & (c_table["h"] == 5))]
+    assert check_message(table) == ("the table's rows at origin week 26 are for h [1, 2, 3, "
+                                    "4], but [receivables] horizons is 5")
+
+
+def test_check_an_origin_with_an_extra_h(c_table):
+    extra = c_table[(c_table["origin_week"] == 22) & (c_table["h"] == 5)].copy()
+    extra["h"] = 6
+    extra.index = extra.index + 100000
+    table = pd.concat([c_table, extra])
+    assert check_message(table) == ("the table's rows at origin week 22 are for h [1, 2, 3, "
+                                    "4, 5, 6], but [receivables] horizons is 5")
+
+
+def test_check_lists_plain_ints_for_a_float_h_column(c_table):
+    table = c_table[~((c_table["origin_week"] == 18) & (c_table["h"] == 2))].copy()
+    table["h"] = table["h"].astype("float64")
+    assert check_message(table) == ("the table's rows at origin week 18 are for h [1, 3, 4, "
+                                    "5], but [receivables] horizons is 5")
+
+
+@pytest.mark.parametrize("horizons", [0, -1])
+def test_check_horizons_below_one_is_refused_as_a_mismatch(c_table, horizons):
+    # range(1, horizons + 1) is empty: no table can match it.
+    assert check_message(c_table, horizons=horizons).endswith(
+        f"but [receivables] horizons is {horizons}")
+
+
+# --- the order of the checks ------------------------------------------------------------
+
+def test_check_order_no_origins_before_duplicate_index(c_table):
+    table = with_label_repeated(c_table, [(0, 1)])
+    assert check_message(table, origins=[]) == "there are no origins to forecast at"
+
+
+def test_check_order_duplicate_index_before_all(c_table):
+    table = with_label_repeated(c_table, [(0, 1)])
+    assert "more than once" in check_message(table, companies=["ALL"])
+
+
+def test_check_order_all_before_missing_origin(c_table):
+    assert check_message(c_table, origins=[99], companies=["ALL"]).startswith("'ALL'")
+
+
+def test_check_order_missing_origin_before_h_mismatch_of_a_later_origin(c_table):
+    table = c_table[~((c_table["origin_week"] == 26) & (c_table["h"] == 5))]
+    assert check_message(table, origins=[18, 22, 26, 99]) == (
+        "the table's rows at origin week 26 are for h [1, 2, 3, 4], but [receivables] "
+        "horizons is 5")
+    # In sorted order: an h mismatch at 18 is found before 99 is missing.
+    table = c_table[~((c_table["origin_week"] == 18) & (c_table["h"] == 5))]
+    assert check_message(table, origins=[99, 18]).startswith(
+        "the table's rows at origin week 18")
+
+
+# --- rolling_forecasts uses it ------------------------------------------------------------
+
+def test_rolling_forecasts_calls_check_forecast_origins_with_its_horizons(r_table,
+                                                                         monkeypatch):
+    seen = []
+
+    def spy(table, origins, companies, horizons):
+        seen.append((table is r_table, list(origins), list(companies), horizons))
+        raise ValueError("stop here")
+    monkeypatch.setattr(evaluate_module, "check_forecast_origins", spy)
+    with pytest.raises(ValueError, match="stop here"):
+        r_run(r_table, [26, 18], settings=f_settings(horizons=5))
+    assert seen == [(True, [26, 18], list(F_COMPANIES), 5)]
+
+
+def test_rolling_forecasts_forecasts_at_the_origins_it_returns(r_table, monkeypatch):
+    # rolling_forecasts uses the checked list: a check returning fewer origins limits it.
+    monkeypatch.setattr(evaluate_module, "check_forecast_origins",
+                        lambda table, origins, companies, horizons: [22])
+    seen = []
+    real = evaluate_module.forecast
+
+    def spy(table, origin, *args, **kwargs):
+        seen.append(origin)
+        return real(table, origin, *args, **kwargs)
+    monkeypatch.setattr(evaluate_module, "forecast", spy)
+    found = r_run(r_table, [18, 22, 26])
+    assert seen == [22]
+    assert list(found.customers["origin_week"].unique()) == [22]
+
+
+# --- numpy-int origins come back as plain ints --------------------------------------------
+# check_forecast_origins returns `sorted({int(o) for o in origins})`: a numpy integer would
+# break the JSON fingerprint of the grid's cache, so every origin is a plain int afterwards.
+
+@pytest.mark.parametrize("given", [
+    [np.int64(26), np.int64(18), np.int64(22)],
+    np.array([26, 18, 22, 18], dtype=np.int64),
+    np.array([26, 18, 22], dtype=np.int32),
+    [np.int64(18), 22, np.int32(26)],
+    pd.Series([22, 26, 18]),
+    pd.Index([26, 22, 18]),
+], ids=["np.int64 list", "int64 array", "int32 array", "mixed", "series", "index"])
+def test_check_numpy_origins_come_back_as_plain_ints(c_table, given):
+    found = check(c_table, origins=given)
+    assert found == [18, 22, 26]
+    assert type(found) is list
+    assert [type(origin) for origin in found] == [int, int, int]
+
+
+def test_check_plain_int_origins_stay_plain_ints(c_table):
+    found = check(c_table, origins=[22, 18])
+    assert [type(origin) for origin in found] == [int, int]
+
+
+def test_check_numpy_origins_encode_as_json(c_table):
+    found = check(c_table, origins=np.array([22, 18], dtype=np.int64))
+    assert fp_json.loads(fp_json.dumps(found)) == [18, 22]
+
+
+def test_check_numpy_and_plain_duplicates_collapse_to_one(c_table):
+    # np.int64(18) and 18 hash equal; after int() they are one origin.
+    assert check(c_table, origins=[np.int64(18), 18, np.int32(18)]) == [18]
+
+
+def test_check_an_empty_numpy_array_is_refused(c_table):
+    assert check_message(c_table, origins=np.array([], dtype=np.int64)) == (
+        "there are no origins to forecast at")
+
+
+def test_check_a_numpy_origin_with_no_rows_names_it_as_a_plain_int(c_table):
+    assert check_message(c_table, origins=np.array([18, 99], dtype=np.int64)) == (
+        "the table has no rows at origin week 99")
+
+
+def test_check_does_not_change_a_numpy_origins_array(c_table):
+    origins = np.array([22, 18, 22], dtype=np.int64)
+    check(c_table, origins=origins)
+    assert origins.tolist() == [22, 18, 22] and origins.dtype == np.int64
+
+
+def test_rolling_forecasts_numpy_origins_equal_plain_ones(r_table, r_result):
+    found = r_run(r_table, np.array([26, 18, 22, 18], dtype=np.int64))
+    pd.testing.assert_frame_equal(found.totals, r_result.totals)
+    pd.testing.assert_frame_equal(found.customers, r_result.customers)
+
+
+def test_rolling_forecasts_passes_plain_int_origins_on(r_table, monkeypatch):
+    seen, progress = [], []
+    real = evaluate_module.forecast
+
+    def spy(table, origin, *args, **kwargs):
+        seen.append(origin)
+        return real(table, origin, *args, **kwargs)
+    monkeypatch.setattr(evaluate_module, "forecast", spy)
+    r_run(r_table, [np.int64(22), np.int32(18)],
+          on_origin_done=lambda *args: progress.append(args))
+    assert seen == [18, 22]
+    assert [type(origin) for origin in seen] == [int, int]
+    assert [args[2] for args in progress] == [18, 22]
+    assert all(type(args[2]) is int for args in progress)
+
+
+def test_rolling_fingerprint_numpy_origins_encode_as_json_like_plain_ones(fp_settings):
+    # Not part of the fix asked for: rolling_fingerprint still does sorted(set(origins))
+    # itself. Step 17 hands it the settings' plain-int tuple, but a numpy array of origins
+    # would reach load_with_cache's json.dumps unchanged.
+    table, origins, settings, keywords = fp_arguments(fp_settings)
+    plain = fp_of(table, [20, 21], settings, keywords)
+    numpy = fp_of(table, np.array([21, 20], dtype=np.int64), settings, keywords)
+    assert fp_json.dumps(numpy) == fp_json.dumps(plain)
+
+
+@pytest.mark.parametrize("given, shown", [([21.5], "21.5"), ([18, 21.5], "21.5"),
+                                          ([np.float64(21.5)], "21.5"), ([21.9], "21.9"),
+                                          ([18, 22, 20.25], "20.25")],
+                         ids=["float", "mixed", "np.float64", "21.9", "between"])
+def test_check_a_fractional_origin_is_not_truncated_to_a_week_with_rows(c_table, given,
+                                                                       shown):
+    # int() floors toward 0: 21.5 and 21.9 would silently become week 21, which has rows,
+    # and the forecast would run at an origin nobody asked for. They are refused, with the
+    # message of an origin that has no rows, naming the origin as given.
+    assert check_message(c_table, origins=given) == (
+        f"the table has no rows at origin week {shown}")
+
+
+def test_check_a_fractional_origin_is_refused_in_sorted_order(c_table):
+    # 20.5 sorts before 22: it is the first refused, ahead of a later missing week.
+    assert check_message(c_table, origins=[99, 22, 20.5]) == (
+        "the table has no rows at origin week 20.5")
+    # An h mismatch at 18 sorts before 20.5.
+    table = c_table[~((c_table["origin_week"] == 18) & (c_table["h"] == 5))]
+    assert check_message(table, origins=[20.5, 18]).startswith(
+        "the table's rows at origin week 18 are for h")
+
+
+@pytest.mark.parametrize("given", [[18.0], [np.float64(18.0)], [18.0, 22], [22.0, 18, 18.0]],
+                         ids=["float", "np.float64", "mixed", "repeated"])
+def test_check_an_integral_float_origin_is_accepted_as_a_plain_int(c_table, given):
+    found = check(c_table, origins=given)
+    assert found == sorted({int(o) for o in given})
+    assert all(type(origin) is int for origin in found)
+
+
+def test_check_an_integral_float_and_its_int_collapse_to_one(c_table):
+    found = check(c_table, origins=[18.0, 18, np.int64(18)])
+    assert found == [18] and type(found[0]) is int
+
+
+def test_rolling_fingerprint_numpy_origins_are_plain_ints_sorted_once(fp_settings):
+    table, _, settings, keywords = fp_arguments(fp_settings)
+    found = fp_of(table, np.array([21, 20, 21], dtype=np.int64), settings, keywords)
+    assert found[0] == [20, 21]
+    assert [type(origin) for origin in found[0]] == [int, int]
+
+
+def test_rolling_fingerprint_integral_floats_equal_ints(fp_settings):
+    table, _, settings, keywords = fp_arguments(fp_settings)
+    plain = fp_of(table, [20, 21], settings, keywords)
+    floats = fp_of(table, [21.0, np.float64(20.0)], settings, keywords)
+    assert floats[0] == [20, 21] and all(type(o) is int for o in floats[0])
+    assert fp_json.dumps(floats) == fp_json.dumps(plain)
+
+
+def test_rolling_fingerprint_a_fractional_origin_stays_fractional(fp_settings):
+    # 21.5 is kept as 21.5, not cut to 21: its fingerprint differs from [20, 21]'s.
+    table, _, settings, keywords = fp_arguments(fp_settings)
+    found = fp_of(table, [21.5, np.int64(20)], settings, keywords)
+    assert found[0] == [20, 21.5]
+    assert [type(origin) for origin in found[0]] == [int, float]
+    assert fp_json.dumps(found) != fp_json.dumps(fp_of(table, [20, 21], settings, keywords))
+    assert fp_json.loads(fp_json.dumps(found))[0] == [20, 21.5]
+
+
+def test_rolling_fingerprint_np_float_fractional_origin_is_a_plain_float(fp_settings):
+    table, _, settings, keywords = fp_arguments(fp_settings)
+    found = fp_of(table, [np.float64(21.5)], settings, keywords)
+    assert found[0] == [21.5] and type(found[0][0]) is float
+    fp_json.dumps(found)
+
+
+def test_rolling_forecasts_integral_float_origins_equal_plain_ones(r_table, r_result):
+    found = r_run(r_table, [26.0, 18.0, np.float64(22.0)])
+    pd.testing.assert_frame_equal(found.totals, r_result.totals)
+    pd.testing.assert_frame_equal(found.customers, r_result.customers)
+
+
+def test_rolling_forecasts_a_fractional_origin_refused_before_any_fit(r_table, monkeypatch):
+    assert refused_before_any_fit(monkeypatch, r_table, [18, 21.5]) == (
+        "the table has no rows at origin week 21.5")

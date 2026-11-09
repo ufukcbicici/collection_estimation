@@ -189,6 +189,39 @@ def actual_totals(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
     return found[ACTUAL_COLUMNS]
 
 
+def check_forecast_origins(table: pd.DataFrame, origins: list[int], companies: list[str],
+                           horizons: int) -> list[int]:
+    """`origins` sorted, each once and as plain ints (a numpy int would break the cache's
+    JSON fingerprint), after the checks every forecast over many origins makes before its
+    first fit (`rolling_forecasts`, `grid.grid_predictions`).
+
+    Raises ValueError if `origins` is empty, the table's index holds a label twice (the
+    actual cash is joined to the customer rows by index), the company list holds "ALL", or
+    an origin has no rows (a week that is not whole, e.g. 21.5, has none) or rows for other h
+    than 1 to `horizons`.
+    """
+    origins = sorted(set(origins))
+    if not origins:
+        raise ValueError("there are no origins to forecast at")
+    if table.index.has_duplicates:
+        repeated = table.index[table.index.duplicated()].unique()
+        raise ValueError(f"the table's index holds {len(repeated)} labels more than once "
+                         f"(first: {list(repeated[:5])}); the customer rows are joined by index")
+    if CONSOLIDATED in companies:
+        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
+                         f"a company")
+    wanted = set(range(1, horizons + 1))
+    h_at = table.groupby("origin_week")["h"].unique()
+    for origin in origins:
+        if origin != int(origin) or origin not in h_at.index:
+            raise ValueError(f"the table has no rows at origin week {origin}")
+        found = {int(h) for h in h_at[origin]}
+        if found != wanted:
+            raise ValueError(f"the table's rows at origin week {origin} are for h "
+                             f"{sorted(found)}, but [receivables] horizons is {horizons}")
+    return [int(origin) for origin in origins]
+
+
 def rolling_forecasts(table: pd.DataFrame, origins: list[int], settings, *,
                       block_columns: dict[str, list[str]], companies: list[str],
                       new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
@@ -211,26 +244,8 @@ def rolling_forecasts(table: pd.DataFrame, origins: list[int], settings, *,
     actual cash is joined to the customer rows by index), the company list holds "ALL", an
     origin has no rows or rows for other h, and as the cheap steps and `forecast` do.
     """
-    origins = sorted(set(origins))
-    if not origins:
-        raise ValueError("there are no origins to forecast at")
-    if table.index.has_duplicates:
-        repeated = table.index[table.index.duplicated()].unique()
-        raise ValueError(f"the table's index holds {len(repeated)} labels more than once "
-                         f"(first: {list(repeated[:5])}); the customer rows are joined by index")
-    if CONSOLIDATED in companies:
-        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
-                         f"a company")
     horizons = settings.receivables.horizons
-    wanted = set(range(1, horizons + 1))
-    h_at = table.groupby("origin_week")["h"].unique()
-    for origin in origins:
-        if origin not in h_at.index:
-            raise ValueError(f"the table has no rows at origin week {origin}")
-        found = {int(h) for h in h_at[origin]}
-        if found != wanted:
-            raise ValueError(f"the table's rows at origin week {origin} are for h "
-                             f"{sorted(found)}, but [receivables] horizons is {horizons}")
+    origins = check_forecast_origins(table, origins, companies, horizons)
     # Dry runs, only to fail in seconds: forecast() makes both again for its own origin.
     topup_forecasts(new_cash, refunds, unidentified, levels, calendar, origins, horizons,
                     settings.topups.method, settings.topups.window, settings.topups.with_level)
@@ -267,7 +282,10 @@ def rolling_fingerprint(table: pd.DataFrame, origins: list[int], settings, *,
     topups = settings.topups
     here = Path(__file__).parent
     return [
-        sorted(set(origins)),
+        # Plain numbers for the JSON (a numpy int is not one); a week that is not whole stays
+        # as it is, so it cannot match the cache of the whole week below it.
+        [int(origin) if origin == int(origin) else float(origin)
+         for origin in sorted(set(origins))],
         # 1. The settings the fits read.
         asdict(settings.receivables),
         asdict(settings.stage1),

@@ -5233,10 +5233,13 @@ def index_of_if(body, test):
 
 
 def step_16_body():
-    """main()'s statements after step 15's `if` and before step 17's."""
+    """main()'s statements after step 15's `if` and before step 17's, without the
+    `rolled = None` right before step 17's `if` (since U16.3 it sits there, outside step 17,
+    so that step 18 can read it when step 17 is switched off; it is not part of step 16)."""
     body = main_body()
-    return body[index_of_if(body, "settings.joint_diagnostic.run") + 1:
-                index_of_if(body, "settings.evaluation.run")]
+    at = index_of_if(body, "settings.evaluation.run")
+    assert ast.unparse(body[at - 1]) == "rolled = None"
+    return body[index_of_if(body, "settings.joint_diagnostic.run") + 1:at - 1]
 
 
 def step_17_block():
@@ -5324,10 +5327,10 @@ def test_step_16_and_17_imports():
     forecast_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.forecast"]
     assert len(forecast_imports) == 1
-    # U16.1 added stage1_predictions and stage2_predictions (step 18).
+    # U16.1 added stage1_predictions and stage2_predictions (step 18); U16.3 removed them
+    # (step 18 now fits through grid_predictions).
     assert [(a.name, a.asname) for a in forecast_imports[0].names] == [
-        ("CONSOLIDATED", None), ("forecast", None), ("stage1_predictions", None),
-        ("stage2_predictions", None)]
+        ("CONSOLIDATED", None), ("forecast", None)]
     evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.evaluate"]
     assert len(evaluate_imports) == 1
@@ -5516,11 +5519,13 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
     statements = [ast.unparse(node) for node in block.body]
-    # Since with_model: the actual cash comes first (right after the header), then
-    # rolled = None, then the with_model branch, whose last statement is the printout.
+    # Since with_model: the actual cash comes first (right after the header), then the
+    # with_model branch, whose last statement is the printout. (rolled = None was between
+    # them until U16.3; it now sits right before step 17's `if`, so step 18 can read it.)
     assert statements[2] == ("rolled_actual = actual_totals(weekly, weeks, levels, companies, "
                              "origins, settings.receivables.horizons)")
-    assert statements[3] == "rolled = None"
+    assert ast.unparse(step_17_block().body[3].test) == "settings.evaluation.with_model"
+    assert "rolled = None" not in statements
     assert ast.unparse(with_model_if().body[-1]) == "show_rolling_forecasts(rolled, rolled_actual)"
 
 
@@ -6199,29 +6204,29 @@ def test_step_17_statement_order_with_the_with_model_branch():
     # U14.5 appended stack_forecasts, evaluation_scores (two Assign) and the printout (Expr);
     # U14.5c subject, pairs, the bootstrap (three Assign) and its printout (Expr);
     # U14.5d the bias (Assign), its printout (Expr) and the guarded payer split (If).
-    assert shapes == ["Assign", "Expr", "Assign", "Assign", "If", "Assign", "Expr", "Assign",
+    # U16.3 moved rolled = None (the Assign at 3) out, right before step 17's `if`.
+    assert shapes == ["Assign", "Expr", "Assign", "If", "Assign", "Expr", "Assign",
                       "Expr", "Assign", "Assign", "Expr", "Assign", "Assign", "Assign", "Expr",
                       "Assign", "Expr", "If"]
     assert ast.unparse(body[0]) == "origins = list(settings.evaluation.validation_origins)"
     assert ast.unparse(body[2]).startswith("rolled_actual = actual_totals(")
-    assert ast.unparse(body[3]) == "rolled = None"
-    assert body[4] is with_model_if(block)
-    assert ast.unparse(body[5]).startswith("reference = deflated_reference(")
-    assert ast.unparse(body[6]) == "show_deflated_reference(reference, rolled, rolled_actual)"
-    assert ast.unparse(body[7]).startswith("rule = rule_reference(")
-    assert ast.unparse(body[8]) == "show_rule_reference(rule, rolled_actual)"
-    assert ast.unparse(body[9]) == "forecasts = stack_forecasts(rolled, reference, rule)"
-    assert ast.unparse(body[10]) == ("scores = evaluation_scores(forecasts, rolled_actual, "
+    assert body[3] is with_model_if(block)
+    assert ast.unparse(body[4]).startswith("reference = deflated_reference(")
+    assert ast.unparse(body[5]) == "show_deflated_reference(reference, rolled, rolled_actual)"
+    assert ast.unparse(body[6]).startswith("rule = rule_reference(")
+    assert ast.unparse(body[7]) == "show_rule_reference(rule, rolled_actual)"
+    assert ast.unparse(body[8]) == "forecasts = stack_forecasts(rolled, reference, rule)"
+    assert ast.unparse(body[9]) == ("scores = evaluation_scores(forecasts, rolled_actual, "
+                                    "settings.receivables.horizons)")
+    assert ast.unparse(body[10]) == ("show_evaluation_scores(scores, "
                                      "settings.receivables.horizons)")
-    assert ast.unparse(body[11]) == ("show_evaluation_scores(scores, "
-                                     "settings.receivables.horizons)")
-    assert ast.unparse(body[12]) == BOOT_SUBJECT_STATEMENT
-    assert ast.unparse(body[13]) == BOOT_PAIRS_STATEMENT
-    assert ast.unparse(body[14]) == BOOT_CALL_STATEMENT
-    assert ast.unparse(body[15]) == BOOT_SHOW_STATEMENT
-    assert ast.unparse(body[16]) == BIAS_CALL_STATEMENT
-    assert ast.unparse(body[17]) == BIAS_SHOW_STATEMENT
-    assert ast.unparse(body[18].test) == "rolled is not None"
+    assert ast.unparse(body[11]) == BOOT_SUBJECT_STATEMENT
+    assert ast.unparse(body[12]) == BOOT_PAIRS_STATEMENT
+    assert ast.unparse(body[13]) == BOOT_CALL_STATEMENT
+    assert ast.unparse(body[14]) == BOOT_SHOW_STATEMENT
+    assert ast.unparse(body[15]) == BIAS_CALL_STATEMENT
+    assert ast.unparse(body[16]) == BIAS_SHOW_STATEMENT
+    assert ast.unparse(body[17].test) == "rolled is not None"
 
 
 def test_step_17_with_model_branch_body_in_order():
@@ -6273,12 +6278,19 @@ def test_step_17_header_no_longer_says_two_fits_each():
 
 
 def test_step_17_rolled_none_is_assigned_once_right_before_the_branch():
-    block = step_17_block()
-    body = block.body
+    # Since U16.3 rolled = None is main()'s statement right before step 17's `if` (step 18
+    # reads rolled even when step 17 is off); step 17's own statements no longer assign it.
+    main = main_body()
+    at = index_of_if(main, "settings.evaluation.run")
+    assert ast.unparse(main[at - 1]) == "rolled = None"
+    body = main[at].body
     rolled = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
               and [ast.unparse(t) for t in node.targets] == ["rolled"]]
-    assert rolled == [body.index(with_model_if(block)) - 1]
-    assert ast.unparse(body[rolled[0]].value) == "None"
+    assert rolled == []
+    # Nothing between it and the branch reads or sets rolled.
+    before_branch = body[:body.index(with_model_if(main[at]))]
+    assert not any(isinstance(n, ast.Name) and n.id == "rolled"
+                   for node in before_branch for n in ast.walk(node))
 
 
 def test_step_17_the_references_get_rolled_whatever_the_branch():
@@ -6390,7 +6402,11 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         show_calibration_reliability=recorder("show_calibration_reliability", None),
         choose_calibration=recorder("choose_calibration", "<choice>"),
         show_calibration_choice=recorder("show_calibration_choice", None))
-    module = ast.Module(body=[step_17_block()], type_ignores=[])
+    # Since U16.3 rolled = None is main()'s statement right before step 17's `if`: run both.
+    body = main_body()
+    at = index_of_if(body, "settings.evaluation.run")
+    assert ast.unparse(body[at - 1]) == "rolled = None"
+    module = ast.Module(body=body[at - 1:at + 1], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     return calls, printed, rolled_result, actual_result
 
@@ -6632,10 +6648,14 @@ def test_step_17_scores_use_the_horizons_setting_twice():
 
 def test_step_17_stacks_the_rolled_reference_and_rule_made_before_it():
     # rolled (None or the model's), reference and rule are all assigned before the stack.
-    block = step_17_block()
+    # Since U16.3 rolled = None sits right before step 17's `if` (main()'s own statement).
+    body = main_body()
+    at = index_of_if(body, "settings.evaluation.run")
+    assert ast.unparse(body[at - 1]) == "rolled = None"
+    block = body[at]
     statements = [ast.unparse(node) for node in block.body]
     stack = statements.index(EVAL_STACK_STATEMENT)
-    for prefix in ("rolled = None", "reference = deflated_reference(", "rule = rule_reference("):
+    for prefix in ("reference = deflated_reference(", "rule = rule_reference("):
         made = [i for i, s in enumerate(statements) if s.startswith(prefix)]
         assert len(made) == 1 and made[0] < stack, prefix
 
@@ -7253,7 +7273,11 @@ def test_step_17_run_the_bootstrap_settings_follow_the_settings_object():
             "show_rule_reference", "evaluation_scores", "show_evaluation_scores",
             "paired_wape_bootstrap", "show_paired_bootstrap", "component_bias",
             "show_component_bias")})
-    module = ast.Module(body=[step_17_block()], type_ignores=[])
+    # Since U16.3 rolled = None is main()'s statement right before step 17's `if`: run both.
+    main = main_body()
+    at = index_of_if(main, "settings.evaluation.run")
+    assert ast.unparse(main[at - 1]) == "rolled = None"
+    module = ast.Module(body=main[at - 1:at + 1], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 17>", "exec"), namespace)
     # 2. The bootstrap got horizons 3, 13 samples and seed 0.
     args, _ = by_name_of(calls)["paired_wape_bootstrap"]
@@ -7454,11 +7478,12 @@ def test_the_bias_printouts_sit_right_before_show_actual_totals():
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     shown = names.index("show_actual_totals")
     # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that;
-    # U16.1 show_stage_predictions (step 18) after those; U16.2 show_grid_candidates after it.
+    # U16.1 show_stage_predictions (step 18) after those; U16.2 show_grid_candidates after it;
+    # U16.3 replaced show_stage_predictions with show_grid_predictions.
     assert names[shown - 8:shown] == ["show_paired_bootstrap", "show_component_bias",
                                       "show_payer_split", "show_balance_coherence",
                                       "show_calibration_reliability", "show_calibration_choice",
-                                      "show_stage_predictions", "show_grid_candidates"]
+                                      "show_grid_predictions", "show_grid_candidates"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -7799,8 +7824,8 @@ def test_show_balance_coherence_is_a_module_level_function_before_show_actual_to
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
     names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
     assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
-    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more,
-    # U16.2 show_grid_candidates one more.
+    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more
+    # (show_grid_predictions since U16.3), U16.2 show_grid_candidates one more.
     assert names.index("show_balance_coherence") + 5 == names.index("show_actual_totals")
 
 
@@ -8204,29 +8229,40 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
                             "          m, scale: common factor 3.337"]
 
 
-# Step 18, U16.1: each stage fitted on its own at the demo origin, after step 17's `if` and
-# outside it, compared with step 16's p and m. U16.2: the whole step behind its own switch,
-# [grid] run, and ending with the settings the grid tries (show_grid_candidates). Wiring on
-# main()'s syntax tree, then step 18's `if` run with fakes, then the exact printouts of
-# show_stage_predictions (in a separate process) and of show_grid_candidates (in this one,
-# the function alone).
+# Step 18, the settings grid (U16), behind its own switch, [grid] run, after step 17's `if`
+# and outside it. U16.2: the settings to try (show_grid_candidates). U16.3: every candidate at
+# every validation origin (grid_predictions, each fit cached under hurdle_grid, with a
+# progress callback), then show_grid_predictions, which checks candidate 0 against step 17's
+# rolled forecasts (or says it cannot, when step 17 made none: `rolled = None` now sits right
+# before step 17's `if`). The U16.1 check (show_stage_predictions) is gone. Wiring on main()'s
+# syntax tree, then step 18's `if` run with fakes, then the exact printouts of
+# show_grid_predictions and show_grid_candidates (each compiled alone from the script).
+STEP_18_FIT_PROGRESS = (
+    "def fit_progress(done, total, stage, at, number, seconds):\n"
+    "    left = (time.perf_counter() - started) / done * (total - done)\n"
+    "    print(f'  ... {stage} setting {number}, origin {at}: {done} of {total} done "
+    "({seconds:.0f} s), about {left / 60:.0f} min left')")
+STEP_18_GRID_CALL = (
+    "predictions = grid_predictions(table, grid_origins, candidates, settings, "
+    "block_columns=block_feature_columns(history, calendar, owed), companies=companies, "
+    "new_cash=new_cash, refunds=refunds, unidentified=unidentified, levels=levels, "
+    "calendar=calendar, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
+    "on_fit_done=fit_progress)")
 STEP_18_STATEMENTS = [
-    "print(f'Step 18: settings grid (U16); each stage fitted on its own at origin {origin}')",
+    "grid_origins = list(settings.evaluation.validation_origins)",
+    "candidates = grid_candidates(settings)",
+    "print(f'Step 18: settings grid (U16) over the validation origins "
+    "{grid_origins[0]}-{grid_origins[-1]} ({len(grid_origins)} origins)')",
+    "show_grid_candidates(candidates, len(grid_origins))",
     "started = time.perf_counter()",
-    "p_alone = stage1_predictions(train_rows, forecast_rows, settings.stage1, "
-    "block_feature_columns(history, calendar, owed), companies)",
-    "p_seconds = time.perf_counter() - started",
-    "started = time.perf_counter()",
-    "m_alone = stage2_predictions(train_rows, forecast_rows, settings.stage2, "
-    "block_feature_columns(history, calendar, owed), companies, "
-    "settings.stage1.company_as_feature)",
-    "m_seconds = time.perf_counter() - started",
-    "show_stage_predictions(p_alone, m_alone, p_seconds, m_seconds, result.customers)",
-    "show_grid_candidates(grid_candidates(settings), "
-    "len(settings.evaluation.validation_origins), p_seconds, m_seconds)",
+    STEP_18_FIT_PROGRESS,
+    STEP_18_GRID_CALL,
+    "show_grid_predictions(predictions, rolled)",
 ]
-STEP_18_NAMES = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
-                 "grid_candidates", "show_grid_candidates")
+STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
+                 "show_grid_predictions")
+STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
+                "p_alone", "m_alone", "p_seconds", "m_seconds")
 
 
 def step_18_block():
@@ -8240,6 +8276,11 @@ def step_18_block():
 def step_18_body():
     """The statements inside step 18's `if`."""
     return step_18_block().body
+
+
+def script_functions():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    return [node for node in module.body if isinstance(node, ast.FunctionDef)]
 
 
 def test_step_18_is_one_if_on_grid_run_right_after_step_17_and_last_in_main():
@@ -8260,8 +8301,7 @@ def test_step_18_switch_is_read_once_in_main():
     assert index_of_if(main_body(), "settings.grid.run") == len(main_body()) - 1
 
 
-def test_step_18_is_outside_step_17_and_has_no_if_of_its_own():
-    # Each of its names is called only inside step 18's `if`, after step 17's.
+def test_step_18_names_are_called_once_only_inside_step_18():
     for name in STEP_18_NAMES:
         assert len(calls_to(main_tree(), name)) == 1, name
         assert calls_in(step_18_body(), name), name
@@ -8269,50 +8309,152 @@ def test_step_18_is_outside_step_17_and_has_no_if_of_its_own():
     assert not any(isinstance(node, ast.If) for node in step_18_body())
 
 
-def test_step_18_calls_take_no_keywords():
-    for name in STEP_18_NAMES:
-        assert calls_in(step_18_body(), name)[0].keywords == [], name
+def test_step_18_the_u16_1_check_is_gone_from_the_script():
+    source = SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    defined = {node.name for node in script_functions()}
+    imported = {a.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                for a in node.names}
+    for name in STEP_18_GONE:
+        assert name not in names | defined | imported, name
 
 
-def test_step_18_grid_candidates_get_the_whole_settings():
+def test_step_18_grid_candidates_get_the_whole_settings_once():
     call = calls_in(step_18_body(), "grid_candidates")[0]
-    assert [ast.unparse(a) for a in call.args] == ["settings"]
+    assert [ast.unparse(a) for a in call.args] == ["settings"] and call.keywords == []
 
 
-def test_step_18_show_grid_candidates_gets_the_validation_origin_count_and_both_times():
+def test_step_18_show_grid_candidates_gets_the_candidates_and_the_origin_count():
     call = calls_in(step_18_body(), "show_grid_candidates")[0]
-    assert [ast.unparse(a) for a in call.args] == [
-        "grid_candidates(settings)", "len(settings.evaluation.validation_origins)", "p_seconds",
-        "m_seconds"]
-    # The test origins stay unread until the v1 test.
-    assert "test_origins" not in ast.unparse(call)
+    assert [ast.unparse(a) for a in call.args] == ["candidates", "len(grid_origins)"]
+    assert call.keywords == []
 
 
-def test_step_18_shows_the_candidates_last_after_the_stage_check():
+def test_step_18_uses_the_validation_origins_never_the_test_origins():
+    assert ast.unparse(step_18_body()[0]) == (
+        "grid_origins = list(settings.evaluation.validation_origins)")
+    assert "test_origins" not in ast.unparse(step_18_block())
+
+
+def test_step_18_grid_predictions_positional_arguments():
+    call = calls_in(step_18_body(), "grid_predictions")[0]
+    assert [ast.unparse(a) for a in call.args] == ["table", "grid_origins", "candidates",
+                                                   "settings"]
+
+
+def test_step_18_grid_predictions_gets_step_17s_inputs_without_week_zero():
+    # The same table pieces rolling_forecasts gets in step 17 (no week_zero: the grid does
+    # not re-inflate), its own cache folder and its own callback.
+    call = calls_in(step_18_body(), "grid_predictions")[0]
+    expected = {name: value for name, value in FORECAST_KEYWORDS.items() if name != "week_zero"}
+    expected.update(cache_folder="settings.data.cache_folder / 'hurdle_grid'",
+                    on_fit_done="fit_progress")
+    assert keywords_of(call) == expected
+    rolling = calls_to(with_model_if(), "rolling_forecasts")[0]
+    rolling_keywords = keywords_of(rolling)
+    for name in ("companies", "new_cash", "refunds", "unidentified", "levels", "calendar"):
+        assert keywords_of(call)[name] == rolling_keywords[name], name
+
+
+def test_step_18_block_columns_are_step_16s():
+    step_16 = calls_in(step_16_body(), "forecast")[0]
+    call = calls_in(step_18_body(), "grid_predictions")[0]
+    assert keywords_of(call)["block_columns"] == keywords_of(step_16)["block_columns"]
+
+
+def test_step_18_cache_folder_is_a_subfolder_of_the_data_cache():
+    call = calls_in(step_18_body(), "grid_predictions")[0]
+    folder = [k.value for k in call.keywords if k.arg == "cache_folder"][0]
+    assert isinstance(folder, ast.BinOp) and isinstance(folder.op, ast.Div)
+    assert ast.unparse(folder.left) == "settings.data.cache_folder"
+    assert isinstance(folder.right, ast.Constant) and folder.right.value == "hurdle_grid"
+
+
+def test_step_18_fit_progress_is_defined_after_the_clock_and_before_the_grid():
+    body = step_18_body()
+    statements = [ast.unparse(node) for node in body]
+    defs = [i for i, node in enumerate(body)
+            if isinstance(node, ast.FunctionDef) and node.name == "fit_progress"]
+    assert len(defs) == 1
+    progress = body[defs[0]]
+    assert [a.arg for a in progress.args.args] == ["done", "total", "stage", "at", "number",
+                                                   "seconds"]
+    assert progress.args.defaults == [] and progress.args.vararg is None
+    started = statements.index("started = time.perf_counter()")
+    grid = statements.index(STEP_18_GRID_CALL)
+    assert started < defs[0] < grid
+
+
+def test_step_18_shows_the_candidates_before_the_grid_and_the_predictions_last():
     statements = [ast.unparse(node) for node in step_18_body()]
-    assert statements[-2].startswith("show_stage_predictions(")
-    assert statements[-1].startswith("show_grid_candidates(")
+    assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
+        statements.index(STEP_18_GRID_CALL))
+    assert statements[-1] == "show_grid_predictions(predictions, rolled)"
 
 
-def test_grid_candidates_is_imported_once_from_the_grid_module():
+def test_rolled_is_set_to_none_once_right_before_step_17():
+    tree = main_tree()   # one parse: nodes are matched by identity below
+    body = tree.body
+    at = index_of_if(body, "settings.evaluation.run")
+    assert ast.unparse(body[at - 1]) == "rolled = None"
+    nones = [node for node in assignments_to(tree, "rolled")
+             if ast.unparse(node.value) == "None"]
+    assert len(nones) == 1 and nones[0] is body[at - 1]
+
+
+def test_rolled_is_not_reset_inside_step_17():
+    tree = main_tree()   # one parse: nodes are matched by identity below
+    block = tree.body[index_of_if(tree.body, "settings.evaluation.run")]
+    assert not any(ast.unparse(node) == "rolled = None" for node in ast.walk(block)
+                   if isinstance(node, ast.Assign))
+    # Its only other assignment is the cached rolling forecasts, in the with_model branch.
+    others = [node for node in assignments_to(tree, "rolled")
+              if ast.unparse(node.value) != "None"]
+    assert len(others) == 1
+    assert any(node is others[0] for node in ast.walk(with_model_if(block)))
+    assert ast.unparse(others[0].value).startswith("load_with_cache('hurdle_rolling_forecasts'")
+
+
+def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
+    # Step 18 reads rolled even when step 17 is switched off: it is set before both ifs.
+    body = main_body()
+    set_at = [i for i, node in enumerate(body) if ast.unparse(node) == "rolled = None"][0]
+    for i, node in enumerate(body[:set_at]):
+        reads = [n for n in ast.walk(node) if isinstance(n, ast.Name) and n.id == "rolled"]
+        assert reads == [], ast.unparse(node)
+
+
+def test_grid_is_imported_once_with_its_two_functions():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.grid"]
     assert len(imports) == 1
-    assert [(a.name, a.asname) for a in imports[0].names] == [("grid_candidates", None)]
+    assert [(a.name, a.asname) for a in imports[0].names] == [("grid_candidates", None),
+                                                              ("grid_predictions", None)]
 
 
-def test_show_grid_candidates_is_a_module_level_function_with_four_parameters():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_grid_candidates"]
+def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_predictions"]
     assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["candidates", "origins", "p_seconds",
-                                                   "m_seconds"]
+    assert [a.arg for a in found[0].args.args] == ["predictions", "rolled"]
     assert found[0].args.defaults == [] and found[0].args.vararg is None
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
-    assert names.index("show_grid_candidates") == names.index("show_stage_predictions") + 1
+
+
+def test_show_grid_candidates_is_a_module_level_function_with_two_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_candidates"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["candidates", "origins"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_step_18_printouts_sit_after_the_calibration_ones():
+    names = [node.name for node in script_functions()]
+    at = names.index("show_calibration_choice")
+    assert names[at + 1:at + 4] == ["show_grid_predictions", "show_grid_candidates",
+                                    "show_actual_totals"]
 
 
 GRID_NAMES = """
@@ -8320,8 +8462,17 @@ import inspect
 import run_hurdle_pipeline as script
 from collection_estimation.hurdle import grid
 assert script.grid_candidates is grid.grid_candidates
+assert script.grid_predictions is grid.grid_predictions
 inspect.signature(script.grid_candidates).bind("settings")
-inspect.signature(script.show_grid_candidates).bind("candidates", 3, 1.0, 2.0)
+inspect.signature(script.grid_predictions).bind(
+    "table", [1], "candidates", "settings", block_columns={}, companies=[], new_cash=None,
+    refunds=None, unidentified=None, levels=None, calendar=None, cache_folder="c",
+    on_fit_done=None)
+inspect.signature(script.show_grid_candidates).bind("candidates", 3)
+inspect.signature(script.show_grid_predictions).bind("predictions", None)
+assert not hasattr(script, "show_stage_predictions")
+assert not hasattr(script, "stage1_predictions")
+assert not hasattr(script, "stage2_predictions")
 print("ok")
 """
 
@@ -8330,51 +8481,6 @@ def test_step_18_grid_names_are_the_modules_functions():
     result = run_code(GRID_NAMES)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
-
-
-def test_step_18_stage2_gets_stage1s_company_setting_and_its_own_settings():
-    stage1 = calls_in(step_18_body(), "stage1_predictions")[0]
-    stage2 = calls_in(step_18_body(), "stage2_predictions")[0]
-    assert ast.unparse(stage1.args[2]) == "settings.stage1"
-    assert ast.unparse(stage2.args[2]) == "settings.stage2"
-    assert ast.unparse(stage2.args[5]) == "settings.stage1.company_as_feature"
-    # Stage 2 sees no other stage-1 setting.
-    assert ast.unparse(stage2).count("settings.stage1") == 1
-
-
-def test_step_18_uses_step_12s_rows_step_16s_result_and_the_demo_origin():
-    # The names it reads are assigned once in main(), so they are step 12's and step 16's.
-    tree = main_tree()
-    for name in ("train_rows", "forecast_rows", "result", "origin", "companies"):
-        assert len(assignments_to(tree, name)) == 1, name
-    assert ast.unparse(assignments_to(tree, "origin")[0].value) == "settings.debug.demo_origin"
-    assert ast.unparse(assignments_to(tree, "train_rows")[0].value) == (
-        "rows_known_at(table, origin)")
-    assert ast.unparse(assignments_to(tree, "forecast_rows")[0].value) == (
-        "rows_at_origin(table, origin)")
-    for name in ("p_alone", "m_alone", "p_seconds", "m_seconds"):
-        assert len(assignments_to(tree, name)) == 1, name
-
-
-def test_step_18_block_columns_are_step_16s():
-    # The same feature blocks step 16's forecast gets.
-    step_16 = calls_in(step_16_body(), "forecast")[0]
-    blocks_16 = keywords_of(step_16)["block_columns"]
-    for name in ("stage1_predictions", "stage2_predictions"):
-        call = calls_in(step_18_body(), name)[0]
-        assert ast.unparse(call.args[3]) == blocks_16, name
-        assert [ast.unparse(a) for a in call.args[:2]] == ["train_rows", "forecast_rows"]
-        assert ast.unparse(call.args[4]) == "companies"
-
-
-def test_show_stage_predictions_is_a_module_level_function_with_five_parameters():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_stage_predictions"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["p", "m", "p_seconds", "m_seconds",
-                                                   "customers"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
 
 
 def test_module_docstring_lists_step_18_after_the_forecast_line():
@@ -8386,9 +8492,12 @@ def test_module_docstring_lists_step_18_after_the_forecast_line():
                               "       (U16)  <- in progress")
 
 
-def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25), run=True,
-                validation_origins=(37, 40, 44)):
-    """Run step 18's `if` with fake inputs and functions; return (calls, printed)."""
+# Running step 18's `if` with fakes.
+
+def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolled="<rolled>",
+                progress_calls=()):
+    """Run step 18's `if` with fake inputs and functions; return (calls, printed). The fake
+    grid_predictions calls its on_fit_done once per item of `progress_calls`."""
     calls, printed = [], []
     clock = iter(ticks)
 
@@ -8398,76 +8507,55 @@ def run_step_18(company_as_feature=False, ticks=(1.0, 3.5, 10.0, 17.25), run=Tru
             return result
         return call
 
-    settings = SimpleNamespace(stage1=SimpleNamespace(company_as_feature=company_as_feature),
-                               stage2="<stage2 settings>", grid=SimpleNamespace(run=run),
-                               evaluation=SimpleNamespace(
-                                   validation_origins=validation_origins,
-                                   test_origins="<never read>"))
-    stage1_settings = settings.stage1
+    def fake_grid(*args, **kwargs):
+        calls.append(("grid_predictions", args, kwargs))
+        for item in progress_calls:
+            kwargs["on_fit_done"](*item)
+        return "<predictions>"
+
+    settings = SimpleNamespace(grid=SimpleNamespace(run=run),
+                               evaluation=SimpleNamespace(validation_origins=validation_origins,
+                                                          test_origins="<never read>"),
+                               data=SimpleNamespace(cache_folder=Path("cache_root")))
     namespace = {
-        "settings": settings, "origin": 37, "train_rows": "<train rows>",
-        "forecast_rows": "<forecast rows>", "history": "<history>", "calendar": "<calendar>",
-        "owed": "<owed>", "companies": "<companies>",
-        "result": SimpleNamespace(customers="<customers>", totals="<totals>"),
+        "settings": settings, "table": "<table>", "history": "<history>",
+        "calendar": "<calendar>", "owed": "<owed>", "companies": "<companies>",
+        "new_cash": "<new cash>", "refunds": "<refunds>", "unidentified": "<unidentified>",
+        "levels": "<levels>", "rolled": rolled,
         "time": SimpleNamespace(perf_counter=lambda: next(clock)),
         "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
         "block_feature_columns": recorder("block_feature_columns", "<blocks>"),
-        "stage1_predictions": recorder("stage1_predictions", "<p>"),
-        "stage2_predictions": recorder("stage2_predictions", "<m>"),
-        "show_stage_predictions": recorder("show_stage_predictions", None),
         "grid_candidates": recorder("grid_candidates", "<candidates>"),
         "show_grid_candidates": recorder("show_grid_candidates", None),
+        "grid_predictions": fake_grid,
+        "show_grid_predictions": recorder("show_grid_predictions", None),
     }
     module = ast.Module(body=[step_18_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
-    assert namespace["settings"].stage1 is stage1_settings
     return calls, printed
 
 
 def test_step_18_run_calls_in_order():
     calls, _ = run_step_18()
-    assert [name for name, _, _ in calls] == [
-        "block_feature_columns", "stage1_predictions", "block_feature_columns",
-        "stage2_predictions", "show_stage_predictions", "grid_candidates",
-        "show_grid_candidates"]
+    assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
+                                              "block_feature_columns", "grid_predictions",
+                                              "show_grid_predictions"]
 
 
 def test_step_18_run_with_the_grid_switched_off_does_nothing():
-    # No fit, no printout, and the clock is never read.
+    # No call, no printout, and the clock is never read.
     calls, printed = run_step_18(run=False, ticks=())
     assert calls == [] and printed == []
 
 
-def test_step_18_run_prints_the_header_with_the_origin_once():
-    _, printed = run_step_18()
-    assert printed == ["Step 18: settings grid (U16); each stage fitted on its own at origin 37"]
-
-
-def test_step_18_run_arguments_of_each_stage():
-    calls, _ = run_step_18(company_as_feature=False)
-    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
-    assert by_name["block_feature_columns"] == (("<history>", "<calendar>", "<owed>"), {})
-    args1, kwargs1 = by_name["stage1_predictions"]
-    assert kwargs1 == {}
-    assert args1[:2] == ("<train rows>", "<forecast rows>")
-    assert args1[2].company_as_feature is False   # settings.stage1 itself
-    assert args1[3:] == ("<blocks>", "<companies>")
-    assert by_name["stage2_predictions"] == (
-        ("<train rows>", "<forecast rows>", "<stage2 settings>", "<blocks>", "<companies>",
-         False), {})
-
-
-def test_step_18_run_company_flag_follows_the_stage1_setting():
-    calls, _ = run_step_18(company_as_feature=True)
-    stage2 = [args for name, args, _ in calls if name == "stage2_predictions"]
-    assert stage2[0][5] is True
-
-
-def test_step_18_run_each_stage_is_timed_on_its_own():
-    # Clock ticks 1.0, 3.5 around stage 1 and 10.0, 17.25 around stage 2.
-    calls, _ = run_step_18()
-    shown = [args for name, args, _ in calls if name == "show_stage_predictions"]
-    assert shown == [("<p>", "<m>", 2.5, 7.25, "<customers>")]
+@pytest.mark.parametrize("origins, header", [
+    ((37, 40, 44), "over the validation origins 37-44 (3 origins)"),
+    ((40,), "over the validation origins 40-40 (1 origins)"),
+    (tuple(range(20, 45)), "over the validation origins 20-44 (25 origins)"),
+])
+def test_step_18_run_prints_the_header_once(origins, header):
+    _, printed = run_step_18(validation_origins=origins)
+    assert printed == [f"Step 18: settings grid (U16) {header}"]
 
 
 def test_step_18_run_grid_candidates_get_the_settings_themselves():
@@ -8475,42 +8563,240 @@ def test_step_18_run_grid_candidates_get_the_settings_themselves():
     found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_candidates"]
     assert len(found) == 1
     (settings,), kwargs = found[0]
-    assert kwargs == {}
-    assert settings.grid.run is True and settings.stage2 == "<stage2 settings>"
+    assert kwargs == {} and settings.grid.run is True
 
 
 @pytest.mark.parametrize("origins, count", [((37, 40, 44), 3), ((40,), 1),
                                             (tuple(range(20, 45)), 25)])
-def test_step_18_run_shows_the_candidates_with_the_origin_count_and_both_times(origins, count):
+def test_step_18_run_shows_the_candidates_with_the_origin_count(origins, count):
     calls, _ = run_step_18(validation_origins=origins)
     shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_candidates"]
-    assert shown == [(("<candidates>", count, 2.5, 7.25), {})]
+    assert shown == [(("<candidates>", count), {})]
 
 
-# show_grid_candidates, the function alone: compiled from the script's source, so the script
+def test_step_18_run_grid_predictions_gets_its_arguments():
+    calls, _ = run_step_18(validation_origins=(40, 37, 44))
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert by_name["block_feature_columns"] == (("<history>", "<calendar>", "<owed>"), {})
+    args, kwargs = by_name["grid_predictions"]
+    assert args[0] == "<table>"
+    # The origins as the settings list them (grid_predictions sorts them itself), as a list.
+    assert args[1] == [40, 37, 44] and type(args[1]) is list
+    assert args[2] == "<candidates>"
+    assert args[3].grid.run is True
+    on_fit_done = kwargs.pop("on_fit_done")
+    assert callable(on_fit_done)
+    assert kwargs == {"block_columns": "<blocks>", "companies": "<companies>",
+                      "new_cash": "<new cash>", "refunds": "<refunds>",
+                      "unidentified": "<unidentified>", "levels": "<levels>",
+                      "calendar": "<calendar>", "cache_folder": Path("cache_root") / "hurdle_grid"}
+
+
+@pytest.mark.parametrize("rolled", ["<rolled>", None])
+def test_step_18_run_shows_the_predictions_beside_rolled(rolled):
+    calls, _ = run_step_18(rolled=rolled)
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_predictions"]
+    assert shown == [(("<predictions>", rolled), {})]
+
+
+def test_step_18_run_progress_lines():
+    # The clock: 100 s at the start; the fits end at 160 s and 400 s (one tick per call).
+    _, printed = run_step_18(ticks=(100.0, 160.0, 400.0),
+                             progress_calls=[(1, 8, "stage 1", 37, 0, 59.6),
+                                             (2, 8, "stage 2", 37, 3, 0.4)])
+    assert printed[1:] == [
+        # 60 s per fit so far x 7 left = 420 s = 7 min.
+        "  ... stage 1 setting 0, origin 37: 1 of 8 done (60 s), about 7 min left",
+        # 300 s / 2 x 6 = 900 s = 15 min.
+        "  ... stage 2 setting 3, origin 37: 2 of 8 done (0 s), about 15 min left",
+    ]
+
+
+def test_step_18_run_last_progress_line_has_nothing_left():
+    _, printed = run_step_18(ticks=(0.0, 3000.0), progress_calls=[(4, 4, "stage 2", 44, 1, 12.0)])
+    assert printed[-1] == "  ... stage 2 setting 1, origin 44: 4 of 4 done (12 s), about 0 min left"
+
+
+def test_step_18_run_never_reads_the_test_origins():
+    calls, _ = run_step_18()
+    for _, args, kwargs in calls:
+        assert "<never read>" not in [a for a in args if isinstance(a, str)]
+        assert "<never read>" not in [v for v in kwargs.values() if isinstance(v, str)]
+
+
+# show_grid_predictions, the function alone: compiled from the script's source, so the script
 # itself (which reconfigures sys.stdout) is not imported into this process.
 
-def grid_printer():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_grid_candidates"]
+def function_from_script(name):
+    found = [node for node in script_functions() if node.name == name]
     assert len(found) == 1
     namespace = {}
-    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_candidates>", "exec"),
-         namespace)
-    return namespace["show_grid_candidates"]
+    exec(compile(ast.Module(body=found, type_ignores=[]), f"<{name}>", "exec"), namespace)
+    return namespace[name]
 
 
-def printed_grid(capsys, candidates, origins, p_seconds, m_seconds):
+def grid_predictions_example(n=1500, origins=(37, 40)):
+    """GridPredictions over `origins` with n rows each: 2 stage-1, 3 stage-2 and 2 top-up
+    candidates, and rolled forecasts whose customers equal candidate 0 row by row."""
+    import numpy as np
+    import pandas as pd
+    from collection_estimation.hurdle.grid import GridPredictions
+    rows_count = n * len(origins)
+    index = pd.Index(5000 + np.arange(rows_count)[::-1])
+    rows = pd.DataFrame({"origin_week": np.repeat(origins, n)}, index=index)
+    p = pd.DataFrame({0: np.full(rows_count, 0.25), 1: np.full(rows_count, 0.5)}, index=index)
+    p.iloc[0, 0] = 0.85
+    m = pd.DataFrame({0: np.full(rows_count, 400000.0), 1: np.full(rows_count, 1e6),
+                      2: np.full(rows_count, 0.0)}, index=index)
+    m.iloc[0, 0] = 35367890.0
+    topups = [pd.DataFrame({"topup": [1.5e6, 2.5e6, -1.0e6]}),
+              pd.DataFrame({"topup": [123456.0, 0.0]})]
+    predictions = GridPredictions(rows=rows, p=p, m=m, topups=topups)
+    customers = pd.DataFrame({"p": p[0].to_numpy(), "m": m[0].to_numpy()}, index=index.copy())
+    return predictions, SimpleNamespace(customers=customers)
+
+
+GRID_HEAD = [
+    "        3,000 customer rows at 2 origins",
+    "        stage 1 setting 0: mean p 0.2502",
+    "        stage 1 setting 1: mean p 0.5000",
+    # (2999 x 400000 + 35367890) / 1e6 = 1,235.0 M
+    "        stage 2 setting 0: sum of m 1,235.0 M (TRY of week 0)",
+    "        stage 2 setting 1: sum of m 3,000.0 M (TRY of week 0)",
+    "        stage 2 setting 2: sum of m 0.0 M (TRY of week 0)",
+    "        top-ups setting 0: sum 3.0 M (TRY of week 0)",
+    "        top-ups setting 1: sum 0.1 M (TRY of week 0)",
+]
+GRID_SAME = "        candidate 0 the same as step 17, row by row: p {}, m {}"
+GRID_NOT_CHECKED = ("        candidate 0 against step 17: not checked (step 17 did not forecast "
+                    "with the model)")
+
+
+def printed_predictions(capsys, predictions, rolled):
     capsys.readouterr()
-    grid_printer()(candidates, origins, p_seconds, m_seconds)
+    assert function_from_script("show_grid_predictions")(predictions, rolled) is None
+    return capsys.readouterr().out.splitlines()
+
+
+def test_show_grid_predictions_exact_printout_when_equal(capsys):
+    predictions, rolled = grid_predictions_example()
+    assert printed_predictions(capsys, predictions, rolled) == GRID_HEAD + [
+        GRID_SAME.format("yes", "yes")]
+
+
+def test_show_grid_predictions_exact_printout_when_rolled_is_none(capsys):
+    predictions, _ = grid_predictions_example()
+    assert printed_predictions(capsys, predictions, None) == GRID_HEAD + [GRID_NOT_CHECKED]
+
+
+def next_up(frame, row, column):
+    import numpy as np
+    frame = frame.copy()
+    frame.iloc[row, column] = np.nextafter(frame.iloc[row, column], np.inf)
+    return frame
+
+
+@pytest.mark.parametrize("change, p, m", [
+    ("p one ulp off", "NO", "yes"),
+    ("m one ulp off", "yes", "NO"),
+    ("both off", "NO", "NO"),
+    ("customers index shifted", "NO", "NO"),
+    ("customers index reordered", "NO", "NO"),
+    ("customers one row short", "NO", "NO"),
+    ("customers one row more", "NO", "NO"),
+])
+def test_show_grid_predictions_exact_printout_when_different(capsys, change, p, m):
+    # Exact, row by row: one ulp is a difference, and any other index (labels, order or
+    # length) is "NO" for both, without raising.
+    import pandas as pd
+    predictions, rolled = grid_predictions_example()
+    customers = rolled.customers
+    if change == "p one ulp off":
+        customers = next_up(customers, 700, 0)
+    elif change == "m one ulp off":
+        customers = next_up(customers, 3, 1)
+    elif change == "both off":
+        customers = next_up(next_up(customers, 1, 0), 2, 1)
+    elif change == "customers index shifted":
+        customers = customers.set_axis(customers.index + 1)
+    elif change == "customers index reordered":
+        customers = customers.iloc[::-1]
+    elif change == "customers one row short":
+        customers = customers.iloc[:-1]
+    elif change == "customers one row more":
+        customers = pd.concat([customers, customers.iloc[:1].set_axis([1])])
+    lines = printed_predictions(capsys, predictions, SimpleNamespace(customers=customers))
+    assert lines == GRID_HEAD + [GRID_SAME.format(p, m)]
+
+
+def test_show_grid_predictions_compares_candidate_0_only(capsys):
+    # Other candidates differ from rolled everywhere; only column 0 is compared.
+    predictions, rolled = grid_predictions_example()
+    assert not (predictions.p[1] == rolled.customers["p"]).all()
+    assert printed_predictions(capsys, predictions, rolled)[-1] == GRID_SAME.format("yes", "yes")
+
+
+def test_show_grid_predictions_extra_columns_of_customers_do_not_matter(capsys):
+    predictions, rolled = grid_predictions_example()
+    customers = rolled.customers.assign(expected=1.0, key="k")
+    lines = printed_predictions(capsys, predictions, SimpleNamespace(customers=customers))
+    assert lines[-1] == GRID_SAME.format("yes", "yes")
+
+
+def test_show_grid_predictions_with_one_candidate_each_and_no_topup(capsys):
+    import pandas as pd
+    from collection_estimation.hurdle.grid import GridPredictions
+    index = pd.Index([7, 3])
+    predictions = GridPredictions(rows=pd.DataFrame({"origin_week": [40, 40]}, index=index),
+                                  p=pd.DataFrame({0: [0.1, 0.3]}, index=index),
+                                  m=pd.DataFrame({0: [2e6, 3e6]}, index=index), topups=[])
+    assert printed_predictions(capsys, predictions, None) == [
+        "        2 customer rows at 1 origins",
+        "        stage 1 setting 0: mean p 0.2000",
+        "        stage 2 setting 0: sum of m 5.0 M (TRY of week 0)",
+        GRID_NOT_CHECKED]
+
+
+def test_show_grid_predictions_shows_a_nan_p_without_raising(capsys):
+    # p and m are not checked by the grid (the gates do it): the printout shows them as they are.
+    import numpy as np
+    predictions, rolled = grid_predictions_example(n=2)
+    predictions.p[1] = np.nan
+    lines = printed_predictions(capsys, predictions, rolled)
+    assert lines[2] == "        stage 1 setting 1: mean p nan"
+    assert lines[-1] == GRID_SAME.format("yes", "yes")
+
+
+def test_show_grid_predictions_changes_nothing(capsys):
+    predictions, rolled = grid_predictions_example(n=3)
+    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
+              [t.copy() for t in predictions.topups], rolled.customers.copy())
+    printed_predictions(capsys, predictions, rolled)
+    import pandas as pd
+    pd.testing.assert_frame_equal(predictions.rows, before[0])
+    pd.testing.assert_frame_equal(predictions.p, before[1])
+    pd.testing.assert_frame_equal(predictions.m, before[2])
+    for a, b in zip(predictions.topups, before[3]):
+        pd.testing.assert_frame_equal(a, b)
+    pd.testing.assert_frame_equal(rolled.customers, before[4])
+
+
+# show_grid_candidates, the function alone.
+
+def grid_printer():
+    return function_from_script("show_grid_candidates")
+
+
+def printed_grid(capsys, candidates, origins):
+    capsys.readouterr()
+    grid_printer()(candidates, origins)
     return capsys.readouterr().out.splitlines()
 
 
 def test_show_grid_candidates_exact_printout_of_the_worked_example(capsys):
     from collection_estimation.hurdle.grid import grid_candidates
     from tests.hurdle.test_grid import make
-    lines = printed_grid(capsys, grid_candidates(make()), 3, 60.0, 15.0)
+    lines = printed_grid(capsys, grid_candidates(make()), 3)
     assert lines == [
         "        stage 1: 4 settings",
         "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
@@ -8529,9 +8815,9 @@ def test_show_grid_candidates_exact_printout_of_the_worked_example(capsys):
         "        top-ups: 2 settings",
         "          0: mean of 13 weeks   <- current",
         "          1: mean of 8 weeks",
-        # 4 x 4 x 2 = 32 pairs; 3 x (4 x 60 + 4 x 15) s = 900 s = 15 min.
+        # 4 x 4 x 2 = 32 pairs; 3 x (4 + 4) = 24 fits.
         "        32 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
-        "validation origins: about 15 min",
+        "origins: 24 fits (those made before are read from the cache)",
     ]
 
 
@@ -8544,7 +8830,7 @@ def test_show_grid_candidates_shows_a_ridge_and_a_scale_none_floor_as_a_dash(cap
     candidates = grid_candidates(make(stage2=stage2, topups=ridge, topup_windows=(13,),
                                       stage1_max_iter=(300,), stage1_learning_rate=(0.05,),
                                       stage2_loss=("poisson",), stage2_learning_rate=(0.05,)))
-    lines = printed_grid(capsys, candidates, 1, 6.0, 6.0)
+    lines = printed_grid(capsys, candidates, 1)
     assert lines == [
         "        stage 1: 1 settings",
         "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
@@ -8557,7 +8843,7 @@ def test_show_grid_candidates_shows_a_ridge_and_a_scale_none_floor_as_a_dash(cap
         "          0: ridge with the level   <- current",
         "          1: mean of 13 weeks",
         "        4 combinations to score; per origin 1 stage-1 and 2 stage-2 fits; 1 "
-        "validation origins: about 0 min",
+        "origins: 3 fits (those made before are read from the cache)",
     ]
 
 
@@ -8566,7 +8852,7 @@ def test_show_grid_candidates_top_up_lines_with_both_ridges(capsys):
     from collection_estimation.hurdle.grid import grid_candidates
     from tests.hurdle.test_grid import make
     candidates = grid_candidates(make(topup_windows=(8, 13), topup_ridge_with_level=(True, False)))
-    lines = printed_grid(capsys, candidates, 3, 60.0, 15.0)
+    lines = printed_grid(capsys, candidates, 3)
     start = lines.index("        top-ups: 4 settings")
     assert lines[start:] == [
         "        top-ups: 4 settings",
@@ -8574,9 +8860,9 @@ def test_show_grid_candidates_top_up_lines_with_both_ridges(capsys):
         "          1: mean of 8 weeks",
         "          2: ridge with the level",
         "          3: ridge without the level",
-        # 4 x 4 x 4 = 64 pairs; the ridges add combinations but no fit: still 15 min.
+        # 4 x 4 x 4 = 64 pairs; the ridges add combinations but no fit: still 24 fits.
         "        64 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
-        "validation origins: about 15 min",
+        "origins: 24 fits (those made before are read from the cache)",
     ]
 
 
@@ -8587,7 +8873,7 @@ def test_show_grid_candidates_a_current_ridge_line(capsys, with_level, text):
         stage1=[SimpleNamespace(params={"k": 0})], stage2=[SimpleNamespace(params={"k": 0})],
         topups=[SimpleNamespace(method="ridge", window=8, with_level=with_level),
                 SimpleNamespace(method="ridge", window=8, with_level=not with_level)])
-    lines = printed_grid(capsys, candidates, 1, 1.0, 1.0)
+    lines = printed_grid(capsys, candidates, 1)
     other = "ridge without the level" if with_level else "ridge with the level"
     assert lines[-3:-1] == [f"          0: {text}   <- current", f"          1: {other}"]
     # The ridge's window is not shown.
@@ -8601,29 +8887,36 @@ def fake_candidates(n1, n2, n3):
     return SimpleNamespace(stage1=stage[:n1], stage2=stage[:n2], topups=topups)
 
 
-@pytest.mark.parametrize("n1, n2, n3, origins, p, m, combos, minutes", [
-    (1, 1, 1, 1, 60.0, 60.0, 1, "2"),
-    (4, 8, 2, 12, 75.0, 30.0, 64, "108"),      # 12 x (300 + 240) = 6480 s
-    (2, 3, 4, 5, 0.0, 0.0, 24, "0"),
-    (5, 1, 3, 2, 600.0, 1.0, 15, "100"),       # 2 x (3000 + 1) = 6002 s = 100.03 min
+@pytest.mark.parametrize("n1, n2, n3, origins, combos, fits", [
+    (1, 1, 1, 1, 1, 2),
+    (4, 8, 2, 12, 64, 144),
+    (2, 3, 4, 5, 24, 25),
+    (5, 1, 3, 2, 15, 12),
+    (1, 1, 1, 0, 1, 0),
 ])
-def test_show_grid_candidates_counts_and_time(capsys, n1, n2, n3, origins, p, m, combos,
-                                              minutes):
-    last = printed_grid(capsys, fake_candidates(n1, n2, n3), origins, p, m)[-1]
+def test_show_grid_candidates_counts(capsys, n1, n2, n3, origins, combos, fits):
+    last = printed_grid(capsys, fake_candidates(n1, n2, n3), origins)[-1]
     assert last == (f"        {combos} combinations to score; per origin {n1} stage-1 and {n2} "
-                    f"stage-2 fits; {origins} validation origins: about {minutes} min")
+                    f"stage-2 fits; {origins} origins: {fits} fits (those made before are read "
+                    f"from the cache)")
 
 
-def test_show_grid_candidates_time_counts_fits_not_combinations(capsys):
-    # The top-ups cost no fit: more of them change the combinations, not the minutes.
-    a = printed_grid(capsys, fake_candidates(2, 2, 1), 3, 30.0, 30.0)[-1]
-    b = printed_grid(capsys, fake_candidates(2, 2, 6), 3, 30.0, 30.0)[-1]
-    assert a.endswith("about 6 min") and b.endswith("about 6 min")
+def test_show_grid_candidates_fits_count_fits_not_combinations(capsys):
+    # The top-ups cost no fit: more of them change the combinations, not the fits.
+    a = printed_grid(capsys, fake_candidates(2, 2, 1), 3)[-1]
+    b = printed_grid(capsys, fake_candidates(2, 2, 6), 3)[-1]
+    assert "origins: 12 fits" in a and "origins: 12 fits" in b
     assert "4 combinations" in a and "24 combinations" in b
 
 
+def test_show_grid_candidates_no_longer_shows_a_time(capsys):
+    lines = printed_grid(capsys, fake_candidates(2, 2, 2), 3)
+    assert not any("min" in line.split() for line in lines)
+    assert "about" not in lines[-1]
+
+
 def test_show_grid_candidates_marks_only_slot_0_in_each_list(capsys):
-    lines = printed_grid(capsys, fake_candidates(3, 2, 4), 1, 1.0, 1.0)
+    lines = printed_grid(capsys, fake_candidates(3, 2, 4), 1)
     marked = [line for line in lines if line.endswith("   <- current")]
     assert marked == ["          0: k 0   <- current", "          0: k 0   <- current",
                       "          0: mean of 1 weeks   <- current"]
@@ -8633,114 +8926,5 @@ def test_show_grid_candidates_returns_none_and_changes_nothing(capsys):
     candidates = fake_candidates(2, 2, 2)
     before = (list(candidates.stage1), list(candidates.stage2), list(candidates.topups))
     capsys.readouterr()
-    assert grid_printer()(candidates, 2, 1.0, 1.0) is None
+    assert grid_printer()(candidates, 2) is None
     assert (candidates.stage1, candidates.stage2, candidates.topups) == before
-
-
-SHOW_STAGES = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-
-
-def base():
-    n = 1500
-    index = pd.Index(5000 + np.arange(n)[::-1])
-    p = pd.Series(np.full(n, 0.25), index=index, name="p")
-    p.iloc[0] = 0.85
-    m = pd.Series(np.full(n, 800000.0), index=index, name="m")
-    m.iloc[0] = 35367890.0
-    customers = pd.DataFrame({"key": "k", "p": p.to_numpy(), "m": m.to_numpy(),
-                              "expected": (p * m).to_numpy()}, index=index.copy())
-    return p, m, customers
-
-
-def next_up(series, row):
-    series = series.copy()
-    series.iloc[row] = np.nextafter(series.iloc[row], np.inf)
-    return series
-
-
-def variant(name):
-    p, m, customers = base()
-    if name == "p one ulp off":
-        p = next_up(p, 700)
-    elif name == "m one ulp off":
-        m = next_up(m, 3)
-    elif name == "both off":
-        p, m = next_up(p, 1), next_up(m, 2)
-    elif name == "customers index shifted":
-        customers.index = customers.index + 1
-    elif name == "customers index reordered":
-        customers = customers.iloc[::-1]
-        customers.index = p.index
-    elif name == "same values other order":
-        p, m = p.iloc[::-1], m.iloc[::-1]
-    elif name == "p index differs only":
-        p = p.set_axis(p.index + 10000)
-    elif name == "customers one row short":
-        customers = customers.iloc[:-1]
-    return p, m, customers
-
-
-for name in ["equal", "p one ulp off", "m one ulp off", "both off", "customers index shifted",
-             "customers index reordered", "same values other order", "p index differs only",
-             "customers one row short"]:
-    p, m, customers = variant(name)
-    before = (p.copy(), m.copy(), customers.copy())
-    print("== " + name)
-    script.show_stage_predictions(p, m, 12.4, 3.6, customers)
-    pd.testing.assert_series_equal(p, before[0])
-    pd.testing.assert_series_equal(m, before[1])
-    pd.testing.assert_frame_equal(customers, before[2])
-print("ok")
-"""
-
-STAGES_HEAD = [
-    "        stage 1 alone: 1,500 rows, mean p 0.2504, 12 s",
-    "        stage 2 alone: 1,500 rows, sum of m 1,234.6 M (TRY of week 0), 4 s",
-]
-SAME_LINE = "        the same as step 16, row by row: p {}, m {}"
-
-
-@pytest.fixture(scope="module")
-def stage_printouts():
-    result = run_code(SHOW_STAGES)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    printed, name = {}, None
-    for line in lines[:-1]:
-        if line.startswith("== "):
-            name = line[3:]
-            printed[name] = []
-        else:
-            printed[name].append(line)
-    return printed
-
-
-def test_show_stage_predictions_exact_printout_when_equal(stage_printouts):
-    assert stage_printouts["equal"] == STAGES_HEAD + [SAME_LINE.format("yes", "yes")]
-
-
-@pytest.mark.parametrize("name,p,m", [
-    ("p one ulp off", "NO", "yes"),
-    ("m one ulp off", "yes", "NO"),
-    ("both off", "NO", "NO"),
-    ("customers index shifted", "NO", "NO"),
-    ("customers index reordered", "NO", "NO"),
-    ("p index differs only", "NO", "NO"),
-    ("customers one row short", "NO", "NO"),
-])
-def test_show_stage_predictions_exact_printout_when_different(stage_printouts, name, p, m):
-    # Exact, row by row: one ulp is a difference, and any other index (labels, order or
-    # length, of p or of m) is "NO" for both, without raising.
-    assert stage_printouts[name] == STAGES_HEAD + [SAME_LINE.format(p, m)]
-
-
-def test_show_stage_predictions_same_values_in_another_order_is_not_the_same(stage_printouts):
-    # Reversed p and m against customers in the original order: the index differs.
-    lines = stage_printouts["same values other order"]
-    assert lines[2] == SAME_LINE.format("NO", "NO")
-    # The size and the sums do not depend on the order.
-    assert lines[:2] == STAGES_HEAD

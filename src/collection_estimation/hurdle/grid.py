@@ -13,12 +13,39 @@ beat them by [grid] min_gain WAPE to replace them (U16.6). Every candidate keeps
 [stage1] company_as_feature and the feature blocks of its stage: stage 2 reads stage 1's
 settings only through company_as_feature, so each stage-1 and each stage-2 setting can be
 fitted once per origin and paired afterwards (U16.1).
+
+U16.3, `grid_predictions`: every candidate's forecast at every origin, nothing scored yet.
+Each stage-1 and each stage-2 candidate is fitted at each origin on the rows known there and
+predicts the rows at it (its p or m); each top-up candidate is forecast at all origins at
+once. Beside them, per row, what happened and the two references the gates (U16.4) need.
+Every fit is cached on its own (`cache.load_with_cache`), keyed by its stage, origin and
+setting: a grid with one more candidate fits only that one, and a run stopped after hours
+keeps every fit it finished.
 """
 import dataclasses
-from dataclasses import dataclass
+import hashlib
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable
 
-from .diagnostic import Candidate
+import pandas as pd
+
+from .cache import load_with_cache, source_fingerprint, table_fingerprint
+from .diagnostic import Candidate, reference_probabilities
 from .diagnostic_joint import stage1_grid, stage2_grid
+from .evaluate import MODEL_CODE, check_forecast_origins
+from .forecast import CUSTOMER_COLUMNS, stage1_predictions, stage2_predictions
+from .stage2 import amount_references
+from .topups import topup_forecasts
+from .training_table import rows_at_origin, rows_known_at
+
+# The columns of `GridPredictions.rows`, in order: the customer row, what happened (labels
+# known only in hindsight), and the references of the gates: the base-rate p (stage 1's
+# log-loss skill) and the training-mean amount (stage 2's deviance skill).
+ROW_COLUMNS = CUSTOMER_COLUMNS[:6] + ["label_status", "paid", "amount_deflated", "base_rate",
+                                      "training_mean"]
 
 
 @dataclass(frozen=True)
@@ -68,3 +95,123 @@ def grid_candidates(settings) -> GridCandidates:
 
     return GridCandidates(stage1=stage1_candidates, stage2=stage2_candidates,
                           topups=topup_candidates)
+
+
+@dataclass(frozen=True)
+class GridPredictions:
+    """Every candidate's forecast at every origin (U16.3). Candidate numbers are those of
+    `GridCandidates` (0 = the current settings)."""
+    rows: pd.DataFrame          # one row per customer, origin and h: ROW_COLUMNS; the table's
+                                # index
+    p: pd.DataFrame             # column i = stage-1 candidate i's p; the index of `rows`
+    m: pd.DataFrame             # column j = stage-2 candidate j's m; the index of `rows`
+    topups: list[pd.DataFrame]  # [k] = top-up candidate k (`topup_forecasts`' table)
+
+
+def setting_hash(setting) -> str:
+    """A short hash of one stage's settings (a dataclass), for the name of its cache files."""
+    text = json.dumps(asdict(setting), sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def cached_fit(stage: str, origin: int, setting, inputs: list, cache_folder: Path,
+               fit: Callable[[], pd.Series]) -> pd.Series:
+    """`fit()`, one stage's prediction with `setting` at `origin`, read from `cache_folder`
+    if it was made before from the same `inputs` (everything else it is made from), else
+    made and saved there. The file name holds the stage, the origin and `setting_hash`."""
+    name = f"{stage}_origin{origin}_{setting_hash(setting)}"
+    fingerprint = [stage, origin, asdict(setting), *inputs]
+    return load_with_cache(name, fingerprint, fit, cache_folder)
+
+
+def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCandidates,
+                     settings, *, block_columns: dict[str, list[str]], companies: list[str],
+                     new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+                     levels: pd.Series, calendar: pd.DataFrame, cache_folder: Path,
+                     on_fit_done: Callable[[int, int, str, int, int, float], None] | None = None
+                     ) -> GridPredictions:
+    """Every candidate of `candidates` at every origin of `origins` (see the module
+    docstring). `table`, `block_columns`, `companies` and the top-up inputs are those of
+    `evaluate.rolling_forecasts`; `settings` the whole settings ([receivables] horizons,
+    [stage1] company_as_feature, and the [diagnostic] reference windows are read).
+
+    Before the first fit: the origins are checked as `rolling_forecasts` checks them
+    (`check_forecast_origins`) and every top-up candidate is forecast; at each origin the
+    references are made before its fits. A wrong setting thus fails in seconds. Each fit is read from `cache_folder` if it was made before from the
+    same inputs, and fitted and saved there if not. p and m are not checked: a candidate
+    with a p that is not a number or an m below 0 is refused by the gates (U16.4), so one
+    broken candidate does not stop the grid.
+
+    `on_fit_done(done, total, stage, origin, candidate, seconds)`, if given, is called after
+    each fit, read from the cache or not (e.g. to print progress).
+
+    Raises ValueError as `check_forecast_origins`, the top-ups, the references and the fits
+    do, and if an origin has no rows.
+    """
+    horizons = settings.receivables.horizons
+    origins = check_forecast_origins(table, origins, companies, horizons)
+    topups = [topup_forecasts(new_cash, refunds, unidentified, levels, calendar, origins,
+                              horizons, topup.method, topup.window, topup.with_level)
+              for topup in candidates.topups]
+
+    # What every fit is made from besides its own setting and origin; the table's hash takes
+    # seconds, so it is made once.
+    here = Path(__file__).parent
+    inputs = [asdict(settings.receivables), block_columns, sorted(companies),
+              table_fingerprint(table), source_fingerprint(*(here / name for name in MODEL_CODE))]
+    company_as_feature = settings.stage1.company_as_feature
+    diagnostic = settings.diagnostic
+
+    rows, p_parts, m_parts = [], [], []
+    total = len(origins) * (len(candidates.stage1) + len(candidates.stage2))
+    done = 0
+    for origin in origins:
+        train_rows = rows_known_at(table, origin)
+        forecast_rows = rows_at_origin(table, origin)
+        if forecast_rows.empty:
+            raise ValueError(f"the table has no rows at origin week {origin}")
+
+        # What happened, and the gates' references, learned from the rows known at T. Made
+        # before the fits, so a wrong [diagnostic] window fails in seconds.
+        base_rate = reference_probabilities(train_rows, forecast_rows,
+                                            diagnostic.reference_window,
+                                            diagnostic.reference_prior_weeks)["base rate"]
+        training_mean = amount_references(train_rows, forecast_rows,
+                                          diagnostic.amount_reference_window,
+                                          diagnostic.reference_prior_weeks)["training mean"]
+        rows.append(forecast_rows[ROW_COLUMNS[:9]].assign(base_rate=base_rate,
+                                                          training_mean=training_mean))
+
+        # Stage 1: each candidate fitted once at this origin (or read back).
+        p_at = {}
+        for number, candidate in enumerate(candidates.stage1):
+            started = time.perf_counter()
+            p_at[number] = cached_fit(
+                "stage1", origin, candidate.settings, inputs, cache_folder,
+                lambda setting=candidate.settings: stage1_predictions(
+                    train_rows, forecast_rows, setting, block_columns, companies))
+            done += 1
+            if on_fit_done is not None:
+                on_fit_done(done, total, "stage 1", origin, number,
+                            time.perf_counter() - started)
+
+        # Stage 2 the same way. company_as_feature is the one stage-1 setting it reads.
+        m_at = {}
+        for number, candidate in enumerate(candidates.stage2):
+            started = time.perf_counter()
+            m_at[number] = cached_fit(
+                "stage2", origin, candidate.settings, inputs + [company_as_feature],
+                cache_folder,
+                lambda setting=candidate.settings: stage2_predictions(
+                    train_rows, forecast_rows, setting, block_columns, companies,
+                    company_as_feature))
+            done += 1
+            if on_fit_done is not None:
+                on_fit_done(done, total, "stage 2", origin, number,
+                            time.perf_counter() - started)
+
+        p_parts.append(pd.DataFrame(p_at, index=forecast_rows.index))
+        m_parts.append(pd.DataFrame(m_at, index=forecast_rows.index))
+
+    return GridPredictions(rows=pd.concat(rows), p=pd.concat(p_parts), m=pd.concat(m_parts),
+                           topups=topups)
