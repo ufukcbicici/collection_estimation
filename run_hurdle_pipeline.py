@@ -103,7 +103,12 @@ from collection_estimation.hurdle.benchmark import (  # noqa: E402
     benchmark_forecasts,
     cash_totals,
 )
-from collection_estimation.hurdle.grid import grid_candidates, grid_predictions  # noqa: E402
+from collection_estimation.hurdle.grid import (  # noqa: E402
+    grid_candidates,
+    grid_gates,
+    grid_predictions,
+    with_params,
+)
 from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
     paired_bootstrap,
     score_pairs,
@@ -683,7 +688,8 @@ def main():
 
     # Step 18: the settings grid (U16) over the validation origins. Built unit by unit.
     # U16.2: the settings to try. U16.3: every candidate at every origin, each fit cached on
-    # its own; the current settings (candidate 0) must give step 17's p and m exactly.
+    # its own; the current settings (candidate 0) must give step 17's p and m exactly. U16.4:
+    # the gates of each stage-1 and stage-2 candidate, all validation origins together.
     if settings.grid.run:
         grid_origins = list(settings.evaluation.validation_origins)
         candidates = grid_candidates(settings)
@@ -704,6 +710,9 @@ def main():
             calendar=calendar, cache_folder=settings.data.cache_folder / "hurdle_grid",
             on_fit_done=fit_progress)
         show_grid_predictions(predictions, rolled)
+        gates = grid_gates(predictions, candidates, settings)
+        show_grid_gates("stage 1", gates.stage1, "log loss", ascending=True)
+        show_grid_gates("stage 2", gates.stage2, "deviance skill", ascending=False)
 
     # Later steps follow as each unit is built.
 
@@ -1850,11 +1859,24 @@ def show_cash_by_p_group(table):
                        "actual_cash": 0, "ratio": 3}).to_string(index=False))
 
 
-def with_params(gates, grid, number_column):
-    """A gate table with each setting's grid parameters added after its number."""
-    params = pd.DataFrame([grid[int(i)].params for i in gates[number_column]])
-    return pd.concat([gates[[number_column]], params, gates.drop(columns=number_column)],
-                     axis=1)
+def show_grid_gates(stage, gates, score, ascending):
+    """Step 18's gates for one stage (U16.4): how many candidates passed, how many failed each
+    gate, a loud line if the current settings (candidate 0) fail one, and every candidate
+    sorted by `score`."""
+    number_column = stage.replace(" ", "")
+    gate_columns = [column for column in gates.columns if column.endswith(" gate")]
+    failed = {column: int((~gates[column]).sum()) for column in gate_columns}
+    print(f"        {stage} gates: {int(gates['eligible'].sum())} of {len(gates)} candidates "
+          f"eligible; candidates failing each gate: {failed}")
+    current = gates[gates[number_column] == 0].iloc[0]
+    if not current["eligible"]:
+        missed = [column for column in gate_columns if not current[column]]
+        print(f"        the current {stage} settings FAIL {', '.join(missed)}; they are still "
+              f"scored, as the settings to beat")
+    others = gates[gates[number_column] != 0]
+    if not others.empty and not others["eligible"].any():
+        print(f"        no other {stage} candidate is eligible: only the current settings go on")
+    print(gates.sort_values(score, ascending=ascending).round(4).to_string(index=False))
 
 
 def show_gates(stage, gates, score, ascending):

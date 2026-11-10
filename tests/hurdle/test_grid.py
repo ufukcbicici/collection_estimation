@@ -6,6 +6,9 @@ at the end loads a real `Settings` through `load_settings`. Nothing is fitted.
 
 U16.3, at the end: `ROW_COLUMNS`, `GridPredictions`, `setting_hash`, `cached_fit` and
 `grid_predictions`, fitted on test_forecast.py's small training table with a tmp_path cache.
+
+U16.4, at the very end: `GridGates`, `with_params` and `grid_gates`, mostly on hand-made
+`GridPredictions` (seeded random rows; nothing fitted), once on the U16.3 grid itself.
 """
 import dataclasses
 import itertools
@@ -1681,3 +1684,727 @@ def test_grid_integral_float_origins_read_the_cache_of_plain_ones(g_table, g_cac
     pd.testing.assert_frame_equal(found.m, result.m)
     assert [args[:5] for args in progress] == [args[:5] for args in first]
     assert all(type(args[3]) is int for args in progress)
+
+
+# =============================================================================================
+# U16.4: `GridGates`, `with_params` and `grid_gates`.
+#
+# A hand-made `GridPredictions` (seeded, no fit): two origins of 300 labelled rows each plus 30
+# missing_week and 30 future rows, whose labels are NaN. True pay probability q per row;
+# stage-1 candidates: 0 a flat 0.5 (the current settings, made bad on purpose), 1 q itself,
+# 2 q shrunk 10% toward 0.5, 3 an over-confident q. Stage-2 candidates on the paid rows: 0 the
+# training mean (no skill), 1 the true mean, 2 the true mean with noise, 3 twice the true mean.
+# With the [grid] tolerances below, the eligible candidates are stage 1 {1, 2} and stage 2
+# {1, 2}; [joint_diagnostic]'s (deliberately stricter) would leave stage 1 {1} and stage 2 {}.
+# =============================================================================================
+
+from scipy.special import expit, logit  # noqa: E402
+
+from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
+    stage1_gates, stage2_gates)
+from collection_estimation.hurdle.grid import GridGates, grid_gates, with_params  # noqa: E402
+from collection_estimation.hurdle.panel import FUTURE, LABELLED, MISSING_WEEK  # noqa: E402
+
+GATE_GRID = dataclasses.replace(GRID, stage1_log_loss_tolerance=0.1,
+                                stage1_slope_band=(0.8, 1.25), stage2_skill_tolerance=0.1,
+                                stage2_ratio_band=(0.9, 1.1))
+# Not read by grid_gates: stricter, so using them would change the result.
+GATE_JOINT = SimpleNamespace(stage1_log_loss_tolerance=0.0, stage1_slope_band=(0.95, 1.05),
+                             stage2_skill_tolerance=0.01, stage2_ratio_band=(0.99, 1.01))
+GATE_ORIGINS = (37, 40)
+GATE_N = 300            # labelled rows per origin
+GATE_UNLABELLED = 30    # missing_week rows and future rows, each, per origin
+
+
+def gate_settings(**grid_changes):
+    return SimpleNamespace(grid=dataclasses.replace(GATE_GRID, **grid_changes),
+                           joint_diagnostic=GATE_JOINT)
+
+
+def gate_candidates(n1=4, n2=4):
+    stage1 = [Candidate(params={"max_iter": 100 * (i + 1), "learning_rate": 0.05},
+                        settings=f"<stage1 {i}>", class_weight="none") for i in range(n1)]
+    stage2 = [Candidate(params={"loss": "poisson", "max_iter": 50 * (j + 1)},
+                        settings=f"<stage2 {j}>", class_weight="none") for j in range(n2)]
+    return GridCandidates(stage1=stage1, stage2=stage2, topups=["<topups 0>"])
+
+
+def gate_example(seed=5, poison_unlabelled=True):
+    """GridPredictions as described above. With `poison_unlabelled`, the unlabelled rows carry
+    p and m that would break candidate 1 (p NaN, m -1) if they were judged."""
+    rng = np.random.default_rng(seed)
+    frames, p_rows, m_rows = [], [], []
+    start = 5000
+    for origin in GATE_ORIGINS:
+        n, u = GATE_N, GATE_UNLABELLED
+        total = n + 2 * u
+        index = pd.Index(start + np.arange(total))
+        start += total
+        q = rng.uniform(0.1, 0.9, total)
+        paid = (rng.uniform(size=total) < q).astype(float)
+        mu = rng.uniform(1e5, 1e6, total)
+        amount = np.where(paid == 1, rng.gamma(4.0, mu / 4.0), 0.0)
+        status = np.array([LABELLED] * n + [MISSING_WEEK] * u + [FUTURE] * u, dtype=object)
+        paid[n:] = np.nan
+        amount[n:] = np.nan
+        labelled_paid = (status == LABELLED) & (paid == 1)
+        base_rate = float(np.nanmean(paid[:n])) + (0.01 if origin == GATE_ORIGINS[0] else -0.01)
+        training_mean = float(amount[labelled_paid].mean()) * (1.02 if origin == 40 else 0.98)
+        frames.append(pd.DataFrame({
+            "key": [f"C{i % 9}" for i in range(total)], "company_code": "TR02",
+            "customer_id": [f"C{i % 9}" for i in range(total)], "origin_week": origin,
+            "h": 1 + np.arange(total) % 5, "target_week": origin + 1 + np.arange(total) % 5,
+            "label_status": status, "paid": paid, "amount_deflated": amount,
+            "base_rate": base_rate, "training_mean": training_mean}, index=index))
+        p = pd.DataFrame({0: np.full(total, 0.5), 1: q, 2: 0.5 + 0.9 * (q - 0.5),
+                          3: expit(2.5 * logit(q))}, index=index)
+        m = pd.DataFrame({0: np.full(total, training_mean), 1: mu,
+                          2: mu * rng.uniform(0.7, 1.4, total), 3: 2 * mu}, index=index)
+        if poison_unlabelled:
+            p.iloc[n:, 1] = np.nan
+            m.iloc[n:, 1] = -1.0
+        p_rows.append(p)
+        m_rows.append(m)
+    rows = pd.concat(frames)
+    return GridPredictions(rows=rows, p=pd.concat(p_rows), m=pd.concat(m_rows),
+                           topups=[pd.DataFrame({"topup": [1.0]})])
+
+
+def by_hand(predictions, s1_tol=0.1, s1_band=(0.8, 1.25), s2_tol=0.1, s2_band=(0.9, 1.1)):
+    """stage1_gates / stage2_gates called directly on the pooled labelled (and paid) rows."""
+    rows = predictions.rows
+    lab = rows[rows["label_status"] == "labelled"]
+    paid = lab[lab["paid"] == 1]
+    g1 = stage1_gates(lab["paid"].astype(bool),
+                      [predictions.p.loc[lab.index, i] for i in predictions.p.columns],
+                      lab["base_rate"], s1_tol, s1_band)
+    g2 = stage2_gates(paid["amount_deflated"],
+                      [predictions.m.loc[paid.index, j] for j in predictions.m.columns],
+                      paid["training_mean"], s2_tol, s2_band)
+    return g1, g2
+
+
+def without_params(table, candidates):
+    return table.drop(columns=list(candidates[0].params))
+
+
+def eligible(table, number_column):
+    return table.loc[table["eligible"], number_column].tolist()
+
+
+def remade(predictions, rows=None, p=None, m=None, topups=None):
+    """A copy of `predictions` with some parts replaced."""
+    return GridPredictions(rows=predictions.rows if rows is None else rows,
+                           p=predictions.p if p is None else p,
+                           m=predictions.m if m is None else m,
+                           topups=predictions.topups if topups is None else topups)
+
+
+def only_rows(predictions, keep):
+    return remade(predictions, rows=predictions.rows.loc[keep], p=predictions.p.loc[keep],
+                  m=predictions.m.loc[keep])
+
+
+@pytest.fixture(scope="module")
+def gate_result():
+    predictions = gate_example()
+    candidates = gate_candidates()
+    return predictions, candidates, grid_gates(predictions, candidates, gate_settings())
+
+
+# --- GridGates -------------------------------------------------------------------------------
+
+def test_grid_gates_type_fields_in_order_and_frozen(gate_result):
+    assert [f.name for f in dataclasses.fields(GridGates)] == ["stage1", "stage2"]
+    _, _, gates = gate_result
+    assert isinstance(gates, GridGates)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        gates.stage1 = None
+
+
+# --- with_params -----------------------------------------------------------------------------
+
+def small_gates(numbers=(0, 1, 2)):
+    return pd.DataFrame({"stage1": list(numbers), "log loss": [0.6, 0.5, 0.7][:len(numbers)],
+                         "eligible": [True, False, True][:len(numbers)]})
+
+
+def test_with_params_puts_the_params_right_after_the_number_column():
+    found = with_params(small_gates(), gate_candidates(3, 1).stage1, "stage1")
+    assert list(found.columns) == ["stage1", "max_iter", "learning_rate", "log loss", "eligible"]
+    assert found["max_iter"].tolist() == [100, 200, 300]
+    assert found["learning_rate"].tolist() == [0.05, 0.05, 0.05]
+    assert found["log loss"].tolist() == [0.6, 0.5, 0.7]
+    assert found["eligible"].tolist() == [True, False, True]
+
+
+def test_with_params_reads_each_rows_own_candidate_by_number():
+    # Numbers out of order: row k gets candidates[number of row k].
+    gates = pd.DataFrame({"stage2": [2, 0], "score": [1.0, 2.0]})
+    found = with_params(gates, gate_candidates(1, 3).stage2, "stage2")
+    assert found["max_iter"].tolist() == [150, 50]
+    assert found["stage2"].tolist() == [2, 0]
+    assert found["loss"].tolist() == ["poisson", "poisson"]
+
+
+def test_with_params_numpy_integer_numbers_work():
+    gates = small_gates()
+    gates["stage1"] = gates["stage1"].astype("int32")
+    found = with_params(gates, gate_candidates(3, 1).stage1, "stage1")
+    assert found["max_iter"].tolist() == [100, 200, 300]
+
+
+def test_with_params_does_not_change_the_gate_table():
+    gates = small_gates()
+    before = gates.copy()
+    with_params(gates, gate_candidates(3, 1).stage1, "stage1")
+    pd.testing.assert_frame_equal(gates, before)
+
+
+def test_with_params_a_number_past_the_candidate_list_raises():
+    with pytest.raises(IndexError):
+        with_params(small_gates((0, 5, 1)), gate_candidates(3, 1).stage1, "stage1")
+
+
+def test_with_params_is_defined_here_not_in_the_pipeline_script():
+    # Moved out of run_hurdle_pipeline.py (step 15) in U16.4: one definition, here.
+    source = (Path(__file__).resolve().parents[2] / "run_hurdle_pipeline.py").read_text(
+        encoding="utf-8")
+    assert "def with_params(" not in source
+    assert "    with_params,\n" in source
+
+
+def test_with_params_keeps_each_rows_params_when_the_table_is_reordered():
+    # A sorted gate table (index 2, 1, 0) keeps each row's own params (fixed in U16.4: the
+    # params frame takes the gate table's index).
+    gates = small_gates().iloc[::-1]
+    found = with_params(gates, gate_candidates(3, 1).stage1, "stage1")
+    pairs = list(zip(found["stage1"], found["max_iter"]))
+    assert pairs == [(2, 300), (1, 200), (0, 100)]
+    assert found.index.tolist() == [2, 1, 0]
+    assert found["log loss"].tolist() == [0.7, 0.5, 0.6]
+    assert len(found) == 3 and not found.isna().any().any()
+
+
+def test_with_params_keeps_each_rows_params_when_the_table_is_filtered():
+    # Only the eligible rows of a 6-candidate table: a non-contiguous index (1, 3, 4).
+    gates = pd.DataFrame({"stage1": [0, 1, 2, 3, 4, 5],
+                          "log loss": [0.6, 0.5, 0.7, 0.55, 0.52, 0.9],
+                          "eligible": [False, True, False, True, True, False]})
+    kept = gates[gates["eligible"]]
+    found = with_params(kept, gate_candidates(6, 1).stage1, "stage1")
+    assert found.index.tolist() == [1, 3, 4]
+    assert list(zip(found["stage1"], found["max_iter"])) == [(1, 200), (3, 400), (4, 500)]
+    assert found["log loss"].tolist() == [0.5, 0.55, 0.52]
+    assert list(found.columns) == ["stage1", "max_iter", "learning_rate", "log loss",
+                                   "eligible"]
+    assert len(found) == 3 and not found.isna().any().any()
+
+
+def test_with_params_filtered_and_sorted_table_keeps_its_index_and_params():
+    gates = pd.DataFrame({"stage2": [0, 1, 2, 3], "deviance skill": [0.0, 0.53, 0.48, -0.5],
+                          "eligible": [False, True, True, False]})
+    kept = gates[gates["eligible"]].sort_values("deviance skill")      # index 2, 1
+    found = with_params(kept, gate_candidates(1, 4).stage2, "stage2")
+    assert found.index.tolist() == [2, 1]
+    assert list(zip(found["stage2"], found["max_iter"])) == [(2, 150), (1, 100)]
+    assert found["deviance skill"].tolist() == [0.48, 0.53]
+
+
+def test_with_params_a_non_integer_index_is_kept():
+    gates = small_gates().set_axis(["a", "b", "c"])
+    found = with_params(gates, gate_candidates(3, 1).stage1, "stage1")
+    assert found.index.tolist() == ["a", "b", "c"]
+    assert found["max_iter"].tolist() == [100, 200, 300]
+
+
+def test_with_params_on_grid_gates_output_filtered_to_the_eligible_rows(gate_result):
+    # grid_gates' own table, filtered: the same params as in the full table, row by row.
+    predictions, candidates, gates = gate_result
+    g1, _ = by_hand(predictions)
+    kept = g1[g1["eligible"]]
+    found = with_params(kept, candidates.stage1, "stage1")
+    pd.testing.assert_frame_equal(found, gates.stage1[gates.stage1["eligible"]])
+
+
+# --- grid_gates: the result ----------------------------------------------------------------
+
+def test_grid_gates_the_worked_example_eligibility(gate_result):
+    _, _, gates = gate_result
+    assert eligible(gates.stage1, "stage1") == [1, 2]
+    assert eligible(gates.stage2, "stage2") == [1, 2]
+    # The current settings (candidate 0) fail in both stages.
+    assert not gates.stage1.loc[0, "eligible"] and not gates.stage2.loc[0, "eligible"]
+
+
+def test_grid_gates_tables_have_one_row_per_candidate_in_number_order(gate_result):
+    _, _, gates = gate_result
+    assert gates.stage1["stage1"].tolist() == [0, 1, 2, 3]
+    assert gates.stage2["stage2"].tolist() == [0, 1, 2, 3]
+
+
+def test_grid_gates_columns_are_number_params_then_the_gate_columns(gate_result):
+    _, _, gates = gate_result
+    assert list(gates.stage1.columns) == [
+        "stage1", "max_iter", "learning_rate", "bad p", "log loss", "log loss skill", "slope",
+        "log loss gate", "skill gate", "slope gate", "eligible"]
+    assert list(gates.stage2.columns) == [
+        "stage2", "loss", "max_iter", "bad m", "deviance skill", "total ratio", "m gate",
+        "skill gate", "ratio gate", "eligible"]
+
+
+def test_grid_gates_params_are_each_candidates_own(gate_result):
+    _, candidates, gates = gate_result
+    for table, listed, column in ((gates.stage1, candidates.stage1, "stage1"),
+                                  (gates.stage2, candidates.stage2, "stage2")):
+        for _, row in table.iterrows():
+            params = listed[int(row[column])].params
+            assert {key: row[key] for key in params} == params
+
+
+def test_grid_gates_equal_the_gate_functions_on_the_pooled_rows(gate_result):
+    predictions, candidates, gates = gate_result
+    g1, g2 = by_hand(predictions)
+    pd.testing.assert_frame_equal(without_params(gates.stage1, candidates.stage1), g1)
+    pd.testing.assert_frame_equal(without_params(gates.stage2, candidates.stage2), g2)
+
+
+def test_grid_gates_equal_with_params_of_the_gate_functions(gate_result):
+    predictions, candidates, gates = gate_result
+    g1, g2 = by_hand(predictions)
+    pd.testing.assert_frame_equal(gates.stage1, with_params(g1, candidates.stage1, "stage1"))
+    pd.testing.assert_frame_equal(gates.stage2, with_params(g2, candidates.stage2, "stage2"))
+
+
+def test_grid_gates_pool_the_origins_rather_than_judging_one(gate_result):
+    # The pooled table differs from either origin alone (its scores are over all rows).
+    predictions, candidates, gates = gate_result
+    for origin in GATE_ORIGINS:
+        keep = predictions.rows.index[predictions.rows["origin_week"] == origin]
+        one = grid_gates(only_rows(predictions, keep), candidates, gate_settings())
+        assert not np.allclose(one.stage1["log loss"], gates.stage1["log loss"])
+        assert not np.allclose(one.stage2["deviance skill"], gates.stage2["deviance skill"])
+
+
+def test_grid_gates_stage2_is_judged_on_the_paid_labelled_rows_only(gate_result):
+    # Candidate 0's m is the training mean: its total ratio is sum(training mean) / sum(paid
+    # amount) over the labelled rows that paid, nothing else.
+    predictions, _, gates = gate_result
+    rows = predictions.rows
+    paid = rows[(rows["label_status"] == "labelled") & (rows["paid"] == 1)]
+    expected = paid["training_mean"].sum() / paid["amount_deflated"].sum()
+    assert gates.stage2.loc[0, "total ratio"] == pytest.approx(expected, rel=1e-12)
+
+
+def test_grid_gates_stage1_reads_each_rows_own_base_rate(gate_result):
+    # The two origins carry different base rates; skill is against each row's own.
+    predictions, _, gates = gate_result
+    rows = predictions.rows
+    lab = rows[rows["label_status"] == "labelled"]
+    assert lab["base_rate"].nunique() == 2
+    flat = stage1_gates(lab["paid"].astype(bool), [predictions.p.loc[lab.index, 1]],
+                        pd.Series(lab["base_rate"].mean(), index=lab.index), 0.1, (0.8, 1.25))
+    assert gates.stage1.loc[1, "log loss skill"] != pytest.approx(flat.loc[0, "log loss skill"],
+                                                                  rel=1e-12)
+
+
+# --- grid_gates: "the best" is the grid's best, not the current settings --------------------
+
+def test_grid_gates_stage1_log_loss_limit_is_the_grids_best_not_candidate_0(gate_result):
+    _, _, gates = gate_result
+    table = gates.stage1
+    best = table["log loss"].min()
+    assert table["log loss"].idxmin() != 0
+    assert table["log loss gate"].tolist() == (table["log loss"] <= best * 1.1).tolist()
+    # Measured against candidate 0 (log loss 0.69), candidate 3 (0.72) would pass; it fails.
+    assert table.loc[3, "log loss"] <= table.loc[0, "log loss"] * 1.1
+    assert not table.loc[3, "log loss gate"] and not table.loc[0, "log loss gate"]
+
+
+def test_grid_gates_stage2_skill_limit_is_the_grids_best_not_candidate_0(gate_result):
+    _, _, gates = gate_result
+    table = gates.stage2
+    best = table["deviance skill"].max()
+    assert table["deviance skill"].idxmax() != 0
+    assert table["skill gate"].tolist() == (table["deviance skill"] >= best - 0.1).tolist()
+    # Candidate 0's skill is about 0 (it is nearly its own reference); against itself as the
+    # best it would pass the skill gate. It fails.
+    assert abs(table.loc[0, "deviance skill"]) < 0.01
+    assert not table.loc[0, "skill gate"]
+
+
+def test_grid_gates_reordering_the_candidates_reorders_the_results_only():
+    # The best is found wherever it is: candidate lists and columns reversed together give
+    # the same verdict per candidate.
+    predictions, candidates = gate_example(), gate_candidates()
+    order = [3, 2, 1, 0]
+    flipped = remade(predictions, p=predictions.p[order].set_axis(range(4), axis=1),
+                     m=predictions.m[order].set_axis(range(4), axis=1))
+    flipped_candidates = GridCandidates(stage1=[candidates.stage1[i] for i in order],
+                                        stage2=[candidates.stage2[i] for i in order],
+                                        topups=candidates.topups)
+    straight = grid_gates(predictions, candidates, gate_settings())
+    reverse = grid_gates(flipped, flipped_candidates, gate_settings())
+    for name in ("stage1", "stage2"):
+        a = getattr(straight, name).drop(columns=name).set_index("max_iter").sort_index()
+        b = getattr(reverse, name).drop(columns=name).set_index("max_iter").sort_index()
+        pd.testing.assert_frame_equal(a, b)
+
+
+# --- grid_gates: the [grid] tolerances, not [joint_diagnostic]'s --------------------------
+
+def test_grid_gates_use_the_grid_tolerances(gate_result):
+    predictions, _, gates = gate_result
+    grid_way = by_hand(predictions)
+    joint_way = by_hand(predictions, 0.0, (0.95, 1.05), 0.01, (0.99, 1.01))
+    # The two settings really disagree on this example ...
+    assert eligible(joint_way[0], "stage1") == [1] and eligible(joint_way[1], "stage2") == []
+    # ... and grid_gates follows [grid].
+    assert eligible(gates.stage1, "stage1") == eligible(grid_way[0], "stage1") == [1, 2]
+    assert eligible(gates.stage2, "stage2") == eligible(grid_way[1], "stage2") == [1, 2]
+
+
+@pytest.mark.parametrize("field, value, stage, expected", [
+    ("stage1_log_loss_tolerance", 0.0, "stage1", [1]),
+    ("stage1_slope_band", (0.95, 1.05), "stage1", [1]),
+    ("stage1_slope_band", (1.0, 1.25), "stage1", [2]),
+    ("stage2_skill_tolerance", 0.01, "stage2", [1]),
+    ("stage2_ratio_band", (0.99, 1.01), "stage2", [2]),
+    ("stage2_ratio_band", (0.5, 2.5), "stage2", [1, 2]),
+])
+def test_grid_gates_each_grid_tolerance_reaches_its_gate(field, value, stage, expected):
+    gates = grid_gates(gate_example(), gate_candidates(), gate_settings(**{field: value}))
+    assert eligible(getattr(gates, stage), stage) == expected
+
+
+def test_grid_gates_read_only_settings_grid():
+    # A stand-in with nothing but .grid is enough.
+    gates = grid_gates(gate_example(), gate_candidates(), SimpleNamespace(grid=GATE_GRID))
+    assert eligible(gates.stage1, "stage1") == [1, 2]
+    assert eligible(gates.stage2, "stage2") == [1, 2]
+
+
+# --- grid_gates: rows that are not labelled are ignored ---------------------------------------
+
+def labelled_only(predictions):
+    return only_rows(predictions,
+                     predictions.rows.index[predictions.rows["label_status"] == "labelled"])
+
+
+def test_grid_gates_unlabelled_rows_change_nothing(gate_result):
+    predictions, candidates, gates = gate_result
+    assert (predictions.rows["label_status"] != "labelled").sum() == 4 * GATE_UNLABELLED
+    alone = grid_gates(labelled_only(predictions), candidates, gate_settings())
+    pd.testing.assert_frame_equal(gates.stage1, alone.stage1)
+    pd.testing.assert_frame_equal(gates.stage2, alone.stage2)
+
+
+def test_grid_gates_a_broken_p_or_m_on_unlabelled_rows_is_not_counted(gate_result):
+    # Candidate 1's p is NaN and its m -1 on every unlabelled row; it is still eligible.
+    predictions, _, gates = gate_result
+    unlabelled = predictions.rows["label_status"] != "labelled"
+    assert predictions.p.loc[unlabelled, 1].isna().all()
+    assert (predictions.m.loc[unlabelled, 1] == -1).all()
+    assert gates.stage1.loc[1, "bad p"] == 0 and gates.stage1.loc[1, "eligible"]
+    assert gates.stage2.loc[1, "bad m"] == 0 and gates.stage2.loc[1, "eligible"]
+
+
+@pytest.mark.parametrize("status", [MISSING_WEEK, FUTURE])
+def test_grid_gates_each_unlabelled_status_alone_is_ignored(status):
+    predictions = gate_example()
+    rows = predictions.rows
+    part = only_rows(predictions, rows.index[rows["label_status"].isin([LABELLED, status])])
+    a = grid_gates(part, gate_candidates(), gate_settings())
+    b = grid_gates(labelled_only(predictions), gate_candidates(), gate_settings())
+    pd.testing.assert_frame_equal(a.stage1, b.stage1)
+    pd.testing.assert_frame_equal(a.stage2, b.stage2)
+
+
+def test_grid_gates_a_labelled_row_turned_unlabelled_drops_out():
+    # Relabelling one paid row as missing_week is the same as removing it.
+    predictions = gate_example()
+    rows = predictions.rows.copy()
+    target = rows.index[(rows["label_status"] == "labelled") & (rows["paid"] == 1)][0]
+    rows.loc[target, "label_status"] = MISSING_WEEK
+    a = grid_gates(remade(predictions, rows=rows), gate_candidates(), gate_settings())
+    b = grid_gates(only_rows(predictions, predictions.rows.index.drop(target)),
+                   gate_candidates(), gate_settings())
+    pd.testing.assert_frame_equal(a.stage1, b.stage1)
+    pd.testing.assert_frame_equal(a.stage2, b.stage2)
+
+
+def test_grid_gates_a_bad_reference_on_an_unlabelled_row_is_ignored(gate_result):
+    predictions, candidates, gates = gate_result
+    rows = predictions.rows.copy()
+    rows.loc[rows["label_status"] != "labelled", ["training_mean", "base_rate"]] = np.nan
+    found = grid_gates(remade(predictions, rows=rows), candidates, gate_settings())
+    pd.testing.assert_frame_equal(found.stage1, gates.stage1)
+    pd.testing.assert_frame_equal(found.stage2, gates.stage2)
+
+
+# --- grid_gates: a broken candidate fails its gates, the others go on -----------------------
+
+def drop_candidate(predictions, candidates, stage, number):
+    """predictions and candidates without one candidate of `stage`, renumbered."""
+    frame = predictions.p if stage == "stage1" else predictions.m
+    kept = [c for c in frame.columns if c != number]
+    frame = frame[kept].set_axis(range(len(kept)), axis=1)
+    listed = [c for i, c in enumerate(getattr(candidates, stage)) if i != number]
+    if stage == "stage1":
+        return (remade(predictions, p=frame),
+                GridCandidates(stage1=listed, stage2=candidates.stage2,
+                               topups=candidates.topups))
+    return (remade(predictions, m=frame),
+            GridCandidates(stage1=candidates.stage1, stage2=listed, topups=candidates.topups))
+
+
+def first_labelled(predictions, paid=None):
+    rows = predictions.rows
+    mask = rows["label_status"] == "labelled"
+    if paid is not None:
+        mask &= rows["paid"] == (1 if paid else 0)
+    return rows.index[mask][0]
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 1.5, -0.2])
+@pytest.mark.parametrize("number", [0, 1, 3])
+def test_grid_gates_a_bad_p_fails_only_its_own_candidate(bad, number):
+    predictions, candidates = gate_example(), gate_candidates()
+    predictions.p.loc[first_labelled(predictions), number] = bad
+    gates = grid_gates(predictions, candidates, gate_settings()).stage1
+    row = gates.loc[number]
+    assert row["bad p"] == 1
+    assert not row["log loss gate"] and not row["skill gate"] and not row["slope gate"]
+    assert not row["eligible"]
+    # The others are judged as if the broken one were not in the grid at all.
+    others = gates.drop(index=number).reset_index(drop=True)
+    p_less, c_less = drop_candidate(predictions, candidates, "stage1", number)
+    expected = grid_gates(p_less, c_less, gate_settings()).stage1
+    pd.testing.assert_frame_equal(others.drop(columns="stage1"),
+                                  expected.drop(columns="stage1"))
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 0.0, -1.0])
+@pytest.mark.parametrize("number", [0, 1, 3])
+def test_grid_gates_a_bad_m_fails_only_its_own_candidate(bad, number):
+    predictions, candidates = gate_example(), gate_candidates()
+    predictions.m.loc[first_labelled(predictions, paid=True), number] = bad
+    gates = grid_gates(predictions, candidates, gate_settings()).stage2
+    row = gates.loc[number]
+    assert row["bad m"] == 1
+    assert not row["m gate"] and not row["skill gate"] and not row["ratio gate"]
+    assert not row["eligible"]
+    others = gates.drop(index=number).reset_index(drop=True)
+    p_less, c_less = drop_candidate(predictions, candidates, "stage2", number)
+    expected = grid_gates(p_less, c_less, gate_settings()).stage2
+    pd.testing.assert_frame_equal(others.drop(columns="stage2"),
+                                  expected.drop(columns="stage2"))
+
+
+def test_grid_gates_a_broken_best_candidate_hands_the_best_to_the_next():
+    # Candidate 1 (the best of both stages) broken: candidate 2 becomes the best and passes.
+    predictions = gate_example()
+    predictions.p.loc[first_labelled(predictions), 1] = np.nan
+    predictions.m.loc[first_labelled(predictions, paid=True), 1] = np.nan
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    assert eligible(gates.stage1, "stage1") == [2]
+    assert eligible(gates.stage2, "stage2") == [2]
+
+
+def test_grid_gates_a_bad_m_on_a_labelled_unpaid_row_is_not_counted():
+    # Stage 2 is judged on the paid rows only: m on a row that did not pay is not read.
+    predictions = gate_example()
+    rows = predictions.rows
+    unpaid = rows.index[(rows["label_status"] == "labelled") & (rows["paid"] == 0)]
+    predictions.m.loc[unpaid, 2] = np.nan
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage2
+    assert gates.loc[2, "bad m"] == 0 and gates.loc[2, "eligible"]
+
+
+def test_grid_gates_every_candidate_broken_still_returns_tables():
+    predictions = gate_example()
+    predictions.p.loc[first_labelled(predictions)] = np.nan
+    predictions.m.loc[first_labelled(predictions, paid=True)] = 0.0
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    assert not gates.stage1["eligible"].any() and not gates.stage2["eligible"].any()
+    assert (gates.stage1["bad p"] == 1).all() and (gates.stage2["bad m"] == 1).all()
+
+
+def test_grid_gates_a_p_of_exactly_0_or_1_is_not_bad():
+    # The ends of [0, 1] are probabilities: not "bad p".
+    predictions = gate_example()
+    predictions.p.loc[first_labelled(predictions, paid=True), 2] = 1.0
+    predictions.p.loc[first_labelled(predictions, paid=False), 2] = 0.0
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage1
+    assert gates.loc[2, "bad p"] == 0
+    assert np.isfinite(gates.loc[2, "log loss"])
+
+
+# --- grid_gates: sizes, single candidates, top-ups -------------------------------------------
+
+@pytest.mark.parametrize("n1, n2", [(1, 1), (1, 4), (4, 1), (2, 3)])
+def test_grid_gates_one_row_per_candidate_for_any_counts(n1, n2):
+    predictions = gate_example()
+    predictions = remade(predictions, p=predictions.p[list(range(n1))],
+                         m=predictions.m[list(range(n2))])
+    gates = grid_gates(predictions, gate_candidates(n1, n2), gate_settings())
+    assert gates.stage1["stage1"].tolist() == list(range(n1))
+    assert gates.stage2["stage2"].tolist() == list(range(n2))
+
+
+def test_grid_gates_a_lone_candidate_is_its_own_best():
+    # Only candidate 1 in each stage: the log-loss and skill limits are its own scores.
+    predictions = gate_example()
+    lone = remade(predictions, p=predictions.p[[1]].set_axis([0], axis=1),
+                  m=predictions.m[[1]].set_axis([0], axis=1), topups=[])
+    gates = grid_gates(lone, gate_candidates(1, 1), gate_settings())
+    assert gates.stage1.loc[0, "log loss gate"] and gates.stage1.loc[0, "eligible"]
+    assert gates.stage2.loc[0, "skill gate"] and gates.stage2.loc[0, "eligible"]
+
+
+@pytest.mark.parametrize("topups", [[], ["a"], ["a", "b", "c"]])
+def test_grid_gates_ignore_the_topups(gate_result, topups):
+    # Top-ups have no gate: their count and tables do not matter.
+    predictions, candidates, gates = gate_result
+    other = GridCandidates(stage1=candidates.stage1, stage2=candidates.stage2, topups=topups)
+    found = grid_gates(remade(predictions, topups=[]), other, gate_settings())
+    assert [f.name for f in dataclasses.fields(found)] == ["stage1", "stage2"]
+    pd.testing.assert_frame_equal(found.stage1, gates.stage1)
+    pd.testing.assert_frame_equal(found.stage2, gates.stage2)
+
+
+def test_grid_gates_paid_given_as_bool_or_float_is_the_same(gate_result):
+    predictions, candidates, gates = gate_result
+    rows = predictions.rows.copy()
+    lab = rows["label_status"] == "labelled"
+    rows["paid"] = rows["paid"].astype(object)
+    rows.loc[lab, "paid"] = [bool(v) for v in rows.loc[lab, "paid"]]
+    found = grid_gates(remade(predictions, rows=rows), candidates, gate_settings())
+    pd.testing.assert_frame_equal(found.stage1, gates.stage1)
+    pd.testing.assert_frame_equal(found.stage2, gates.stage2)
+
+
+# --- grid_gates: purity --------------------------------------------------------------------
+
+def test_grid_gates_are_deterministic_and_change_nothing():
+    predictions, candidates, settings = gate_example(), gate_candidates(), gate_settings()
+    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
+              [dict(c.params) for c in candidates.stage1 + candidates.stage2], settings.grid)
+    a = grid_gates(predictions, candidates, settings)
+    b = grid_gates(predictions, candidates, settings)
+    pd.testing.assert_frame_equal(a.stage1, b.stage1)
+    pd.testing.assert_frame_equal(a.stage2, b.stage2)
+    pd.testing.assert_frame_equal(predictions.rows, before[0])
+    pd.testing.assert_frame_equal(predictions.p, before[1])
+    pd.testing.assert_frame_equal(predictions.m, before[2])
+    assert [c.params for c in candidates.stage1 + candidates.stage2] == before[3]
+    assert settings.grid is before[4]
+
+
+def test_grid_gates_tables_are_not_views_of_the_predictions():
+    predictions = gate_example()
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    p_before, m_before = predictions.p.copy(), predictions.m.copy()
+    gates.stage1.loc[:, "log loss"] = -1.0
+    gates.stage2.loc[:, "deviance skill"] = -1.0
+    pd.testing.assert_frame_equal(predictions.p, p_before)
+    pd.testing.assert_frame_equal(predictions.m, m_before)
+
+
+# --- grid_gates: refused --------------------------------------------------------------------
+
+@pytest.mark.parametrize("n1", [3, 5])
+def test_grid_gates_stage1_count_mismatch_raises(n1):
+    with pytest.raises(ValueError) as error:
+        grid_gates(gate_example(), gate_candidates(n1, 4), gate_settings())
+    assert str(error.value) == f"the predictions hold 4 stage-1 candidates, the candidates {n1}"
+
+
+@pytest.mark.parametrize("n2", [3, 5])
+def test_grid_gates_stage2_count_mismatch_raises(n2):
+    with pytest.raises(ValueError) as error:
+        grid_gates(gate_example(), gate_candidates(4, n2), gate_settings())
+    assert str(error.value) == f"the predictions hold 4 stage-2 candidates, the candidates {n2}"
+
+
+def test_grid_gates_stage1_count_is_checked_before_stage2():
+    with pytest.raises(ValueError, match="stage-1 candidates"):
+        grid_gates(gate_example(), gate_candidates(2, 2), gate_settings())
+
+
+def test_grid_gates_count_check_comes_before_the_label_check():
+    predictions = gate_example()
+    rows = predictions.rows.assign(label_status=FUTURE)
+    with pytest.raises(ValueError, match="stage-2 candidates"):
+        grid_gates(remade(predictions, rows=rows), gate_candidates(4, 3), gate_settings())
+
+
+@pytest.mark.parametrize("statuses", [[FUTURE], [MISSING_WEEK], [FUTURE, MISSING_WEEK]])
+def test_grid_gates_no_labelled_row_raises(statuses):
+    predictions = gate_example()
+    rows = predictions.rows.copy()
+    rows["label_status"] = [statuses[i % len(statuses)] for i in range(len(rows))]
+    with pytest.raises(ValueError) as error:
+        grid_gates(remade(predictions, rows=rows), gate_candidates(), gate_settings())
+    assert str(error.value) == ("no row of the predictions is labelled: the gates have "
+                                "nothing to judge")
+
+
+def test_grid_gates_empty_predictions_raise_no_labelled_row():
+    predictions = gate_example()
+    with pytest.raises(ValueError, match="no row of the predictions is labelled"):
+        grid_gates(only_rows(predictions, predictions.rows.index[:0]), gate_candidates(),
+                   gate_settings())
+
+
+def test_grid_gates_no_labelled_row_paid_raises():
+    # Rows marked paid exist, but only among the unlabelled ones: the paid rows are taken
+    # from the labelled ones.
+    predictions = gate_example()
+    rows = predictions.rows.copy()
+    lab = rows["label_status"] == "labelled"
+    rows.loc[lab, "paid"] = 0.0
+    rows.loc[~lab, "paid"] = 1.0
+    with pytest.raises(ValueError) as error:
+        grid_gates(remade(predictions, rows=rows), gate_candidates(), gate_settings())
+    assert str(error.value) == ("no labelled row of the predictions paid: stage 2 cannot be "
+                                "judged")
+
+
+def test_grid_gates_every_labelled_row_paid_raises_as_stage1_gates_does():
+    # One outcome only: stage 1 cannot be judged; stage1_gates' own error comes through.
+    predictions = gate_example()
+    rows = predictions.rows.copy()
+    lab = rows["label_status"] == "labelled"
+    rows.loc[lab, "paid"] = 1.0
+    rows.loc[lab & ~(rows["amount_deflated"] > 0), "amount_deflated"] = 1000.0
+    with pytest.raises(ValueError, match="both outcomes"):
+        grid_gates(remade(predictions, rows=rows), gate_candidates(), gate_settings())
+
+
+def test_grid_gates_a_bad_training_mean_on_a_paid_row_raises_as_stage2_gates_does():
+    predictions = gate_example()
+    rows = predictions.rows.copy()
+    rows.loc[first_labelled(predictions, paid=True), "training_mean"] = 0.0
+    with pytest.raises(ValueError, match="reference must be finite and above 0"):
+        grid_gates(remade(predictions, rows=rows), gate_candidates(), gate_settings())
+
+
+# --- grid_gates on the U16.3 grid itself ----------------------------------------------------
+
+def test_grid_gates_run_on_grid_predictions_output(g_result):
+    result, _ = g_result
+    settings = g_settings()
+    settings.grid = GATE_GRID
+    candidates = g_candidates(settings)
+    gates = grid_gates(result, candidates, settings)
+    assert gates.stage1["stage1"].tolist() == [0, 1]
+    assert gates.stage2["stage2"].tolist() == [0, 1]
+    assert gates.stage1.columns[1] == "max_iter"
+    assert gates.stage2.columns[1] == "learning_rate"
+    g1, g2 = by_hand(result)
+    pd.testing.assert_frame_equal(gates.stage1, with_params(g1, candidates.stage1, "stage1"))
+    pd.testing.assert_frame_equal(gates.stage2, with_params(g2, candidates.stage2, "stage2"))
+    # The U16.3 grid holds future rows (labels NaN); they were left out without trouble.
+    assert (result.rows["label_status"] == "future").any()
+    assert (gates.stage1["bad p"] == 0).all() and (gates.stage2["bad m"] == 0).all()

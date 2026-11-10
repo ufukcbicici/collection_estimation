@@ -3774,6 +3774,9 @@ for name in ("paired_bootstrap", "score_pairs", "scores_by_h", "stage1_grid", "s
              "stage1_gates", "stage2_gates"):
     assert getattr(script, name) is getattr(diagnostic_joint, name), name
 inspect.signature(script.with_params).bind("gates", "grid", "stage1")
+# U16.4 moved with_params into hurdle/grid.py; step 15 imports it from there.
+from collection_estimation.hurdle import grid as grid_module
+assert script.with_params is grid_module.with_params
 inspect.signature(script.show_gates).bind("stage 1", "gates", "log loss", ascending=True)
 # total_codes was removed: score_pairs sums p x m per total with cash_totals itself.
 assert not hasattr(diagnostic_joint, "total_codes")
@@ -8237,6 +8240,8 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
 # before step 17's `if`). The U16.1 check (show_stage_predictions) is gone. Wiring on main()'s
 # syntax tree, then step 18's `if` run with fakes, then the exact printouts of
 # show_grid_predictions and show_grid_candidates (each compiled alone from the script).
+# U16.4: then grid_gates on the predictions, candidates and settings, and show_grid_gates
+# once per stage (stage 1 by log loss ascending, stage 2 by deviance skill descending).
 STEP_18_FIT_PROGRESS = (
     "def fit_progress(done, total, stage, at, number, seconds):\n"
     "    left = (time.perf_counter() - started) / done * (total - done)\n"
@@ -8258,9 +8263,12 @@ STEP_18_STATEMENTS = [
     STEP_18_FIT_PROGRESS,
     STEP_18_GRID_CALL,
     "show_grid_predictions(predictions, rolled)",
+    "gates = grid_gates(predictions, candidates, settings)",
+    "show_grid_gates('stage 1', gates.stage1, 'log loss', ascending=True)",
+    "show_grid_gates('stage 2', gates.stage2, 'deviance skill', ascending=False)",
 ]
 STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
-                 "show_grid_predictions")
+                 "show_grid_predictions", "grid_gates")
 STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
                 "p_alone", "m_alone", "p_seconds", "m_seconds")
 
@@ -8386,11 +8394,14 @@ def test_step_18_fit_progress_is_defined_after_the_clock_and_before_the_grid():
     assert started < defs[0] < grid
 
 
-def test_step_18_shows_the_candidates_before_the_grid_and_the_predictions_last():
+def test_step_18_shows_the_candidates_before_the_grid_then_the_predictions_then_gates():
     statements = [ast.unparse(node) for node in step_18_body()]
     assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
         statements.index(STEP_18_GRID_CALL))
-    assert statements[-1] == "show_grid_predictions(predictions, rolled)"
+    # U16.4: the gates come right after the predictions printout, and end step 18.
+    at = statements.index("show_grid_predictions(predictions, rolled)")
+    assert statements[at + 1:] == STEP_18_STATEMENTS[-3:]
+    assert statements.index(STEP_18_GRID_CALL) < at
 
 
 def test_rolled_is_set_to_none_once_right_before_step_17():
@@ -8425,13 +8436,14 @@ def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
         assert reads == [], ast.unparse(node)
 
 
-def test_grid_is_imported_once_with_its_two_functions():
+def test_grid_is_imported_once_with_its_four_functions():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.grid"]
     assert len(imports) == 1
-    assert [(a.name, a.asname) for a in imports[0].names] == [("grid_candidates", None),
-                                                              ("grid_predictions", None)]
+    assert [(a.name, a.asname) for a in imports[0].names] == [
+        ("grid_candidates", None), ("grid_gates", None), ("grid_predictions", None),
+        ("with_params", None)]
 
 
 def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
@@ -8470,6 +8482,11 @@ inspect.signature(script.grid_predictions).bind(
     on_fit_done=None)
 inspect.signature(script.show_grid_candidates).bind("candidates", 3)
 inspect.signature(script.show_grid_predictions).bind("predictions", None)
+assert script.grid_gates is grid.grid_gates
+assert script.with_params is grid.with_params
+inspect.signature(script.grid_gates).bind("predictions", "candidates", "settings")
+inspect.signature(script.show_grid_gates).bind("stage 1", "gates", "log loss",
+                                               ascending=True)
 assert not hasattr(script, "show_stage_predictions")
 assert not hasattr(script, "stage1_predictions")
 assert not hasattr(script, "stage2_predictions")
@@ -8529,6 +8546,9 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
         "show_grid_candidates": recorder("show_grid_candidates", None),
         "grid_predictions": fake_grid,
         "show_grid_predictions": recorder("show_grid_predictions", None),
+        "grid_gates": recorder("grid_gates", SimpleNamespace(stage1="<gates 1>",
+                                                             stage2="<gates 2>")),
+        "show_grid_gates": recorder("show_grid_gates", None),
     }
     module = ast.Module(body=[step_18_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
@@ -8539,7 +8559,8 @@ def test_step_18_run_calls_in_order():
     calls, _ = run_step_18()
     assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
                                               "block_feature_columns", "grid_predictions",
-                                              "show_grid_predictions"]
+                                              "show_grid_predictions", "grid_gates",
+                                              "show_grid_gates", "show_grid_gates"]
 
 
 def test_step_18_run_with_the_grid_switched_off_does_nothing():
@@ -8928,3 +8949,287 @@ def test_show_grid_candidates_returns_none_and_changes_nothing(capsys):
     capsys.readouterr()
     assert grid_printer()(candidates, 2) is None
     assert (candidates.stage1, candidates.stage2, candidates.topups) == before
+
+
+# --- U16.4: step 18's gates (grid_gates, then show_grid_gates once per stage) ---------------
+
+def test_step_18_grid_gates_is_called_once_with_the_predictions_candidates_and_settings():
+    calls = calls_in(step_18_body(), "grid_gates")
+    assert len(calls) == 1 and len(calls_to(main_tree(), "grid_gates")) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["predictions", "candidates", "settings"]
+    assert calls[0].keywords == []
+
+
+def test_step_18_show_grid_gates_is_called_twice_only_inside_step_18():
+    assert len(calls_to(main_tree(), "show_grid_gates")) == 2
+    assert len(calls_in(step_18_body(), "show_grid_gates")) == 2
+    assert calls_to(step_17_block(), "show_grid_gates") == []
+
+
+def test_step_18_show_grid_gates_stage_1_by_log_loss_ascending_then_stage_2_by_skill():
+    found = [(ast.unparse(c.args[0]), ast.unparse(c.args[1]), ast.unparse(c.args[2]),
+              keywords_of(c)) for c in calls_in(step_18_body(), "show_grid_gates")]
+    assert found == [("'stage 1'", "gates.stage1", "'log loss'", {"ascending": "True"}),
+                     ("'stage 2'", "gates.stage2", "'deviance skill'", {"ascending": "False"})]
+
+
+def test_step_18_gates_are_made_after_the_predictions_are_shown():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    shown = statements.index("show_grid_predictions(predictions, rolled)")
+    gates = statements.index("gates = grid_gates(predictions, candidates, settings)")
+    assert gates == shown + 1
+
+
+def test_step_15_still_calls_with_params_on_both_stages():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count('with_params(gates1, grid1, "stage1")') == 1
+    assert source.count('with_params(gates2, grid2, "stage2")') == 1
+    tree = ast.parse(source)
+    defined = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert "with_params" not in defined
+
+
+def test_show_grid_gates_is_a_module_level_function_with_four_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_gates"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["stage", "gates", "score", "ascending"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_show_grid_gates_sits_right_before_step_15s_show_gates():
+    names = [node.name for node in script_functions()]
+    assert names[names.index("show_grid_gates") + 1] == "show_gates"
+
+
+def test_step_18_run_grid_gates_gets_the_predictions_candidates_and_settings():
+    calls, _ = run_step_18()
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_gates"]
+    assert len(found) == 1
+    (predictions, candidates, settings), kwargs = found[0]
+    assert kwargs == {}
+    assert predictions == "<predictions>" and candidates == "<candidates>"
+    assert settings.grid.run is True
+
+
+def test_step_18_run_shows_both_stages_gates():
+    calls, _ = run_step_18()
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_gates"]
+    assert shown == [(("stage 1", "<gates 1>", "log loss"), {"ascending": True}),
+                     (("stage 2", "<gates 2>", "deviance skill"), {"ascending": False})]
+
+
+def test_step_18_run_switched_off_makes_no_gates():
+    calls, _ = run_step_18(run=False, ticks=())
+    assert not any(name in ("grid_gates", "show_grid_gates") for name, _, _ in calls)
+
+
+# show_grid_gates, the function alone (compiled from the script).
+
+def gates_printer():
+    return function_from_script("show_grid_gates")
+
+
+def printed_gates(capsys, stage, gates, score, ascending):
+    capsys.readouterr()
+    assert gates_printer()(stage, gates, score, ascending) is None
+    return capsys.readouterr().out.splitlines()
+
+
+def stage1_table(eligible_rows=(1, 2), current=None, n=4):
+    """A stage-1 gate table as grid_gates returns it: candidate 0 fails all three gates (or
+    the gates in `current`, a dict of gate -> passed), 1 and 2 pass, 3 has a bad p."""
+    import numpy as np
+    import pandas as pd
+    base = [
+        # stage1, max_iter, bad p, log loss, skill, slope
+        (0, 300, 0, 0.693147, -0.000072, 0.0),
+        (1, 100, 0, 0.582705, 0.159274, 0.971141),
+        (2, 200, 0, 0.583829, 0.157652, 1.120210),
+        (3, 400, 1, np.nan, np.nan, np.nan),
+    ][:n]
+    table = pd.DataFrame(base, columns=["stage1", "max_iter", "bad p", "log loss",
+                                        "log loss skill", "slope"])
+    for gate in ("log loss gate", "skill gate", "slope gate"):
+        table[gate] = [i in eligible_rows for i in table["stage1"]]
+    if current is not None:
+        for gate, passed in current.items():
+            table.loc[table["stage1"] == 0, gate] = passed
+    table["eligible"] = table["log loss gate"] & table["skill gate"] & table["slope gate"]
+    return table
+
+
+def stage2_table():
+    import numpy as np
+    import pandas as pd
+    table = pd.DataFrame(
+        [(0, "poisson", 50, 0, 0.0, 1.0), (1, "poisson", 100, 0, 0.532846, 0.960442),
+         (2, "gamma", 150, 0, 0.479335, 0.99328), (3, "poisson", 200, 2, np.nan, np.nan)],
+        columns=["stage2", "loss", "max_iter", "bad m", "deviance skill", "total ratio"])
+    table["m gate"] = [True, True, True, False]
+    table["skill gate"] = [False, True, True, False]
+    table["ratio gate"] = [True, True, True, False]
+    table["eligible"] = table["m gate"] & table["skill gate"] & table["ratio gate"]
+    return table
+
+
+def gates_text(table, score, ascending):
+    return table.sort_values(score, ascending=ascending).round(4).to_string(
+        index=False).splitlines()
+
+
+def first_tokens(lines):
+    return [line.split()[0] for line in lines[1:]]     # skip the table's header line
+
+
+STAGE1_HEAD = ("        stage 1 gates: 2 of 4 candidates eligible; candidates failing each "
+               "gate: {'log loss gate': 2, 'skill gate': 2, 'slope gate': 2}")
+
+
+def test_show_grid_gates_exact_printout_when_the_current_settings_fail(capsys):
+    table = stage1_table()
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines == [
+        STAGE1_HEAD,
+        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
+        "are still scored, as the settings to beat",
+    ] + gates_text(table, "log loss", True)
+
+
+def test_show_grid_gates_table_sorted_by_the_score_with_unscored_candidates_last(capsys):
+    lines = printed_gates(capsys, "stage 1", stage1_table(), "log loss", True)
+    assert first_tokens(lines[2:]) == ["1", "2", "0", "3"]
+    assert lines[2].split()[:4] == ["stage1", "max_iter", "bad", "p"]
+
+
+def test_show_grid_gates_rounds_the_table_to_four_decimals(capsys):
+    lines = printed_gates(capsys, "stage 1", stage1_table(), "log loss", True)
+    assert "0.5827" in lines[3] and "0.582705" not in lines[3]
+
+
+def test_show_grid_gates_names_only_the_gates_the_current_settings_miss(capsys):
+    table = stage1_table(current={"log loss gate": True, "skill gate": True})
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines[0] == ("        stage 1 gates: 2 of 4 candidates eligible; candidates failing "
+                        "each gate: {'log loss gate': 1, 'skill gate': 1, 'slope gate': 2}")
+    assert lines[1] == ("        the current stage 1 settings FAIL slope gate; they are still "
+                        "scored, as the settings to beat")
+
+
+def test_show_grid_gates_eligible_current_and_others_prints_no_warning(capsys):
+    table = stage1_table(eligible_rows=(0, 1, 2))
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines == [
+        "        stage 1 gates: 3 of 4 candidates eligible; candidates failing each gate: "
+        "{'log loss gate': 1, 'skill gate': 1, 'slope gate': 1}",
+    ] + gates_text(table, "log loss", True)
+
+
+def test_show_grid_gates_eligible_current_and_no_other_says_only_the_current_goes_on(capsys):
+    table = stage1_table(eligible_rows=(0,))
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines == [
+        "        stage 1 gates: 1 of 4 candidates eligible; candidates failing each gate: "
+        "{'log loss gate': 3, 'skill gate': 3, 'slope gate': 3}",
+        "        no other stage 1 candidate is eligible: only the current settings go on",
+    ] + gates_text(table, "log loss", True)
+
+
+def test_show_grid_gates_nothing_eligible_prints_both_lines(capsys):
+    table = stage1_table(eligible_rows=())
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines[:3] == [
+        "        stage 1 gates: 0 of 4 candidates eligible; candidates failing each gate: "
+        "{'log loss gate': 4, 'skill gate': 4, 'slope gate': 4}",
+        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
+        "are still scored, as the settings to beat",
+        "        no other stage 1 candidate is eligible: only the current settings go on",
+    ]
+    assert lines[3:] == gates_text(table, "log loss", True)
+
+
+def test_show_grid_gates_a_lone_eligible_current_prints_no_no_other_line(capsys):
+    # Only the current settings in the grid: there are no others to be ineligible.
+    table = stage1_table(eligible_rows=(0,), n=1)
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines == [
+        "        stage 1 gates: 1 of 1 candidates eligible; candidates failing each gate: "
+        "{'log loss gate': 0, 'skill gate': 0, 'slope gate': 0}",
+    ] + gates_text(table, "log loss", True)
+    assert not any(line.startswith("        no other") for line in lines)
+
+
+def test_show_grid_gates_a_lone_failing_current_prints_the_fail_line_only(capsys):
+    table = stage1_table(eligible_rows=(), n=1)
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines == [
+        "        stage 1 gates: 0 of 1 candidates eligible; candidates failing each gate: "
+        "{'log loss gate': 1, 'skill gate': 1, 'slope gate': 1}",
+        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
+        "are still scored, as the settings to beat",
+    ] + gates_text(table, "log loss", True)
+
+
+def test_show_grid_gates_one_other_eligible_is_enough_for_no_no_other_line(capsys):
+    table = stage1_table(eligible_rows=(0, 3))
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert not any(line.startswith("        no other") for line in lines)
+
+
+def test_show_grid_gates_finds_candidate_0_by_number_not_position(capsys):
+    # Candidate 0 is the third row; it is still the one reported as the current settings.
+    table = stage1_table(eligible_rows=(1, 2, 3)).iloc[[2, 1, 0, 3]].reset_index(drop=True)
+    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
+    assert lines[1] == ("        the current stage 1 settings FAIL log loss gate, skill gate, "
+                        "slope gate; they are still scored, as the settings to beat")
+    eligible_current = stage1_table(eligible_rows=(0,)).iloc[[3, 1, 0, 2]]
+    lines = printed_gates(capsys, "stage 1", eligible_current, "log loss", True)
+    assert lines[1] == ("        no other stage 1 candidate is eligible: only the current "
+                        "settings go on")
+
+
+def test_show_grid_gates_exact_printout_for_stage_2_descending(capsys):
+    table = stage2_table()
+    lines = printed_gates(capsys, "stage 2", table, "deviance skill", False)
+    assert lines == [
+        "        stage 2 gates: 2 of 4 candidates eligible; candidates failing each gate: "
+        "{'m gate': 1, 'skill gate': 2, 'ratio gate': 1}",
+        "        the current stage 2 settings FAIL skill gate; they are still scored, as the "
+        "settings to beat",
+    ] + gates_text(table, "deviance skill", False)
+    # Highest skill first; the candidate without a score last.
+    assert first_tokens(lines[2:]) == ["1", "2", "0", "3"]
+
+
+def test_show_grid_gates_counts_only_columns_ending_in_gate(capsys):
+    # "eligible" and the params are not gates, even a param whose name holds "gate".
+    table = stage2_table().assign(gates_used=1)
+    head = printed_gates(capsys, "stage 2", table, "deviance skill", False)[0]
+    assert head.endswith("{'m gate': 1, 'skill gate': 2, 'ratio gate': 1}")
+
+
+def test_show_grid_gates_changes_nothing(capsys):
+    import pandas as pd
+    table = stage1_table()
+    before = table.copy()
+    printed_gates(capsys, "stage 1", table, "log loss", True)
+    pd.testing.assert_frame_equal(table, before)
+
+
+def test_show_grid_gates_on_grid_gates_own_output(capsys):
+    # The worked example of test_grid.py (stage 1 {1, 2} and stage 2 {1, 2} eligible;
+    # candidate 0 fails all three stage-1 gates and stage 2's skill gate).
+    from collection_estimation.hurdle.grid import grid_gates
+    from tests.hurdle.test_grid import gate_candidates, gate_example, gate_settings
+    gates = grid_gates(gate_example(), gate_candidates(), gate_settings())
+    one = printed_gates(capsys, "stage 1", gates.stage1, "log loss", True)
+    two = printed_gates(capsys, "stage 2", gates.stage2, "deviance skill", False)
+    assert one[0].startswith("        stage 1 gates: 2 of 4 candidates eligible;")
+    assert one[1] == ("        the current stage 1 settings FAIL log loss gate, skill gate, "
+                      "slope gate; they are still scored, as the settings to beat")
+    assert first_tokens(one[2:]) == ["1", "2", "0", "3"]
+    assert two[0].startswith("        stage 2 gates: 2 of 4 candidates eligible;")
+    assert two[1] == ("        the current stage 2 settings FAIL skill gate; they are still "
+                      "scored, as the settings to beat")
+    assert first_tokens(two[2:]) == ["1", "2", "0", "3"]
+    assert not any(line.startswith("        no other") for line in one + two)

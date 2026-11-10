@@ -21,6 +21,13 @@ once. Beside them, per row, what happened and the two references the gates (U16.
 Every fit is cached on its own (`cache.load_with_cache`), keyed by its stage, origin and
 setting: a grid with one more candidate fits only that one, and a run stopped after hours
 keeps every fit it finished.
+
+U16.4, `grid_gates`: which stage-1 and stage-2 candidates make sense on their own, judged on
+the labelled rows of every validation origin pooled (`diagnostic_joint.stage1_gates` and
+`stage2_gates`, with the [grid] tolerances). "The best" a gate measures against is the best
+candidate of the grid, whichever it is. Top-ups have no gate: they are judged in the totals
+only (U16.5). The current settings are scored even if they fail a gate (U16.6): they are what
+is kept unless beaten.
 """
 import dataclasses
 import hashlib
@@ -34,7 +41,7 @@ import pandas as pd
 
 from .cache import load_with_cache, source_fingerprint, table_fingerprint
 from .diagnostic import Candidate, reference_probabilities
-from .diagnostic_joint import stage1_grid, stage2_grid
+from .diagnostic_joint import stage1_gates, stage1_grid, stage2_gates, stage2_grid
 from .evaluate import MODEL_CODE, check_forecast_origins
 from .forecast import CUSTOMER_COLUMNS, stage1_predictions, stage2_predictions
 from .stage2 import amount_references
@@ -215,3 +222,60 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
 
     return GridPredictions(rows=pd.concat(rows), p=pd.concat(p_parts), m=pd.concat(m_parts),
                            topups=topups)
+
+
+@dataclass(frozen=True)
+class GridGates:
+    """The gates of every stage-1 and stage-2 candidate (U16.4): `stage1_gates`' and
+    `stage2_gates`' tables, with each candidate's grid settings after its number."""
+    stage1: pd.DataFrame        # one row per stage-1 candidate; column "stage1" its number
+    stage2: pd.DataFrame        # one row per stage-2 candidate; column "stage2" its number
+
+
+def with_params(gates: pd.DataFrame, candidates: list[Candidate],
+                number_column: str) -> pd.DataFrame:
+    """A gate table with each candidate's grid settings (`params`) added after its number,
+    row by row (the gate table may be sorted or filtered)."""
+    params = pd.DataFrame([candidates[int(i)].params for i in gates[number_column]],
+                          index=gates.index)
+    return pd.concat([gates[[number_column]], params, gates.drop(columns=number_column)],
+                     axis=1)
+
+
+def grid_gates(predictions: GridPredictions, candidates: GridCandidates,
+               settings) -> GridGates:
+    """The gates of every candidate (see the module docstring), on the rows of `predictions`
+    whose label is known, all origins together; the tolerances are [grid]'s.
+
+    Stage 1 is judged on every labelled row (paid or not, against the base rate); stage 2 on
+    the labelled rows that paid (the deflated amount, against the training mean).
+
+    Raises ValueError if `predictions` and `candidates` do not have the same number of
+    stage-1 or stage-2 candidates, if no row is labelled or none of them paid, and as the
+    gate functions do.
+    """
+    for stage, columns, listed in (("stage-1", predictions.p.columns, candidates.stage1),
+                                   ("stage-2", predictions.m.columns, candidates.stage2)):
+        if len(columns) != len(listed):
+            raise ValueError(f"the predictions hold {len(columns)} {stage} candidates, the "
+                             f"candidates {len(listed)}")
+    rows = predictions.rows
+    labelled = rows[rows["label_status"] == "labelled"]
+    if labelled.empty:
+        raise ValueError("no row of the predictions is labelled: the gates have nothing to "
+                         "judge")
+    paid = labelled[labelled["paid"].astype(bool)]
+    if paid.empty:
+        raise ValueError("no labelled row of the predictions paid: stage 2 cannot be judged")
+
+    grid = settings.grid
+    gates1 = stage1_gates(labelled["paid"].astype(bool),
+                          [predictions.p.loc[labelled.index, i] for i in predictions.p.columns],
+                          labelled["base_rate"], grid.stage1_log_loss_tolerance,
+                          grid.stage1_slope_band)
+    gates2 = stage2_gates(paid["amount_deflated"],
+                          [predictions.m.loc[paid.index, j] for j in predictions.m.columns],
+                          paid["training_mean"], grid.stage2_skill_tolerance,
+                          grid.stage2_ratio_band)
+    return GridGates(stage1=with_params(gates1, candidates.stage1, "stage1"),
+                     stage2=with_params(gates2, candidates.stage2, "stage2"))
