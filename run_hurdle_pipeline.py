@@ -75,6 +75,7 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
     POOLED,
     REFERENCES,
     RULE,
+    STACK_COLUMNS,
     actual_totals,
     balance_coherence,
     component_bias,
@@ -107,6 +108,7 @@ from collection_estimation.hurdle.grid import (  # noqa: E402
     grid_candidates,
     grid_gates,
     grid_predictions,
+    grid_scores,
     with_params,
 )
 from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
@@ -689,7 +691,9 @@ def main():
     # Step 18: the settings grid (U16) over the validation origins. Built unit by unit.
     # U16.2: the settings to try. U16.3: every candidate at every origin, each fit cached on
     # its own; the current settings (candidate 0) must give step 17's p and m exactly. U16.4:
-    # the gates of each stage-1 and stage-2 candidate, all validation origins together.
+    # the gates of each stage-1 and stage-2 candidate, all validation origins together. U16.5:
+    # every combination of the scored candidates, scored on the cash that came; the current
+    # combination must score exactly as step 17's model.
     if settings.grid.run:
         grid_origins = list(settings.evaluation.validation_origins)
         candidates = grid_candidates(settings)
@@ -713,6 +717,12 @@ def main():
         gates = grid_gates(predictions, candidates, settings)
         show_grid_gates("stage 1", gates.stage1, "log loss", ascending=True)
         show_grid_gates("stage 2", gates.stage2, "deviance skill", ascending=False)
+        grid_actual = actual_totals(weekly, weeks, levels, companies, grid_origins,
+                                    settings.receivables.horizons)
+        grid_table = grid_scores(predictions, candidates, gates, grid_actual, settings,
+                                 companies=companies, week_zero=week_zero)
+        show_grid_scores(grid_table, candidates, rolled, grid_actual,
+                         settings.receivables.horizons)
 
     # Later steps follow as each unit is built.
 
@@ -1877,6 +1887,33 @@ def show_grid_gates(stage, gates, score, ascending):
     if not others.empty and not others["eligible"].any():
         print(f"        no other {stage} candidate is eligible: only the current settings go on")
     print(gates.sort_values(score, ascending=ascending).round(4).to_string(index=False))
+
+
+def show_grid_scores(table, candidates, rolled, actual, horizons):
+    """Step 18's scores (U16.5): how many combinations were scored, the 10 best by WAPE, the
+    current combination and its rank, and whether it scores exactly as step 17's model
+    (`rolled`, scored here on `actual`; None if step 17 did not forecast with the model)."""
+    every = len(candidates.stage1) * len(candidates.stage2) * len(candidates.topups)
+    print(f"        {len(table)} of {every} combinations scored (stage-1 and stage-2 "
+          f"candidates eligible or current, every top-up); the 10 best by WAPE:")
+    print(table.head(10).round(4).to_string(index=False))
+    rank = int(table.index[table["current"]][0]) + 1
+    current = table[table["current"]].iloc[0]
+    print(f"        current settings: rank {rank} of {len(table)}, WAPE {current['wape']:.4f}, "
+          f"5-week WAPE {current['total_wape']:.4f}, bias {current['bias']:+.4f}, company "
+          f"WAPE {current['company_wape']:.4f}")
+    if rolled is None:
+        print("        current against step 17: not checked (step 17 did not forecast with "
+              "the model)")
+        return
+    hurdle = rolled.totals[["company_code", "origin_week", "h", "target_week", "total"]]
+    hurdle = hurdle.rename(columns={"total": "forecast"}).assign(method=HURDLE)
+    step17 = evaluation_scores(hurdle[STACK_COLUMNS], actual, horizons)
+    step17_wape = step17.loc[(step17["company_code"] == CONSOLIDATED)
+                             & (step17["horizon"] == POOLED), "wape"].iloc[0]
+    print(f"        current WAPE the same as step 17's model: "
+          f"{'yes' if step17_wape == current['wape'] else 'NO'} (step 17 {step17_wape:.6f}, "
+          f"grid {current['wape']:.6f})")
 
 
 def show_gates(stage, gates, score, ascending):

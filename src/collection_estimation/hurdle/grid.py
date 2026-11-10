@@ -28,22 +28,34 @@ the labelled rows of every validation origin pooled (`diagnostic_joint.stage1_ga
 candidate of the grid, whichever it is. Top-ups have no gate: they are judged in the totals
 only (U16.5). The current settings are scored even if they fail a gate (U16.6): they are what
 is kept unless beaten.
+
+U16.5, `grid_scores`: every combination of a scored stage-1 candidate (eligible, or the
+current settings), a scored stage-2 candidate (the same) and a top-up candidate, forecast at
+every origin as `forecast.forecast` does (p x m added up per company and h, plus the top-ups,
+times the price level projected at the origin; nominal TRY) and scored against the cash that
+came by `evaluate.evaluation_scores`, as step 17 scores the model. Nothing is chosen here
+(U16.6), and p and m are not calibrated.
 """
 import dataclasses
 import hashlib
+import itertools
 import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 from .cache import load_with_cache, source_fingerprint, table_fingerprint
 from .diagnostic import Candidate, reference_probabilities
 from .diagnostic_joint import stage1_gates, stage1_grid, stage2_gates, stage2_grid
-from .evaluate import MODEL_CODE, check_forecast_origins
-from .forecast import CUSTOMER_COLUMNS, stage1_predictions, stage2_predictions
+from .evaluate import (HORIZON_TOTAL, MODEL_CODE, POOLED, STACK_COLUMNS, check_forecast_origins,
+                       evaluation_scores)
+from .forecast import (CONSOLIDATED, CUSTOMER_COLUMNS, forecast_totals, stage1_predictions,
+                       stage2_predictions)
+from .prices import projected_levels
 from .stage2 import amount_references
 from .topups import topup_forecasts
 from .training_table import rows_at_origin, rows_known_at
@@ -53,6 +65,12 @@ from .training_table import rows_at_origin, rows_known_at
 # log-loss skill) and the training-mean amount (stage 2's deviance skill).
 ROW_COLUMNS = CUSTOMER_COLUMNS[:6] + ["label_status", "paid", "amount_deflated", "base_rate",
                                       "training_mean"]
+
+# The columns of `grid_scores`' table, in order: the candidate numbers, whether it is the
+# current settings, then the scores of the consolidated totals (WAPE over every (origin, h),
+# WAPE of each origin's total over its h weeks, bias) and the mean of the companies' WAPE.
+GRID_SCORE_COLUMNS = ["stage1", "stage2", "topups", "current", "wape", "total_wape", "bias",
+                      "company_wape"]
 
 
 @dataclass(frozen=True)
@@ -250,6 +268,12 @@ def grid_gates(predictions: GridPredictions, candidates: GridCandidates,
     Stage 1 is judged on every labelled row (paid or not, against the base rate); stage 2 on
     the labelled rows that paid (the deflated amount, against the training mean).
 
+    Every row is forecast, though, not only those judged. A candidate whose p is not a
+    number in [0, 1], or whose m is not a number, on a row the gates do not judge is judged as
+    if its p (or m) were unusable on every judged row: it fails every gate and does not set
+    the best. Column "bad elsewhere" counts those rows, so a broken candidate does not stop
+    the scores (U16.5).
+
     Raises ValueError if `predictions` and `candidates` do not have the same number of
     stage-1 or stage-2 candidates, if no row is labelled or none of them paid, and as the
     gate functions do.
@@ -268,14 +292,123 @@ def grid_gates(predictions: GridPredictions, candidates: GridCandidates,
     if paid.empty:
         raise ValueError("no labelled row of the predictions paid: stage 2 cannot be judged")
 
+    # Each candidate's values on the judged rows, and how many rows outside them are broken.
+    p_judged, p_elsewhere = [], []
+    for i in predictions.p.columns:
+        p = predictions.p[i].astype("float64")
+        broken = ~np.isfinite(p) | (p < 0) | (p > 1)
+        p_elsewhere.append(int(broken.drop(labelled.index).sum()))
+        p_judged.append(refused_if(p.loc[labelled.index], p_elsewhere[-1] > 0))
+    m_judged, m_elsewhere = [], []
+    for j in predictions.m.columns:
+        m = predictions.m[j].astype("float64")
+        broken = ~np.isfinite(m)
+        m_elsewhere.append(int(broken.drop(paid.index).sum()))
+        m_judged.append(refused_if(m.loc[paid.index], m_elsewhere[-1] > 0))
+
     grid = settings.grid
-    gates1 = stage1_gates(labelled["paid"].astype(bool),
-                          [predictions.p.loc[labelled.index, i] for i in predictions.p.columns],
-                          labelled["base_rate"], grid.stage1_log_loss_tolerance,
-                          grid.stage1_slope_band)
-    gates2 = stage2_gates(paid["amount_deflated"],
-                          [predictions.m.loc[paid.index, j] for j in predictions.m.columns],
-                          paid["training_mean"], grid.stage2_skill_tolerance,
-                          grid.stage2_ratio_band)
+    gates1 = stage1_gates(labelled["paid"].astype(bool), p_judged, labelled["base_rate"],
+                          grid.stage1_log_loss_tolerance, grid.stage1_slope_band)
+    gates2 = stage2_gates(paid["amount_deflated"], m_judged, paid["training_mean"],
+                          grid.stage2_skill_tolerance, grid.stage2_ratio_band)
+    gates1.insert(gates1.columns.get_loc("bad p") + 1, "bad elsewhere", p_elsewhere)
+    gates2.insert(gates2.columns.get_loc("bad m") + 1, "bad elsewhere", m_elsewhere)
     return GridGates(stage1=with_params(gates1, candidates.stage1, "stage1"),
                      stage2=with_params(gates2, candidates.stage2, "stage2"))
+
+
+def refused_if(values: pd.Series, refused: bool) -> pd.Series:
+    """`values`, or, if `refused`, NaN in every row: a candidate the gates must fail."""
+    if refused:
+        return pd.Series(float("nan"), index=values.index, name=values.name)
+    return values
+
+
+def scored_numbers(gates: pd.DataFrame, number_column: str) -> list[int]:
+    """The candidates of one stage that are scored: the eligible ones, and the current
+    settings (number 0) always."""
+    scored = gates["eligible"] | (gates[number_column] == 0)
+    return sorted(int(number) for number in gates.loc[scored, number_column])
+
+
+def combination_name(stage1: int, stage2: int, topups: int) -> str:
+    """The name of a combination of candidates in the stacked forecasts."""
+    return f"stage1 {stage1}, stage2 {stage2}, top-ups {topups}"
+
+
+def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates: GridGates,
+                actual: pd.DataFrame, settings, *, companies: list[str],
+                week_zero) -> pd.DataFrame:
+    """The scores of every combination (see the module docstring): one row per combination,
+    `GRID_SCORE_COLUMNS`, sorted by WAPE (on a tie, in the order of the candidates, so the
+    current settings first). `actual` is `evaluate.actual_totals` at the origins of
+    `predictions`; `companies` the settings' company list; `week_zero` the start of week 0,
+    from which the price levels are projected.
+
+    company_wape is the mean over the companies that have cash at the grid's origins: a
+    company with none has no WAPE (a share of nothing) and is left out of the mean.
+
+    Raises ValueError if `gates` or `predictions` do not have one entry per candidate, if
+    `actual` is not for the origins of `predictions` (scored on fewer origins, the grid would
+    be judged on other weeks than asked), if there is no consolidated cash to score on, and
+    as `forecast_totals` (e.g. a NaN p x m of the current settings) and `evaluation_scores`
+    do.
+    """
+    for what, found, listed in (("stage-1 gates", len(gates.stage1), candidates.stage1),
+                                ("stage-1 p columns", len(predictions.p.columns),
+                                 candidates.stage1),
+                                ("stage-2 gates", len(gates.stage2), candidates.stage2),
+                                ("stage-2 m columns", len(predictions.m.columns),
+                                 candidates.stage2),
+                                ("top-up forecasts", len(predictions.topups),
+                                 candidates.topups)):
+        if found != len(listed):
+            raise ValueError(f"there are {found} {what} for {len(listed)} candidates")
+    horizons = settings.receivables.horizons
+    rows = predictions.rows
+    origins = sorted(set(rows["origin_week"]))
+    actual_origins = sorted(set(actual["origin_week"]))
+    if actual_origins != origins:
+        raise ValueError(f"the actual cash is for origins {actual_origins}, the predictions "
+                         f"for {origins}")
+    at_origin = {origin: rows["origin_week"] == origin for origin in origins}
+    projected = {origin: projected_levels(week_zero, origin,
+                                          [origin + h for h in range(1, horizons + 1)])
+                 for origin in origins}
+    stage1 = scored_numbers(gates.stage1, "stage1")
+    stage2 = scored_numbers(gates.stage2, "stage2")
+    combinations = list(itertools.product(stage1, stage2, range(len(candidates.topups))))
+
+    # 1. Each combination's totals at each origin, as `forecast` makes them.
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    parts = []
+    for i, j, k in combinations:
+        customers = rows[keys].assign(expected=predictions.p[i] * predictions.m[j])
+        topups = predictions.topups[k]
+        for origin in origins:
+            totals = forecast_totals(customers[at_origin[origin]],
+                                     topups[topups["origin_week"] == origin],
+                                     projected[origin], companies, horizons)
+            part = totals[keys + ["total"]].rename(columns={"total": "forecast"})
+            part.insert(0, "method", combination_name(i, j, k))
+            parts.append(part)
+    forecasts = pd.concat(parts, ignore_index=True)
+    forecasts["company_code"] = forecasts["company_code"].astype(object)
+
+    # 2. Every combination scored as step 17 scores the model.
+    scores = evaluation_scores(forecasts[STACK_COLUMNS], actual, horizons)
+    if scores[(scores["company_code"] == CONSOLIDATED) & (scores["horizon"] == POOLED)].empty:
+        raise ValueError("there is no consolidated cash at the grid's origins to score on")
+    lines = []
+    for i, j, k in combinations:
+        mine = scores[scores["method"] == combination_name(i, j, k)]
+        consolidated = mine[mine["company_code"] == CONSOLIDATED].set_index("horizon")
+        by_company = mine[(mine["company_code"] != CONSOLIDATED) & (mine["horizon"] == POOLED)]
+        lines.append({"stage1": i, "stage2": j, "topups": k, "current": (i, j, k) == (0, 0, 0),
+                      "wape": consolidated.loc[POOLED, "wape"],
+                      "total_wape": consolidated["wape"].get(HORIZON_TOTAL, float("nan")),
+                      "bias": consolidated.loc[POOLED, "bias"],
+                      "company_wape": by_company["wape"].mean()})
+    table = pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+    # "stable" keeps the candidates' order on a tie.
+    return table.sort_values("wape", kind="stable").reset_index(drop=True)

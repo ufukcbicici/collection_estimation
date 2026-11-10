@@ -5340,10 +5340,11 @@ def test_step_16_and_17_imports():
     # U14.3 added REFERENCES and deflated_reference to the one import of evaluate; U14.5
     # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
     # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap; U14.5d added
-    # KNOWN_CUSTOMERS, RULE, component_bias and payer_split; U14.6 added balance_coherence.
+    # KNOWN_CUSTOMERS, RULE, component_bias and payer_split; U14.6 added balance_coherence;
+    # U16.5 added STACK_COLUMNS (show_grid_scores stacks step 17's totals with it).
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
         ("HORIZON_TOTAL", None), ("HURDLE", None), ("KNOWN_CUSTOMERS", None), ("POOLED", None),
-        ("REFERENCES", None), ("RULE", None), ("actual_totals", None),
+        ("REFERENCES", None), ("RULE", None), ("STACK_COLUMNS", None), ("actual_totals", None),
         ("balance_coherence", None),
         ("component_bias", None), ("deflated_reference", None), ("evaluation_scores", None),
         ("paired_wape_bootstrap", None), ("payer_split", None), ("rolling_fingerprint", None),
@@ -5517,7 +5518,9 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(calls) == 1
     assert [ast.unparse(a) for a in calls[0].args] == [
         "weekly", "weeks", "levels", "companies", "origins", "settings.receivables.horizons"]
-    assert len(calls_to(main_tree(), "actual_totals")) == 2   # step 16 and step 17
+    # Step 16, step 17 and (since U16.5) step 18's grid_actual.
+    assert len(calls_to(main_tree(), "actual_totals")) == 3
+    assert len(calls_to(step_18_block(), "actual_totals")) == 1
     shows = calls_to(block, "show_rolling_forecasts")
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
@@ -8242,6 +8245,8 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
 # show_grid_predictions and show_grid_candidates (each compiled alone from the script).
 # U16.4: then grid_gates on the predictions, candidates and settings, and show_grid_gates
 # once per stage (stage 1 by log loss ascending, stage 2 by deviance skill descending).
+# U16.5: then the actual cash at the grid's origins (actual_totals), every combination scored
+# (grid_scores), and show_grid_scores, which checks the current combination against step 17.
 STEP_18_FIT_PROGRESS = (
     "def fit_progress(done, total, stage, at, number, seconds):\n"
     "    left = (time.perf_counter() - started) / done * (total - done)\n"
@@ -8253,6 +8258,12 @@ STEP_18_GRID_CALL = (
     "new_cash=new_cash, refunds=refunds, unidentified=unidentified, levels=levels, "
     "calendar=calendar, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
     "on_fit_done=fit_progress)")
+STEP_18_ACTUAL = ("grid_actual = actual_totals(weekly, weeks, levels, companies, grid_origins, "
+                  "settings.receivables.horizons)")
+STEP_18_SCORES = ("grid_table = grid_scores(predictions, candidates, gates, grid_actual, "
+                  "settings, companies=companies, week_zero=week_zero)")
+STEP_18_SHOW_SCORES = ("show_grid_scores(grid_table, candidates, rolled, grid_actual, "
+                       "settings.receivables.horizons)")
 STEP_18_STATEMENTS = [
     "grid_origins = list(settings.evaluation.validation_origins)",
     "candidates = grid_candidates(settings)",
@@ -8266,9 +8277,12 @@ STEP_18_STATEMENTS = [
     "gates = grid_gates(predictions, candidates, settings)",
     "show_grid_gates('stage 1', gates.stage1, 'log loss', ascending=True)",
     "show_grid_gates('stage 2', gates.stage2, 'deviance skill', ascending=False)",
+    STEP_18_ACTUAL,
+    STEP_18_SCORES,
+    STEP_18_SHOW_SCORES,
 ]
 STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
-                 "show_grid_predictions", "grid_gates")
+                 "show_grid_predictions", "grid_gates", "grid_scores", "show_grid_scores")
 STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
                 "p_alone", "m_alone", "p_seconds", "m_seconds")
 
@@ -8398,9 +8412,11 @@ def test_step_18_shows_the_candidates_before_the_grid_then_the_predictions_then_
     statements = [ast.unparse(node) for node in step_18_body()]
     assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
         statements.index(STEP_18_GRID_CALL))
-    # U16.4: the gates come right after the predictions printout, and end step 18.
+    # U16.4: the gates come right after the predictions printout; U16.5: the scores after
+    # them end step 18.
     at = statements.index("show_grid_predictions(predictions, rolled)")
-    assert statements[at + 1:] == STEP_18_STATEMENTS[-3:]
+    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-6:-3]
+    assert statements[at + 4:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES]
     assert statements.index(STEP_18_GRID_CALL) < at
 
 
@@ -8436,14 +8452,15 @@ def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
         assert reads == [], ast.unparse(node)
 
 
-def test_grid_is_imported_once_with_its_four_functions():
+def test_grid_is_imported_once_with_its_five_functions():
+    # U16.5 added grid_scores (the test was "..._four_functions" before).
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.grid"]
     assert len(imports) == 1
     assert [(a.name, a.asname) for a in imports[0].names] == [
         ("grid_candidates", None), ("grid_gates", None), ("grid_predictions", None),
-        ("with_params", None)]
+        ("grid_scores", None), ("with_params", None)]
 
 
 def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
@@ -8487,6 +8504,14 @@ assert script.with_params is grid.with_params
 inspect.signature(script.grid_gates).bind("predictions", "candidates", "settings")
 inspect.signature(script.show_grid_gates).bind("stage 1", "gates", "log loss",
                                                ascending=True)
+assert script.grid_scores is grid.grid_scores
+inspect.signature(script.grid_scores).bind("predictions", "candidates", "gates", "actual",
+                                           "settings", companies=[], week_zero=None)
+inspect.signature(script.show_grid_scores).bind("table", "candidates", None, "actual", 5)
+from collection_estimation.hurdle import evaluate
+assert script.STACK_COLUMNS is evaluate.STACK_COLUMNS
+assert script.evaluation_scores is evaluate.evaluation_scores
+assert script.HURDLE == evaluate.HURDLE and script.POOLED == evaluate.POOLED
 assert not hasattr(script, "show_stage_predictions")
 assert not hasattr(script, "stage1_predictions")
 assert not hasattr(script, "stage2_predictions")
@@ -8533,12 +8558,17 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
     settings = SimpleNamespace(grid=SimpleNamespace(run=run),
                                evaluation=SimpleNamespace(validation_origins=validation_origins,
                                                           test_origins="<never read>"),
-                               data=SimpleNamespace(cache_folder=Path("cache_root")))
+                               data=SimpleNamespace(cache_folder=Path("cache_root")),
+                               receivables=SimpleNamespace(horizons=5))
     namespace = {
         "settings": settings, "table": "<table>", "history": "<history>",
         "calendar": "<calendar>", "owed": "<owed>", "companies": "<companies>",
         "new_cash": "<new cash>", "refunds": "<refunds>", "unidentified": "<unidentified>",
         "levels": "<levels>", "rolled": rolled,
+        "weekly": "<weekly>", "weeks": "<weeks>", "week_zero": "<week zero>",
+        "actual_totals": recorder("actual_totals", "<grid actual>"),
+        "grid_scores": recorder("grid_scores", "<grid table>"),
+        "show_grid_scores": recorder("show_grid_scores", None),
         "time": SimpleNamespace(perf_counter=lambda: next(clock)),
         "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
         "block_feature_columns": recorder("block_feature_columns", "<blocks>"),
@@ -8560,7 +8590,9 @@ def test_step_18_run_calls_in_order():
     assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
                                               "block_feature_columns", "grid_predictions",
                                               "show_grid_predictions", "grid_gates",
-                                              "show_grid_gates", "show_grid_gates"]
+                                              "show_grid_gates", "show_grid_gates",
+                                              "actual_totals", "grid_scores",
+                                              "show_grid_scores"]
 
 
 def test_step_18_run_with_the_grid_switched_off_does_nothing():
@@ -8997,9 +9029,12 @@ def test_show_grid_gates_is_a_module_level_function_with_four_parameters():
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
 
 
-def test_show_grid_gates_sits_right_before_step_15s_show_gates():
+def test_show_grid_gates_and_show_grid_scores_sit_right_before_step_15s_show_gates():
+    # U16.5 put show_grid_scores between them (the test was "show_grid_gates_sits_right_
+    # before_step_15s_show_gates" before).
     names = [node.name for node in script_functions()]
-    assert names[names.index("show_grid_gates") + 1] == "show_gates"
+    at = names.index("show_grid_gates")
+    assert names[at + 1:at + 3] == ["show_grid_scores", "show_gates"]
 
 
 def test_step_18_run_grid_gates_gets_the_predictions_candidates_and_settings():
@@ -9233,3 +9268,338 @@ def test_show_grid_gates_on_grid_gates_own_output(capsys):
                       "scored, as the settings to beat")
     assert first_tokens(two[2:]) == ["1", "2", "0", "3"]
     assert not any(line.startswith("        no other") for line in one + two)
+
+
+def test_show_grid_gates_prints_bad_elsewhere_and_does_not_count_it_as_a_gate(capsys):
+    # U16.5 (F2) gave both gate tables a "bad elsewhere" column; the printout shows it in the
+    # table and leaves it out of the gate counts (its name does not end in "gate").
+    from collection_estimation.hurdle.grid import grid_gates
+    from tests.hurdle.test_grid import gate_candidates, gate_example, gate_settings
+    gates = grid_gates(gate_example(poison_unlabelled=True), gate_candidates(), gate_settings())
+    one = printed_gates(capsys, "stage 1", gates.stage1, "log loss", True)
+    two = printed_gates(capsys, "stage 2", gates.stage2, "deviance skill", False)
+    # Candidate 1 is refused (bad elsewhere): only candidate 2 passes stage 1.
+    assert one[0] == ("        stage 1 gates: 1 of 4 candidates eligible; candidates failing "
+                      "each gate: {'log loss gate': 3, 'skill gate': 3, 'slope gate': 3}")
+    assert one[-5:] == gates_text(gates.stage1, "log loss", True)
+    assert two[-5:] == gates_text(gates.stage2, "deviance skill", False)
+    assert "elsewhere" in one[-5] and "elsewhere" in two[-5]
+
+
+# --- U16.5: step 18's scores (actual_totals at the grid's origins, grid_scores, then
+# show_grid_scores) ------------------------------------------------------------------------
+
+def test_step_18_grid_actual_is_actual_totals_at_the_grid_origins():
+    calls = calls_in(step_18_body(), "actual_totals")
+    assert len(calls) == 1 and calls[0].keywords == []
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "weekly", "weeks", "levels", "companies", "grid_origins", "settings.receivables.horizons"]
+
+
+def test_step_18_grid_actual_reads_what_step_17s_actual_reads_but_the_origins():
+    # The same cash, weeks, levels, companies and horizons as step 17's rolled_actual: the
+    # current combination can then be compared with step 17's model on the same weeks.
+    step_17 = calls_to(step_17_block(), "actual_totals")[0]
+    step_18 = calls_in(step_18_body(), "actual_totals")[0]
+    seventeen = [ast.unparse(a) for a in step_17.args]
+    eighteen = [ast.unparse(a) for a in step_18.args]
+    assert seventeen[4] == "origins" and eighteen[4] == "grid_origins"
+    assert seventeen[:4] + seventeen[5:] == eighteen[:4] + eighteen[5:]
+
+
+def test_step_18_grid_scores_gets_the_predictions_candidates_gates_actual_and_settings():
+    call = calls_in(step_18_body(), "grid_scores")[0]
+    assert [ast.unparse(a) for a in call.args] == ["predictions", "candidates", "gates",
+                                                   "grid_actual", "settings"]
+    assert keywords_of(call) == {"companies": "companies", "week_zero": "week_zero"}
+
+
+def test_step_18_grid_scores_week_zero_and_companies_are_step_17s():
+    call = calls_in(step_18_body(), "grid_scores")[0]
+    rolling = calls_to(with_model_if(), "rolling_forecasts")[0]
+    for name in ("companies", "week_zero"):
+        assert keywords_of(call)[name] == keywords_of(rolling)[name], name
+
+
+def test_step_18_show_grid_scores_gets_the_table_candidates_rolled_actual_and_horizons():
+    calls = calls_in(step_18_body(), "show_grid_scores")
+    assert len(calls) == 1 and calls[0].keywords == []
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "grid_table", "candidates", "rolled", "grid_actual", "settings.receivables.horizons"]
+
+
+def test_step_18_scores_come_right_after_the_gates_in_order_and_end_step_18():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    at = statements.index("show_grid_gates('stage 2', gates.stage2, 'deviance skill', "
+                          "ascending=False)")
+    assert statements[at + 1:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES]
+
+
+def test_step_18_scores_never_read_the_test_origins():
+    for node in step_18_body()[-3:]:
+        assert "test_origins" not in ast.unparse(node)
+
+
+def test_show_grid_scores_is_a_module_level_function_with_five_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_scores"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["table", "candidates", "rolled", "actual",
+                                                   "horizons"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+SHOW_SCORES_GLOBALS = {"CONSOLIDATED", "HURDLE", "POOLED", "STACK_COLUMNS", "evaluation_scores"}
+
+
+def test_show_grid_scores_reads_only_names_the_script_imports():
+    import builtins
+    function = [node for node in script_functions() if node.name == "show_grid_scores"][0]
+    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Load)}
+    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Store)}
+    params = {a.arg for a in function.args.args}
+    free = loaded - stored - params - set(dir(builtins))
+    assert free == SHOW_SCORES_GLOBALS
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
+                for a in node.names}
+    assert SHOW_SCORES_GLOBALS <= imported
+
+
+def test_step_18_run_reads_the_actual_cash_at_the_grid_origins():
+    calls, _ = run_step_18(validation_origins=(40, 37, 44))
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "actual_totals"]
+    assert found == [(("<weekly>", "<weeks>", "<levels>", "<companies>", [40, 37, 44], 5), {})]
+
+
+def test_step_18_run_grid_scores_gets_its_arguments():
+    calls, _ = run_step_18()
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_scores"]
+    assert len(found) == 1
+    (predictions, candidates, gates, actual, settings), kwargs = found[0]
+    assert predictions == "<predictions>" and candidates == "<candidates>"
+    assert (gates.stage1, gates.stage2) == ("<gates 1>", "<gates 2>")
+    assert actual == "<grid actual>" and settings.grid.run is True
+    assert kwargs == {"companies": "<companies>", "week_zero": "<week zero>"}
+
+
+@pytest.mark.parametrize("rolled", ["<rolled>", None])
+def test_step_18_run_shows_the_scores_beside_rolled(rolled):
+    calls, _ = run_step_18(rolled=rolled)
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_scores"]
+    assert shown == [(("<grid table>", "<candidates>", rolled, "<grid actual>", 5), {})]
+
+
+def test_step_18_run_gates_and_scores_are_the_same_objects_passed_on():
+    calls, _ = run_step_18()
+    by_name = {name: args for name, args, _ in calls}
+    gates_made = [args for name, args, _ in calls if name == "show_grid_gates"]
+    assert by_name["grid_scores"][2].stage1 == gates_made[0][1]
+    assert by_name["grid_scores"][2].stage2 == gates_made[1][1]
+
+
+def test_step_18_run_switched_off_scores_nothing():
+    calls, _ = run_step_18(run=False, ticks=())
+    assert not any(name in ("actual_totals", "grid_scores", "show_grid_scores")
+                   for name, _, _ in calls)
+
+
+# show_grid_scores, the function alone: compiled from the script with the names it reads
+# from the script's imports (evaluate's and forecast's own objects).
+
+def scores_printer():
+    from collection_estimation.hurdle import evaluate, forecast
+    found = [node for node in script_functions() if node.name == "show_grid_scores"]
+    assert len(found) == 1
+    namespace = {"CONSOLIDATED": forecast.CONSOLIDATED, "HURDLE": evaluate.HURDLE,
+                 "POOLED": evaluate.POOLED, "STACK_COLUMNS": evaluate.STACK_COLUMNS,
+                 "evaluation_scores": evaluate.evaluation_scores}
+    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_scores>", "exec"),
+         namespace)
+    return namespace["show_grid_scores"]
+
+
+def grid_score_table(lines=None):
+    """A grid_scores table (sorted by WAPE, index reset); the current settings are rank 2."""
+    import pandas as pd
+    from collection_estimation.hurdle.grid import GRID_SCORE_COLUMNS
+    lines = lines or [(1, 0, 1, False, 0.150004, 0.101234, -0.020001, 0.200049),
+                      (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
+                      (0, 1, 1, False, 0.170001, float("nan"), 0.0, 0.25)]
+    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+
+
+def score_candidates(n1=2, n2=3, n3=2):
+    return SimpleNamespace(stage1=["s1"] * n1, stage2=["s2"] * n2, topups=["t"] * n3)
+
+
+def score_actual():
+    """Origin 10, h 1 and 2, one company: TR02 and ALL each 100 then 200 TRY."""
+    import pandas as pd
+    from collection_estimation.hurdle.evaluate import ACTUAL_COLUMNS
+    rows = [(company, 10, h, 10 + h, actual, actual) for company in ("TR02", "ALL")
+            for h, actual in ((1, 100.0), (2, 200.0))]
+    return pd.DataFrame(rows, columns=ACTUAL_COLUMNS)
+
+
+def score_rolled(first=110.0, second=180.0):
+    """Step 17's totals: |110 - 100| + |180 - 200| = 30 over 300, WAPE 0.1."""
+    import pandas as pd
+    rows = [(company, 10, h, 10 + h, total, 99.0) for company in ("TR02", "ALL")
+            for h, total in ((1, first), (2, second))]
+    totals = pd.DataFrame(rows, columns=["company_code", "origin_week", "h", "target_week",
+                                         "total", "customers"])
+    return SimpleNamespace(totals=totals, customers="<not read>")
+
+
+def printed_scores(capsys, table, candidates, rolled, actual=None, horizons=2):
+    capsys.readouterr()
+    assert scores_printer()(table, candidates, rolled,
+                            score_actual() if actual is None else actual, horizons) is None
+    return capsys.readouterr().out.splitlines()
+
+
+SCORES_HEAD = ("        3 of 12 combinations scored (stage-1 and stage-2 candidates eligible "
+               "or current, every top-up); the 10 best by WAPE:")
+CURRENT_LINE = ("        current settings: rank 2 of 3, WAPE 0.1000, 5-week WAPE 0.1200, bias "
+                "+0.0310, company WAPE 0.2200")
+NOT_CHECKED = ("        current against step 17: not checked (step 17 did not forecast with "
+               "the model)")
+
+
+def table_text(table, rows=10):
+    return table.head(rows).round(4).to_string(index=False).splitlines()
+
+
+def test_show_grid_scores_exact_printout_when_rolled_is_none(capsys):
+    table = grid_score_table()
+    lines = printed_scores(capsys, table, score_candidates(), None)
+    assert lines == [SCORES_HEAD] + table_text(table) + [CURRENT_LINE, NOT_CHECKED]
+
+
+def test_show_grid_scores_exact_printout_when_the_current_equals_step_17(capsys):
+    table = grid_score_table()
+    lines = printed_scores(capsys, table, score_candidates(), score_rolled())
+    assert lines == [SCORES_HEAD] + table_text(table) + [
+        CURRENT_LINE,
+        "        current WAPE the same as step 17's model: yes (step 17 0.100000, grid "
+        "0.100000)"]
+
+
+def test_show_grid_scores_a_different_step_17_says_no(capsys):
+    lines = printed_scores(capsys, grid_score_table(), score_candidates(), score_rolled(first=130.0))
+    # |130 - 100| + |180 - 200| = 50 over 300.
+    assert lines[-1] == ("        current WAPE the same as step 17's model: NO (step 17 "
+                         "0.166667, grid 0.100000)")
+
+
+def test_show_grid_scores_compares_exactly_not_to_the_printed_digits(capsys):
+    # A difference far below the 6 printed decimals is still NO: the check is exact.
+    table = grid_score_table()
+    table.loc[1, "wape"] = 0.1 + 1e-12
+    lines = printed_scores(capsys, table, score_candidates(), score_rolled())
+    assert lines[-1] == ("        current WAPE the same as step 17's model: NO (step 17 "
+                         "0.100000, grid 0.100000)")
+
+
+def test_show_grid_scores_compares_the_consolidated_pooled_wape_only(capsys):
+    # A company-only error (TR02 h 1 off by 50, ALL right on its own) does not move the check:
+    # step 17's consolidated WAPE is scored on ALL's rows, as the grid's is.
+    totals = score_rolled().totals.copy()
+    totals.loc[(totals["company_code"] == "TR02") & (totals["h"] == 1), "total"] = 160.0
+    lines = printed_scores(capsys, grid_score_table(), score_candidates(),
+                           SimpleNamespace(totals=totals))
+    assert lines[-1].startswith("        current WAPE the same as step 17's model: yes")
+
+
+def test_show_grid_scores_reads_only_the_total_of_step_17(capsys):
+    rolled = score_rolled()
+    rolled.totals["customers"] = float("nan")     # every other column is not read
+    lines = printed_scores(capsys, grid_score_table(), score_candidates(), rolled)
+    assert lines[-1].startswith("        current WAPE the same as step 17's model: yes")
+
+
+def test_show_grid_scores_counts_every_combination_of_the_candidates(capsys):
+    lines = printed_scores(capsys, grid_score_table(), score_candidates(4, 5, 3), None)
+    assert lines[0] == ("        3 of 60 combinations scored (stage-1 and stage-2 candidates "
+                        "eligible or current, every top-up); the 10 best by WAPE:")
+
+
+def many_lines(n, current_at):
+    lines = [(i + 1, 0, 0, False, 0.1 + 0.01 * i, 0.1, 0.0, 0.2) for i in range(n)]
+    lines[current_at] = (0, 0, 0, True) + lines[current_at][4:]
+    return lines
+
+
+def test_show_grid_scores_shows_the_10_best_only(capsys):
+    table = grid_score_table(many_lines(14, current_at=12))
+    lines = printed_scores(capsys, table, score_candidates(5, 3, 1), None)
+    assert lines[1:12] == table_text(table)
+    assert len(table_text(table)) == 11            # the header and 10 rows
+    assert lines[12].startswith("        current settings: rank 13 of 14, WAPE 0.2200")
+    assert len(lines) == 14
+
+
+def test_show_grid_scores_rank_1_when_the_current_is_best(capsys):
+    table = grid_score_table(many_lines(4, current_at=0))
+    lines = printed_scores(capsys, table, score_candidates(2, 2, 1), None)
+    assert lines[-2].startswith("        current settings: rank 1 of 4, WAPE 0.1000")
+
+
+def test_show_grid_scores_a_lone_current_combination(capsys):
+    table = grid_score_table([(0, 0, 0, True, 0.25, 0.3, -0.05, 0.4)])
+    lines = printed_scores(capsys, table, score_candidates(1, 1, 1), None)
+    assert lines[0] == ("        1 of 1 combinations scored (stage-1 and stage-2 candidates "
+                        "eligible or current, every top-up); the 10 best by WAPE:")
+    assert lines[-2] == ("        current settings: rank 1 of 1, WAPE 0.2500, 5-week WAPE "
+                         "0.3000, bias -0.0500, company WAPE 0.4000")
+
+
+def test_show_grid_scores_a_missing_5_week_wape_prints_nan(capsys):
+    table = grid_score_table([(0, 0, 0, True, 0.25, float("nan"), 0.0, 0.4)])
+    lines = printed_scores(capsys, table, score_candidates(1, 1, 1), None)
+    assert lines[-2] == ("        current settings: rank 1 of 1, WAPE 0.2500, 5-week WAPE "
+                         "nan, bias +0.0000, company WAPE 0.4000")
+
+
+def test_show_grid_scores_rounds_the_table_to_four_decimals(capsys):
+    lines = printed_scores(capsys, grid_score_table(), score_candidates(), None)
+    body = "\n".join(lines[1:5])
+    assert "0.15" in body and "0.150004" not in body and "0.101234" not in body
+
+
+def test_show_grid_scores_rolled_missing_a_row_with_actual_cash_raises(capsys):
+    # Step 17's totals at another origin than the grid's: evaluation_scores refuses them.
+    rolled = score_rolled()
+    rolled.totals["origin_week"] = 11
+    rolled.totals["target_week"] = 11 + rolled.totals["h"]
+    with pytest.raises(ValueError, match="has no forecast for"):
+        scores_printer()(grid_score_table(), score_candidates(), rolled, score_actual(), 2)
+
+
+def test_show_grid_scores_changes_nothing(capsys):
+    import pandas as pd
+    table, rolled, actual = grid_score_table(), score_rolled(), score_actual()
+    before = (table.copy(), rolled.totals.copy(), actual.copy())
+    printed_scores(capsys, table, score_candidates(), rolled, actual)
+    pd.testing.assert_frame_equal(table, before[0])
+    pd.testing.assert_frame_equal(rolled.totals, before[1])
+    pd.testing.assert_frame_equal(actual, before[2])
+
+
+def test_show_grid_scores_on_grid_scores_own_output(capsys):
+    # test_grid.py's hand-made example: 3 x 3 x 2 combinations, all scored.
+    from tests.hurdle.test_grid import sc_candidates, sc_run
+    table = sc_run()
+    lines = printed_scores(capsys, table, sc_candidates(), None, horizons=5)
+    assert lines[0] == ("        18 of 18 combinations scored (stage-1 and stage-2 candidates "
+                        "eligible or current, every top-up); the 10 best by WAPE:")
+    assert lines[1].split()[:4] == ["stage1", "stage2", "topups", "current"]
+    rank = int(table.index[table["current"]][0]) + 1
+    current = table[table["current"]].iloc[0]
+    assert lines[-2] == (f"        current settings: rank {rank} of 18, WAPE "
+                         f"{current['wape']:.4f}, 5-week WAPE {current['total_wape']:.4f}, bias "
+                         f"{current['bias']:+.4f}, company WAPE {current['company_wape']:.4f}")
+    assert lines[-1] == NOT_CHECKED

@@ -9,6 +9,10 @@ U16.3, at the end: `ROW_COLUMNS`, `GridPredictions`, `setting_hash`, `cached_fit
 
 U16.4, at the very end: `GridGates`, `with_params` and `grid_gates`, mostly on hand-made
 `GridPredictions` (seeded random rows; nothing fitted), once on the U16.3 grid itself.
+
+U16.5, after that: `GRID_SCORE_COLUMNS`, `scored_numbers`, `combination_name` and
+`grid_scores`, on hand-made predictions checked against a computation by hand, then on the
+U16.3 grid against `rolling_forecasts` (the current combination must score as step 17's model).
 """
 import dataclasses
 import itertools
@@ -1729,9 +1733,12 @@ def gate_candidates(n1=4, n2=4):
     return GridCandidates(stage1=stage1, stage2=stage2, topups=["<topups 0>"])
 
 
-def gate_example(seed=5, poison_unlabelled=True):
+def gate_example(seed=5, poison_unlabelled=False):
     """GridPredictions as described above. With `poison_unlabelled`, the unlabelled rows carry
-    p and m that would break candidate 1 (p NaN, m -1) if they were judged."""
+    a broken p and m for candidate 1 (p NaN, m -1). Since the "bad elsewhere" rule (F2 of
+    U16.5) a p that is not a number in [0, 1] on a row the gates do not judge refuses the
+    candidate, so the worked example is clean by default (it was poisoned by default before,
+    when unlabelled rows were simply ignored)."""
     rng = np.random.default_rng(seed)
     frames, p_rows, m_rows = [], [], []
     start = 5000
@@ -1771,16 +1778,31 @@ def gate_example(seed=5, poison_unlabelled=True):
 
 
 def by_hand(predictions, s1_tol=0.1, s1_band=(0.8, 1.25), s2_tol=0.1, s2_band=(0.9, 1.1)):
-    """stage1_gates / stage2_gates called directly on the pooled labelled (and paid) rows."""
+    """stage1_gates / stage2_gates called directly on the pooled labelled (and paid) rows,
+    with the "bad elsewhere" rule: a candidate with a p outside [0, 1] or not finite (an m not
+    finite) on a row its stage does not judge is given NaN on every judged row, and the count
+    of such rows is put right after "bad p" ("bad m")."""
     rows = predictions.rows
     lab = rows[rows["label_status"] == "labelled"]
     paid = lab[lab["paid"] == 1]
-    g1 = stage1_gates(lab["paid"].astype(bool),
-                      [predictions.p.loc[lab.index, i] for i in predictions.p.columns],
-                      lab["base_rate"], s1_tol, s1_band)
-    g2 = stage2_gates(paid["amount_deflated"],
-                      [predictions.m.loc[paid.index, j] for j in predictions.m.columns],
-                      paid["training_mean"], s2_tol, s2_band)
+    other1 = rows.index.difference(lab.index)
+    other2 = rows.index.difference(paid.index)
+    p_values, p_bad, m_values, m_bad = [], [], [], []
+    for i in predictions.p.columns:
+        p = predictions.p.loc[other1, i].astype(float)
+        bad = int(((~np.isfinite(p)) | (p < 0) | (p > 1)).sum())
+        judged = predictions.p.loc[lab.index, i]
+        p_values.append(judged * np.nan if bad else judged)
+        p_bad.append(bad)
+    for j in predictions.m.columns:
+        bad = int((~np.isfinite(predictions.m.loc[other2, j].astype(float))).sum())
+        judged = predictions.m.loc[paid.index, j]
+        m_values.append(judged * np.nan if bad else judged)
+        m_bad.append(bad)
+    g1 = stage1_gates(lab["paid"].astype(bool), p_values, lab["base_rate"], s1_tol, s1_band)
+    g2 = stage2_gates(paid["amount_deflated"], m_values, paid["training_mean"], s2_tol, s2_band)
+    g1.insert(g1.columns.get_loc("bad p") + 1, "bad elsewhere", p_bad)
+    g2.insert(g2.columns.get_loc("bad m") + 1, "bad elsewhere", m_bad)
     return g1, g2
 
 
@@ -1946,11 +1968,13 @@ def test_grid_gates_tables_have_one_row_per_candidate_in_number_order(gate_resul
 def test_grid_gates_columns_are_number_params_then_the_gate_columns(gate_result):
     _, _, gates = gate_result
     assert list(gates.stage1.columns) == [
-        "stage1", "max_iter", "learning_rate", "bad p", "log loss", "log loss skill", "slope",
-        "log loss gate", "skill gate", "slope gate", "eligible"]
+        "stage1", "max_iter", "learning_rate", "bad p", "bad elsewhere", "log loss",
+        "log loss skill", "slope", "log loss gate", "skill gate", "slope gate", "eligible"]
     assert list(gates.stage2.columns) == [
-        "stage2", "loss", "max_iter", "bad m", "deviance skill", "total ratio", "m gate",
-        "skill gate", "ratio gate", "eligible"]
+        "stage2", "loss", "max_iter", "bad m", "bad elsewhere", "deviance skill", "total ratio",
+        "m gate", "skill gate", "ratio gate", "eligible"]
+    # The worked example is clean: nothing is broken outside the judged rows.
+    assert (gates.stage1["bad elsewhere"] == 0).all() and (gates.stage2["bad elsewhere"] == 0).all()
 
 
 def test_grid_gates_params_are_each_candidates_own(gate_result):
@@ -2099,14 +2123,110 @@ def test_grid_gates_unlabelled_rows_change_nothing(gate_result):
     pd.testing.assert_frame_equal(gates.stage2, alone.stage2)
 
 
-def test_grid_gates_a_broken_p_or_m_on_unlabelled_rows_is_not_counted(gate_result):
-    # Candidate 1's p is NaN and its m -1 on every unlabelled row; it is still eligible.
-    predictions, _, gates = gate_result
+def test_grid_gates_a_nan_p_on_unlabelled_rows_refuses_the_candidate():
+    # Reversed in U16.5 (F2): candidate 1's p is NaN on every unlabelled row (120 of them).
+    # It used to be eligible (unlabelled rows were not read); now it fails every gate, since
+    # grid_scores forecasts those rows too.
+    predictions = gate_example(poison_unlabelled=True)
     unlabelled = predictions.rows["label_status"] != "labelled"
     assert predictions.p.loc[unlabelled, 1].isna().all()
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage1
+    row = gates.loc[1]
+    assert row["bad elsewhere"] == 4 * GATE_UNLABELLED
+    assert not row["log loss gate"] and not row["skill gate"] and not row["slope gate"]
+    assert not row["eligible"]
+    # Judged as NaN on every labelled row: no score.
+    assert row["bad p"] == 2 * GATE_N and np.isnan(row["log loss"])
+    # The others: no row broken elsewhere.
+    assert (gates.drop(index=1)["bad elsewhere"] == 0).all()
+
+
+def test_grid_gates_a_negative_m_on_unlabelled_rows_is_not_bad_elsewhere():
+    # Stage 2's rule is "not finite" only: candidate 1's m of -1 on the unlabelled rows is not
+    # counted, and it stays eligible (as the U16.5 rule is written; see the report).
+    predictions = gate_example(poison_unlabelled=True)
+    unlabelled = predictions.rows["label_status"] != "labelled"
     assert (predictions.m.loc[unlabelled, 1] == -1).all()
-    assert gates.stage1.loc[1, "bad p"] == 0 and gates.stage1.loc[1, "eligible"]
-    assert gates.stage2.loc[1, "bad m"] == 0 and gates.stage2.loc[1, "eligible"]
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage2
+    assert gates.loc[1, "bad elsewhere"] == 0 and gates.loc[1, "bad m"] == 0
+    assert gates.loc[1, "eligible"]
+
+
+def test_grid_gates_a_poisoned_example_equals_the_rule_by_hand():
+    predictions = gate_example(poison_unlabelled=True)
+    candidates = gate_candidates()
+    gates = grid_gates(predictions, candidates, gate_settings())
+    g1, g2 = by_hand(predictions)
+    pd.testing.assert_frame_equal(gates.stage1, with_params(g1, candidates.stage1, "stage1"))
+    pd.testing.assert_frame_equal(gates.stage2, with_params(g2, candidates.stage2, "stage2"))
+    # Candidate 1, the best of stage 1, is refused: the best passes to candidate 2.
+    assert eligible(gates.stage1, "stage1") == [2]
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 1.5, -0.2])
+@pytest.mark.parametrize("status", [MISSING_WEEK, FUTURE])
+def test_grid_gates_one_bad_p_on_one_unlabelled_row_refuses_only_its_candidate(bad, status):
+    predictions, candidates = gate_example(), gate_candidates()
+    rows = predictions.rows
+    target = rows.index[rows["label_status"] == status][0]
+    predictions.p.loc[target, 3] = bad
+    gates = grid_gates(predictions, candidates, gate_settings()).stage1
+    assert gates.loc[3, "bad elsewhere"] == 1 and not gates.loc[3, "eligible"]
+    assert not gates.loc[3, ["log loss gate", "skill gate", "slope gate"]].any()
+    # Candidate 3 was not eligible anyway; the others are untouched.
+    clean = grid_gates(gate_example(), candidates, gate_settings()).stage1
+    pd.testing.assert_frame_equal(gates.drop(index=3), clean.drop(index=3))
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_grid_gates_a_p_of_exactly_0_or_1_on_an_unlabelled_row_is_not_bad_elsewhere(value):
+    predictions = gate_example()
+    unlabelled = predictions.rows.index[predictions.rows["label_status"] != "labelled"]
+    predictions.p.loc[unlabelled, 2] = value
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage1
+    assert gates.loc[2, "bad elsewhere"] == 0 and gates.loc[2, "eligible"]
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_grid_gates_a_non_finite_m_on_an_unlabelled_row_refuses_its_candidate(bad):
+    predictions = gate_example()
+    target = predictions.rows.index[predictions.rows["label_status"] == FUTURE][0]
+    predictions.m.loc[target, 2] = bad
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage2
+    assert gates.loc[2, "bad elsewhere"] == 1
+    assert not gates.loc[2, ["m gate", "skill gate", "ratio gate"]].any()
+    assert eligible(gates, "stage2") == [1]
+
+
+def test_grid_gates_a_broken_best_elsewhere_does_not_set_the_best():
+    # Candidate 1 is the best of both stages; broken on one future row in each stage, it is
+    # refused and candidate 2 becomes the best, as when it is broken on a judged row.
+    predictions = gate_example()
+    target = predictions.rows.index[predictions.rows["label_status"] == FUTURE][0]
+    predictions.p.loc[target, 1] = np.nan
+    predictions.m.loc[target, 1] = np.inf
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    assert eligible(gates.stage1, "stage1") == [2]
+    assert eligible(gates.stage2, "stage2") == [2]
+
+
+def test_grid_gates_the_current_broken_elsewhere_fails_its_gates_and_is_still_scored():
+    predictions = gate_example()
+    target = predictions.rows.index[predictions.rows["label_status"] == MISSING_WEEK][0]
+    predictions.p.loc[target, 0] = np.nan
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    assert gates.stage1.loc[0, "bad elsewhere"] == 1 and not gates.stage1.loc[0, "eligible"]
+    assert scored_numbers(gates.stage1, "stage1") == [0, 1, 2]
+
+
+def test_grid_gates_bad_p_counts_judged_rows_and_bad_elsewhere_the_others():
+    # One NaN on a labelled row and two on unlabelled rows of candidate 2.
+    predictions = gate_example()
+    rows = predictions.rows
+    predictions.p.loc[first_labelled(predictions), 2] = np.nan
+    predictions.p.loc[rows.index[rows["label_status"] != "labelled"][:2], 2] = np.nan
+    row = grid_gates(predictions, gate_candidates(), gate_settings()).stage1.loc[2]
+    assert row["bad elsewhere"] == 2 and not row["eligible"]
 
 
 @pytest.mark.parametrize("status", [MISSING_WEEK, FUTURE])
@@ -2211,14 +2331,36 @@ def test_grid_gates_a_broken_best_candidate_hands_the_best_to_the_next():
     assert eligible(gates.stage2, "stage2") == [2]
 
 
-def test_grid_gates_a_bad_m_on_a_labelled_unpaid_row_is_not_counted():
-    # Stage 2 is judged on the paid rows only: m on a row that did not pay is not read.
+def test_grid_gates_a_nan_m_on_a_labelled_unpaid_row_is_bad_elsewhere():
+    # Reversed in U16.5 (F2): stage 2 judges the paid rows only, so a NaN m on a labelled row
+    # that did not pay is "elsewhere"; it used to be ignored, now it refuses the candidate.
     predictions = gate_example()
     rows = predictions.rows
     unpaid = rows.index[(rows["label_status"] == "labelled") & (rows["paid"] == 0)]
     predictions.m.loc[unpaid, 2] = np.nan
     gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage2
-    assert gates.loc[2, "bad m"] == 0 and gates.loc[2, "eligible"]
+    assert gates.loc[2, "bad elsewhere"] == len(unpaid)
+    assert not gates.loc[2, "eligible"]
+    assert eligible(gates, "stage2") == [1]
+
+
+def test_grid_gates_a_zero_m_on_a_labelled_unpaid_row_is_not_bad():
+    # 0 is a finite m: neither "bad m" (not judged there) nor "bad elsewhere".
+    predictions = gate_example()
+    rows = predictions.rows
+    unpaid = rows.index[(rows["label_status"] == "labelled") & (rows["paid"] == 0)]
+    predictions.m.loc[unpaid, 2] = 0.0
+    gates = grid_gates(predictions, gate_candidates(), gate_settings()).stage2
+    assert gates.loc[2, "bad m"] == 0 and gates.loc[2, "bad elsewhere"] == 0
+    assert gates.loc[2, "eligible"]
+
+
+def test_grid_gates_a_p_broken_on_a_labelled_row_is_bad_p_not_bad_elsewhere():
+    # Stage 1 judges every labelled row, paid or not.
+    predictions = gate_example()
+    predictions.p.loc[first_labelled(predictions, paid=False), 2] = np.nan
+    row = grid_gates(predictions, gate_candidates(), gate_settings()).stage1.loc[2]
+    assert row["bad p"] == 1 and row["bad elsewhere"] == 0
 
 
 def test_grid_gates_every_candidate_broken_still_returns_tables():
@@ -2408,3 +2550,941 @@ def test_grid_gates_run_on_grid_predictions_output(g_result):
     # The U16.3 grid holds future rows (labels NaN); they were left out without trouble.
     assert (result.rows["label_status"] == "future").any()
     assert (gates.stage1["bad p"] == 0).all() and (gates.stage2["bad m"] == 0).all()
+
+
+# =============================================================================================
+# U16.5: `GRID_SCORE_COLUMNS`, `scored_numbers`, `combination_name` and `grid_scores`.
+#
+# Mostly on a hand-made `GridPredictions` (seeded, nothing fitted): companies TR02 and TR04,
+# origins 18 and 22, h 1..5, three customers per company; p and m columns per candidate; top-up
+# tables in `topup_forecasts`' shape. The actual cash is `actual_totals` on a seeded weekly
+# table. The gates are hand-made tables (`scored_numbers` reads only the number column and
+# "eligible"). The scores are checked against an independent computation by hand (sums, the
+# projected level, WAPE / bias formulas). At the end, on the U16.3 grid itself: combination
+# (0, 0, 0) scores exactly as `rolling_forecasts` with the same settings.
+# =============================================================================================
+
+from datetime import date  # noqa: E402
+
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    HORIZON_TOTAL, HURDLE, POOLED, STACK_COLUMNS, actual_totals, evaluation_scores,
+    rolling_forecasts)
+from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast_totals  # noqa: E402
+from collection_estimation.hurdle.grid import (  # noqa: E402
+    GRID_SCORE_COLUMNS, combination_name, grid_scores, scored_numbers)
+from collection_estimation.hurdle.prices import projected_levels  # noqa: E402
+from collection_estimation.hurdle.topups import TOPUP_COLUMNS  # noqa: E402
+from tests.hurdle.test_evaluate import make_weekly, make_weeks  # noqa: E402
+from tests.hurdle.test_forecast import WEEK_ZERO  # noqa: E402
+
+SC_COMPANIES = ["TR02", "TR04"]
+SC_ORIGINS = (18, 22)
+SC_H = 5
+SC_CUSTOMERS = 3        # per company
+
+
+def sc_settings(horizons=SC_H):
+    return SimpleNamespace(receivables=SimpleNamespace(horizons=horizons))
+
+
+def sc_topups(seed, origins=SC_ORIGINS, companies=SC_COMPANIES, horizons=SC_H):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for origin in origins:
+        for company in companies:
+            for h in range(1, horizons + 1):
+                new, refunds, unid = (rng.uniform(100, 400), -rng.uniform(10, 80),
+                                      rng.uniform(20, 120))
+                rows.append({"company_code": company, "origin_week": origin, "h": h,
+                             "target_week": origin + h, "new_customer_cash": new,
+                             "refunds": refunds, "unidentified_cash": unid,
+                             "topup": new + refunds + unid, "fallback": False})
+    return pd.DataFrame(rows, columns=TOPUP_COLUMNS)
+
+
+def sc_predictions(n1=3, n2=3, n3=2, seed=11, origins=SC_ORIGINS, index_offset=900):
+    """A hand-made GridPredictions; every candidate distinct, p in (0, 1), m above 0."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for origin in origins:
+        for number, company in enumerate(SC_COMPANIES):
+            for c in range(SC_CUSTOMERS):
+                for h in range(1, SC_H + 1):
+                    customer = f"C{number}{c}"
+                    rows.append({"key": f"{company}|{customer}", "company_code": company,
+                                 "customer_id": customer, "origin_week": origin, "h": h,
+                                 "target_week": origin + h, "label_status": "labelled",
+                                 "paid": 1.0, "amount_deflated": 500.0, "base_rate": 0.5,
+                                 "training_mean": 400.0})
+    frame = pd.DataFrame(rows, columns=ROW_COLUMNS)
+    # A shuffled index that is not a range, as the training table's.
+    frame.index = pd.Index(index_offset + rng.permutation(len(frame)))
+    n = len(frame)
+    p = pd.DataFrame({i: rng.uniform(0.05, 0.95, n) for i in range(n1)}, index=frame.index)
+    m = pd.DataFrame({j: rng.uniform(200, 2000, n) for j in range(n2)}, index=frame.index)
+    topups = [sc_topups(seed + 100 + k, origins=origins) for k in range(n3)]
+    return GridPredictions(rows=frame, p=p, m=m, topups=topups)
+
+
+def sc_candidates(n1=3, n2=3, n3=2):
+    return GridCandidates(stage1=[f"<s1 {i}>" for i in range(n1)],
+                          stage2=[f"<s2 {j}>" for j in range(n2)],
+                          topups=[f"<t {k}>" for k in range(n3)])
+
+
+def sc_gate(number_column, eligible):
+    return pd.DataFrame({number_column: list(range(len(eligible))), "eligible": list(eligible)})
+
+
+def sc_gates(eligible1=(True, True, True), eligible2=(True, True, True)):
+    return GridGates(stage1=sc_gate("stage1", eligible1), stage2=sc_gate("stage2", eligible2))
+
+
+def sc_actual(origins=SC_ORIGINS, missing=(), seed=3, horizons=SC_H, zero_company=None):
+    """`actual_totals` on seeded weekly cash; `zero_company` gets no cash at all (rows of 0)."""
+    rng = np.random.default_rng(seed)
+    lines = [(f"{company}|K", company, "K", week, rng.uniform(500, 6000), -rng.uniform(0, 100))
+             for company in SC_COMPANIES for week in range(0, 41)]
+    lines = [line for line in lines if line[1] != zero_company]
+    return actual_totals(make_weekly(lines), make_weeks(40, missing=missing), f_levels(),
+                         list(SC_COMPANIES), list(origins), horizons)
+
+
+def sc_run(predictions=None, candidates=None, gates=None, actual=None, settings=None,
+           companies=SC_COMPANIES, week_zero=WEEK_ZERO):
+    predictions = predictions if predictions is not None else sc_predictions()
+    return grid_scores(predictions, candidates or sc_candidates(), gates or sc_gates(),
+                       actual if actual is not None else sc_actual(), settings or sc_settings(),
+                       companies=list(companies), week_zero=week_zero)
+
+
+def sc_by_hand(predictions, i, j, k, actual, horizons=SC_H, week_zero=WEEK_ZERO):
+    """One combination's scores computed from scratch: no forecast_totals, no
+    evaluation_scores. Returns (wape, total_wape, bias, company_wape)."""
+    rows = predictions.rows
+    expected = predictions.p[i] * predictions.m[j]
+    topups = predictions.topups[k]
+    forecast_rows = []
+    for origin in sorted(set(rows["origin_week"])):
+        level = projected_levels(week_zero, origin, [origin + h for h in range(1, horizons + 1)])
+        for h in range(1, horizons + 1):
+            consolidated = 0.0
+            for company in SC_COMPANIES:
+                mine = (rows["origin_week"] == origin) & (rows["h"] == h) & (
+                    rows["company_code"] == company)
+                top = topups[(topups["origin_week"] == origin) & (topups["h"] == h)
+                             & (topups["company_code"] == company)].iloc[0]
+                real = (expected[mine].sum() + top["new_customer_cash"]
+                        + top["unidentified_cash"] + top["refunds"])
+                value = real * level[origin + h]
+                consolidated += value
+                forecast_rows.append((company, origin, h, value))
+            forecast_rows.append((CONSOLIDATED, origin, h, consolidated))
+    made = pd.DataFrame(forecast_rows, columns=["company_code", "origin_week", "h", "forecast"])
+    both = made.merge(actual[["company_code", "origin_week", "h", "actual"]],
+                      on=["company_code", "origin_week", "h"])
+
+    def wape(frame):
+        return float((frame["forecast"] - frame["actual"]).abs().sum() / frame["actual"].sum())
+
+    everything = both[both["company_code"] == CONSOLIDATED]
+    per_origin = everything.groupby("origin_week").agg(
+        weeks=("h", "size"), forecast=("forecast", "sum"), actual=("actual", "sum"))
+    complete = per_origin[per_origin["weeks"] == horizons]
+    total_wape = wape(complete) if not complete.empty else float("nan")
+    bias = float(everything["forecast"].sum() / everything["actual"].sum() - 1)
+    company_wape = float(np.mean([wape(both[both["company_code"] == c]) for c in SC_COMPANIES]))
+    return wape(everything), total_wape, bias, company_wape
+
+
+def sc_line(table, i, j, k):
+    found = table[(table["stage1"] == i) & (table["stage2"] == j) & (table["topups"] == k)]
+    assert len(found) == 1
+    return found.iloc[0]
+
+
+@pytest.fixture(scope="module")
+def sc_result():
+    predictions = sc_predictions()
+    actual = sc_actual()
+    return predictions, actual, sc_run(predictions=predictions, actual=actual)
+
+
+# --- the constants and the small helpers --------------------------------------------------
+
+def test_grid_score_columns_are_the_documented_list():
+    assert GRID_SCORE_COLUMNS == ["stage1", "stage2", "topups", "current", "wape", "total_wape",
+                                  "bias", "company_wape"]
+
+
+def test_combination_name_exact_format():
+    assert combination_name(0, 0, 0) == "stage1 0, stage2 0, top-ups 0"
+    assert combination_name(3, 12, 1) == "stage1 3, stage2 12, top-ups 1"
+
+
+def test_combination_names_of_different_combinations_differ():
+    names = {combination_name(i, j, k) for i, j, k in itertools.product(range(12), repeat=3)}
+    assert len(names) == 12 ** 3
+
+
+def test_scored_numbers_are_the_eligible_ones_plus_0_sorted():
+    gates = pd.DataFrame({"stage1": [0, 1, 2, 3, 4], "eligible": [False, True, False, True, True]})
+    assert scored_numbers(gates, "stage1") == [0, 1, 3, 4]
+
+
+def test_scored_numbers_an_eligible_current_is_listed_once():
+    gates = pd.DataFrame({"stage2": [0, 1, 2], "eligible": [True, False, True]})
+    assert scored_numbers(gates, "stage2") == [0, 2]
+
+
+def test_scored_numbers_nothing_eligible_gives_only_the_current():
+    gates = pd.DataFrame({"stage1": [0, 1, 2], "eligible": [False, False, False]})
+    assert scored_numbers(gates, "stage1") == [0]
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_scored_numbers_a_lone_current_is_scored_eligible_or_not(flag):
+    assert scored_numbers(pd.DataFrame({"stage1": [0], "eligible": [flag]}), "stage1") == [0]
+
+
+def test_scored_numbers_are_sorted_whatever_the_order_of_the_gate_table():
+    gates = pd.DataFrame({"stage1": [3, 0, 4, 1, 2],
+                          "eligible": [True, False, True, True, False]})
+    assert scored_numbers(gates, "stage1") == [0, 1, 3, 4]
+
+
+def test_scored_numbers_find_the_current_by_number_not_position():
+    # Candidate 0 is the last row, ineligible; the first row (candidate 2) is not current.
+    gates = pd.DataFrame({"stage1": [2, 1, 0], "eligible": [False, True, False]})
+    assert scored_numbers(gates, "stage1") == [0, 1]
+
+
+def test_scored_numbers_are_plain_ints():
+    gates = pd.DataFrame({"stage1": np.array([0, 1, 2], dtype=np.int64),
+                          "eligible": [False, True, True]})
+    found = scored_numbers(gates, "stage1")
+    assert found == [0, 1, 2] and all(type(n) is int for n in found)
+
+
+def test_scored_numbers_read_the_named_column_only():
+    gates = pd.DataFrame({"stage1": [5, 6, 7], "stage2": [0, 1, 2],
+                          "eligible": [False, True, False]})
+    assert scored_numbers(gates, "stage2") == [0, 1]
+    assert scored_numbers(gates, "stage1") == [6]
+
+
+def test_scored_numbers_do_not_change_the_gate_table():
+    gates = pd.DataFrame({"stage1": [2, 0, 1], "eligible": [True, False, True]})
+    before = gates.copy()
+    scored_numbers(gates, "stage1")
+    pd.testing.assert_frame_equal(gates, before)
+
+
+def test_scored_numbers_on_grid_gates_output(gate_result):
+    # The U16.4 worked example: eligible stage 1 {1, 2} and stage 2 {1, 2}; 0 fails both.
+    _, _, gates = gate_result
+    assert scored_numbers(gates.stage1, "stage1") == [0, 1, 2]
+    assert scored_numbers(gates.stage2, "stage2") == [0, 1, 2]
+
+
+# --- grid_scores: the table ---------------------------------------------------------------
+
+def test_grid_scores_columns_and_a_fresh_range_index(sc_result):
+    _, _, table = sc_result
+    assert list(table.columns) == GRID_SCORE_COLUMNS
+    assert table.index.equals(pd.RangeIndex(len(table)))
+
+
+def test_grid_scores_one_row_per_combination_of_every_candidate_when_all_eligible(sc_result):
+    _, _, table = sc_result
+    assert len(table) == 3 * 3 * 2
+    found = set(zip(table["stage1"], table["stage2"], table["topups"]))
+    assert found == set(itertools.product(range(3), range(3), range(2)))
+
+
+def test_grid_scores_only_the_current_combination_is_current(sc_result):
+    _, _, table = sc_result
+    current = table[table["current"]]
+    assert len(current) == 1
+    assert current[["stage1", "stage2", "topups"]].iloc[0].tolist() == [0, 0, 0]
+    assert table["current"].dtype == bool
+
+
+def test_grid_scores_number_columns_are_integers(sc_result):
+    _, _, table = sc_result
+    for column in ("stage1", "stage2", "topups"):
+        assert pd.api.types.is_integer_dtype(table[column]), column
+
+
+def test_grid_scores_sorted_by_wape_ascending(sc_result):
+    _, _, table = sc_result
+    assert table["wape"].is_monotonic_increasing
+    # The premise: the example's combinations really do score differently.
+    assert table["wape"].nunique() == len(table)
+
+
+def test_grid_scores_scores_are_finite_numbers(sc_result):
+    _, _, table = sc_result
+    for column in ("wape", "total_wape", "bias", "company_wape"):
+        assert np.isfinite(table[column].astype(float)).all(), column
+    assert (table["wape"] >= 0).all() and (table["company_wape"] >= 0).all()
+
+
+def test_grid_scores_every_combination_equals_the_computation_by_hand(sc_result):
+    predictions, actual, table = sc_result
+    for i, j, k in itertools.product(range(3), range(3), range(2)):
+        line = sc_line(table, i, j, k)
+        wape, total_wape, bias, company_wape = sc_by_hand(predictions, i, j, k, actual)
+        assert line["wape"] == pytest.approx(wape, rel=1e-12), (i, j, k)
+        assert line["total_wape"] == pytest.approx(total_wape, rel=1e-12), (i, j, k)
+        assert line["bias"] == pytest.approx(bias, rel=1e-9, abs=1e-12), (i, j, k)
+        assert line["company_wape"] == pytest.approx(company_wape, rel=1e-12), (i, j, k)
+
+
+def alone_scores(predictions, i, j, k, actual, method="alone"):
+    """One combination through forecast_totals and evaluation_scores on its own."""
+    rows = predictions.rows
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    customers = rows[keys].assign(expected=predictions.p[i] * predictions.m[j])
+    topups = predictions.topups[k]
+    parts = []
+    for origin in sorted(set(rows["origin_week"])):
+        projected = projected_levels(WEEK_ZERO, origin, [origin + h for h in range(1, SC_H + 1)])
+        totals = forecast_totals(customers[rows["origin_week"] == origin],
+                                 topups[topups["origin_week"] == origin], projected,
+                                 list(SC_COMPANIES), SC_H)
+        parts.append(totals[keys + ["total"]].rename(columns={"total": "forecast"}))
+    stacked = pd.concat(parts, ignore_index=True).assign(method=method)
+    return evaluation_scores(stacked[STACK_COLUMNS], actual, SC_H)
+
+
+def pooled(scores, company, column="wape", horizon=POOLED):
+    return scores.loc[(scores["company_code"] == company) & (scores["horizon"] == horizon),
+                      column].iloc[0]
+
+
+def test_grid_scores_each_combination_equals_scoring_it_alone_exactly(sc_result):
+    # Being scored beside the others changes nothing: the same numbers, to the last bit.
+    predictions, actual, table = sc_result
+    for i, j, k in [(0, 0, 0), (2, 1, 1), (1, 2, 0)]:
+        scores = alone_scores(predictions, i, j, k, actual)
+        line = sc_line(table, i, j, k)
+        assert line["wape"] == pooled(scores, CONSOLIDATED)
+        assert line["total_wape"] == pooled(scores, CONSOLIDATED, horizon=HORIZON_TOTAL)
+        assert line["bias"] == pooled(scores, CONSOLIDATED, "bias")
+        companies = [pooled(scores, c) for c in SC_COMPANIES]
+        assert line["company_wape"] == pytest.approx(np.mean(companies), rel=1e-15)
+
+
+def test_grid_scores_the_stage_candidates_and_topups_each_move_the_score(sc_result):
+    _, _, table = sc_result
+    base = sc_line(table, 0, 0, 0)["wape"]
+    assert sc_line(table, 1, 0, 0)["wape"] != base
+    assert sc_line(table, 0, 1, 0)["wape"] != base
+    assert sc_line(table, 0, 0, 1)["wape"] != base
+
+
+def test_grid_scores_company_wape_is_the_plain_mean_of_the_companies_pooled_wape(sc_result):
+    predictions, actual, table = sc_result
+    scores = alone_scores(predictions, 1, 1, 1, actual)
+    tr02, tr04 = pooled(scores, "TR02"), pooled(scores, "TR04")
+    line = sc_line(table, 1, 1, 1)
+    assert line["company_wape"] == pytest.approx((tr02 + tr04) / 2, rel=1e-15)
+    # Not the consolidated WAPE: errors of the companies do not cancel in it.
+    assert line["company_wape"] != line["wape"]
+
+
+def test_grid_scores_are_deterministic_and_change_no_input():
+    predictions, actual, gates = sc_predictions(), sc_actual(), sc_gates((True, False, True))
+    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
+              [t.copy() for t in predictions.topups], actual.copy(), gates.stage1.copy(),
+              gates.stage2.copy())
+    first = sc_run(predictions=predictions, actual=actual, gates=gates)
+    second = sc_run(predictions=predictions, actual=actual, gates=gates)
+    pd.testing.assert_frame_equal(first, second)
+    pd.testing.assert_frame_equal(predictions.rows, before[0])
+    pd.testing.assert_frame_equal(predictions.p, before[1])
+    pd.testing.assert_frame_equal(predictions.m, before[2])
+    for found, kept in zip(predictions.topups, before[3]):
+        pd.testing.assert_frame_equal(found, kept)
+    pd.testing.assert_frame_equal(actual, before[4])
+    pd.testing.assert_frame_equal(gates.stage1, before[5])
+    pd.testing.assert_frame_equal(gates.stage2, before[6])
+
+
+def test_grid_scores_the_row_order_of_the_predictions_does_not_matter(sc_result):
+    predictions, actual, table = sc_result
+    order = np.random.default_rng(1).permutation(len(predictions.rows))
+    shuffled = remade(predictions, rows=predictions.rows.iloc[order],
+                      p=predictions.p.iloc[order[::-1]], m=predictions.m.iloc[order])
+    found = sc_run(predictions=shuffled, actual=actual)
+    pd.testing.assert_frame_equal(found[GRID_SCORE_COLUMNS[:4]], table[GRID_SCORE_COLUMNS[:4]])
+    for column in ("wape", "total_wape", "bias", "company_wape"):
+        np.testing.assert_allclose(found[column], table[column], rtol=1e-12, atol=1e-15)
+
+
+# --- grid_scores: ties keep the candidates' order -------------------------------------------
+
+def identical_candidates(n1=2, n2=3, n3=2):
+    predictions = sc_predictions(n1=1, n2=1, n3=1)
+    p = pd.concat([predictions.p[0]] * n1, axis=1, keys=range(n1))
+    m = pd.concat([predictions.m[0]] * n2, axis=1, keys=range(n2))
+    return GridPredictions(rows=predictions.rows, p=p, m=m, topups=predictions.topups * n3)
+
+
+def test_grid_scores_ties_keep_the_order_of_the_candidates():
+    # Every candidate the same: every WAPE ties, so the table is the product order itself.
+    table = sc_run(predictions=identical_candidates(), candidates=sc_candidates(2, 3, 2),
+                   gates=sc_gates((True, True), (True, True, True)))
+    assert table["wape"].nunique() == 1
+    assert list(zip(table["stage1"], table["stage2"], table["topups"])) == list(
+        itertools.product(range(2), range(3), range(2)))
+    assert bool(table.loc[0, "current"]) is True
+
+
+def test_grid_scores_a_tie_with_the_current_settings_puts_the_current_first():
+    # Candidate 1 of stage 2 equals the current one: they tie and (0, 0, 0) stays first.
+    predictions = sc_predictions(n1=1, n2=2, n3=1)
+    m = predictions.m.copy()
+    m[1] = m[0]
+    table = sc_run(predictions=remade(predictions, m=m), candidates=sc_candidates(1, 2, 1),
+                   gates=sc_gates((True,), (True, True)))
+    assert table["wape"].iloc[0] == table["wape"].iloc[1]
+    assert table[["stage1", "stage2", "topups"]].values.tolist() == [[0, 0, 0], [0, 1, 0]]
+
+
+# --- grid_scores: which candidates are scored ----------------------------------------------
+
+def test_grid_scores_ineligible_candidates_other_than_the_current_are_not_scored(sc_result):
+    predictions, actual, table = sc_result
+    found = sc_run(predictions=predictions, actual=actual,
+                   gates=sc_gates((True, False, True), (True, True, False)))
+    assert set(found["stage1"]) == {0, 2} and set(found["stage2"]) == {0, 1}
+    assert len(found) == 2 * 2 * 2
+    # Each kept combination scores as in the full grid.
+    for _, line in found.iterrows():
+        full = sc_line(table, line["stage1"], line["stage2"], line["topups"])
+        assert line["wape"] == full["wape"] and line["bias"] == full["bias"]
+
+
+def test_grid_scores_an_ineligible_current_is_still_scored_with_the_eligible_others(sc_result):
+    predictions, actual, table = sc_result
+    found = sc_run(predictions=predictions, actual=actual,
+                   gates=sc_gates((False, True, False), (False, False, True)))
+    assert set(zip(found["stage1"], found["stage2"], found["topups"])) == set(
+        itertools.product([0, 1], [0, 2], [0, 1]))
+    assert found["current"].sum() == 1
+    current = found[found["current"]].iloc[0]
+    assert current["wape"] == sc_line(table, 0, 0, 0)["wape"]
+
+
+def test_grid_scores_nothing_eligible_scores_the_current_with_every_topup(sc_result):
+    predictions, actual, _ = sc_result
+    found = sc_run(predictions=predictions, actual=actual,
+                   gates=sc_gates((False,) * 3, (False,) * 3))
+    assert sorted(zip(found["stage1"], found["stage2"], found["topups"])) == [(0, 0, 0),
+                                                                                (0, 0, 1)]
+
+
+@pytest.mark.parametrize("n3", [1, 2, 4])
+def test_grid_scores_every_topup_candidate_is_scored(n3):
+    predictions = sc_predictions(n1=2, n2=1, n3=n3)
+    table = sc_run(predictions=predictions, candidates=sc_candidates(2, 1, n3),
+                   gates=sc_gates((False, False), (False,)))
+    # Top-ups have no gate: all of them, beside the current stage settings only.
+    assert sorted(table["topups"]) == list(range(n3))
+    assert set(table["stage1"]) == {0} and set(table["stage2"]) == {0}
+
+
+def test_grid_scores_combinations_are_the_product_of_the_scored_numbers(sc_result):
+    predictions, actual, _ = sc_result
+    gates = sc_gates((True, False, True), (False, True, True))
+    found = sc_run(predictions=predictions, actual=actual, gates=gates)
+    expected = set(itertools.product(scored_numbers(gates.stage1, "stage1"),
+                                     scored_numbers(gates.stage2, "stage2"), range(2)))
+    assert set(zip(found["stage1"], found["stage2"], found["topups"])) == expected
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_grid_scores_a_broken_ineligible_p_is_never_touched(sc_result, bad):
+    predictions, actual, _ = sc_result
+    p = predictions.p.copy()
+    p[1] = bad
+    found = sc_run(predictions=remade(predictions, p=p), actual=actual,
+                   gates=sc_gates((True, False, True)))
+    assert 1 not in set(found["stage1"])
+    assert np.isfinite(found["wape"]).all()
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -1.0])
+def test_grid_scores_a_broken_ineligible_m_is_never_touched(sc_result, bad):
+    predictions, actual, _ = sc_result
+    m = predictions.m.copy()
+    m[2] = bad
+    found = sc_run(predictions=remade(predictions, m=m), actual=actual,
+                   gates=sc_gates(eligible2=(True, True, False)))
+    assert 2 not in set(found["stage2"])
+    assert np.isfinite(found["wape"]).all()
+
+
+# --- grid_scores: the inputs it reads -------------------------------------------------------
+
+def test_grid_scores_project_the_levels_once_per_origin(sc_result, monkeypatch):
+    predictions, actual, _ = sc_result
+    calls = []
+
+    def spy(week_zero, origin, targets, *args, **kwargs):
+        calls.append((week_zero, origin, list(targets), args, kwargs))
+        return projected_levels(week_zero, origin, targets, *args, **kwargs)
+
+    monkeypatch.setattr(grid_module, "projected_levels", spy)
+    sc_run(predictions=predictions, actual=actual)
+    assert calls == [(WEEK_ZERO, 18, [19, 20, 21, 22, 23], (), {}),
+                     (WEEK_ZERO, 22, [23, 24, 25, 26, 27], (), {})]
+
+
+def test_grid_scores_another_week_zero_changes_the_nominal_scores(sc_result):
+    predictions, actual, table = sc_result
+    later = sc_run(predictions=predictions, actual=actual, week_zero=date(2025, 1, 6))
+    merged = table.merge(later, on=["stage1", "stage2", "topups"], suffixes=("", "_later"))
+    assert (merged["wape"] != merged["wape_later"]).all()
+
+
+def test_grid_scores_a_week_zero_not_a_monday_raises_as_projected_levels_does(sc_result):
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError, match="not a Monday"):
+        sc_run(predictions=predictions, actual=actual, week_zero=date(2025, 6, 3))
+
+
+def test_grid_scores_each_topup_candidate_reads_its_own_table_at_its_own_origin(sc_result):
+    # Change top-up candidate 1 at origin 22 only: only k = 1 rows move.
+    predictions, actual, table = sc_result
+    changed = predictions.topups[1].copy()
+    changed.loc[changed["origin_week"] == 22, "new_customer_cash"] += 5000.0
+    found = sc_run(predictions=remade(predictions, topups=[predictions.topups[0], changed]),
+                   actual=actual)
+    merged = table.merge(found, on=["stage1", "stage2", "topups"], suffixes=("", "_new"))
+    k0, k1 = merged[merged["topups"] == 0], merged[merged["topups"] == 1]
+    assert (k0["wape"] == k0["wape_new"]).all()
+    assert (k1["wape"] != k1["wape_new"]).all()
+
+
+def test_grid_scores_the_topup_column_topup_is_not_what_is_added(sc_result):
+    # forecast_totals adds new_customer_cash, unidentified_cash and refunds; the `topup`
+    # column is not read.
+    predictions, actual, table = sc_result
+    topups = [t.assign(topup=t["topup"] * 99.0) for t in predictions.topups]
+    found = sc_run(predictions=remade(predictions, topups=topups), actual=actual)
+    pd.testing.assert_frame_equal(found, table)
+
+
+def test_grid_scores_the_label_columns_of_the_rows_are_not_read(sc_result):
+    predictions, actual, table = sc_result
+    rows = predictions.rows.assign(paid=np.nan, amount_deflated=np.nan, label_status="future",
+                                   base_rate=np.nan, training_mean=np.nan)
+    found = sc_run(predictions=remade(predictions, rows=rows), actual=actual)
+    pd.testing.assert_frame_equal(found, table)
+
+
+def test_grid_scores_the_origins_come_from_the_rows():
+    # A grid at origin 18 alone, scored on the actual cash at 18.
+    predictions = sc_predictions(origins=(18,))
+    actual = sc_actual(origins=(18,))
+    table = sc_run(predictions=predictions, actual=actual)
+    wape, _, _, _ = sc_by_hand(predictions, 0, 0, 0, actual)
+    assert sc_line(table, 0, 0, 0)["wape"] == pytest.approx(wape, rel=1e-12)
+
+
+def test_grid_scores_total_wape_is_nan_when_no_origin_has_all_its_weeks():
+    # Week 23 has no data: origin 18 lacks h 5, origin 22 lacks h 1; no 5-week total.
+    predictions = sc_predictions()
+    actual = sc_actual(missing=(23,))
+    assert not (actual["target_week"] == 23).any()
+    table = sc_run(predictions=predictions, actual=actual)
+    assert table["total_wape"].isna().all()
+    assert np.isfinite(table["wape"]).all() and np.isfinite(table["bias"]).all()
+    wape, total_wape, _, _ = sc_by_hand(predictions, 0, 0, 0, actual)
+    assert np.isnan(total_wape)
+    assert sc_line(table, 0, 0, 0)["wape"] == pytest.approx(wape, rel=1e-12)
+
+
+def test_grid_scores_total_wape_uses_only_the_complete_origins():
+    # Week 27 missing: origin 22 lacks h 5, origin 18 is whole; the total is origin 18's alone.
+    predictions = sc_predictions()
+    actual = sc_actual(missing=(27,))
+    table = sc_run(predictions=predictions, actual=actual)
+    _, total_wape, _, _ = sc_by_hand(predictions, 0, 0, 0, actual)
+    assert np.isfinite(total_wape)
+    assert sc_line(table, 0, 0, 0)["total_wape"] == pytest.approx(total_wape, rel=1e-12)
+
+
+# --- grid_scores: refused -------------------------------------------------------------------
+
+@pytest.mark.parametrize("stage, eligible1, eligible2, found", [
+    ("stage-1", (True, True), (True, True, True), 2),
+    ("stage-1", (True,) * 4, (True, True, True), 4),
+    ("stage-2", (True, True, True), (True,), 1),
+    ("stage-2", (True, True, True), (True,) * 5, 5),
+])
+def test_grid_scores_a_gate_table_of_the_wrong_length_raises(sc_result, stage, eligible1,
+                                                             eligible2, found):
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=predictions, actual=actual, gates=sc_gates(eligible1, eligible2))
+    assert str(error.value) == f"there are {found} {stage} gates for 3 candidates"
+
+
+@pytest.mark.parametrize("n3", [1, 3])
+def test_grid_scores_a_topup_list_of_the_wrong_length_raises(sc_result, n3):
+    # The candidates list n3 top-ups, the predictions hold 2 top-up forecasts.
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=predictions, actual=actual, candidates=sc_candidates(3, 3, n3))
+    assert str(error.value) == f"there are 2 top-up forecasts for {n3} candidates"
+
+
+def test_grid_scores_the_stage_1_count_is_checked_first(sc_result):
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=predictions, actual=actual, candidates=sc_candidates(2, 2, 5))
+    assert str(error.value) == "there are 3 stage-1 gates for 2 candidates"
+
+
+def test_grid_scores_count_checks_in_their_order(sc_result):
+    # stage-1 gates, stage-1 p columns, stage-2 gates, stage-2 m columns, top-up forecasts:
+    # with every later one also wrong, each check in turn is the one that speaks.
+    predictions, actual, _ = sc_result
+    p2 = predictions.p.drop(columns=[2])
+    m2 = predictions.m.drop(columns=[2])
+    bad_all = remade(predictions, p=p2, m=m2, topups=predictions.topups[:1])
+    cases = [
+        (sc_gates((True,) * 2, (True,) * 2), "there are 2 stage-1 gates for 3 candidates"),
+        (sc_gates((True,) * 3, (True,) * 2), "there are 2 stage-1 p columns for 3 candidates"),
+    ]
+    for gates, message in cases:
+        with pytest.raises(ValueError) as error:
+            sc_run(predictions=bad_all, actual=actual, gates=gates)
+        assert str(error.value) == message
+    later = [
+        (remade(predictions, m=m2, topups=predictions.topups[:1]), sc_gates(eligible2=(True,) * 2),
+         "there are 2 stage-2 gates for 3 candidates"),
+        (remade(predictions, m=m2, topups=predictions.topups[:1]), sc_gates(),
+         "there are 2 stage-2 m columns for 3 candidates"),
+        (remade(predictions, topups=predictions.topups[:1]), sc_gates(),
+         "there are 1 top-up forecasts for 2 candidates"),
+    ]
+    for found, gates, message in later:
+        with pytest.raises(ValueError) as error:
+            sc_run(predictions=found, actual=actual, gates=gates)
+        assert str(error.value) == message
+
+
+def test_grid_scores_the_counts_are_checked_before_anything_is_forecast(sc_result, monkeypatch):
+    predictions, actual, _ = sc_result
+
+    def never(*args, **kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(grid_module, "forecast_totals", never)
+    monkeypatch.setattr(grid_module, "projected_levels", never)
+    with pytest.raises(ValueError, match="top-up forecasts"):
+        sc_run(predictions=predictions, actual=actual, candidates=sc_candidates(3, 3, 1))
+    with pytest.raises(ValueError, match="stage-1 p columns"):
+        sc_run(predictions=remade(predictions, p=predictions.p.drop(columns=[1])), actual=actual)
+
+
+@pytest.mark.parametrize("part", ["p", "m"])
+def test_grid_scores_a_nan_p_or_m_of_the_current_settings_raises(sc_result, part):
+    predictions, actual, _ = sc_result
+    broken = getattr(predictions, part).copy()
+    broken.iloc[4, 0] = np.nan
+    with pytest.raises(ValueError, match="the customers have no expected in 1 rows"):
+        sc_run(predictions=remade(predictions, **{part: broken}), actual=actual,
+               gates=sc_gates((False,) * 3, (False,) * 3))
+
+
+def test_grid_scores_an_infinite_m_of_the_current_settings_raises(sc_result):
+    predictions, actual, _ = sc_result
+    m = predictions.m.copy()
+    m.iloc[0, 0] = np.inf
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        sc_run(predictions=remade(predictions, m=m), actual=actual)
+
+
+def test_grid_scores_a_nan_p_of_an_eligible_candidate_raises(sc_result):
+    # Eligible means scored: a broken eligible candidate is not skipped silently.
+    predictions, actual, _ = sc_result
+    p = predictions.p.copy()
+    p.iloc[7, 2] = np.nan
+    with pytest.raises(ValueError, match="no expected"):
+        sc_run(predictions=remade(predictions, p=p), actual=actual)
+
+
+def gated_scores(predictions):
+    """grid_gates then grid_scores on a U16.4 example (one company TR02, zero top-ups)."""
+    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    topups = pd.DataFrame([{"company_code": "TR02", "origin_week": origin, "h": h,
+                            "target_week": origin + h, "new_customer_cash": 0.0,
+                            "refunds": 0.0, "unidentified_cash": 0.0, "topup": 0.0,
+                            "fallback": False}
+                           for origin in GATE_ORIGINS for h in range(1, 6)],
+                          columns=TOPUP_COLUMNS)
+    candidates = GridCandidates(stage1=gate_candidates().stage1,
+                                stage2=gate_candidates().stage2, topups=["<t>"])
+    lines = [("TR02|K", "TR02", "K", week, 1e7, 0.0) for week in range(0, 50)]
+    actual = actual_totals(make_weekly(lines), make_weeks(49), f_levels(), ["TR02"],
+                           list(GATE_ORIGINS), 5)
+    return gates, grid_scores(remade(predictions, topups=[topups]), candidates, gates, actual,
+                              sc_settings(), companies=["TR02"], week_zero=WEEK_ZERO)
+
+
+def test_grid_scores_a_candidate_broken_only_on_unlabelled_rows_is_refused_not_fatal():
+    # F2 of U16.5: candidate 1's p is NaN on the unlabelled rows only. grid_gates now refuses
+    # it ("bad elsewhere"), so grid_scores never forecasts with it and scores the others.
+    predictions = gate_example(poison_unlabelled=True)
+    gates, table = gated_scores(predictions)
+    assert gates.stage1.loc[1, "bad elsewhere"] > 0
+    assert 1 not in scored_numbers(gates.stage1, "stage1")
+    assert set(table["stage1"]) == {0, 2}
+    assert np.isfinite(table["wape"]).all()
+
+
+def test_grid_scores_the_current_broken_on_unlabelled_rows_fails_its_gates_and_still_raises():
+    # Candidate 0 is scored even when it fails its gates, so a NaN p of the current settings
+    # on an unlabelled row reaches forecast_totals, which refuses it.
+    predictions = gate_example()
+    target = predictions.rows.index[predictions.rows["label_status"] == FUTURE][0]
+    predictions.p.loc[target, 0] = np.nan
+    with pytest.raises(ValueError, match="the customers have no expected in 1 rows"):
+        gated_scores(predictions)
+
+
+def test_grid_scores_on_the_clean_gate_example_scores_the_eligible_and_the_current():
+    _, table = gated_scores(gate_example())
+    assert set(zip(table["stage1"], table["stage2"])) == set(
+        itertools.product([0, 1, 2], [0, 1, 2]))
+    assert table["current"].sum() == 1
+
+
+@pytest.mark.parametrize("origins", [(18, 22, 26), (18,), (22, 26), (17, 18, 22)])
+def test_grid_scores_actual_for_other_origins_than_the_predictions_raises(sc_result, origins):
+    # F4 of U16.5: fewer or more origins are refused, with the two lists in the message.
+    predictions, _, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=predictions, actual=sc_actual(origins=origins))
+    assert str(error.value) == (f"the actual cash is for origins {sorted(origins)}, the "
+                                f"predictions for [18, 22]")
+
+
+def test_grid_scores_the_origin_check_comes_before_any_forecast(sc_result, monkeypatch):
+    predictions, _, _ = sc_result
+
+    def never(*args, **kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(grid_module, "forecast_totals", never)
+    monkeypatch.setattr(grid_module, "projected_levels", never)
+    with pytest.raises(ValueError, match="the actual cash is for origins"):
+        sc_run(predictions=predictions, actual=sc_actual(origins=(18,)))
+
+
+def test_grid_scores_the_counts_are_checked_before_the_origins(sc_result):
+    predictions, _, _ = sc_result
+    with pytest.raises(ValueError, match="top-up forecasts"):
+        sc_run(predictions=predictions, actual=sc_actual(origins=(18,)),
+               candidates=sc_candidates(3, 3, 1))
+
+
+def test_grid_scores_actual_origins_compare_as_numbers_not_types(sc_result):
+    # numpy integer origins in `actual` are the same origins.
+    predictions, actual, table = sc_result
+    found = sc_run(predictions=predictions,
+                   actual=actual.assign(origin_week=actual["origin_week"].astype("int32")))
+    pd.testing.assert_frame_equal(found, table)
+
+
+def test_grid_scores_company_wape_leaves_out_a_company_with_no_cash():
+    # F3 of U16.5, documented as intended: TR04 has no cash at the grid's origins (its WAPE is
+    # a share of nothing, NaN); company_wape is TR02's alone, not NaN and not halved.
+    predictions = sc_predictions()
+    actual = sc_actual(zero_company="TR04")
+    tr04 = actual[actual["company_code"] == "TR04"]
+    assert len(tr04) > 0 and (tr04["actual"] == 0).all()
+    table = sc_run(predictions=predictions, actual=actual)
+    scores = alone_scores(predictions, 0, 0, 0, actual)
+    assert np.isnan(pooled(scores, "TR04"))
+    current = table[table["current"]].iloc[0]
+    assert current["company_wape"] == pooled(scores, "TR02")
+    assert np.isfinite(table["company_wape"]).all()
+
+
+def test_grid_scores_empty_actual_raises_as_actual_for_no_origin():
+    # Since F4, an empty actual is refused by the origin check first.
+    with pytest.raises(ValueError) as error:
+        sc_run(actual=sc_actual().iloc[0:0])
+    assert str(error.value) == ("the actual cash is for origins [], the predictions for "
+                                "[18, 22]")
+
+
+def test_grid_scores_actual_without_consolidated_rows_raises():
+    # Company rows only, at the right origins: past the origin check, nothing to score on.
+    actual = sc_actual()
+    actual = actual[actual["company_code"] != CONSOLIDATED]
+    assert sorted(set(actual["origin_week"])) == [18, 22]
+    with pytest.raises(ValueError) as error:
+        sc_run(actual=actual)
+    assert str(error.value) == "there is no consolidated cash at the grid's origins to score on"
+
+
+def test_grid_scores_a_company_missing_from_the_rows_raises_as_forecast_totals_does():
+    # The company list names TR05, which has no customers nor top-ups: never a silent zero.
+    with pytest.raises(ValueError, match="have no rows for"):
+        sc_run(companies=["TR02", "TR04", "TR05"])
+
+
+def test_grid_scores_a_company_list_without_a_company_of_the_rows_raises():
+    with pytest.raises(ValueError, match="not in the company list"):
+        sc_run(companies=["TR02"])
+
+
+def test_grid_scores_horizons_other_than_the_rows_raise():
+    with pytest.raises(ValueError):
+        sc_run(settings=sc_settings(horizons=4))
+
+
+def test_grid_scores_a_topup_table_missing_an_origin_raises(sc_result):
+    predictions, actual, _ = sc_result
+    short = predictions.topups[1][predictions.topups[1]["origin_week"] == 18]
+    with pytest.raises(ValueError):
+        sc_run(predictions=remade(predictions, topups=[predictions.topups[0], short]),
+               actual=actual)
+
+
+# --- grid_scores: the docstring's promise on the sizes of `predictions` --------------------
+
+P_COLUMNS_MESSAGE = "there are 2 stage-1 p columns for 3 candidates"
+
+
+def test_grid_scores_p_lacking_an_eligible_candidates_column_raises_value_error(sc_result):
+    # The docstring: "Raises ValueError if `gates` or `predictions` do not have one entry per
+    # candidate". The gates are the right size; p lacks the column of candidate 2 (F1: this
+    # was a raw KeyError before).
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=remade(predictions, p=predictions.p.drop(columns=[2])),
+               actual=actual)
+    assert str(error.value) == P_COLUMNS_MESSAGE
+
+
+def test_grid_scores_p_lacking_an_ineligible_candidates_column_raises_value_error(sc_result):
+    # F1: was silent before (the column of an ineligible candidate is never read).
+    predictions, actual, _ = sc_result
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=remade(predictions, p=predictions.p.drop(columns=[2])),
+               actual=actual, gates=sc_gates((True, True, False)))
+    assert str(error.value) == P_COLUMNS_MESSAGE
+
+
+def test_grid_scores_m_with_more_columns_than_candidates_raises_value_error(sc_result):
+    predictions, actual, _ = sc_result
+    m = predictions.m.copy()
+    m[3] = m[0]
+    with pytest.raises(ValueError) as error:
+        sc_run(predictions=remade(predictions, m=m), actual=actual)
+    assert str(error.value) == "there are 4 stage-2 m columns for 3 candidates"
+
+
+# --- grid_scores on the U16.3 grid itself: the current combination is step 17's model --------
+
+def g_actual(origins=G_ORIGINS):
+    rng = np.random.default_rng(8)
+    lines = [(f"{company}|K", company, "K", week, rng.uniform(2000, 20000), -rng.uniform(0, 300))
+             for company in F_COMPANIES for week in range(0, 41)]
+    return actual_totals(make_weekly(lines), make_weeks(40), f_levels(), list(F_COMPANIES),
+                         list(origins), 5)
+
+
+def g_gates(candidates, eligible1=None, eligible2=None):
+    n1, n2 = len(candidates.stage1), len(candidates.stage2)
+    return GridGates(stage1=sc_gate("stage1", eligible1 or (True,) * n1),
+                     stage2=sc_gate("stage2", eligible2 or (True,) * n2))
+
+
+@pytest.fixture(scope="module")
+def g_scores(g_result):
+    result, _ = g_result
+    settings = g_settings()
+    candidates = g_candidates(settings)
+    actual = g_actual()
+    table = grid_scores(result, candidates, g_gates(candidates), actual, settings,
+                        companies=list(F_COMPANIES), week_zero=WEEK_ZERO)
+    return result, candidates, settings, actual, table
+
+
+@pytest.fixture(scope="module")
+def g_rolled(g_table):
+    return rolling_forecasts(g_table, G_ORIGINS, g_settings(), week_zero=WEEK_ZERO,
+                             **g_inputs())
+
+
+def hurdle_scores(rolled, actual):
+    """rolling_forecasts' totals scored as step 17 (and show_grid_scores) score them."""
+    hurdle = rolled.totals[["company_code", "origin_week", "h", "target_week", "total"]]
+    hurdle = hurdle.rename(columns={"total": "forecast"}).assign(method=HURDLE)
+    return evaluation_scores(hurdle[STACK_COLUMNS], actual, 5)
+
+
+def test_grid_scores_on_the_u16_3_grid_has_every_combination(g_scores):
+    _, _, _, _, table = g_scores
+    assert set(zip(table["stage1"], table["stage2"], table["topups"])) == set(
+        itertools.product(range(2), range(2), range(2)))
+
+
+def test_grid_scores_current_combination_equals_step_17s_rolling_forecasts_exactly(g_scores,
+                                                                                     g_rolled):
+    # The check the pipeline prints: (0, 0, 0) scored as step 17 scores rolling_forecasts.
+    _, _, _, actual, table = g_scores
+    scores = hurdle_scores(g_rolled, actual)
+    current = table[table["current"]].iloc[0]
+    assert current["wape"] == pooled(scores, CONSOLIDATED)
+    assert current["bias"] == pooled(scores, CONSOLIDATED, "bias")
+    assert current["total_wape"] == pooled(scores, CONSOLIDATED, horizon=HORIZON_TOTAL)
+    assert current["company_wape"] == pytest.approx(
+        np.mean([pooled(scores, c) for c in F_COMPANIES]), rel=1e-15)
+
+
+def test_grid_scores_current_combination_totals_equal_rolling_forecasts_totals(g_scores,
+                                                                                g_rolled):
+    # Under the scores: the forecast of (0, 0, 0) is rolling_forecasts' total, row by row.
+    result, _, _, _, _ = g_scores
+    rows = result.rows
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    customers = rows[keys].assign(expected=result.p[0] * result.m[0])
+    parts = []
+    for origin in G_ORIGINS:
+        projected = projected_levels(WEEK_ZERO, origin, [origin + h for h in range(1, 6)])
+        parts.append(forecast_totals(customers[rows["origin_week"] == origin],
+                                     result.topups[0][result.topups[0]["origin_week"] == origin],
+                                     projected, list(F_COMPANIES), 5))
+    mine = pd.concat(parts, ignore_index=True)
+    pd.testing.assert_series_equal(mine["total"], g_rolled.totals["total"])
+
+
+def test_grid_scores_another_combination_is_not_step_17s(g_scores, g_rolled):
+    _, _, _, actual, table = g_scores
+    step17 = pooled(hurdle_scores(g_rolled, actual), CONSOLIDATED)
+    assert (table.loc[~table["current"], "wape"] != step17).all()
+
+
+def test_grid_scores_on_the_u16_3_grid_ineligible_gates_drop_only_the_others(g_scores):
+    result, candidates, settings, actual, table = g_scores
+    found = grid_scores(result, candidates, g_gates(candidates, (False, True), (False, True)),
+                        actual, settings, companies=list(F_COMPANIES), week_zero=WEEK_ZERO)
+    pd.testing.assert_frame_equal(found, table)
+    only_current = grid_scores(result, candidates,
+                               g_gates(candidates, (False, False), (False, False)), actual,
+                               settings, companies=list(F_COMPANIES), week_zero=WEEK_ZERO)
+    assert sorted(zip(only_current["stage1"], only_current["stage2"],
+                      only_current["topups"])) == [(0, 0, 0), (0, 0, 1)]
+    current = only_current[only_current["current"]].iloc[0]
+    assert current["wape"] == table[table["current"]].iloc[0]["wape"]
