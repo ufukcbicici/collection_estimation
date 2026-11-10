@@ -106,6 +106,7 @@ from collection_estimation.hurdle.benchmark import (  # noqa: E402
 )
 from collection_estimation.hurdle.grid import (  # noqa: E402
     grid_candidates,
+    grid_choice,
     grid_gates,
     grid_predictions,
     grid_scores,
@@ -693,7 +694,9 @@ def main():
     # its own; the current settings (candidate 0) must give step 17's p and m exactly. U16.4:
     # the gates of each stage-1 and stage-2 candidate, all validation origins together. U16.5:
     # every combination of the scored candidates, scored on the cash that came; the current
-    # combination must score exactly as step 17's model.
+    # combination must score exactly as step 17's model. U16.6: the combination kept, its
+    # calibration, and on the same origins how it compares with the current settings and the
+    # references (made here, so the grid does not need step 17).
     if settings.grid.run:
         grid_origins = list(settings.evaluation.validation_origins)
         candidates = grid_candidates(settings)
@@ -723,6 +726,12 @@ def main():
                                  companies=companies, week_zero=week_zero)
         show_grid_scores(grid_table, candidates, rolled, grid_actual,
                          settings.receivables.horizons)
+        choice = grid_choice(predictions, candidates, grid_table, grid_actual, settings,
+                             companies=companies, week_zero=week_zero, weekly=weekly,
+                             weeks=weeks, levels=levels, calendar=calendar, ledger=ledger,
+                             rates=rates, new_cash=new_cash, refunds=refunds,
+                             unidentified=unidentified)
+        show_grid_choice(choice, candidates, grid_table, settings)
 
     # Later steps follow as each unit is built.
 
@@ -1914,6 +1923,30 @@ def show_grid_scores(table, candidates, rolled, actual, horizons):
     print(f"        current WAPE the same as step 17's model: "
           f"{'yes' if step17_wape == current['wape'] else 'NO'} (step 17 {step17_wape:.6f}, "
           f"grid {current['wape']:.6f})")
+
+
+def show_grid_choice(choice, candidates, table, settings):
+    """Step 18's choice (U16.6): kept or new settings (beside the current ones), the WAPE
+    gain, the calibration chosen for it, and on the same origins its scores beside the
+    current settings and the references, with the paired bootstrap."""
+    winner = choice.winner
+    current = table[table["current"]].iloc[0]
+    min_gain = settings.grid.min_gain
+    if winner["current"]:
+        print(f"        kept the current settings: no combination beats their WAPE "
+              f"{current['wape']:.4f} by more than {min_gain} (best {table['wape'].min():.4f})")
+    else:
+        print(f"        NEW settings: WAPE {winner['wape']:.4f} against {current['wape']:.4f} "
+              f"(gain {current['wape'] - winner['wape']:.4f}, more than {min_gain}):")
+        for stage, chosen, now in (("stage 1", choice.stage1.params, candidates.stage1[0].params),
+                                   ("stage 2", choice.stage2.params, candidates.stage2[0].params),
+                                   ("top-ups", choice.topups, candidates.topups[0])):
+            print(f"          {stage}: {chosen}" + ("" if chosen == now else f" (was {now})"))
+    print("        its calibration (U15.4 on its forecast):")
+    show_calibration_choice(choice.calibration, settings.calibration.min_gain)
+    print(f"        on the same origins, uncorrected ({HURDLE} = the combination kept):")
+    show_evaluation_scores(choice.scores, settings.receivables.horizons)
+    show_paired_bootstrap(choice.bootstrap)
 
 
 def show_gates(stage, gates, score, ascending):

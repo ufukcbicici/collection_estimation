@@ -3488,3 +3488,1000 @@ def test_grid_scores_on_the_u16_3_grid_ineligible_gates_drop_only_the_others(g_s
                       only_current["topups"])) == [(0, 0, 0), (0, 0, 1)]
     current = only_current[only_current["current"]].iloc[0]
     assert current["wape"] == table[table["current"]].iloc[0]["wape"]
+
+
+# =============================================================================================
+# U16.6: `projected_at`, `combination_forecast`, `choose_combination`, `CURRENT_SETTINGS`,
+# `GridChoice` and `grid_choice`.
+#
+# `projected_at` and `combination_forecast` on the hand-made U16.5 predictions (sc_*), checked
+# against `projected_levels` and `forecast_totals` called by hand. `choose_combination` on
+# small hand-made score tables, with exactly representable WAPEs (0.75 - 0.25 == 0.5) so the
+# "more than min_gain" boundary is exact. `grid_choice` twice: on the sc_* predictions with
+# the calibration and the references replaced by recording fakes (what each step is given,
+# how the comparison is stacked), and on a fitted grid at three origins with everything real
+# (the current combination is step 17's model, the rule uses the chosen top-ups, the
+# calibration is `choose_calibration` on the winner's forecast). `grid_choice` calls
+# `dataclasses.replace` on the settings, so its settings here are a small frozen dataclass.
+# =============================================================================================
+
+from collection_estimation.hurdle.calibrate import (  # noqa: E402
+    CalibrationChoice, choose_calibration)
+from collection_estimation.hurdle.evaluate import (  # noqa: E402
+    REFERENCE_COLUMNS, REFERENCES, RULE, deflated_reference, paired_wape_bootstrap,
+    rule_reference, stack_forecasts)
+from collection_estimation.hurdle.forecast import Forecast  # noqa: E402
+from collection_estimation.hurdle.grid import (  # noqa: E402
+    CURRENT_SETTINGS, GridChoice, choose_combination, combination_forecast, grid_choice,
+    projected_at)
+from tests.hurdle.test_evaluate import rule_rates, running_ledger  # noqa: E402
+
+CH_KEYS = ["company_code", "origin_week", "h", "target_week"]
+
+
+# --- projected_at ----------------------------------------------------------------------------
+
+def test_projected_at_equals_projected_levels_per_origin():
+    found = projected_at([18, 22], 5, WEEK_ZERO)
+    assert list(found) == [18, 22]
+    for origin in (18, 22):
+        expected = projected_levels(WEEK_ZERO, origin, [origin + h for h in range(1, 6)])
+        pd.testing.assert_series_equal(found[origin], expected)
+
+
+def test_projected_at_covers_the_target_weeks_origin_plus_1_to_horizons():
+    found = projected_at([10, 30], 3, WEEK_ZERO)
+    assert list(found[10].index) == [11, 12, 13]
+    assert list(found[30].index) == [31, 32, 33]
+
+
+def test_projected_at_one_horizon_gives_one_week():
+    found = projected_at([20], 1, WEEK_ZERO)
+    assert list(found[20].index) == [21]
+
+
+def test_projected_at_keeps_the_order_given():
+    assert list(projected_at([22, 18], 2, WEEK_ZERO)) == [22, 18]
+
+
+def test_projected_at_no_origins_gives_an_empty_dict():
+    assert projected_at([], 5, WEEK_ZERO) == {}
+
+
+def test_projected_at_a_week_zero_not_a_monday_raises_as_projected_levels_does():
+    with pytest.raises(ValueError):
+        projected_levels(date(2025, 6, 3), 18, [19])
+    with pytest.raises(ValueError):
+        projected_at([18], 5, date(2025, 6, 3))
+
+
+# --- combination_forecast on the hand-made predictions ----------------------------------------
+
+def sc_projected(origins=SC_ORIGINS):
+    return projected_at(sorted(origins), SC_H, WEEK_ZERO)
+
+
+def sc_combination(predictions, i, j, k):
+    return combination_forecast(predictions, i, j, k, projected=sc_projected(),
+                                companies=list(SC_COMPANIES), horizons=SC_H)
+
+
+def by_hand_totals(predictions, i, j, k, horizons=SC_H, companies=SC_COMPANIES,
+                   week_zero=WEEK_ZERO):
+    rows = predictions.rows
+    customers = rows[CUSTOMER_COLUMNS[:6]].assign(p=predictions.p[i], m=predictions.m[j])
+    customers["expected"] = customers["p"] * customers["m"]
+    topups = predictions.topups[k]
+    parts = []
+    for origin in sorted(set(rows["origin_week"])):
+        levels = projected_levels(week_zero, origin, [origin + h for h in range(1, horizons + 1)])
+        parts.append(forecast_totals(customers[customers["origin_week"] == origin],
+                                     topups[topups["origin_week"] == origin], levels,
+                                     list(companies), horizons))
+    return pd.concat(parts, ignore_index=True)
+
+
+def test_combination_forecast_returns_a_forecast():
+    found = sc_combination(sc_predictions(), 0, 0, 0)
+    assert isinstance(found, Forecast)
+
+
+def test_combination_forecast_customers_have_the_customer_columns_and_the_rows_index():
+    predictions = sc_predictions()
+    customers = sc_combination(predictions, 1, 2, 0).customers
+    assert list(customers.columns) == CUSTOMER_COLUMNS
+    pd.testing.assert_index_equal(customers.index, predictions.rows.index)
+
+
+def test_combination_forecast_customers_copy_the_six_row_columns():
+    predictions = sc_predictions()
+    customers = sc_combination(predictions, 1, 2, 0).customers
+    pd.testing.assert_frame_equal(customers[CUSTOMER_COLUMNS[:6]],
+                                  predictions.rows[CUSTOMER_COLUMNS[:6]])
+
+
+@pytest.mark.parametrize("i, j", [(0, 0), (1, 2), (2, 1)])
+def test_combination_forecast_p_m_and_expected_are_the_chosen_candidates(i, j):
+    predictions = sc_predictions()
+    customers = sc_combination(predictions, i, j, 1).customers
+    np.testing.assert_array_equal(customers["p"].to_numpy(), predictions.p[i].to_numpy())
+    np.testing.assert_array_equal(customers["m"].to_numpy(), predictions.m[j].to_numpy())
+    np.testing.assert_array_equal(customers["expected"].to_numpy(),
+                                  (predictions.p[i] * predictions.m[j]).to_numpy())
+
+
+def test_combination_forecast_p_and_m_are_joined_by_index_not_position():
+    # p and m with their rows in reverse order: the same labels, the same values per label.
+    predictions = sc_predictions()
+    found = sc_combination(remade(predictions, p=predictions.p.iloc[::-1],
+                                  m=predictions.m.iloc[::-1]), 1, 1, 0)
+    expected = sc_combination(predictions, 1, 1, 0)
+    pd.testing.assert_frame_equal(found.customers, expected.customers)
+    pd.testing.assert_frame_equal(found.totals, expected.totals)
+
+
+@pytest.mark.parametrize("i, j, k", [(0, 0, 0), (2, 1, 1), (1, 2, 0)])
+def test_combination_forecast_totals_equal_forecast_totals_by_hand(i, j, k):
+    predictions = sc_predictions()
+    found = sc_combination(predictions, i, j, k).totals
+    pd.testing.assert_frame_equal(found, by_hand_totals(predictions, i, j, k))
+
+
+def test_combination_forecast_totals_have_a_fresh_range_index_in_origin_order():
+    totals = sc_combination(sc_predictions(), 0, 0, 0).totals
+    assert list(totals.index) == list(range(len(totals)))
+    origins = list(totals["origin_week"])
+    assert origins == sorted(origins)
+    # One row per company and h, then the consolidated ones, at each origin.
+    assert len(totals) == len(SC_ORIGINS) * (len(SC_COMPANIES) + 1) * SC_H
+
+
+def test_combination_forecast_totals_are_what_grid_scores_scores(sc_result):
+    predictions, actual, table = sc_result
+    for i, j, k in [(0, 0, 0), (2, 1, 1)]:
+        totals = sc_combination(predictions, i, j, k).totals
+        stacked = totals[CH_KEYS + ["total"]].rename(columns={"total": "forecast"})
+        stacked = stacked.assign(method="x")[STACK_COLUMNS]
+        scores = evaluation_scores(stacked, actual, SC_H)
+        assert sc_line(table, i, j, k)["wape"] == pooled(scores, CONSOLIDATED)
+
+
+def test_combination_forecast_each_topup_candidate_reads_its_own_table():
+    predictions = sc_predictions()
+    first = sc_combination(predictions, 0, 0, 0).totals
+    second = sc_combination(predictions, 0, 0, 1).totals
+    assert (first["total"] != second["total"]).all()
+    pd.testing.assert_series_equal(first["customers"], second["customers"])
+
+
+def test_combination_forecast_uses_the_projected_levels_given():
+    predictions = sc_predictions()
+    doubled = {origin: levels * 2 for origin, levels in sc_projected().items()}
+    found = combination_forecast(predictions, 0, 0, 0, projected=doubled,
+                                 companies=list(SC_COMPANIES), horizons=SC_H).totals
+    plain = sc_combination(predictions, 0, 0, 0).totals
+    np.testing.assert_allclose(found["total"], 2 * plain["total"], rtol=1e-15)
+    pd.testing.assert_series_equal(found["real_total"], plain["real_total"])
+
+
+def test_combination_forecast_origins_come_from_the_rows_sorted():
+    # Rows of origin 22 first: the totals still start with origin 18.
+    predictions = sc_predictions()
+    rows = predictions.rows.sort_values("origin_week", ascending=False, kind="stable")
+    found = sc_combination(remade(predictions, rows=rows), 0, 0, 0)
+    assert list(dict.fromkeys(found.totals["origin_week"])) == [18, 22]
+    pd.testing.assert_frame_equal(found.totals, sc_combination(predictions, 0, 0, 0).totals)
+
+
+def test_combination_forecast_does_not_change_the_predictions():
+    predictions = sc_predictions()
+    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
+              [t.copy() for t in predictions.topups])
+    forecast = sc_combination(predictions, 1, 1, 1)
+    forecast.customers["p"] = -1.0
+    forecast.customers["key"] = "changed"
+    pd.testing.assert_frame_equal(predictions.rows, before[0])
+    pd.testing.assert_frame_equal(predictions.p, before[1])
+    pd.testing.assert_frame_equal(predictions.m, before[2])
+    for found, kept in zip(predictions.topups, before[3]):
+        pd.testing.assert_frame_equal(found, kept)
+
+
+def test_combination_forecast_is_deterministic():
+    predictions = sc_predictions()
+    first, second = sc_combination(predictions, 2, 0, 1), sc_combination(predictions, 2, 0, 1)
+    pd.testing.assert_frame_equal(first.totals, second.totals)
+    pd.testing.assert_frame_equal(first.customers, second.customers)
+
+
+@pytest.mark.parametrize("part, bad", [("p", np.nan), ("m", np.nan), ("m", np.inf)])
+def test_combination_forecast_a_bad_p_or_m_raises_value_error(part, bad):
+    predictions = sc_predictions()
+    frame = getattr(predictions, part).copy()
+    frame.iloc[3, 1] = bad
+    broken = remade(predictions, **{part: frame})
+    with pytest.raises(ValueError):
+        sc_combination(broken, 1, 1, 0)
+
+
+def test_combination_forecast_a_company_missing_from_the_list_raises():
+    with pytest.raises(ValueError):
+        combination_forecast(sc_predictions(), 0, 0, 0, projected=sc_projected(),
+                             companies=["TR02"], horizons=SC_H)
+
+
+# --- choose_combination ------------------------------------------------------------------------
+
+def choice_table(lines):
+    """A grid_scores-like table from (stage1, stage2, topups, current, wape)."""
+    frame = pd.DataFrame([(i, j, k, current, wape, 0.1, 0.0, 0.2)
+                          for i, j, k, current, wape in lines], columns=GRID_SCORE_COLUMNS)
+    frame["current"] = frame["current"].astype(bool)
+    return frame
+
+
+def test_choose_combination_returns_a_series_the_row_of_the_scores():
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 0, 0, False, 0.3)])
+    found = choose_combination(table, 0.25)
+    assert isinstance(found, pd.Series)
+    pd.testing.assert_series_equal(found, table.iloc[1])
+
+
+def test_choose_combination_nothing_better_keeps_the_current_row():
+    table = choice_table([(0, 0, 0, True, 0.5), (1, 0, 0, False, 0.6), (0, 1, 0, False, 0.7)])
+    found = choose_combination(table, 0.0)
+    pd.testing.assert_series_equal(found, table.iloc[0])
+    assert bool(found["current"])
+
+
+def test_choose_combination_exactly_min_gain_better_is_not_enough():
+    # 0.75 - 0.25 == 0.5 exactly in binary floating point.
+    assert 0.75 - 0.25 == 0.5
+    table = choice_table([(1, 0, 0, False, 0.5), (0, 0, 0, True, 0.75)])
+    found = choose_combination(table, 0.25)
+    assert bool(found["current"]) and found["wape"] == 0.75
+
+
+def test_choose_combination_just_more_than_min_gain_better_wins():
+    better = float(np.nextafter(0.5, 0.0))
+    table = choice_table([(1, 0, 0, False, better), (0, 0, 0, True, 0.75)])
+    found = choose_combination(table, 0.25)
+    assert not bool(found["current"]) and found["wape"] == better
+
+
+def test_choose_combination_min_gain_zero_an_equal_wape_keeps_the_current():
+    table = choice_table([(1, 0, 0, False, 0.5), (0, 0, 0, True, 0.5)])
+    assert bool(choose_combination(table, 0.0)["current"])
+
+
+def test_choose_combination_min_gain_zero_any_strictly_lower_wape_wins():
+    table = choice_table([(1, 0, 0, False, float(np.nextafter(0.5, 0.0))),
+                          (0, 0, 0, True, 0.5)])
+    assert not bool(choose_combination(table, 0.0)["current"])
+
+
+def test_choose_combination_a_large_min_gain_keeps_even_the_worst_current():
+    table = choice_table([(1, 0, 0, False, 0.1), (0, 1, 0, False, 0.2), (0, 0, 0, True, 0.9)])
+    assert bool(choose_combination(table, 1.0)["current"])
+
+
+def test_choose_combination_of_several_better_the_lowest_wape_wins():
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 0, 0, False, 0.4),
+                          (0, 1, 0, False, 0.125), (1, 1, 1, False, 0.3)])
+    pd.testing.assert_series_equal(choose_combination(table, 0.25), table.iloc[2])
+
+
+def test_choose_combination_a_tie_among_the_better_gives_the_first_row():
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 1, 0, False, 0.375),
+                          (0, 1, 1, False, 0.25), (1, 0, 1, False, 0.25)])
+    found = choose_combination(table, 0.25)
+    pd.testing.assert_series_equal(found, table.iloc[2])
+    assert (found["stage1"], found["stage2"], found["topups"]) == (0, 1, 1)
+
+
+def test_choose_combination_a_tie_keeps_the_table_order_whatever_the_index():
+    table = choice_table([(0, 0, 0, True, 0.75), (2, 0, 0, False, 0.25),
+                          (1, 0, 0, False, 0.25)])
+    table.index = [30, 10, 20]
+    found = choose_combination(table, 0.0)
+    assert found.name == 10 and found["stage1"] == 2
+
+
+def test_choose_combination_finds_the_current_by_its_flag_not_its_position():
+    table = choice_table([(1, 0, 0, False, 0.6), (0, 1, 0, False, 0.7), (0, 0, 0, True, 0.5)])
+    found = choose_combination(table, 0.0)
+    pd.testing.assert_series_equal(found, table.iloc[2])
+
+
+def test_choose_combination_the_returned_row_keeps_its_index_label():
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 0, 0, False, 0.25)])
+    table.index = [7, 4]
+    assert choose_combination(table, 0.25).name == 4
+    assert choose_combination(table, 0.6).name == 7
+
+
+def test_choose_combination_a_lone_current_row_is_kept():
+    table = choice_table([(0, 0, 0, True, 0.5)])
+    pd.testing.assert_series_equal(choose_combination(table, 0.005), table.iloc[0])
+
+
+def test_choose_combination_a_nan_in_another_score_column_does_not_matter():
+    # total_wape is NaN when no origin has all its weeks (grid_scores); only wape decides.
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 0, 0, False, 0.25)])
+    table["total_wape"] = np.nan
+    assert choose_combination(table, 0.25)["stage1"] == 1
+
+
+def test_choose_combination_does_not_change_the_scores():
+    table = choice_table([(0, 0, 0, True, 0.75), (1, 0, 0, False, 0.25), (0, 1, 0, False, 0.3)])
+    before = table.copy()
+    choose_combination(table, 0.0)
+    pd.testing.assert_frame_equal(table, before)
+
+
+@pytest.mark.parametrize("lines", [
+    [(0, 0, 0, False, 0.5), (1, 0, 0, False, 0.4)],
+    [(0, 0, 0, True, 0.5), (1, 0, 0, True, 0.4)],
+    [],
+])
+def test_choose_combination_not_exactly_one_current_row_raises(lines):
+    table = choice_table(lines) if lines else (
+        pd.DataFrame(columns=GRID_SCORE_COLUMNS).astype({"current": bool, "wape": float}))
+    with pytest.raises(ValueError, match="one is needed"):
+        choose_combination(table, 0.005)
+
+
+@pytest.mark.parametrize("nan_at", [0, 1])
+def test_choose_combination_a_nan_wape_raises(nan_at):
+    lines = [(0, 0, 0, True, 0.5), (1, 0, 0, False, 0.1)]
+    i, j, k, current, _ = lines[nan_at]
+    lines[nan_at] = (i, j, k, current, float("nan"))
+    with pytest.raises(ValueError, match="no WAPE"):
+        choose_combination(choice_table(lines), 0.005)
+
+
+def test_choose_combination_a_nan_wape_raises_even_when_the_current_would_be_kept():
+    table = choice_table([(0, 0, 0, True, 0.1), (1, 0, 0, False, float("nan"))])
+    with pytest.raises(ValueError, match="no WAPE"):
+        choose_combination(table, 10.0)
+
+
+def test_choose_combination_the_current_check_comes_before_the_nan_check():
+    table = choice_table([(0, 0, 0, False, float("nan")), (1, 0, 0, False, 0.1)])
+    with pytest.raises(ValueError, match="one is needed"):
+        choose_combination(table, 0.005)
+
+
+def test_choose_combination_on_grid_scores_output(sc_result):
+    _, _, table = sc_result
+    current = table[table["current"]].iloc[0]
+    pd.testing.assert_series_equal(choose_combination(table, 10.0), current)
+    pd.testing.assert_series_equal(choose_combination(table, -1.0), table.iloc[0])
+
+
+# --- CURRENT_SETTINGS and GridChoice -----------------------------------------------------------
+
+def test_current_settings_name():
+    assert CURRENT_SETTINGS == "current settings"
+
+
+def test_current_settings_is_no_other_methods_name():
+    assert CURRENT_SETTINGS not in {HURDLE, RULE, *REFERENCES}
+
+
+def test_grid_choice_type_fields_in_order_and_frozen():
+    assert [f.name for f in dataclasses.fields(GridChoice)] == [
+        "winner", "stage1", "stage2", "topups", "forecast", "calibration", "scores",
+        "bootstrap"]
+    choice = GridChoice(*[f"<{n}>" for n in range(8)])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        choice.winner = "other"
+
+
+# --- grid_choice with recording fakes, on the hand-made predictions ----------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ChoiceSettings:
+    """What grid_choice and the steps it calls read; a dataclass, as `dataclasses.replace`
+    needs one."""
+    receivables: object
+    topups: object
+    grid: object
+    evaluation: object
+    calibration: object
+    diagnostic: object
+    stage1: object = None
+    stage2: object = None
+
+
+def ch_settings(min_gain=0.005, samples=40, seed=9, topups="<settings topups>"):
+    return ChoiceSettings(
+        receivables=SimpleNamespace(horizons=SC_H, min_cleared_for_delay=3),
+        topups=topups,
+        grid=SimpleNamespace(min_gain=min_gain),
+        evaluation=SimpleNamespace(bootstrap_samples=samples, bootstrap_seed=seed,
+                                   rule_doubtful_days=90),
+        calibration=SimpleNamespace(company_shrink_rows=200, min_gain=0.005),
+        diagnostic=SimpleNamespace(calibration_groups=2))
+
+
+def fake_reference(actual):
+    """deflated_reference's shape: each variant a fixed multiple of the actual cash."""
+    frames = []
+    for factor, name in zip((1.05, 1.10, 0.95), REFERENCES):
+        frame = actual[CH_KEYS].copy()
+        frame["reference"] = name
+        frame["real_forecast"] = actual["actual_real"] * factor
+        frame["price_level"] = 1.0
+        frame["forecast"] = actual["actual"] * factor
+        frame["fallback"] = False
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)[REFERENCE_COLUMNS]
+
+
+def fake_rule_totals(actual):
+    return actual[CH_KEYS].assign(forecast=actual["actual"] * 0.9)
+
+
+class Recorder:
+    """Replaces choose_calibration, deflated_reference and rule_reference as grid sees them."""
+
+    def __init__(self, monkeypatch, actual, fail=None):
+        self.calls = []
+        self.fail = fail
+        self.actual = actual
+        monkeypatch.setattr(grid_module, "choose_calibration", self.calibration)
+        monkeypatch.setattr(grid_module, "deflated_reference", self.reference)
+        monkeypatch.setattr(grid_module, "rule_reference", self.rule)
+
+    def check(self, name):
+        if self.fail == name:
+            raise ValueError(f"{name} failed")
+
+    def calibration(self, *args, **kwargs):
+        self.calls.append(("calibration", args, kwargs))
+        self.check("calibration")
+        return "<calibration>"
+
+    def reference(self, *args, **kwargs):
+        self.calls.append(("reference", args, kwargs))
+        self.check("reference")
+        return fake_reference(self.actual)
+
+    def rule(self, *args, **kwargs):
+        self.calls.append(("rule", args, kwargs))
+        self.check("rule")
+        return SimpleNamespace(totals=fake_rule_totals(self.actual), invoices="<invoices>")
+
+    def only(self, name):
+        found = [(args, kwargs) for called, args, kwargs in self.calls if called == name]
+        assert len(found) == 1, name
+        return found[0]
+
+
+CH_SIDE = dict(weekly="<weekly>", weeks="<weeks>", levels="<levels>", calendar="<calendar>",
+               ledger="<ledger>", rates="<rates>", new_cash="<new cash>", refunds="<refunds>",
+               unidentified="<unidentified>")
+
+
+def ch_run(predictions, scores, actual, settings=None, candidates=None, **overrides):
+    kwargs = dict(CH_SIDE, companies=list(SC_COMPANIES), week_zero=WEEK_ZERO)
+    kwargs.update(overrides)
+    return grid_choice(predictions, candidates or sc_candidates(), scores, actual,
+                       settings or ch_settings(), **kwargs)
+
+
+def without_current(table, also=None):
+    """`table` with the current settings' WAPE (and those of rows matching `also`) made 1
+    worse, so that another combination is chosen; every other row keeps grid_scores' WAPE."""
+    table = table.copy()
+    worse = table["current"].copy()
+    if also is not None:
+        worse |= also(table)
+    table.loc[worse, "wape"] += 1.0
+    return table
+
+
+@pytest.fixture
+def ch_case(sc_result, monkeypatch):
+    predictions, actual, table = sc_result
+    return predictions, actual, table, Recorder(monkeypatch, actual)
+
+
+def stacked_by_hand(predictions, i, j, k, actual, with_current):
+    forecast = sc_combination(predictions, i, j, k)
+    rule = SimpleNamespace(totals=fake_rule_totals(actual))
+    stacked = stack_forecasts(forecast, fake_reference(actual), rule)
+    if with_current:
+        current = sc_combination(predictions, 0, 0, 0).totals
+        current = current[CH_KEYS + ["total"]].rename(columns={"total": "forecast"})
+        current = current.assign(method=CURRENT_SETTINGS)[STACK_COLUMNS]
+        stacked = pd.concat([stacked, current], ignore_index=True)
+        stacked["company_code"] = stacked["company_code"].astype(object)
+    return stacked
+
+
+def winner_numbers(choice):
+    return tuple(int(choice.winner[c]) for c in ("stage1", "stage2", "topups"))
+
+
+def test_grid_choice_returns_a_grid_choice(ch_case):
+    predictions, actual, table, _ = ch_case
+    assert isinstance(ch_run(predictions, table, actual), GridChoice)
+
+
+def test_grid_choice_current_wins_the_winner_is_the_current_row(ch_case):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, table, actual, settings=ch_settings(min_gain=10.0))
+    pd.testing.assert_series_equal(choice.winner, table[table["current"]].iloc[0])
+    candidates = sc_candidates()
+    assert (choice.stage1, choice.stage2, choice.topups) == (
+        candidates.stage1[0], candidates.stage2[0], candidates.topups[0])
+
+
+@pytest.mark.parametrize("min_gain", [10.0, 0.0, -1.0])
+def test_grid_choice_winner_is_choose_combination_with_grid_min_gain(ch_case, min_gain):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, table, actual, settings=ch_settings(min_gain=min_gain))
+    pd.testing.assert_series_equal(choice.winner, choose_combination(table, min_gain))
+
+
+def test_grid_choice_new_winner_gives_its_candidates(ch_case):
+    predictions, actual, table, _ = ch_case
+    doctored = without_current(table)
+    choice = ch_run(predictions, doctored, actual, settings=ch_settings(min_gain=0.0))
+    expected = choose_combination(doctored, 0.0)
+    assert not bool(choice.winner["current"])
+    pd.testing.assert_series_equal(choice.winner, expected)
+    i, j, k = winner_numbers(choice)
+    assert (choice.stage1, choice.stage2, choice.topups) == (f"<s1 {i}>", f"<s2 {j}>",
+                                                             f"<t {k}>")
+
+
+def test_grid_choice_forecast_is_the_winners_combination_forecast(ch_case):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, without_current(table), actual,
+                    settings=ch_settings(min_gain=0.0))
+    expected = sc_combination(predictions, *winner_numbers(choice))
+    pd.testing.assert_frame_equal(choice.forecast.totals, expected.totals)
+    pd.testing.assert_frame_equal(choice.forecast.customers, expected.customers)
+
+
+def test_grid_choice_calibration_is_choose_calibration_on_the_winners_forecast(ch_case):
+    predictions, actual, table, recorder = ch_case
+    settings = ch_settings(min_gain=0.0)
+    choice = ch_run(predictions, without_current(table), actual, settings=settings)
+    assert choice.calibration == "<calibration>"
+    args, kwargs = recorder.only("calibration")
+    assert kwargs == {}
+    forecast, weekly, weeks, levels, given_actual, given_settings = args
+    assert forecast is choice.forecast
+    assert (weekly, weeks, levels) == ("<weekly>", "<weeks>", "<levels>")
+    assert given_actual is actual
+    # The settings themselves, not the copy with the chosen top-ups.
+    assert given_settings is settings
+
+
+def test_grid_choice_deflated_reference_at_the_predictions_origins(ch_case):
+    predictions, actual, table, recorder = ch_case
+    ch_run(predictions, table, actual)
+    args, kwargs = recorder.only("reference")
+    assert kwargs == {}
+    assert args == ("<weekly>", "<weeks>", "<levels>", "<calendar>", list(SC_COMPANIES),
+                    sorted(SC_ORIGINS), SC_H, WEEK_ZERO)
+
+
+def test_grid_choice_rule_reference_gets_its_inputs(ch_case):
+    predictions, actual, table, recorder = ch_case
+    ch_run(predictions, table, actual)
+    args, kwargs = recorder.only("rule")
+    assert args[:3] == ("<ledger>", "<rates>", sorted(SC_ORIGINS))
+    assert kwargs == {"companies": list(SC_COMPANIES), "new_cash": "<new cash>",
+                      "refunds": "<refunds>", "unidentified": "<unidentified>",
+                      "levels": "<levels>", "calendar": "<calendar>", "week_zero": WEEK_ZERO}
+
+
+def test_grid_choice_origins_are_sorted_and_once_each(ch_case):
+    predictions, actual, table, recorder = ch_case
+    rows = predictions.rows.sort_values("origin_week", ascending=False, kind="stable")
+    ch_run(remade(predictions, rows=rows), table, actual)
+    assert recorder.only("reference")[0][5] == [18, 22]
+    assert recorder.only("rule")[0][2] == [18, 22]
+
+
+@pytest.mark.parametrize("k", [0, 1])
+def test_grid_choice_rule_uses_the_chosen_topups_not_the_settings_topups(ch_case, k):
+    predictions, actual, table, recorder = ch_case
+    settings = ch_settings(min_gain=0.0)
+    doctored = without_current(table, also=lambda t: t["topups"] != k)
+    choice = ch_run(predictions, doctored, actual, settings=settings)
+    assert int(choice.winner["topups"]) == k
+    given = recorder.only("rule")[0][3]
+    assert given.topups == f"<t {k}>"
+    assert given.topups == choice.topups
+    # Only the top-ups are replaced; the settings given stay as they were.
+    assert dataclasses.replace(given, topups=settings.topups) == settings
+    assert settings.topups == "<settings topups>"
+
+
+def test_grid_choice_rule_uses_candidate_0s_topups_when_the_current_wins(ch_case):
+    predictions, actual, table, recorder = ch_case
+    choice = ch_run(predictions, table, actual, settings=ch_settings(min_gain=10.0))
+    assert recorder.only("rule")[0][3].topups == "<t 0>" == choice.topups
+
+
+def test_grid_choice_each_step_is_called_once(ch_case):
+    predictions, actual, table, recorder = ch_case
+    ch_run(predictions, table, actual)
+    assert sorted(name for name, _, _ in recorder.calls) == ["calibration", "reference", "rule"]
+
+
+def test_grid_choice_current_wins_the_methods_have_no_current_settings(ch_case):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, table, actual, settings=ch_settings(min_gain=10.0))
+    assert list(dict.fromkeys(choice.scores["method"])) == [HURDLE, *REFERENCES, RULE]
+    assert CURRENT_SETTINGS not in set(choice.bootstrap["against"])
+
+
+def test_grid_choice_new_winner_adds_the_current_settings_last(ch_case):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, without_current(table), actual,
+                    settings=ch_settings(min_gain=0.0))
+    assert list(dict.fromkeys(choice.scores["method"])) == [HURDLE, *REFERENCES, RULE,
+                                                            CURRENT_SETTINGS]
+
+
+@pytest.mark.parametrize("new", [False, True])
+def test_grid_choice_scores_equal_evaluation_scores_of_the_stack_by_hand(ch_case, new):
+    predictions, actual, table, _ = ch_case
+    scores = without_current(table) if new else table
+    choice = ch_run(predictions, scores, actual,
+                    settings=ch_settings(min_gain=0.0 if new else 10.0))
+    stacked = stacked_by_hand(predictions, *winner_numbers(choice), actual, with_current=new)
+    pd.testing.assert_frame_equal(choice.scores, evaluation_scores(stacked, actual, SC_H))
+
+
+@pytest.mark.parametrize("new", [False, True])
+def test_grid_choice_the_winners_scores_equal_its_grid_scores_row(ch_case, new):
+    predictions, actual, table, _ = ch_case
+    scores = without_current(table) if new else table
+    choice = ch_run(predictions, scores, actual,
+                    settings=ch_settings(min_gain=0.0 if new else 10.0))
+    line = sc_line(table, *winner_numbers(choice))          # the untouched grid_scores row
+    hurdle = choice.scores[choice.scores["method"] == HURDLE]
+    assert pooled(hurdle, CONSOLIDATED) == line["wape"]
+    assert pooled(hurdle, CONSOLIDATED, "bias") == line["bias"]
+    assert pooled(hurdle, CONSOLIDATED, horizon=HORIZON_TOTAL) == line["total_wape"]
+    assert np.mean([pooled(hurdle, c) for c in SC_COMPANIES]) == pytest.approx(
+        line["company_wape"], rel=1e-15)
+
+
+def test_grid_choice_current_settings_scores_equal_the_current_grid_scores_row(ch_case):
+    predictions, actual, table, _ = ch_case
+    choice = ch_run(predictions, without_current(table), actual,
+                    settings=ch_settings(min_gain=0.0))
+    current = choice.scores[choice.scores["method"] == CURRENT_SETTINGS]
+    line = sc_line(table, 0, 0, 0)
+    assert pooled(current, CONSOLIDATED) == line["wape"]
+    assert pooled(current, CONSOLIDATED, "bias") == line["bias"]
+    assert pooled(current, CONSOLIDATED, horizon=HORIZON_TOTAL) == line["total_wape"]
+
+
+@pytest.mark.parametrize("new", [False, True])
+def test_grid_choice_bootstrap_is_hurdle_against_every_other_method(ch_case, new):
+    predictions, actual, table, _ = ch_case
+    scores = without_current(table) if new else table
+    choice = ch_run(predictions, scores, actual,
+                    settings=ch_settings(min_gain=0.0 if new else 10.0, samples=40, seed=9))
+    others = [*REFERENCES, RULE] + ([CURRENT_SETTINGS] if new else [])
+    stacked = stacked_by_hand(predictions, *winner_numbers(choice), actual, with_current=new)
+    expected = paired_wape_bootstrap(stacked, actual, [(HURDLE, o) for o in others], SC_H,
+                                     40, 9)
+    pd.testing.assert_frame_equal(choice.bootstrap, expected)
+    assert set(choice.bootstrap["method"]) == {HURDLE}
+    assert list(dict.fromkeys(choice.bootstrap["against"])) == others
+
+
+def test_grid_choice_bootstrap_reads_the_evaluation_samples_and_seed(ch_case):
+    predictions, actual, table, _ = ch_case
+    first = ch_run(predictions, table, actual, settings=ch_settings(samples=30, seed=1))
+    assert set(first.bootstrap["samples"]) == {30}
+    second = ch_run(predictions, table, actual, settings=ch_settings(samples=30, seed=2))
+    assert not first.bootstrap[["low", "high"]].equals(second.bootstrap[["low", "high"]])
+
+
+def test_grid_choice_does_not_change_its_inputs(ch_case):
+    predictions, actual, table, _ = ch_case
+    doctored = without_current(table)
+    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
+              doctored.copy(), actual.copy())
+    settings = ch_settings(min_gain=0.0)
+    ch_run(predictions, doctored, actual, settings=settings)
+    pd.testing.assert_frame_equal(predictions.rows, before[0])
+    pd.testing.assert_frame_equal(predictions.p, before[1])
+    pd.testing.assert_frame_equal(predictions.m, before[2])
+    pd.testing.assert_frame_equal(doctored, before[3])
+    pd.testing.assert_frame_equal(actual, before[4])
+    assert settings == ch_settings(min_gain=0.0)
+
+
+def test_grid_choice_is_deterministic(ch_case):
+    predictions, actual, table, _ = ch_case
+    first = ch_run(predictions, table, actual)
+    second = ch_run(predictions, table, actual)
+    pd.testing.assert_frame_equal(first.scores, second.scores)
+    pd.testing.assert_frame_equal(first.bootstrap, second.bootstrap)
+    pd.testing.assert_series_equal(first.winner, second.winner)
+
+
+@pytest.mark.parametrize("step", ["calibration", "reference", "rule"])
+def test_grid_choice_a_failing_step_passes_its_error_through(sc_result, monkeypatch, step):
+    predictions, actual, table = sc_result
+    Recorder(monkeypatch, actual, fail=step)
+    with pytest.raises(ValueError, match=f"{step} failed"):
+        ch_run(predictions, table, actual)
+
+
+def test_grid_choice_two_current_rows_raise_before_any_step(ch_case):
+    predictions, actual, table, recorder = ch_case
+    broken = table.copy()
+    broken.loc[broken.index[-1], "current"] = True
+    with pytest.raises(ValueError, match="one is needed"):
+        ch_run(predictions, broken, actual)
+    assert recorder.calls == []
+
+
+def test_grid_choice_a_nan_wape_raises_before_any_step(ch_case):
+    predictions, actual, table, recorder = ch_case
+    broken = table.copy()
+    broken.loc[broken.index[-1], "wape"] = np.nan
+    with pytest.raises(ValueError, match="no WAPE"):
+        ch_run(predictions, broken, actual)
+    assert recorder.calls == []
+
+
+def test_grid_choice_a_broken_winner_p_raises_as_forecast_totals_does(ch_case):
+    predictions, actual, table, _ = ch_case
+    p = predictions.p.copy()
+    p.iloc[0, 0] = np.nan
+    with pytest.raises(ValueError):
+        ch_run(remade(predictions, p=p), table, actual, settings=ch_settings(min_gain=10.0))
+
+
+def test_grid_choice_a_reference_without_a_variant_raises_as_stack_forecasts_does(
+        sc_result, monkeypatch):
+    predictions, actual, table = sc_result
+    Recorder(monkeypatch, actual)
+    reference = fake_reference(actual)
+    monkeypatch.setattr(grid_module, "deflated_reference", lambda *args, **kwargs: reference[
+        reference["reference"] != "deflated_trend"])
+    with pytest.raises(ValueError, match="deflated_trend"):
+        ch_run(predictions, table, actual)
+
+
+# --- grid_choice on a fitted grid at three origins, everything real ----------------------------
+#
+# Origins 18, 22, 26 (the calibration judges at the origins after the middle target week, 25;
+# two origins would leave none). The weekly cash holds the table's own customer keys, so the
+# calibration rows see who paid; actual, deflated and calibration all read it.
+
+FIT_ORIGINS = [18, 22, 26]
+
+
+def fit_settings(min_gain=0.005):
+    base = g_settings()
+    return ChoiceSettings(
+        receivables=base.receivables, topups=base.topups, stage1=base.stage1, stage2=base.stage2,
+        grid=SimpleNamespace(min_gain=min_gain),
+        evaluation=SimpleNamespace(bootstrap_samples=40, bootstrap_seed=5,
+                                   rule_doubtful_days=90),
+        calibration=SimpleNamespace(company_shrink_rows=50, min_gain=0.005),
+        diagnostic=SimpleNamespace(reference_window=G_WINDOW, amount_reference_window=G_WINDOW,
+                                   reference_prior_weeks=1.0, calibration_groups=2))
+
+
+def fit_weekly():
+    rng = np.random.default_rng(21)
+    lines = []
+    for c in range(8):
+        company = F_COMPANIES[c % 2]
+        for week in range(0, 41):
+            if rng.random() < 0.55:
+                lines.append((f"{company}|C{c}", company, f"C{c}", week,
+                              rng.uniform(200, 900) * (c + 1), -rng.uniform(0, 30)))
+    for company in F_COMPANIES:
+        for week in range(0, 41):
+            lines.append((f"{company}|U", company, None, week, rng.uniform(300, 900), 0.0))
+    return make_weekly(lines)
+
+
+@pytest.fixture(scope="module")
+def fit_case(g_table, tmp_path_factory):
+    settings = fit_settings()
+    candidates = g_candidates(settings)
+    predictions = grid_predictions(g_table, FIT_ORIGINS, candidates, settings,
+                                   cache_folder=tmp_path_factory.mktemp("choice_cache"),
+                                   **g_inputs())
+    weekly, weeks, levels = fit_weekly(), make_weeks(40), f_levels()
+    actual = actual_totals(weekly, weeks, levels, list(F_COMPANIES), FIT_ORIGINS, 5)
+    table = grid_scores(predictions, candidates, g_gates(candidates), actual, settings,
+                        companies=list(F_COMPANIES), week_zero=WEEK_ZERO)
+    rolled = rolling_forecasts(g_table, FIT_ORIGINS, settings, week_zero=WEEK_ZERO,
+                               **g_inputs())
+    new_cash, refunds, unidentified = f_side_tables()
+    side = dict(weekly=weekly, weeks=weeks, levels=levels, calendar=f_calendar(),
+                ledger=running_ledger(), rates=rule_rates(), new_cash=new_cash,
+                refunds=refunds, unidentified=unidentified)
+    return SimpleNamespace(settings=settings, candidates=candidates, predictions=predictions,
+                           actual=actual, table=table, rolled=rolled, side=side)
+
+
+def fit_run(case, scores=None, min_gain=0.005):
+    return grid_choice(case.predictions, case.candidates,
+                       case.table if scores is None else scores, case.actual,
+                       fit_settings(min_gain), companies=list(F_COMPANIES), week_zero=WEEK_ZERO,
+                       **case.side)
+
+
+def fit_projected():
+    return projected_at(FIT_ORIGINS, 5, WEEK_ZERO)
+
+
+@pytest.fixture(scope="module")
+def fit_kept(fit_case):
+    return fit_run(fit_case, min_gain=10.0)
+
+
+@pytest.fixture(scope="module")
+def fit_new(fit_case):
+    # The current WAPE and every row with candidate-0 top-ups made worse: a combination with
+    # the other top-ups (window 4, not [topups]' 8) wins with its real grid_scores WAPE.
+    scores = without_current(fit_case.table, also=lambda t: t["topups"] == 0)
+    return fit_run(fit_case, scores=scores, min_gain=0.0)
+
+
+def assert_same_calibration(found, expected):
+    assert isinstance(found, CalibrationChoice)
+    assert found.p_correction == expected.p_correction
+    assert found.m_correction == expected.m_correction
+    assert found.split_week == expected.split_week
+    assert found.judged_origins == expected.judged_origins
+    assert found.winner == expected.winner
+    pd.testing.assert_frame_equal(found.candidates, expected.candidates)
+    pd.testing.assert_frame_equal(found.bootstrap, expected.bootstrap)
+
+
+def test_fitted_combination_0_0_0_equals_rolling_forecasts_totals(fit_case):
+    found = combination_forecast(fit_case.predictions, 0, 0, 0, projected=fit_projected(),
+                                 companies=list(F_COMPANIES), horizons=5)
+    pd.testing.assert_frame_equal(found.totals, fit_case.rolled.totals)
+
+
+def test_fitted_combination_0_0_0_equals_rolling_forecasts_customers(fit_case):
+    found = combination_forecast(fit_case.predictions, 0, 0, 0, projected=fit_projected(),
+                                 companies=list(F_COMPANIES), horizons=5)
+    pd.testing.assert_frame_equal(found.customers, fit_case.rolled.customers)
+
+
+def test_fitted_kept_the_current_settings(fit_case, fit_kept):
+    assert bool(fit_kept.winner["current"])
+    assert fit_kept.stage1 is fit_case.candidates.stage1[0]
+    assert fit_kept.stage2 is fit_case.candidates.stage2[0]
+    assert fit_kept.topups is fit_case.candidates.topups[0]
+
+
+def test_fitted_kept_forecast_is_step_17s(fit_case, fit_kept):
+    pd.testing.assert_frame_equal(fit_kept.forecast.totals, fit_case.rolled.totals)
+    pd.testing.assert_frame_equal(fit_kept.forecast.customers, fit_case.rolled.customers)
+
+
+def test_fitted_kept_calibration_is_step_17s_choice(fit_case, fit_kept):
+    case = fit_case
+    step_17 = choose_calibration(case.rolled, case.side["weekly"], case.side["weeks"],
+                                 case.side["levels"], case.actual, case.settings)
+    assert_same_calibration(fit_kept.calibration, step_17)
+
+
+def test_fitted_kept_hurdle_scores_equal_the_current_grid_row_and_step_17(fit_case, fit_kept):
+    case = fit_case
+    hurdle = fit_kept.scores[fit_kept.scores["method"] == HURDLE].reset_index(drop=True)
+    line = case.table[case.table["current"]].iloc[0]
+    assert pooled(hurdle, CONSOLIDATED) == line["wape"]
+    assert pooled(hurdle, CONSOLIDATED, "bias") == line["bias"]
+    pd.testing.assert_frame_equal(hurdle, hurdle_scores(case.rolled, case.actual)
+                                  .reset_index(drop=True))
+
+
+def test_fitted_kept_has_no_current_settings_method(fit_kept):
+    assert CURRENT_SETTINGS not in set(fit_kept.scores["method"])
+    assert list(dict.fromkeys(fit_kept.bootstrap["against"])) == [*REFERENCES, RULE]
+
+
+def test_fitted_references_equal_the_reference_functions_by_hand(fit_case, fit_kept):
+    case = fit_case
+    side = case.side
+    reference = deflated_reference(side["weekly"], side["weeks"], side["levels"],
+                                   side["calendar"], list(F_COMPANIES), FIT_ORIGINS, 5,
+                                   WEEK_ZERO)
+    rule = rule_reference(side["ledger"], side["rates"], FIT_ORIGINS, case.settings,
+                          companies=list(F_COMPANIES), new_cash=side["new_cash"],
+                          refunds=side["refunds"], unidentified=side["unidentified"],
+                          levels=side["levels"], calendar=side["calendar"], week_zero=WEEK_ZERO)
+    stacked = stack_forecasts(case.rolled, reference, rule)
+    pd.testing.assert_frame_equal(fit_kept.scores, evaluation_scores(stacked, case.actual, 5))
+
+
+def test_fitted_new_winner_has_the_other_topups(fit_case, fit_new):
+    assert not bool(fit_new.winner["current"])
+    assert int(fit_new.winner["topups"]) == 1
+    assert fit_new.topups is fit_case.candidates.topups[1]
+    assert fit_new.topups != fit_case.settings.topups
+
+
+def test_fitted_new_winner_scores_equal_its_grid_scores_row(fit_case, fit_new):
+    i, j, k = winner_numbers(fit_new)
+    table = fit_case.table
+    line = table[(table["stage1"] == i) & (table["stage2"] == j) & (table["topups"] == k)]
+    line = line.iloc[0]
+    hurdle = fit_new.scores[fit_new.scores["method"] == HURDLE]
+    assert pooled(hurdle, CONSOLIDATED) == line["wape"]
+    assert pooled(hurdle, CONSOLIDATED, "bias") == line["bias"]
+    assert pooled(hurdle, CONSOLIDATED, horizon=HORIZON_TOTAL) == line["total_wape"]
+    assert fit_new.winner["wape"] == line["wape"]
+
+
+def test_fitted_new_current_settings_scores_are_step_17s_model(fit_case, fit_new):
+    case = fit_case
+    current = fit_new.scores[fit_new.scores["method"] == CURRENT_SETTINGS]
+    step_17 = hurdle_scores(case.rolled, case.actual)
+    pd.testing.assert_frame_equal(current.drop(columns="method").reset_index(drop=True),
+                                  step_17.drop(columns="method").reset_index(drop=True))
+
+
+def test_fitted_new_rule_uses_the_chosen_topups(fit_case, fit_new):
+    case = fit_case
+    side = case.side
+
+    def rule_scores(topups):
+        rule = rule_reference(side["ledger"], side["rates"], FIT_ORIGINS,
+                              dataclasses.replace(case.settings, topups=topups),
+                              companies=list(F_COMPANIES), new_cash=side["new_cash"],
+                              refunds=side["refunds"], unidentified=side["unidentified"],
+                              levels=side["levels"], calendar=side["calendar"],
+                              week_zero=WEEK_ZERO)
+        stacked = rule.totals[CH_KEYS + ["forecast"]].assign(method=RULE)[STACK_COLUMNS]
+        return evaluation_scores(stacked, case.actual, 5).reset_index(drop=True)
+
+    found = fit_new.scores[fit_new.scores["method"] == RULE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(found, rule_scores(case.candidates.topups[1]))
+    with_settings_topups = rule_scores(case.settings.topups)
+    assert pooled(found, CONSOLIDATED) != pooled(with_settings_topups, CONSOLIDATED)
+
+
+def test_fitted_new_calibration_is_choose_calibration_on_its_forecast(fit_case, fit_new):
+    case = fit_case
+    forecast = combination_forecast(case.predictions, *winner_numbers(fit_new),
+                                    projected=fit_projected(), companies=list(F_COMPANIES),
+                                    horizons=5)
+    pd.testing.assert_frame_equal(fit_new.forecast.totals, forecast.totals)
+    by_hand = choose_calibration(forecast, case.side["weekly"], case.side["weeks"],
+                                 case.side["levels"], case.actual, case.settings)
+    assert_same_calibration(fit_new.calibration, by_hand)
+
+
+def test_fitted_new_bootstrap_pairs_hurdle_with_every_other_method(fit_new):
+    assert set(fit_new.bootstrap["method"]) == {HURDLE}
+    assert list(dict.fromkeys(fit_new.bootstrap["against"])) == [*REFERENCES, RULE,
+                                                                 CURRENT_SETTINGS]
+    assert set(fit_new.bootstrap["samples"]) == {40}
+
+
+@pytest.mark.parametrize("min_gain", [0.0, 0.005, 10.0])
+def test_fitted_on_the_natural_scores_the_winner_follows_the_min_gain_rule(fit_case, min_gain):
+    # Whatever this grid's numbers: kept unless some WAPE is more than min_gain lower.
+    case = fit_case
+    choice = fit_run(case, min_gain=min_gain)
+    pd.testing.assert_series_equal(choice.winner, choose_combination(case.table, min_gain))
+    current = case.table[case.table["current"]].iloc[0]["wape"]
+    better = (case.table["wape"] < current - min_gain).any()
+    assert bool(choice.winner["current"]) == (not better)

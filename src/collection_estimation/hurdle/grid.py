@@ -35,6 +35,11 @@ every origin as `forecast.forecast` does (p x m added up per company and h, plus
 times the price level projected at the origin; nominal TRY) and scored against the cash that
 came by `evaluate.evaluation_scores`, as step 17 scores the model. Nothing is chosen here
 (U16.6), and p and m are not calibrated.
+
+U16.6, `grid_choice`: the combination kept (the current settings unless beaten by more than
+[grid] min_gain WAPE), its calibration, and, on the same validation origins, how it compares
+with the current settings and with the references (`deflated` variants, financial rule), which
+are made here so the grid does not need step 17.
 """
 import dataclasses
 import hashlib
@@ -51,10 +56,12 @@ import pandas as pd
 from .cache import load_with_cache, source_fingerprint, table_fingerprint
 from .diagnostic import Candidate, reference_probabilities
 from .diagnostic_joint import stage1_gates, stage1_grid, stage2_gates, stage2_grid
-from .evaluate import (HORIZON_TOTAL, MODEL_CODE, POOLED, STACK_COLUMNS, check_forecast_origins,
-                       evaluation_scores)
-from .forecast import (CONSOLIDATED, CUSTOMER_COLUMNS, forecast_totals, stage1_predictions,
-                       stage2_predictions)
+from .calibrate import CalibrationChoice, choose_calibration
+from .evaluate import (HORIZON_TOTAL, HURDLE, MODEL_CODE, POOLED, STACK_COLUMNS,
+                       check_forecast_origins, deflated_reference, evaluation_scores,
+                       paired_wape_bootstrap, rule_reference, stack_forecasts)
+from .forecast import (CONSOLIDATED, CUSTOMER_COLUMNS, Forecast, forecast_totals,
+                       stage1_predictions, stage2_predictions)
 from .prices import projected_levels
 from .stage2 import amount_references
 from .topups import topup_forecasts
@@ -336,6 +343,34 @@ def combination_name(stage1: int, stage2: int, topups: int) -> str:
     return f"stage1 {stage1}, stage2 {stage2}, top-ups {topups}"
 
 
+def projected_at(origins: list[int], horizons: int, week_zero) -> dict[int, pd.Series]:
+    """Per origin, the price levels of its target weeks projected at it
+    (`prices.projected_levels` from `week_zero`), as `forecast.forecast` uses them."""
+    return {origin: projected_levels(week_zero, origin,
+                                     [origin + h for h in range(1, horizons + 1)])
+            for origin in origins}
+
+
+def combination_forecast(predictions: GridPredictions, stage1: int, stage2: int, topups: int,
+                         *, projected: dict[int, pd.Series], companies: list[str],
+                         horizons: int) -> Forecast:
+    """The forecast of one combination of candidates at every origin of `predictions`, as
+    `evaluate.rolling_forecasts` returns it: `customers` (p of stage-1 candidate `stage1`, m of
+    stage-2 candidate `stage2`, expected = p x m) and `totals` (`forecast_totals` at each
+    origin, with top-up candidate `topups` and the price levels `projected` (`projected_at`)).
+    Raises ValueError as `forecast_totals` does (e.g. a NaN p x m)."""
+    rows = predictions.rows
+    customers = rows[CUSTOMER_COLUMNS[:6]].assign(p=predictions.p[stage1],
+                                                  m=predictions.m[stage2])
+    customers["expected"] = customers["p"] * customers["m"]
+    topup_table = predictions.topups[topups]
+    totals = [forecast_totals(customers[customers["origin_week"] == origin],
+                              topup_table[topup_table["origin_week"] == origin],
+                              projected[origin], companies, horizons)
+              for origin in sorted(set(rows["origin_week"]))]
+    return Forecast(totals=pd.concat(totals, ignore_index=True), customers=customers)
+
+
 def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates: GridGates,
                 actual: pd.DataFrame, settings, *, companies: list[str],
                 week_zero) -> pd.DataFrame:
@@ -365,16 +400,12 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
         if found != len(listed):
             raise ValueError(f"there are {found} {what} for {len(listed)} candidates")
     horizons = settings.receivables.horizons
-    rows = predictions.rows
-    origins = sorted(set(rows["origin_week"]))
+    origins = sorted(set(predictions.rows["origin_week"]))
     actual_origins = sorted(set(actual["origin_week"]))
     if actual_origins != origins:
         raise ValueError(f"the actual cash is for origins {actual_origins}, the predictions "
                          f"for {origins}")
-    at_origin = {origin: rows["origin_week"] == origin for origin in origins}
-    projected = {origin: projected_levels(week_zero, origin,
-                                          [origin + h for h in range(1, horizons + 1)])
-                 for origin in origins}
+    projected = projected_at(origins, horizons, week_zero)
     stage1 = scored_numbers(gates.stage1, "stage1")
     stage2 = scored_numbers(gates.stage2, "stage2")
     combinations = list(itertools.product(stage1, stage2, range(len(candidates.topups))))
@@ -383,15 +414,11 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
     keys = ["company_code", "origin_week", "h", "target_week"]
     parts = []
     for i, j, k in combinations:
-        customers = rows[keys].assign(expected=predictions.p[i] * predictions.m[j])
-        topups = predictions.topups[k]
-        for origin in origins:
-            totals = forecast_totals(customers[at_origin[origin]],
-                                     topups[topups["origin_week"] == origin],
-                                     projected[origin], companies, horizons)
-            part = totals[keys + ["total"]].rename(columns={"total": "forecast"})
-            part.insert(0, "method", combination_name(i, j, k))
-            parts.append(part)
+        totals = combination_forecast(predictions, i, j, k, projected=projected,
+                                      companies=companies, horizons=horizons).totals
+        part = totals[keys + ["total"]].rename(columns={"total": "forecast"})
+        part.insert(0, "method", combination_name(i, j, k))
+        parts.append(part)
     forecasts = pd.concat(parts, ignore_index=True)
     forecasts["company_code"] = forecasts["company_code"].astype(object)
 
@@ -412,3 +439,111 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
     table = pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
     # "stable" keeps the candidates' order on a tie.
     return table.sort_values("wape", kind="stable").reset_index(drop=True)
+
+
+def choose_combination(scores: pd.DataFrame, min_gain: float) -> pd.Series:
+    """The row of `scores` (`grid_scores`) to keep: the current settings, unless a combination's
+    WAPE is lower than theirs by more than `min_gain`; then the lowest WAPE (on a tie, the
+    first row, the earlier candidates).
+
+    So a new combination must beat the current settings by more than the noise of choosing
+    among many. Raises ValueError if there is not one current row or a WAPE is NaN (it could
+    not be compared).
+    """
+    current = scores[scores["current"]]
+    if len(current) != 1:
+        raise ValueError(f"the scores hold {len(current)} rows of the current settings; one "
+                         f"is needed")
+    if scores["wape"].isna().any():
+        missing = scores.loc[scores["wape"].isna(), ["stage1", "stage2", "topups"]]
+        raise ValueError(f"no WAPE for the combinations {missing.values.tolist()}: is there no "
+                         f"consolidated cash to judge on?")
+    better = scores[scores["wape"] < current["wape"].iloc[0] - min_gain]
+    if better.empty:
+        return current.iloc[0]
+    return better.sort_values("wape", kind="stable").iloc[0]
+
+
+# The method names of the comparison on validation (`grid_choice`): the chosen combination is
+# `evaluate.HURDLE`; the current settings, if they were not chosen, this.
+CURRENT_SETTINGS = "current settings"
+
+
+@dataclass(frozen=True)
+class GridChoice:
+    """What the grid chose (U16.6), on the validation origins."""
+    winner: pd.Series            # its row of `grid_scores`
+    stage1: Candidate            # its stage-1 candidate
+    stage2: Candidate            # its stage-2 candidate
+    topups: object               # its top-up candidate (`TopupSettings`)
+    forecast: Forecast           # its forecast at every origin (`combination_forecast`)
+    calibration: CalibrationChoice  # `choose_calibration` on that forecast
+    scores: pd.DataFrame         # `evaluation_scores` of it, the current settings (if not
+                                 # chosen), the `deflated` variants and the rule
+    bootstrap: pd.DataFrame      # `paired_wape_bootstrap`: it against each of the others
+
+
+def grid_choice(predictions: GridPredictions, candidates: GridCandidates, scores: pd.DataFrame,
+                actual: pd.DataFrame, settings, *, companies: list[str], week_zero,
+                weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
+                calendar: pd.DataFrame, ledger: pd.DataFrame, rates: pd.DataFrame,
+                new_cash: pd.DataFrame, refunds: pd.DataFrame,
+                unidentified: pd.DataFrame) -> GridChoice:
+    """The grid's choice on the validation origins of `predictions` (U16.6):
+
+      1. the combination kept (`choose_combination` on `scores`, `grid_scores`' table, with
+         [grid] min_gain) and its forecast (`combination_forecast`);
+      2. its corrections of p and m (`calibrate.choose_calibration`, no new fits);
+      3. the references made here at the same origins, so step 17 is not needed: the
+         `deflated` variants (`evaluate.deflated_reference`) and the financial rule
+         (`evaluate.rule_reference`, with the chosen top-ups, so that it differs from the
+         model only in the known customers);
+      4. the chosen combination, uncorrected, scored beside the current settings (if not
+         chosen) and the references (`evaluation_scores`), and compared with each of them
+         (`paired_wape_bootstrap`, [evaluation] samples and seed). Uncorrected: the kept
+         corrections are learned on these very weeks, so the corrected forecast would be
+         flattered here; its fair comparison is the v1 test (U16.7).
+
+    `actual` is `evaluate.actual_totals` at the origins of `predictions`; the other arguments
+    are those of the steps named. Raises ValueError as they do.
+    """
+    horizons = settings.receivables.horizons
+    origins = sorted(set(predictions.rows["origin_week"]))
+    projected = projected_at(origins, horizons, week_zero)
+
+    # 1. The combination kept, and its forecast.
+    winner = choose_combination(scores, settings.grid.min_gain)
+    i, j, k = int(winner["stage1"]), int(winner["stage2"]), int(winner["topups"])
+    forecast = combination_forecast(predictions, i, j, k, projected=projected,
+                                    companies=companies, horizons=horizons)
+
+    # 2. Its corrections.
+    calibration = choose_calibration(forecast, weekly, weeks, levels, actual, settings)
+
+    # 3. The references at the same origins.
+    reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins,
+                                   horizons, week_zero)
+    with_chosen_topups = dataclasses.replace(settings, topups=candidates.topups[k])
+    rule = rule_reference(ledger, rates, origins, with_chosen_topups, companies=companies,
+                          new_cash=new_cash, refunds=refunds, unidentified=unidentified,
+                          levels=levels, calendar=calendar, week_zero=week_zero)
+
+    # 4. Everything scored together, and the chosen one against each of the others.
+    forecasts = stack_forecasts(forecast, reference, rule)
+    if not winner["current"]:
+        current = combination_forecast(predictions, 0, 0, 0, projected=projected,
+                                       companies=companies, horizons=horizons).totals
+        keys = ["company_code", "origin_week", "h", "target_week"]
+        current = current[keys + ["total"]].rename(columns={"total": "forecast"})
+        current.insert(0, "method", CURRENT_SETTINGS)
+        current["company_code"] = current["company_code"].astype(object)
+        forecasts = pd.concat([forecasts, current[STACK_COLUMNS]], ignore_index=True)
+    method_scores = evaluation_scores(forecasts, actual, horizons)
+    pairs = [(HURDLE, other) for other in dict.fromkeys(forecasts["method"]) if other != HURDLE]
+    bootstrap = paired_wape_bootstrap(forecasts, actual, pairs, horizons,
+                                      settings.evaluation.bootstrap_samples,
+                                      settings.evaluation.bootstrap_seed)
+
+    return GridChoice(winner=winner, stage1=candidates.stage1[i], stage2=candidates.stage2[j],
+                      topups=candidates.topups[k], forecast=forecast, calibration=calibration,
+                      scores=method_scores, bootstrap=bootstrap)

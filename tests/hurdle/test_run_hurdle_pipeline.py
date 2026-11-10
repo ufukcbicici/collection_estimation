@@ -8247,6 +8247,8 @@ def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
 # once per stage (stage 1 by log loss ascending, stage 2 by deviance skill descending).
 # U16.5: then the actual cash at the grid's origins (actual_totals), every combination scored
 # (grid_scores), and show_grid_scores, which checks the current combination against step 17.
+# U16.6: then grid_choice (the combination kept, its calibration, and its comparison with the
+# current settings and the references, made in step 18) and show_grid_choice, which end step 18.
 STEP_18_FIT_PROGRESS = (
     "def fit_progress(done, total, stage, at, number, seconds):\n"
     "    left = (time.perf_counter() - started) / done * (total - done)\n"
@@ -8264,6 +8266,11 @@ STEP_18_SCORES = ("grid_table = grid_scores(predictions, candidates, gates, grid
                   "settings, companies=companies, week_zero=week_zero)")
 STEP_18_SHOW_SCORES = ("show_grid_scores(grid_table, candidates, rolled, grid_actual, "
                        "settings.receivables.horizons)")
+STEP_18_CHOICE = ("choice = grid_choice(predictions, candidates, grid_table, grid_actual, "
+                  "settings, companies=companies, week_zero=week_zero, weekly=weekly, "
+                  "weeks=weeks, levels=levels, calendar=calendar, ledger=ledger, rates=rates, "
+                  "new_cash=new_cash, refunds=refunds, unidentified=unidentified)")
+STEP_18_SHOW_CHOICE = "show_grid_choice(choice, candidates, grid_table, settings)"
 STEP_18_STATEMENTS = [
     "grid_origins = list(settings.evaluation.validation_origins)",
     "candidates = grid_candidates(settings)",
@@ -8280,9 +8287,12 @@ STEP_18_STATEMENTS = [
     STEP_18_ACTUAL,
     STEP_18_SCORES,
     STEP_18_SHOW_SCORES,
+    STEP_18_CHOICE,
+    STEP_18_SHOW_CHOICE,
 ]
 STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
-                 "show_grid_predictions", "grid_gates", "grid_scores", "show_grid_scores")
+                 "show_grid_predictions", "grid_gates", "grid_scores", "show_grid_scores",
+                 "grid_choice", "show_grid_choice")
 STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
                 "p_alone", "m_alone", "p_seconds", "m_seconds")
 
@@ -8413,10 +8423,11 @@ def test_step_18_shows_the_candidates_before_the_grid_then_the_predictions_then_
     assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
         statements.index(STEP_18_GRID_CALL))
     # U16.4: the gates come right after the predictions printout; U16.5: the scores after
-    # them end step 18.
+    # them; U16.6: the choice after those ends step 18.
     at = statements.index("show_grid_predictions(predictions, rolled)")
-    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-6:-3]
-    assert statements[at + 4:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES]
+    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-8:-5]
+    assert statements[at + 4:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
+                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
     assert statements.index(STEP_18_GRID_CALL) < at
 
 
@@ -8452,15 +8463,16 @@ def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
         assert reads == [], ast.unparse(node)
 
 
-def test_grid_is_imported_once_with_its_five_functions():
-    # U16.5 added grid_scores (the test was "..._four_functions" before).
+def test_grid_is_imported_once_with_its_six_functions():
+    # U16.5 added grid_scores (the test was "..._four_functions" before); U16.6 grid_choice
+    # (it was "..._five_functions").
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.grid"]
     assert len(imports) == 1
     assert [(a.name, a.asname) for a in imports[0].names] == [
-        ("grid_candidates", None), ("grid_gates", None), ("grid_predictions", None),
-        ("grid_scores", None), ("with_params", None)]
+        ("grid_candidates", None), ("grid_choice", None), ("grid_gates", None),
+        ("grid_predictions", None), ("grid_scores", None), ("with_params", None)]
 
 
 def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
@@ -8508,6 +8520,12 @@ assert script.grid_scores is grid.grid_scores
 inspect.signature(script.grid_scores).bind("predictions", "candidates", "gates", "actual",
                                            "settings", companies=[], week_zero=None)
 inspect.signature(script.show_grid_scores).bind("table", "candidates", None, "actual", 5)
+assert script.grid_choice is grid.grid_choice
+inspect.signature(script.grid_choice).bind(
+    "predictions", "candidates", "table", "actual", "settings", companies=[], week_zero=None,
+    weekly=None, weeks=None, levels=None, calendar=None, ledger=None, rates=None,
+    new_cash=None, refunds=None, unidentified=None)
+inspect.signature(script.show_grid_choice).bind("choice", "candidates", "table", "settings")
 from collection_estimation.hurdle import evaluate
 assert script.STACK_COLUMNS is evaluate.STACK_COLUMNS
 assert script.evaluation_scores is evaluate.evaluation_scores
@@ -8566,9 +8584,12 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
         "new_cash": "<new cash>", "refunds": "<refunds>", "unidentified": "<unidentified>",
         "levels": "<levels>", "rolled": rolled,
         "weekly": "<weekly>", "weeks": "<weeks>", "week_zero": "<week zero>",
+        "ledger": "<ledger>", "rates": "<rates>",
         "actual_totals": recorder("actual_totals", "<grid actual>"),
         "grid_scores": recorder("grid_scores", "<grid table>"),
         "show_grid_scores": recorder("show_grid_scores", None),
+        "grid_choice": recorder("grid_choice", "<choice>"),
+        "show_grid_choice": recorder("show_grid_choice", None),
         "time": SimpleNamespace(perf_counter=lambda: next(clock)),
         "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
         "block_feature_columns": recorder("block_feature_columns", "<blocks>"),
@@ -8592,7 +8613,8 @@ def test_step_18_run_calls_in_order():
                                               "show_grid_predictions", "grid_gates",
                                               "show_grid_gates", "show_grid_gates",
                                               "actual_totals", "grid_scores",
-                                              "show_grid_scores"]
+                                              "show_grid_scores", "grid_choice",
+                                              "show_grid_choice"]
 
 
 def test_step_18_run_with_the_grid_switched_off_does_nothing():
@@ -9029,12 +9051,13 @@ def test_show_grid_gates_is_a_module_level_function_with_four_parameters():
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
 
 
-def test_show_grid_gates_and_show_grid_scores_sit_right_before_step_15s_show_gates():
+def test_show_grid_gates_scores_and_choice_sit_right_before_step_15s_show_gates():
     # U16.5 put show_grid_scores between them (the test was "show_grid_gates_sits_right_
-    # before_step_15s_show_gates" before).
+    # before_step_15s_show_gates" before); U16.6 show_grid_choice after it (the test was
+    # "show_grid_gates_and_show_grid_scores_sit_right_before_step_15s_show_gates").
     names = [node.name for node in script_functions()]
     at = names.index("show_grid_gates")
-    assert names[at + 1:at + 3] == ["show_grid_scores", "show_gates"]
+    assert names[at + 1:at + 4] == ["show_grid_scores", "show_grid_choice", "show_gates"]
 
 
 def test_step_18_run_grid_gates_gets_the_predictions_candidates_and_settings():
@@ -9328,15 +9351,17 @@ def test_step_18_show_grid_scores_gets_the_table_candidates_rolled_actual_and_ho
         "grid_table", "candidates", "rolled", "grid_actual", "settings.receivables.horizons"]
 
 
-def test_step_18_scores_come_right_after_the_gates_in_order_and_end_step_18():
+def test_step_18_scores_come_right_after_the_gates_in_order_then_the_choice_ends_step_18():
+    # Since U16.6 the choice follows the scores (the test was "..._in_order_and_end_step_18").
     statements = [ast.unparse(node) for node in step_18_body()]
     at = statements.index("show_grid_gates('stage 2', gates.stage2, 'deviance skill', "
                           "ascending=False)")
-    assert statements[at + 1:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES]
+    assert statements[at + 1:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
+                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
 
 
-def test_step_18_scores_never_read_the_test_origins():
-    for node in step_18_body()[-3:]:
+def test_step_18_scores_and_choice_never_read_the_test_origins():
+    for node in step_18_body()[-5:]:
         assert "test_origins" not in ast.unparse(node)
 
 
@@ -9603,3 +9628,393 @@ def test_show_grid_scores_on_grid_scores_own_output(capsys):
                          f"{current['wape']:.4f}, 5-week WAPE {current['total_wape']:.4f}, bias "
                          f"{current['bias']:+.4f}, company WAPE {current['company_wape']:.4f}")
     assert lines[-1] == NOT_CHECKED
+
+
+# --- U16.6: step 18's choice (grid_choice) and its printout (show_grid_choice) -----------------
+
+CHOICE_KEYWORDS = {"companies": "companies", "week_zero": "week_zero", "weekly": "weekly",
+                   "weeks": "weeks", "levels": "levels", "calendar": "calendar",
+                   "ledger": "ledger", "rates": "rates", "new_cash": "new_cash",
+                   "refunds": "refunds", "unidentified": "unidentified"}
+
+
+def test_step_18_grid_choice_positional_arguments():
+    calls = calls_in(step_18_body(), "grid_choice")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["predictions", "candidates", "grid_table",
+                                                       "grid_actual", "settings"]
+
+
+def test_step_18_grid_choice_keywords():
+    call = calls_in(step_18_body(), "grid_choice")[0]
+    assert keywords_of(call) == CHOICE_KEYWORDS
+
+
+def test_step_18_grid_choice_reads_what_step_17s_references_read():
+    # The references are made inside grid_choice from the same inputs step 17 gives them.
+    call = keywords_of(calls_in(step_18_body(), "grid_choice")[0])
+    rule = calls_to(step_17_block(), "rule_reference")[0]
+    assert [ast.unparse(a) for a in rule.args][:2] == [call["ledger"], call["rates"]]
+    for name, value in keywords_of(rule).items():
+        assert call[name] == value, name
+    reference = calls_to(step_17_block(), "deflated_reference")[0]
+    reference_args = [ast.unparse(a) for a in reference.args]
+    assert reference_args[:5] == [call["weekly"], call["weeks"], call["levels"],
+                                  call["calendar"], call["companies"]]
+    assert reference_args[-1] == call["week_zero"]
+
+
+def test_step_18_grid_choice_does_not_read_step_17s_results():
+    # The grid makes its own references: nothing step 17 computes is handed to it.
+    source = ast.unparse(calls_in(step_18_body(), "grid_choice")[0])
+    for name in ("rolled", "reference", "rule", "rolled_actual", "scores", "bootstrap",
+                 "forecasts", "origins"):
+        assert not re.search(rf"\b{name}\b", source.replace("grid_actual", "")), name
+
+
+def test_step_18_choice_is_assigned_once_in_step_18():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    assert sum(s.startswith("choice = ") for s in statements) == 1
+
+
+def test_step_18_show_grid_choice_gets_the_choice_candidates_table_and_settings():
+    calls = calls_in(step_18_body(), "show_grid_choice")
+    assert len(calls) == 1 and calls[0].keywords == []
+    assert [ast.unparse(a) for a in calls[0].args] == ["choice", "candidates", "grid_table",
+                                                       "settings"]
+
+
+def test_step_18_choice_comes_right_after_show_grid_scores_and_its_printout_ends_step_18():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    at = statements.index(STEP_18_SHOW_SCORES)
+    assert statements[at + 1:] == [STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
+
+
+def test_show_grid_choice_is_a_module_level_function_with_four_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_choice"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["choice", "candidates", "table", "settings"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+SHOW_CHOICE_GLOBALS = {"HURDLE", "show_calibration_choice", "show_evaluation_scores",
+                       "show_paired_bootstrap"}
+
+
+def test_show_grid_choice_reads_only_names_the_script_imports_or_defines():
+    import builtins
+    function = [node for node in script_functions() if node.name == "show_grid_choice"][0]
+    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Load)}
+    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Store)}
+    params = {a.arg for a in function.args.args}
+    free = loaded - stored - params - set(dir(builtins))
+    assert free == SHOW_CHOICE_GLOBALS
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
+                for a in node.names}
+    defined = {node.name for node in script_functions()}
+    assert "HURDLE" in imported
+    assert SHOW_CHOICE_GLOBALS - {"HURDLE"} <= defined
+
+
+def test_step_18_run_grid_choice_gets_its_arguments():
+    calls, _ = run_step_18()
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_choice"]
+    assert len(found) == 1
+    (predictions, candidates, table, actual, settings), kwargs = found[0]
+    assert (predictions, candidates, table, actual) == ("<predictions>", "<candidates>",
+                                                        "<grid table>", "<grid actual>")
+    assert settings.grid.run is True
+    assert kwargs == {"companies": "<companies>", "week_zero": "<week zero>",
+                      "weekly": "<weekly>", "weeks": "<weeks>", "levels": "<levels>",
+                      "calendar": "<calendar>", "ledger": "<ledger>", "rates": "<rates>",
+                      "new_cash": "<new cash>", "refunds": "<refunds>",
+                      "unidentified": "<unidentified>"}
+
+
+@pytest.mark.parametrize("rolled", ["<rolled>", None])
+def test_step_18_run_shows_the_choice_with_the_candidates_table_and_settings(rolled):
+    calls, _ = run_step_18(rolled=rolled)
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_choice"]
+    assert len(shown) == 1
+    (choice, candidates, table, settings), kwargs = shown[0]
+    assert kwargs == {}
+    assert (choice, candidates, table) == ("<choice>", "<candidates>", "<grid table>")
+    assert settings.grid.run is True
+
+
+def test_step_18_run_the_choice_reads_the_same_table_and_settings_as_the_scores():
+    calls, _ = run_step_18()
+    by_name = {name: args for name, args, _ in calls}
+    assert by_name["grid_choice"][4] is by_name["grid_scores"][4]
+    assert by_name["show_grid_choice"][3] is by_name["grid_choice"][4]
+    assert by_name["grid_choice"][3] == by_name["grid_scores"][3] == "<grid actual>"
+
+
+def test_step_18_run_switched_off_chooses_nothing():
+    calls, _ = run_step_18(run=False, ticks=())
+    assert not any(name in ("grid_choice", "show_grid_choice") for name, _, _ in calls)
+
+
+# show_grid_choice, the function alone: compiled from the script, with the printers it calls
+# replaced by fakes that print what they were given (each is tested on its own above).
+
+def choice_printer(printed):
+    from collection_estimation.hurdle import evaluate
+    found = [node for node in script_functions() if node.name == "show_grid_choice"]
+    assert len(found) == 1
+
+    def fake(name):
+        def show(*args):
+            printed.append((name, args))
+            print(f"<{name}>")
+        return show
+
+    namespace = {"HURDLE": evaluate.HURDLE,
+                 "show_calibration_choice": fake("show_calibration_choice"),
+                 "show_evaluation_scores": fake("show_evaluation_scores"),
+                 "show_paired_bootstrap": fake("show_paired_bootstrap")}
+    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_choice>", "exec"),
+         namespace)
+    return namespace["show_grid_choice"]
+
+
+def choice_candidates():
+    from collection_estimation.hurdle.settings import TopupSettings
+    topups = TopupSettings(method="mean", window=13, with_level=True, compare=False,
+                           compare_first_origin=0, compare_last_origin=0, compare_windows=(4,))
+    return SimpleNamespace(
+        stage1=[SimpleNamespace(params={"max_iter": 300, "learning_rate": 0.05}),
+                SimpleNamespace(params={"max_iter": 900, "learning_rate": 0.05})],
+        stage2=[SimpleNamespace(params={"loss": "poisson", "learning_rate": 0.05}),
+                SimpleNamespace(params={"loss": "gamma", "learning_rate": 0.1})],
+        topups=[topups, SimpleNamespace(method="mean", window=8),
+                SimpleNamespace(method="ridge", with_level=False)])
+
+
+def choice_scores_table(lines=None):
+    """A grid_scores table: current (0, 0, 0) WAPE 0.1, rank 2 by WAPE."""
+    import pandas as pd
+    from collection_estimation.hurdle.grid import GRID_SCORE_COLUMNS
+    lines = lines or [(1, 0, 1, False, 0.098, 0.1, 0.0, 0.2),
+                      (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
+                      (0, 1, 2, False, 0.17, 0.2, 0.0, 0.25)]
+    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+
+
+def choice_settings(grid_min_gain=0.005, calibration_min_gain=0.01, horizons=5):
+    return SimpleNamespace(grid=SimpleNamespace(min_gain=grid_min_gain),
+                           calibration=SimpleNamespace(min_gain=calibration_min_gain),
+                           receivables=SimpleNamespace(horizons=horizons))
+
+
+def hand_choice(table, row, candidates):
+    winner = table.iloc[row]
+    i, j, k = int(winner["stage1"]), int(winner["stage2"]), int(winner["topups"])
+    return SimpleNamespace(winner=winner, stage1=candidates.stage1[i],
+                           stage2=candidates.stage2[j], topups=candidates.topups[k],
+                           forecast="<forecast>", calibration="<calibration>",
+                           scores="<scores>", bootstrap="<bootstrap>")
+
+
+def printed_choice(capsys, choice, candidates, table, settings):
+    printed = []
+    capsys.readouterr()
+    assert choice_printer(printed)(choice, candidates, table, settings) is None
+    return capsys.readouterr().out.splitlines(), printed
+
+
+CHOICE_TAIL = ["        its calibration (U15.4 on its forecast):",
+               "<show_calibration_choice>",
+               "        on the same origins, uncorrected (hurdle = the combination kept):",
+               "<show_evaluation_scores>",
+               "<show_paired_bootstrap>"]
+
+
+def test_show_grid_choice_exact_printout_when_the_current_settings_are_kept(capsys):
+    candidates, table = choice_candidates(), choice_scores_table()
+    choice = hand_choice(table, 1, candidates)
+    lines, _ = printed_choice(capsys, choice, candidates, table, choice_settings())
+    assert lines == ["        kept the current settings: no combination beats their WAPE "
+                     "0.1000 by more than 0.005 (best 0.0980)"] + CHOICE_TAIL
+
+
+def test_show_grid_choice_kept_and_best_shows_its_own_wape_as_the_best(capsys):
+    candidates = choice_candidates()
+    table = choice_scores_table([(0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
+                                 (1, 0, 1, False, 0.13, 0.1, 0.0, 0.2)])
+    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                              choice_settings(grid_min_gain=0.02))
+    assert lines[0] == ("        kept the current settings: no combination beats their WAPE "
+                        "0.1000 by more than 0.02 (best 0.1000)")
+
+
+def test_show_grid_choice_exact_printout_of_new_settings(capsys):
+    candidates, table = choice_candidates(), choice_scores_table(
+        [(1, 0, 1, False, 0.08, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
+         (0, 1, 2, False, 0.17, 0.2, 0.0, 0.25)])
+    choice = hand_choice(table, 0, candidates)
+    lines, _ = printed_choice(capsys, choice, candidates, table, choice_settings())
+    assert lines == [
+        "        NEW settings: WAPE 0.0800 against 0.1000 (gain 0.0200, more than 0.005):",
+        "          stage 1: {'max_iter': 900, 'learning_rate': 0.05} (was {'max_iter': 300, "
+        "'learning_rate': 0.05})",
+        "          stage 2: {'loss': 'poisson', 'learning_rate': 0.05}",
+        f"          top-ups: {candidates.topups[1]} (was {candidates.topups[0]})",
+    ] + CHOICE_TAIL
+
+
+def test_show_grid_choice_new_settings_mark_only_the_stages_that_changed(capsys):
+    candidates, table = choice_candidates(), choice_scores_table(
+        [(0, 1, 0, False, 0.05, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
+    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                              choice_settings())
+    stage_lines = lines[1:4]
+    assert stage_lines[0] == "          stage 1: {'max_iter': 300, 'learning_rate': 0.05}"
+    assert stage_lines[1].endswith("(was {'loss': 'poisson', 'learning_rate': 0.05})")
+    assert stage_lines[1].startswith("          stage 2: {'loss': 'gamma', ")
+    assert stage_lines[2] == f"          top-ups: {candidates.topups[0]}"
+    assert "(was" not in stage_lines[0] and "(was" not in stage_lines[2]
+
+
+def test_show_grid_choice_the_was_test_compares_values_not_identity(capsys):
+    # A winner whose stage-1 params equal candidate 0's (another dict, same values) is not
+    # marked as changed.
+    candidates, table = choice_candidates(), choice_scores_table(
+        [(1, 1, 2, False, 0.05, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
+    candidates.stage1[1] = SimpleNamespace(params=dict(candidates.stage1[0].params))
+    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                              choice_settings())
+    assert lines[1] == "          stage 1: {'max_iter': 300, 'learning_rate': 0.05}"
+
+
+def test_show_grid_choice_the_gain_is_current_minus_winner_rounded_to_four(capsys):
+    candidates, table = choice_candidates(), choice_scores_table(
+        [(1, 0, 1, False, 0.123456, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.2, 0.12, 0.031, 0.22)])
+    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                              choice_settings(grid_min_gain=0.05))
+    assert lines[0] == ("        NEW settings: WAPE 0.1235 against 0.2000 (gain 0.0765, more "
+                        "than 0.05):")
+
+
+def test_show_grid_choice_finds_the_current_by_its_flag_not_its_position(capsys):
+    candidates = choice_candidates()
+    table = choice_scores_table([(1, 0, 1, False, 0.07, 0.1, 0.0, 0.2),
+                                 (0, 1, 2, False, 0.08, 0.2, 0.0, 0.25),
+                                 (0, 0, 0, True, 0.3, 0.12, 0.031, 0.22)])
+    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                              choice_settings())
+    assert lines[0].startswith("        NEW settings: WAPE 0.0700 against 0.3000 (gain 0.2300")
+
+
+def test_show_grid_choice_the_current_kept_prints_no_stage_lines(capsys):
+    candidates, table = choice_candidates(), choice_scores_table()
+    lines, _ = printed_choice(capsys, hand_choice(table, 1, candidates), candidates, table,
+                              choice_settings())
+    assert not any("stage 1:" in line or "top-ups:" in line for line in lines)
+
+
+@pytest.mark.parametrize("row", [0, 1])
+def test_show_grid_choice_passes_the_choice_parts_to_the_printers(capsys, row):
+    candidates, table = choice_candidates(), choice_scores_table(
+        [(1, 0, 1, False, 0.08, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
+    choice = hand_choice(table, row, candidates)
+    choice.calibration, choice.scores, choice.bootstrap = "<cal>", "<sc>", "<bs>"
+    _, printed = printed_choice(capsys, choice, candidates, table,
+                                choice_settings(grid_min_gain=0.005, calibration_min_gain=0.03,
+                                                horizons=4))
+    # The calibration's own min_gain, not the grid's.
+    assert printed == [("show_calibration_choice", ("<cal>", 0.03)),
+                       ("show_evaluation_scores", ("<sc>", 4)),
+                       ("show_paired_bootstrap", ("<bs>",))]
+
+
+def test_show_grid_choice_changes_nothing(capsys):
+    import pandas as pd
+    candidates, table = choice_candidates(), choice_scores_table()
+    before = table.copy()
+    params = [dict(c.params) for c in candidates.stage1 + candidates.stage2]
+    printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
+                   choice_settings())
+    pd.testing.assert_frame_equal(table, before)
+    assert [c.params for c in candidates.stage1 + candidates.stage2] == params
+
+
+# show_grid_choice through the real script, with real printers, on a real GridChoice made by
+# grid_choice on test_grid.py's hand-made example (the references are fakes there; the
+# calibration a hand-made CalibrationChoice).
+SHOW_GRID_CHOICE = """
+from types import SimpleNamespace
+import pandas as pd
+import run_hurdle_pipeline as script
+from collection_estimation.hurdle import grid as grid_module
+from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
+                                                    MCorrection, PCorrection)
+from tests.hurdle import test_grid as tg
+
+candidates_table = pd.DataFrame(
+    [("p none, m none", "none", "none", 0, 0.17034, 0.11119, -0.05, 0.22221)],
+    columns=CANDIDATE_COLUMNS)
+calibration = CalibrationChoice(p_correction=PCorrection("none"),
+                                m_correction=MCorrection("none"), split_week=21,
+                                judged_origins=[22], candidates=candidates_table,
+                                winner="p none, m none",
+                                bootstrap=pd.DataFrame(columns=["horizon"]))
+predictions, actual = tg.sc_predictions(), tg.sc_actual()
+table = tg.sc_run(predictions=predictions, actual=actual)
+candidates = SimpleNamespace(
+    stage1=[SimpleNamespace(params={"max_iter": 10 * (i + 1)}) for i in range(3)],
+    stage2=[SimpleNamespace(params={"learning_rate": 0.1 * (j + 1)}) for j in range(3)],
+    topups=[f"<topups {k}>" for k in range(2)])
+grid_module.choose_calibration = lambda *args, **kwargs: calibration
+grid_module.deflated_reference = lambda *args, **kwargs: tg.fake_reference(actual)
+grid_module.rule_reference = lambda *args, **kwargs: SimpleNamespace(
+    totals=tg.fake_rule_totals(actual))
+MODE
+choice = tg.ch_run(predictions, scores, actual, settings=settings, candidates=candidates)
+shown = SimpleNamespace(grid=settings.grid, calibration=settings.calibration,
+                        receivables=settings.receivables)
+script.show_grid_choice(choice, candidates, scores, shown)
+print("ok")
+"""
+KEPT_MODE = "scores = table\nsettings = tg.ch_settings(min_gain=10.0)"
+NEW_MODE = "scores = tg.without_current(table)\nsettings = tg.ch_settings(min_gain=0.0)"
+
+
+def real_choice_lines(mode):
+    result = run_code(SHOW_GRID_CHOICE.replace("MODE", mode))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] == "ok"
+    return lines[:-1]
+
+
+def test_show_grid_choice_real_printers_when_the_current_is_kept():
+    lines = real_choice_lines(KEPT_MODE)
+    assert lines[0].startswith("        kept the current settings: no combination beats their "
+                               "WAPE ")
+    assert lines[0].endswith(")") and "by more than 10.0 (best " in lines[0]
+    assert lines[1] == "        its calibration (U15.4 on its forecast):"
+    assert "        chosen: p none, m none" in lines
+    at = lines.index("        on the same origins, uncorrected (hurdle = the combination kept):")
+    rest = "\n".join(lines[at + 1:])
+    assert "scores (U14.5), consolidated" in rest
+    assert "paired bootstrap (U14.5c)" in rest
+    assert "current settings" not in rest
+    for method in ("hurdle", "deflated", "deflated_nolevel", "deflated_trend", "rule"):
+        assert method in rest, method
+
+
+def test_show_grid_choice_real_printers_with_new_settings():
+    lines = real_choice_lines(NEW_MODE)
+    assert lines[0].startswith("        NEW settings: WAPE ")
+    assert lines[0].endswith("more than 0.0):")
+    assert lines[1].startswith("          stage 1: ")
+    assert lines[2].startswith("          stage 2: ")
+    assert lines[3].startswith("          top-ups: ")
+    at = lines.index("        on the same origins, uncorrected (hurdle = the combination kept):")
+    rest = "\n".join(lines[at + 1:])
+    assert "hurdle vs current settings" in rest
