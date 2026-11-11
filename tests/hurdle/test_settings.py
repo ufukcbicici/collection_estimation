@@ -220,10 +220,11 @@ VALID = {
     # U15: the calibration. Values differ from synthetic.toml's on purpose (150 and 0.02 against
     # 200 and 0.005).
     "calibration": {"company_shrink_rows": "150", "min_gain": "0.02"},
-    # U16.2: the settings grid. Values differ from synthetic.toml's on purpose (run false,
-    # run_test true, unsorted grids, topup_windows [13, 4] unsorted, min_gain 0.01), and from
+    # U16.2: the settings grid. Values differ from synthetic.toml's on purpose (run_test true,
+    # unsorted grids, topup_windows [13, 4] unsorted, min_gain 0.01), and from
     # [joint_diagnostic]'s and [calibration]'s, so a test can tell which section was read.
-    "grid": {"run": "false", "run_test": "true", "stage1_max_iter": "[900, 100]",
+    # U16.7: run is true, since run_test = true needs run = true.
+    "grid": {"run": "true", "run_test": "true", "stage1_max_iter": "[900, 100]",
              "stage1_learning_rate": "[0.2, 0.05]", "stage1_max_leaf_nodes": "[15, 63]",
              "stage2_loss": '["gamma"]', "stage2_max_iter": "[600]",
              "stage2_learning_rate": "[0.1, 0.01]", "stage2_max_leaf_nodes": "[31, 15]",
@@ -6407,7 +6408,7 @@ GRID_STAGE_KEYS = ["stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_n
                    "stage2_loss", "stage2_max_iter", "stage2_learning_rate",
                    "stage2_max_leaf_nodes", "stage2_scale", "stage2_balance_floor"]
 GRID_READ = GridSettings(
-    run=False, run_test=True, stage1_max_iter=(900, 100), stage1_learning_rate=(0.2, 0.05),
+    run=True, run_test=True, stage1_max_iter=(900, 100), stage1_learning_rate=(0.2, 0.05),
     stage1_max_leaf_nodes=(15, 63), stage2_loss=("gamma",), stage2_max_iter=(600,),
     stage2_learning_rate=(0.1, 0.01), stage2_max_leaf_nodes=(31, 15),
     stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "mean"),
@@ -6483,7 +6484,7 @@ def test_the_grid_section_is_read(tmp_path, repo):
 
 def test_the_grid_values_have_the_right_python_types(tmp_path, repo):
     grid = load(tmp_path, repo).grid
-    assert grid.run is False and grid.run_test is True
+    assert grid.run is True and grid.run_test is True
     for name, item_type in (("stage1_max_iter", int), ("stage1_learning_rate", float),
                             ("stage1_max_leaf_nodes", int), ("stage2_loss", str),
                             ("stage2_max_iter", int), ("stage2_learning_rate", float),
@@ -6503,7 +6504,7 @@ def test_the_grid_values_have_the_right_python_types(tmp_path, repo):
 def test_grid_settings_is_frozen_and_hashable(tmp_path, repo):
     grid = load(tmp_path, repo).grid
     with pytest.raises(dataclasses.FrozenInstanceError):
-        grid.run = True
+        grid.run = False
     assert hash(grid) == hash(dataclasses.replace(grid))
 
 
@@ -6536,7 +6537,51 @@ def test_topup_windows_good_values(tmp_path, repo, text, expected):
 @pytest.mark.parametrize("key", ["run", "run_test"])
 @pytest.mark.parametrize("text, expected", [("true", True), ("false", False)])
 def test_run_and_run_test_accept_true_and_false(tmp_path, repo, key, text, expected):
-    assert getattr(load(tmp_path, repo, changes={("grid", key): text}).grid, key) is expected
+    # U16.7: run = false is only allowed with run_test = false, so run_test is switched off
+    # while run is varied; run_test is varied with VALID's run = true.
+    changes = {("grid", key): text}
+    if key == "run":
+        changes[("grid", "run_test")] = "false"
+    assert getattr(load(tmp_path, repo, changes=changes).grid, key) is expected
+
+
+# --- U16.7: run_test needs run -----------------------------------------------------------
+
+def test_run_test_true_with_run_false_is_refused_with_the_exact_message(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"run": "false", "run_test": "true"})
+    assert message == (f"{GRID_SECTION}: run_test = true needs run = true (the test uses the "
+                       f"grid's choice)")
+
+
+@pytest.mark.parametrize("run, run_test", [("true", "true"), ("true", "false"),
+                                           ("false", "false")])
+def test_the_other_three_run_and_run_test_pairs_are_accepted(tmp_path, repo, run, run_test):
+    grid = load(tmp_path, repo, changes={("grid", "run"): run,
+                                         ("grid", "run_test"): run_test}).grid
+    assert grid.run is (run == "true")
+    assert grid.run_test is (run_test == "true")
+
+
+def test_read_grid_refuses_run_test_without_run_naming_where():
+    assert read_grid_error(run=False, run_test=True) == (
+        "here: run_test = true needs run = true (the test uses the grid's choice)")
+
+
+@pytest.mark.parametrize("run, run_test", [(True, True), (True, False), (False, False)])
+def test_read_grid_accepts_the_other_three_pairs(run, run_test):
+    grid = read_grid(grid_table(run=run, run_test=run_test), "here")
+    assert (grid.run, grid.run_test) == (run, run_test)
+
+
+def test_read_grid_checks_run_test_is_a_bool_before_the_pair():
+    # A non-bool run_test with run false gets the bool message, not the pair message.
+    assert read_grid_error(run=False, run_test="yes") == (
+        "here: run_test is 'yes', not true or false")
+
+
+def test_read_grid_checks_the_pair_before_the_grids():
+    assert read_grid_error(run=False, run_test=True, stage2_loss=["squared_error"]) == (
+        "here: run_test = true needs run = true (the test uses the grid's choice)")
 
 
 def test_both_grid_losses_are_accepted(tmp_path, repo):
@@ -6569,7 +6614,7 @@ def test_tolerances_and_min_gain_good_values(tmp_path, repo, key, text, expected
 
 def test_the_grid_does_not_change_the_other_sections(tmp_path, repo):
     a = load(tmp_path, repo)
-    b = load(tmp_path, repo, changes={("grid", "run"): "true", ("grid", "min_gain"): "0.2",
+    b = load(tmp_path, repo, changes={("grid", "run_test"): "false", ("grid", "min_gain"): "0.2",
                                       ("grid", "stage2_loss"): '["poisson"]'})
     for field in dataclasses.fields(Settings):
         if field.name != "grid":
@@ -6641,7 +6686,8 @@ def test_a_grid_key_in_another_section_is_unknown_there(tmp_path, repo, key, val
 
 def test_a_bad_grid_is_refused_with_the_grid_switched_off(tmp_path, repo):
     # A broken file fails on load whatever run says.
-    message = grid_error(tmp_path, repo, {"run": "false", "stage2_loss": '["squared_error"]'})
+    message = grid_error(tmp_path, repo, {"run": "false", "run_test": "false",
+                                          "stage2_loss": '["squared_error"]'})
     assert message.startswith(f"{GRID_SECTION} stage2_loss item:")
 
 

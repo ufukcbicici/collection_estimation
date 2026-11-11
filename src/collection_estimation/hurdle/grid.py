@@ -40,6 +40,11 @@ U16.6, `grid_choice`: the combination kept (the current settings unless beaten b
 [grid] min_gain WAPE), its calibration, and, on the same validation origins, how it compares
 with the current settings and with the references (`deflated` variants, financial rule), which
 are made here so the grid does not need step 17.
+
+U16.7, `grid_test`: the v1 test, only with [grid] run_test. What `grid_choice` froze (the
+three settings and the corrections of p and m) is judged on the [evaluation] test origins
+against the same references. The settings are fitted again at each test origin on the rows
+known there; the corrections are not learned again. A report, nothing is chosen from it.
 """
 import dataclasses
 import hashlib
@@ -56,7 +61,7 @@ import pandas as pd
 from .cache import load_with_cache, source_fingerprint, table_fingerprint
 from .diagnostic import Candidate, reference_probabilities
 from .diagnostic_joint import stage1_gates, stage1_grid, stage2_gates, stage2_grid
-from .calibrate import CalibrationChoice, choose_calibration
+from .calibrate import CalibrationChoice, choose_calibration, corrected_forecast
 from .evaluate import (HORIZON_TOTAL, HURDLE, MODEL_CODE, POOLED, STACK_COLUMNS,
                        check_forecast_origins, deflated_reference, evaluation_scores,
                        paired_wape_bootstrap, rule_reference, stack_forecasts)
@@ -467,6 +472,19 @@ def choose_combination(scores: pd.DataFrame, min_gain: float) -> pd.Series:
 # The method names of the comparison on validation (`grid_choice`): the chosen combination is
 # `evaluate.HURDLE`; the current settings, if they were not chosen, this.
 CURRENT_SETTINGS = "current settings"
+# On the v1 test (`grid_test`) the chosen combination with its corrections is `evaluate.HURDLE`;
+# the same forecast without them, shown for information only, this.
+UNCORRECTED = "hurdle uncorrected"
+
+
+def method_rows(forecast: Forecast, method: str) -> pd.DataFrame:
+    """The totals of `forecast` as one method's rows of the stacked forecasts
+    (`evaluate.STACK_COLUMNS`), named `method`."""
+    keys = ["company_code", "origin_week", "h", "target_week"]
+    rows = forecast.totals[keys + ["total"]].rename(columns={"total": "forecast"})
+    rows.insert(0, "method", method)
+    rows["company_code"] = rows["company_code"].astype(object)
+    return rows[STACK_COLUMNS]
 
 
 @dataclass(frozen=True)
@@ -532,12 +550,9 @@ def grid_choice(predictions: GridPredictions, candidates: GridCandidates, scores
     forecasts = stack_forecasts(forecast, reference, rule)
     if not winner["current"]:
         current = combination_forecast(predictions, 0, 0, 0, projected=projected,
-                                       companies=companies, horizons=horizons).totals
-        keys = ["company_code", "origin_week", "h", "target_week"]
-        current = current[keys + ["total"]].rename(columns={"total": "forecast"})
-        current.insert(0, "method", CURRENT_SETTINGS)
-        current["company_code"] = current["company_code"].astype(object)
-        forecasts = pd.concat([forecasts, current[STACK_COLUMNS]], ignore_index=True)
+                                       companies=companies, horizons=horizons)
+        forecasts = pd.concat([forecasts, method_rows(current, CURRENT_SETTINGS)],
+                              ignore_index=True)
     method_scores = evaluation_scores(forecasts, actual, horizons)
     pairs = [(HURDLE, other) for other in dict.fromkeys(forecasts["method"]) if other != HURDLE]
     bootstrap = paired_wape_bootstrap(forecasts, actual, pairs, horizons,
@@ -547,3 +562,89 @@ def grid_choice(predictions: GridPredictions, candidates: GridCandidates, scores
     return GridChoice(winner=winner, stage1=candidates.stage1[i], stage2=candidates.stage2[j],
                       topups=candidates.topups[k], forecast=forecast, calibration=calibration,
                       scores=method_scores, bootstrap=bootstrap)
+
+
+@dataclass(frozen=True)
+class GridTest:
+    """The v1 test (U16.7): the grid's choice on the test origins, with nothing chosen there."""
+    forecast: Forecast           # the chosen combination with its corrections, every test origin
+    uncorrected: Forecast        # the same without the corrections (information only)
+    scores: pd.DataFrame         # `evaluation_scores` of both, the `deflated` variants and the
+                                 # rule
+    bootstrap: pd.DataFrame      # `paired_wape_bootstrap`: the corrected one against each other
+
+
+def grid_test(choice: GridChoice, actual: pd.DataFrame, settings, *, table: pd.DataFrame,
+              block_columns: dict[str, list[str]], companies: list[str], week_zero,
+              weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
+              calendar: pd.DataFrame, ledger: pd.DataFrame, rates: pd.DataFrame,
+              new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
+              cache_folder: Path,
+              on_fit_done: Callable[[int, int, str, int, int, float], None] | None = None
+              ) -> GridTest:
+    """The v1 test (U16.7) on the [evaluation] test origins: what `choice` (`grid_choice`)
+    froze on validation, judged on weeks it never saw. A report: nothing is chosen from it.
+
+      1. the chosen stage-1, stage-2 and top-up settings fitted at each test origin on the rows
+         known there (`grid_predictions` with those three alone, each fit cached in
+         `cache_folder`; `on_fit_done` as there) and forecast (`combination_forecast`);
+      2. its corrections of p and m, as learned on validation, applied unchanged
+         (`calibrate.corrected_forecast`);
+      3. the references at the test origins: the `deflated` variants and the financial rule
+         with the chosen top-ups, as in `grid_choice`;
+      4. the corrected forecast (`evaluate.HURDLE`), the uncorrected one (`UNCORRECTED`) and the
+         references scored together (`evaluation_scores`), and the corrected one compared with
+         each of the others (`paired_wape_bootstrap`, [evaluation] samples and seed).
+
+    `actual` is `evaluate.actual_totals` at the test origins; the other arguments are those of
+    `grid_predictions` and `grid_choice`. Raises ValueError if a test target week is not after
+    every validation target week of `choice` (validation would have seen the test), if
+    `actual` is not for the test origins, and as the steps named do.
+    """
+    horizons = settings.receivables.horizons
+    origins = sorted(set(settings.evaluation.test_origins))
+    validation = sorted(set(choice.forecast.customers["origin_week"]))
+    if validation[-1] + horizons > origins[0]:
+        raise ValueError(f"the last validation origin {validation[-1]} forecasts up to week "
+                         f"{validation[-1] + horizons}, which is not before the first test "
+                         f"target week {origins[0] + 1}")
+    actual_origins = sorted(set(actual["origin_week"]))
+    if actual_origins != origins:
+        raise ValueError(f"the actual cash is for origins {actual_origins}, the test origins are "
+                         f"{origins}")
+
+    # 1. The chosen settings fitted at every test origin, and their forecast.
+    chosen = GridCandidates(stage1=[choice.stage1], stage2=[choice.stage2],
+                            topups=[choice.topups])
+    predictions = grid_predictions(table, origins, chosen, settings,
+                                   block_columns=block_columns, companies=companies,
+                                   new_cash=new_cash, refunds=refunds,
+                                   unidentified=unidentified, levels=levels, calendar=calendar,
+                                   cache_folder=cache_folder, on_fit_done=on_fit_done)
+    uncorrected = combination_forecast(predictions, 0, 0, 0,
+                                       projected=projected_at(origins, horizons, week_zero),
+                                       companies=companies, horizons=horizons)
+
+    # 2. The corrections learned on validation, applied unchanged.
+    calibration = choice.calibration
+    forecast = corrected_forecast(uncorrected, calibration.p_correction,
+                                  calibration.m_correction)
+
+    # 3. The references at the test origins.
+    reference = deflated_reference(weekly, weeks, levels, calendar, companies, origins,
+                                   horizons, week_zero)
+    with_chosen_topups = dataclasses.replace(settings, topups=choice.topups)
+    rule = rule_reference(ledger, rates, origins, with_chosen_topups, companies=companies,
+                          new_cash=new_cash, refunds=refunds, unidentified=unidentified,
+                          levels=levels, calendar=calendar, week_zero=week_zero)
+
+    # 4. Everything scored together, and the corrected forecast against each of the others.
+    forecasts = pd.concat([stack_forecasts(forecast, reference, rule),
+                           method_rows(uncorrected, UNCORRECTED)], ignore_index=True)
+    method_scores = evaluation_scores(forecasts, actual, horizons)
+    pairs = [(HURDLE, other) for other in dict.fromkeys(forecasts["method"]) if other != HURDLE]
+    bootstrap = paired_wape_bootstrap(forecasts, actual, pairs, horizons,
+                                      settings.evaluation.bootstrap_samples,
+                                      settings.evaluation.bootstrap_seed)
+    return GridTest(forecast=forecast, uncorrected=uncorrected, scores=method_scores,
+                    bootstrap=bootstrap)

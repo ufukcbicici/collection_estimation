@@ -90,6 +90,7 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
 )
 from collection_estimation.hurdle.calibrate import (  # noqa: E402
     calibration_reliability,
+    candidate_name,
     choose_calibration,
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
@@ -105,11 +106,13 @@ from collection_estimation.hurdle.benchmark import (  # noqa: E402
     cash_totals,
 )
 from collection_estimation.hurdle.grid import (  # noqa: E402
+    UNCORRECTED,
     grid_candidates,
     grid_choice,
     grid_gates,
     grid_predictions,
     grid_scores,
+    grid_test,
     with_params,
 )
 from collection_estimation.hurdle.diagnostic_joint import (  # noqa: E402
@@ -696,7 +699,8 @@ def main():
     # every combination of the scored candidates, scored on the cash that came; the current
     # combination must score exactly as step 17's model. U16.6: the combination kept, its
     # calibration, and on the same origins how it compares with the current settings and the
-    # references (made here, so the grid does not need step 17).
+    # references (made here, so the grid does not need step 17). U16.7: the v1 test, only with
+    # [grid] run_test.
     if settings.grid.run:
         grid_origins = list(settings.evaluation.validation_origins)
         candidates = grid_candidates(settings)
@@ -732,6 +736,27 @@ def main():
                              rates=rates, new_cash=new_cash, refunds=refunds,
                              unidentified=unidentified)
         show_grid_choice(choice, candidates, grid_table, settings)
+
+        # U16.7: the v1 test. What the grid froze, on the test origins; nothing is chosen there.
+        if settings.grid.run_test:
+            test_origins = list(settings.evaluation.test_origins)
+            print(f"        V1 TEST over the test origins {test_origins[0]}-{test_origins[-1]} "
+                  f"({len(test_origins)} origins): a report, not a choice; do not change the "
+                  f"settings because of it")
+            started = time.perf_counter()
+            test_actual = actual_totals(weekly, weeks, levels, companies, test_origins,
+                                        settings.receivables.horizons)
+            test = grid_test(choice, test_actual, settings, table=table,
+                             block_columns=block_feature_columns(history, calendar, owed),
+                             companies=companies, week_zero=week_zero, weekly=weekly,
+                             weeks=weeks, levels=levels, calendar=calendar, ledger=ledger,
+                             rates=rates, new_cash=new_cash, refunds=refunds,
+                             unidentified=unidentified,
+                             cache_folder=settings.data.cache_folder / "hurdle_grid",
+                             on_fit_done=fit_progress)
+            show_grid_test(test, choice, settings)
+        else:
+            print("        the v1 test is not run ([grid] run_test = false)")
 
     # Later steps follow as each unit is built.
 
@@ -1947,6 +1972,20 @@ def show_grid_choice(choice, candidates, table, settings):
     print(f"        on the same origins, uncorrected ({HURDLE} = the combination kept):")
     show_evaluation_scores(choice.scores, settings.receivables.horizons)
     show_paired_bootstrap(choice.bootstrap)
+
+
+def show_grid_test(test, choice, settings):
+    """Step 18's v1 test (U16.7): what was frozen, then the scores on the test origins beside
+    the references, with the paired bootstrap."""
+    calibration = choice.calibration
+    print(f"        frozen on validation: stage 1 {choice.stage1.params}, stage 2 "
+          f"{choice.stage2.params}, top-ups {choice.topups.method} (window "
+          f"{choice.topups.window}, with_level {choice.topups.with_level}); corrections "
+          f"{candidate_name(calibration.p_correction, calibration.m_correction)}")
+    print(f"        on the test origins ({HURDLE} = corrected; {UNCORRECTED} for information "
+          f"only):")
+    show_evaluation_scores(test.scores, settings.receivables.horizons)
+    show_paired_bootstrap(test.bootstrap)
 
 
 def show_gates(stage, gates, score, ascending):

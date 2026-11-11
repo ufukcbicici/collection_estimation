@@ -478,13 +478,20 @@ def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiag
 
 def read_grid(table: dict, where: str) -> GridSettings:
     """The [grid] section, checked. Refused, as settings known to fail: a stage-2 loss outside
-    GRID_STAGE2_LOSSES and a learning rate of GRID_LEARNING_RATE_LIMIT or more."""
+    GRID_STAGE2_LOSSES and a learning rate of GRID_LEARNING_RATE_LIMIT or more. Refused too:
+    run_test without run, since the test needs the grid's choice and would be skipped without
+    a word."""
     def one_of(choices):
         return lambda item_table, key, item_where: choice_setting(item_table, key, item_where,
                                                                   choices)
+    run = bool_setting(table, "run", where)
+    run_test = bool_setting(table, "run_test", where)
+    if run_test and not run:
+        raise ValueError(f"{where}: run_test = true needs run = true (the test uses the grid's "
+                         f"choice)")
     return GridSettings(
-        run=bool_setting(table, "run", where),
-        run_test=bool_setting(table, "run_test", where),
+        run=run,
+        run_test=run_test,
         stage1_max_iter=grid_setting(table, "stage1_max_iter", where, count_setting),
         stage1_learning_rate=grid_setting(table, "stage1_learning_rate", where,
                                           grid_rate_setting),

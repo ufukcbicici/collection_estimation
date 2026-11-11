@@ -4485,3 +4485,646 @@ def test_fitted_on_the_natural_scores_the_winner_follows_the_min_gain_rule(fit_c
     current = case.table[case.table["current"]].iloc[0]["wape"]
     better = (case.table["wape"] < current - min_gain).any()
     assert bool(choice.winner["current"]) == (not better)
+
+
+# =============================================================================================
+# U16.7: `method_rows`, `UNCORRECTED`, `GridTest` and `grid_test`.
+#
+# `method_rows` on the hand-made U16.5 predictions, against the inline code `grid_choice`
+# used before it (the U16.6 tests above still pin grid_choice's output). `grid_test` on the
+# U16.3 table, really fitted at the test origins 18 and 22 (G_ORIGINS, so the U16.3 grid and
+# step 17's rolling forecasts at the same origins are the references to compare with), with a
+# hand-made GridChoice: its validation forecast only needs `customers["origin_week"]`, its
+# calibration a hand-made CalibrationChoice whose corrections are distinctive, so that applying
+# them unchanged (and not learning them again) can be told apart. Every cache is a tmp_path.
+# =============================================================================================
+
+from collection_estimation.hurdle import calibrate as calibrate_module  # noqa: E402
+from collection_estimation.hurdle.calibrate import (  # noqa: E402
+    ALL_H, ONE_MAP, PER_H, SCALE, MCorrection, PCorrection, corrected_forecast)
+from collection_estimation.hurdle.grid import (  # noqa: E402
+    UNCORRECTED, GridTest, grid_test, method_rows)
+
+T_ORIGINS = [18, 22]
+T_VALIDATION = (9, 13)          # the last one forecasts up to week 18: just before week 19
+
+
+# --- UNCORRECTED and method_rows ---------------------------------------------------------------
+
+def test_uncorrected_name():
+    assert UNCORRECTED == "hurdle uncorrected"
+
+
+def test_uncorrected_is_no_other_methods_name():
+    assert UNCORRECTED not in {HURDLE, CURRENT_SETTINGS, RULE, *REFERENCES}
+
+
+def old_inline_rows(forecast, method):
+    """What grid_choice did inline before U16.7 moved it into method_rows."""
+    current = forecast.totals
+    current = current[CH_KEYS + ["total"]].rename(columns={"total": "forecast"})
+    current.insert(0, "method", method)
+    current["company_code"] = current["company_code"].astype(object)
+    return current[STACK_COLUMNS]
+
+
+@pytest.mark.parametrize("ijk", [(0, 0, 0), (2, 1, 1)])
+def test_method_rows_equals_grid_choices_old_inline_code(sc_result, ijk):
+    predictions, _, _ = sc_result
+    forecast = sc_combination(predictions, *ijk)
+    pd.testing.assert_frame_equal(method_rows(forecast, CURRENT_SETTINGS),
+                                  old_inline_rows(forecast, CURRENT_SETTINGS))
+
+
+def test_method_rows_shape_columns_and_values(sc_result):
+    predictions, _, _ = sc_result
+    forecast = sc_combination(predictions, 1, 2, 0)
+    rows = method_rows(forecast, "some method")
+    assert list(rows.columns) == STACK_COLUMNS
+    assert len(rows) == len(forecast.totals)
+    assert set(rows["method"]) == {"some method"}
+    assert rows["company_code"].dtype == object
+    pd.testing.assert_index_equal(rows.index, forecast.totals.index)
+    for column in CH_KEYS:
+        assert list(rows[column]) == list(forecast.totals[column]), column
+    assert rows["forecast"].to_numpy().tolist() == forecast.totals["total"].to_numpy().tolist()
+
+
+def test_method_rows_company_code_is_object_even_from_a_category(sc_result):
+    predictions, _, _ = sc_result
+    forecast = sc_combination(predictions, 0, 0, 0)
+    totals = forecast.totals.assign(company_code=forecast.totals["company_code"].astype("category"))
+    rows = method_rows(Forecast(totals=totals, customers=forecast.customers), "x")
+    assert rows["company_code"].dtype == object
+    assert list(rows["company_code"]) == list(forecast.totals["company_code"].astype(str))
+
+
+def test_method_rows_does_not_change_the_forecast(sc_result):
+    predictions, _, _ = sc_result
+    forecast = sc_combination(predictions, 0, 0, 0)
+    before = forecast.totals.copy()
+    rows = method_rows(forecast, "x")
+    rows.loc[rows.index[0], "forecast"] = -1.0
+    pd.testing.assert_frame_equal(forecast.totals, before)
+
+
+def test_method_rows_stacks_with_stack_forecasts_without_dtype_trouble(sc_result):
+    predictions, actual, _ = sc_result
+    forecast = sc_combination(predictions, 0, 0, 0)
+    stacked = stack_forecasts(forecast, fake_reference(actual),
+                              SimpleNamespace(totals=fake_rule_totals(actual)))
+    both = pd.concat([stacked, method_rows(forecast, UNCORRECTED)], ignore_index=True)
+    assert both["company_code"].dtype == object
+    hurdle = both[both["method"] == HURDLE].drop(columns="method").reset_index(drop=True)
+    plain = both[both["method"] == UNCORRECTED].drop(columns="method").reset_index(drop=True)
+    pd.testing.assert_frame_equal(hurdle, plain)
+
+
+# --- GridTest ----------------------------------------------------------------------------------
+
+def test_grid_test_type_fields_in_order_and_frozen():
+    assert [f.name for f in dataclasses.fields(GridTest)] == ["forecast", "uncorrected",
+                                                              "scores", "bootstrap"]
+    found = GridTest("<f>", "<u>", "<s>", "<b>")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        found.forecast = "other"
+
+
+# --- grid_test: the case ---------------------------------------------------------------------
+
+def t_settings(test_origins=tuple(T_ORIGINS), samples=40, seed=5, topups=None):
+    """fit_settings with [evaluation] test_origins; a frozen dataclass (grid_test calls
+    `dataclasses.replace` on it)."""
+    base = fit_settings()
+    evaluation = SimpleNamespace(bootstrap_samples=samples, bootstrap_seed=seed,
+                                 rule_doubtful_days=90, test_origins=tuple(test_origins),
+                                 validation_origins="<never read>")
+    changes = dict(evaluation=evaluation)
+    if topups is not None:
+        changes["topups"] = topups
+    return dataclasses.replace(base, **changes)
+
+
+def t_calibration(p=None, m=None):
+    return CalibrationChoice(p_correction=p or PCorrection("none"),
+                             m_correction=m or MCorrection("none"), split_week=11,
+                             judged_origins=[13], candidates=pd.DataFrame(),
+                             winner="<winner>", bootstrap=pd.DataFrame())
+
+
+def t_choice(ijk=(0, 0, 0), p=None, m=None, validation=T_VALIDATION, settings=None):
+    """A GridChoice as grid_choice gives it, with g_candidates' candidates `ijk`; its forecast
+    holds only the validation origins of its customers (all grid_test reads of it)."""
+    candidates = g_candidates(settings or t_settings())
+    i, j, k = ijk
+    forecast = SimpleNamespace(customers=pd.DataFrame({"origin_week": list(validation)}),
+                               totals="<validation totals>")
+    return GridChoice(winner="<winner>", stage1=candidates.stage1[i],
+                      stage2=candidates.stage2[j], topups=candidates.topups[k],
+                      forecast=forecast, calibration=t_calibration(p, m),
+                      scores="<validation scores>", bootstrap="<validation bootstrap>")
+
+
+def t_actual(origins=T_ORIGINS):
+    return actual_totals(fit_weekly(), make_weeks(40), f_levels(), list(F_COMPANIES),
+                         list(origins), 5)
+
+
+def t_side():
+    new_cash, refunds, unidentified = f_side_tables()
+    return dict(weekly=fit_weekly(), weeks=make_weeks(40), levels=f_levels(),
+                calendar=f_calendar(), ledger=running_ledger(), rates=rule_rates(),
+                new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+
+
+def t_run(table, choice, cache_folder, actual=None, settings=None, on_fit_done=None,
+          **overrides):
+    kwargs = dict(t_side(), table=table, block_columns=BLOCK_COLUMNS,
+                  companies=list(F_COMPANIES), week_zero=WEEK_ZERO, cache_folder=cache_folder,
+                  on_fit_done=on_fit_done)
+    kwargs.update(overrides)
+    return grid_test(choice, t_actual() if actual is None else actual,
+                     settings or t_settings(), **kwargs)
+
+
+def t_stacked(found, choice, settings):
+    """The stack grid_test scores, made by hand with the real references."""
+    side = t_side()
+    reference = deflated_reference(side["weekly"], side["weeks"], side["levels"],
+                                   side["calendar"], list(F_COMPANIES), T_ORIGINS, 5, WEEK_ZERO)
+    rule = rule_reference(side["ledger"], side["rates"], T_ORIGINS,
+                          dataclasses.replace(settings, topups=choice.topups),
+                          companies=list(F_COMPANIES), new_cash=side["new_cash"],
+                          refunds=side["refunds"], unidentified=side["unidentified"],
+                          levels=side["levels"], calendar=side["calendar"], week_zero=WEEK_ZERO)
+    return pd.concat([stack_forecasts(found.forecast, reference, rule),
+                      method_rows(found.uncorrected, UNCORRECTED)], ignore_index=True)
+
+
+# A distinctive m scale and a p map, applied as frozen on validation.
+T_SCALE = MCorrection(SCALE, common=1.2345)
+T_MAP = PCorrection(ONE_MAP, {ALL_H: (0.8, 0.3)})
+
+
+@pytest.fixture(scope="module")
+def t_cache(tmp_path_factory):
+    return tmp_path_factory.mktemp("test_cache")
+
+
+@pytest.fixture(scope="module")
+def t_plain(g_table, t_cache):
+    """grid_test with the current settings and no corrections, on a fresh cache."""
+    progress = []
+    found = t_run(g_table, t_choice(), t_cache,
+                  on_fit_done=lambda *args: progress.append(args))
+    return found, progress
+
+
+@pytest.fixture(scope="module")
+def t_corrected(g_table, t_cache, t_plain):
+    """grid_test with the current settings and the distinctive corrections (fits read back)."""
+    return t_run(g_table, t_choice(p=T_MAP, m=T_SCALE), t_cache)
+
+
+@pytest.fixture(scope="module")
+def t_other(g_table, tmp_path_factory):
+    """grid_test with candidates (1, 1, 1): not the current settings, other top-ups."""
+    choice = t_choice((1, 1, 1), m=T_SCALE)
+    return choice, t_run(g_table, choice, tmp_path_factory.mktemp("test_cache_other"))
+
+
+# --- grid_test: what it returns --------------------------------------------------------------
+
+def test_grid_test_returns_a_grid_test(t_plain):
+    found, _ = t_plain
+    assert isinstance(found, GridTest)
+    assert isinstance(found.forecast, Forecast) and isinstance(found.uncorrected, Forecast)
+
+
+def test_grid_test_forecasts_are_at_the_test_origins_only(t_plain):
+    found, _ = t_plain
+    for forecast in (found.forecast, found.uncorrected):
+        assert sorted(set(forecast.totals["origin_week"])) == T_ORIGINS
+        assert sorted(set(forecast.customers["origin_week"])) == T_ORIGINS
+
+
+def test_grid_test_uncorrected_is_grid_predictions_and_combination_forecast_by_hand(
+        g_table, t_plain, tmp_path):
+    found, _ = t_plain
+    choice = t_choice()
+    chosen = GridCandidates(stage1=[choice.stage1], stage2=[choice.stage2],
+                            topups=[choice.topups])
+    predictions = grid_predictions(g_table, T_ORIGINS, chosen, t_settings(),
+                                   cache_folder=tmp_path, **g_inputs())
+    expected = combination_forecast(predictions, 0, 0, 0,
+                                    projected=projected_at(T_ORIGINS, 5, WEEK_ZERO),
+                                    companies=list(F_COMPANIES), horizons=5)
+    pd.testing.assert_frame_equal(found.uncorrected.totals, expected.totals)
+    pd.testing.assert_frame_equal(found.uncorrected.customers, expected.customers)
+
+
+def test_grid_test_uncorrected_with_the_current_settings_equals_rolling_forecasts(t_plain,
+                                                                                 g_rolled):
+    # Step 17's model at the same origins: the current settings fitted again at each origin.
+    found, _ = t_plain
+    pd.testing.assert_frame_equal(found.uncorrected.totals, g_rolled.totals)
+    pd.testing.assert_frame_equal(found.uncorrected.customers, g_rolled.customers)
+
+
+def test_grid_test_uncorrected_of_other_candidates_is_the_grids_combination(t_other, g_result):
+    # g_result is the U16.3 grid (g_candidates) at the same origins: (1, 1, 1) must match.
+    _, found = t_other
+    predictions, _ = g_result
+    expected = combination_forecast(predictions, 1, 1, 1,
+                                    projected=projected_at(T_ORIGINS, 5, WEEK_ZERO),
+                                    companies=list(F_COMPANIES), horizons=5)
+    pd.testing.assert_frame_equal(found.uncorrected.totals, expected.totals)
+    pd.testing.assert_frame_equal(found.uncorrected.customers, expected.customers)
+
+
+def test_grid_test_other_candidates_give_another_forecast_than_the_current(t_other, t_plain):
+    _, other = t_other
+    plain, _ = t_plain
+    assert not np.allclose(other.uncorrected.totals["total"], plain.uncorrected.totals["total"])
+
+
+# --- grid_test: the corrections, applied and not learned ---------------------------------------
+
+def test_grid_test_with_no_corrections_the_forecast_equals_the_uncorrected(t_plain):
+    found, _ = t_plain
+    pd.testing.assert_frame_equal(found.forecast.totals, found.uncorrected.totals)
+    pd.testing.assert_frame_equal(found.forecast.customers, found.uncorrected.customers)
+
+
+def test_grid_test_forecast_is_corrected_forecast_of_the_uncorrected(t_corrected):
+    expected = corrected_forecast(t_corrected.uncorrected, T_MAP, T_SCALE)
+    pd.testing.assert_frame_equal(t_corrected.forecast.totals, expected.totals)
+    pd.testing.assert_frame_equal(t_corrected.forecast.customers, expected.customers)
+
+
+def test_grid_test_corrections_do_not_change_the_uncorrected_forecast(t_corrected, t_plain):
+    plain, _ = t_plain
+    pd.testing.assert_frame_equal(t_corrected.uncorrected.totals, plain.uncorrected.totals)
+    pd.testing.assert_frame_equal(t_corrected.uncorrected.customers, plain.uncorrected.customers)
+
+
+def test_grid_test_the_m_scale_is_applied_exactly_as_frozen(g_table, tmp_path):
+    found = t_run(g_table, t_choice(m=T_SCALE), tmp_path)
+    customers, plain = found.forecast.customers, found.uncorrected.customers
+    pd.testing.assert_series_equal(customers["m"], plain["m"] * 1.2345)
+    pd.testing.assert_series_equal(customers["p"], plain["p"])
+    pd.testing.assert_series_equal(customers["expected"], customers["p"] * customers["m"],
+                                   check_names=False)
+
+
+def test_grid_test_the_corrected_total_differs_from_the_uncorrected(t_corrected):
+    assert not np.allclose(t_corrected.forecast.totals["total"],
+                           t_corrected.uncorrected.totals["total"])
+
+
+def test_grid_test_never_learns_a_correction_again(g_table, tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("a correction must not be learned on the test origins")
+    monkeypatch.setattr(grid_module, "choose_calibration", refuse)
+    for name in ("choose_calibration", "fit_p_correction", "fit_m_correction", "fit_platt",
+                 "calibration_rows"):
+        monkeypatch.setattr(calibrate_module, name, refuse)
+    found = t_run(g_table, t_choice(p=T_MAP, m=T_SCALE), tmp_path)
+    expected = corrected_forecast(found.uncorrected, T_MAP, T_SCALE)
+    pd.testing.assert_frame_equal(found.forecast.totals, expected.totals)
+
+
+def test_grid_test_does_not_read_the_rest_of_the_calibration_choice(g_table, tmp_path):
+    # Only the two corrections are used: the rest of the choice may be anything.
+    choice = t_choice(m=T_SCALE)
+    calibration = SimpleNamespace(p_correction=PCorrection("none"), m_correction=T_SCALE)
+    choice = dataclasses.replace(choice, calibration=calibration)
+    found = t_run(g_table, choice, tmp_path)
+    pd.testing.assert_series_equal(found.forecast.customers["m"],
+                                   found.uncorrected.customers["m"] * 1.2345)
+
+
+def test_grid_test_a_per_h_correction_missing_an_h_raises_as_corrected_forecast_does(
+        g_table, tmp_path):
+    p = PCorrection(PER_H, {1: (1.0, 0.0), 2: (1.0, 0.0)})
+    with pytest.raises(ValueError, match="learned nothing for h"):
+        t_run(g_table, t_choice(p=p), tmp_path)
+
+
+# --- grid_test: the comparison -----------------------------------------------------------------
+
+def test_grid_test_methods_are_hurdle_the_references_the_rule_then_uncorrected(t_plain):
+    found, _ = t_plain
+    assert list(dict.fromkeys(found.scores["method"])) == [HURDLE, *REFERENCES, RULE,
+                                                           UNCORRECTED]
+    assert CURRENT_SETTINGS not in set(found.scores["method"])
+
+
+def test_grid_test_scores_equal_evaluation_scores_of_the_stack_by_hand(t_corrected):
+    stacked = t_stacked(t_corrected, t_choice(p=T_MAP, m=T_SCALE), t_settings())
+    pd.testing.assert_frame_equal(t_corrected.scores,
+                                  evaluation_scores(stacked, t_actual(), 5))
+
+
+def test_grid_test_hurdle_scores_are_the_corrected_forecasts(t_corrected):
+    rows = t_corrected.forecast.totals[CH_KEYS + ["total"]].rename(columns={"total": "forecast"})
+    rows = rows.assign(method=HURDLE)[STACK_COLUMNS]
+    expected = evaluation_scores(rows, t_actual(), 5).reset_index(drop=True)
+    found = t_corrected.scores[t_corrected.scores["method"] == HURDLE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(found, expected)
+
+
+def test_grid_test_uncorrected_scores_are_the_uncorrected_forecasts(t_corrected):
+    expected = evaluation_scores(method_rows(t_corrected.uncorrected, UNCORRECTED), t_actual(),
+                                 5).reset_index(drop=True)
+    found = t_corrected.scores[t_corrected.scores["method"] == UNCORRECTED]
+    pd.testing.assert_frame_equal(found.reset_index(drop=True), expected)
+
+
+def test_grid_test_with_no_corrections_hurdle_and_uncorrected_score_the_same(t_plain):
+    found, _ = t_plain
+    scores = found.scores
+    hurdle = scores[scores["method"] == HURDLE].drop(columns="method").reset_index(drop=True)
+    plain = scores[scores["method"] == UNCORRECTED].drop(columns="method").reset_index(drop=True)
+    pd.testing.assert_frame_equal(hurdle, plain)
+
+
+def test_grid_test_with_corrections_hurdle_and_uncorrected_score_differently(t_corrected):
+    scores = t_corrected.scores
+    assert pooled(scores[scores["method"] == HURDLE], CONSOLIDATED) != pooled(
+        scores[scores["method"] == UNCORRECTED], CONSOLIDATED)
+
+
+def test_grid_test_bootstrap_is_hurdle_against_every_other_method(t_corrected):
+    stacked = t_stacked(t_corrected, t_choice(p=T_MAP, m=T_SCALE), t_settings())
+    others = [*REFERENCES, RULE, UNCORRECTED]
+    expected = paired_wape_bootstrap(stacked, t_actual(), [(HURDLE, o) for o in others], 5,
+                                     40, 5)
+    pd.testing.assert_frame_equal(t_corrected.bootstrap, expected)
+    assert set(t_corrected.bootstrap["method"]) == {HURDLE}
+    assert list(dict.fromkeys(t_corrected.bootstrap["against"])) == others
+
+
+def test_grid_test_bootstrap_with_no_corrections_still_pairs_with_uncorrected(t_plain):
+    found, _ = t_plain
+    assert list(dict.fromkeys(found.bootstrap["against"])) == [*REFERENCES, RULE, UNCORRECTED]
+
+
+def test_grid_test_bootstrap_reads_the_evaluation_samples_and_seed(g_table, t_cache, t_plain):
+    first = t_run(g_table, t_choice(m=T_SCALE), t_cache, settings=t_settings(samples=30, seed=1))
+    assert set(first.bootstrap["samples"]) == {30}
+    second = t_run(g_table, t_choice(m=T_SCALE), t_cache,
+                   settings=t_settings(samples=30, seed=2))
+    assert not first.bootstrap[["low", "high"]].equals(second.bootstrap[["low", "high"]])
+    pd.testing.assert_frame_equal(first.scores, second.scores)
+
+
+def test_grid_test_references_equal_the_reference_functions_by_hand(t_corrected):
+    side = t_side()
+    reference = deflated_reference(side["weekly"], side["weeks"], side["levels"],
+                                   side["calendar"], list(F_COMPANIES), T_ORIGINS, 5, WEEK_ZERO)
+    stacked = stack_forecasts(None, reference, SimpleNamespace(
+        totals=pd.DataFrame(columns=CH_KEYS + ["forecast"])))
+    expected = evaluation_scores(stacked[stacked["method"].isin(list(REFERENCES))], t_actual(),
+                                 5).reset_index(drop=True)
+    found = t_corrected.scores[t_corrected.scores["method"].isin(list(REFERENCES))]
+    pd.testing.assert_frame_equal(found.reset_index(drop=True), expected)
+
+
+def test_grid_test_rule_uses_the_chosen_topups_not_the_settings_topups(t_other):
+    choice, found = t_other
+    settings = t_settings()
+    assert choice.topups != settings.topups
+    side = t_side()
+
+    def rule_scores(topups):
+        rule = rule_reference(side["ledger"], side["rates"], T_ORIGINS,
+                              dataclasses.replace(settings, topups=topups),
+                              companies=list(F_COMPANIES), new_cash=side["new_cash"],
+                              refunds=side["refunds"], unidentified=side["unidentified"],
+                              levels=side["levels"], calendar=side["calendar"],
+                              week_zero=WEEK_ZERO)
+        stacked = rule.totals[CH_KEYS + ["forecast"]].assign(method=RULE)[STACK_COLUMNS]
+        return evaluation_scores(stacked, t_actual(), 5).reset_index(drop=True)
+
+    rule = found.scores[found.scores["method"] == RULE].reset_index(drop=True)
+    pd.testing.assert_frame_equal(rule, rule_scores(choice.topups))
+    assert pooled(rule, CONSOLIDATED) != pooled(rule_scores(settings.topups), CONSOLIDATED)
+
+
+class GridSpy:
+    """Wraps the references (and grid_predictions) as grid sees them: records, then calls
+    the real function."""
+
+    def __init__(self, monkeypatch):
+        self.calls = {}
+        for name in ("deflated_reference", "rule_reference", "grid_predictions"):
+            real = getattr(grid_module, name)
+            monkeypatch.setattr(grid_module, name, self.wrap(name, real))
+
+    def wrap(self, name, real):
+        def step(*args, **kwargs):
+            self.calls.setdefault(name, []).append((args, kwargs))
+            return real(*args, **kwargs)
+        return step
+
+
+def test_grid_test_rule_gets_the_settings_with_only_the_topups_replaced(g_table, tmp_path,
+                                                                       monkeypatch):
+    spy = GridSpy(monkeypatch)
+    settings = t_settings()
+    choice = t_choice((0, 0, 1), settings=settings)
+    t_run(g_table, choice, tmp_path, settings=settings)
+    (args, kwargs), = spy.calls["rule_reference"]
+    given = args[3]
+    assert given.topups is choice.topups
+    assert dataclasses.replace(given, topups=settings.topups) == settings
+    assert settings.topups != choice.topups          # the settings themselves are untouched
+    assert settings == t_settings()
+
+
+def test_grid_test_the_references_get_their_inputs_at_the_test_origins(g_table, tmp_path,
+                                                                       monkeypatch):
+    spy = GridSpy(monkeypatch)
+    side = t_side()
+    t_run(g_table, t_choice(), tmp_path, settings=t_settings(test_origins=(22, 18, 22)))
+    (args, kwargs), = spy.calls["deflated_reference"]
+    assert kwargs == {}
+    assert args[5] == T_ORIGINS and args[6] == 5 and args[7] == WEEK_ZERO
+    assert list(args[4]) == list(F_COMPANIES)
+    pd.testing.assert_frame_equal(args[0], side["weekly"])
+    (args, kwargs), = spy.calls["rule_reference"]
+    assert args[2] == T_ORIGINS
+    assert sorted(kwargs) == ["calendar", "companies", "levels", "new_cash", "refunds",
+                              "unidentified", "week_zero"]
+    assert kwargs["week_zero"] == WEEK_ZERO
+
+
+def test_grid_test_fits_at_the_test_origins_sorted_once_each_with_one_candidate_each(
+        g_table, tmp_path, monkeypatch):
+    spy = GridSpy(monkeypatch)
+    choice = t_choice((1, 0, 1))
+    cache = tmp_path / "grid cache"
+    t_run(g_table, choice, cache, settings=t_settings(test_origins=(22, 18, 22)))
+    (args, kwargs), = spy.calls["grid_predictions"]
+    assert args[1] == T_ORIGINS
+    candidates = args[2]
+    assert isinstance(candidates, GridCandidates)
+    assert candidates.stage1 == [choice.stage1]
+    assert candidates.stage2 == [choice.stage2]
+    assert candidates.topups == [choice.topups]
+    assert kwargs["cache_folder"] == cache
+
+
+def test_grid_test_unsorted_test_origins_give_the_same_result(g_table, t_cache, t_corrected):
+    found = t_run(g_table, t_choice(p=T_MAP, m=T_SCALE), t_cache,
+                  settings=t_settings(test_origins=(22, 18, 22)))
+    pd.testing.assert_frame_equal(found.forecast.totals, t_corrected.forecast.totals)
+    pd.testing.assert_frame_equal(found.scores, t_corrected.scores)
+    pd.testing.assert_frame_equal(found.bootstrap, t_corrected.bootstrap)
+
+
+# --- grid_test: only the chosen candidates are fitted, through the cache --------------------
+
+def test_grid_test_fits_each_stage_once_per_test_origin(t_plain):
+    _, progress = t_plain
+    assert len(progress) == 2 * len(T_ORIGINS)
+    assert [(done, total) for done, total, *_ in progress] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+    assert [(stage, origin, number) for _, _, stage, origin, number, _ in progress] == [
+        ("stage 1", 18, 0), ("stage 2", 18, 0), ("stage 1", 22, 0), ("stage 2", 22, 0)]
+
+
+def test_grid_test_fresh_cache_fits_only_the_chosen_settings(g_table, tmp_path, monkeypatch):
+    calls = count_fits(monkeypatch)
+    t_run(g_table, t_choice((1, 1, 0)), tmp_path)
+    assert calls == [("stage1", 18), ("stage2", 18), ("stage1", 22), ("stage2", 22)]
+
+
+def test_grid_test_writes_its_fits_into_the_cache_folder_named_by_the_chosen_settings(
+        g_table, tmp_path):
+    choice = t_choice((1, 1, 0))
+    t_run(g_table, choice, tmp_path)
+    names = cache_files(tmp_path)
+    for stage, setting in (("stage1", choice.stage1.settings), ("stage2", choice.stage2.settings)):
+        for origin in T_ORIGINS:
+            prefix = f"{stage}_origin{origin}_{setting_hash(setting)}"
+            assert any(name.startswith(prefix) for name in names), (prefix, names)
+    for origin in (9, 13):
+        assert not any(f"origin{origin}_" in name for name in names)
+
+
+def test_grid_test_a_second_call_reads_every_fit_from_the_cache(g_table, t_cache, t_plain,
+                                                                monkeypatch):
+    found, _ = t_plain
+    count_fits(monkeypatch, fail=True)       # any fit would raise
+    progress = []
+    again = t_run(g_table, t_choice(), t_cache, on_fit_done=lambda *args: progress.append(args))
+    assert len(progress) == 4
+    pd.testing.assert_frame_equal(again.uncorrected.totals, found.uncorrected.totals)
+    pd.testing.assert_frame_equal(again.scores, found.scores)
+
+
+def test_grid_test_reads_the_fits_the_grid_made_at_the_same_origins(g_table, g_cache, g_result,
+                                                                    monkeypatch, tmp_path):
+    # The U16.3 grid fitted g_candidates at 18 and 22 in g_cache: grid_test with those
+    # settings refits nothing (on a private copy of that cache).
+    cache = copied_cache(g_cache, tmp_path)
+    count_fits(monkeypatch, fail=True)
+    t_run(g_table, t_choice((1, 1, 1)), cache)
+
+
+def test_grid_test_without_on_fit_done_runs(t_corrected):
+    # t_corrected passes on_fit_done=None.
+    assert isinstance(t_corrected, GridTest)
+
+
+# --- grid_test: the checks --------------------------------------------------------------------
+
+@pytest.mark.parametrize("validation", [(9, 14), (14, 9), (17,), (18,), (22,), (30, 3)])
+def test_grid_test_validation_reaching_the_test_weeks_raises_before_any_fit(
+        g_table, tmp_path, monkeypatch, validation):
+    count_fits(monkeypatch, fail=True)
+    last = max(validation)
+    with pytest.raises(ValueError) as error:
+        t_run(g_table, t_choice(validation=validation), tmp_path)
+    message = str(error.value)
+    assert f"the last validation origin {last} forecasts up to week {last + 5}" in message
+    assert "first test target week 19" in message
+    assert cache_files(tmp_path) == []
+
+
+@pytest.mark.parametrize("validation", [(13,), (13, 9), (2, 13, 7), (0,)])
+def test_grid_test_validation_ending_just_before_the_test_weeks_is_accepted(
+        g_table, t_cache, t_plain, validation):
+    # The last validation origin 13 forecasts up to week 18; the first test target is 19.
+    found = t_run(g_table, t_choice(validation=validation), t_cache)
+    pd.testing.assert_frame_equal(found.forecast.totals, t_plain[0].forecast.totals)
+
+
+def test_grid_test_the_overlap_check_reads_the_horizons(g_table, t_cache, t_plain):
+    # With 5 weeks, 14 overlaps (week 19); the check is origin + horizons, not a fixed gap.
+    with pytest.raises(ValueError, match="forecasts up to week 19"):
+        t_run(g_table, t_choice(validation=(14,)), t_cache)
+
+
+@pytest.mark.parametrize("origins", [[18], [22], [18, 22, 26], [17, 22], [14, 18]])
+def test_grid_test_actual_for_other_origins_raises_before_any_fit(g_table, tmp_path,
+                                                                  monkeypatch, origins):
+    count_fits(monkeypatch, fail=True)
+    with pytest.raises(ValueError) as error:
+        t_run(g_table, t_choice(), tmp_path, actual=t_actual(origins))
+    assert str(error.value) == (f"the actual cash is for origins {sorted(origins)}, the test "
+                                f"origins are {T_ORIGINS}")
+    assert cache_files(tmp_path) == []
+
+
+def test_grid_test_actual_with_rows_in_any_order_is_accepted(g_table, t_cache, t_corrected):
+    actual = t_actual().iloc[::-1]
+    found = t_run(g_table, t_choice(p=T_MAP, m=T_SCALE), t_cache, actual=actual)
+    pd.testing.assert_frame_equal(found.forecast.totals, t_corrected.forecast.totals)
+
+
+def test_grid_test_the_overlap_check_comes_before_the_actual_check(g_table, tmp_path):
+    with pytest.raises(ValueError, match="last validation origin"):
+        t_run(g_table, t_choice(validation=(20,)), tmp_path, actual=t_actual([18]))
+
+
+@pytest.mark.parametrize("step", ["deflated_reference", "rule_reference", "grid_predictions",
+                                  "corrected_forecast", "evaluation_scores",
+                                  "paired_wape_bootstrap", "combination_forecast"])
+def test_grid_test_a_failing_step_passes_its_error_through(g_table, tmp_path, monkeypatch,
+                                                           step):
+    def fail(*args, **kwargs):
+        raise ValueError(f"{step} failed")
+    monkeypatch.setattr(grid_module, step, fail)
+    with pytest.raises(ValueError, match=f"{step} failed"):
+        t_run(g_table, t_choice(), tmp_path)
+
+
+def test_grid_test_a_test_origin_outside_the_table_raises_as_grid_predictions_does(
+        g_table, tmp_path):
+    settings = t_settings(test_origins=(18, 40))
+    with pytest.raises(ValueError):
+        t_run(g_table, t_choice(), tmp_path, settings=settings, actual=t_actual([18, 40]))
+
+
+# --- grid_test: purity -------------------------------------------------------------------------
+
+def test_grid_test_does_not_change_its_inputs(g_table, t_cache, t_plain):
+    table, actual, settings = g_table.copy(), t_actual(), t_settings()
+    choice = t_choice(p=T_MAP, m=T_SCALE)
+    before_actual = actual.copy()
+    before_customers = choice.forecast.customers.copy()
+    t_run(g_table, choice, t_cache, actual=actual, settings=settings)
+    pd.testing.assert_frame_equal(g_table, table)
+    pd.testing.assert_frame_equal(actual, before_actual)
+    pd.testing.assert_frame_equal(choice.forecast.customers, before_customers)
+    assert settings == t_settings()
+    assert choice.calibration.m_correction == T_SCALE and choice.calibration.p_correction == T_MAP
+
+
+def test_grid_test_is_deterministic(g_table, t_cache, t_corrected):
+    again = t_run(g_table, t_choice(p=T_MAP, m=T_SCALE), t_cache)
+    pd.testing.assert_frame_equal(again.forecast.totals, t_corrected.forecast.totals)
+    pd.testing.assert_frame_equal(again.scores, t_corrected.scores)
+    pd.testing.assert_frame_equal(again.bootstrap, t_corrected.bootstrap)

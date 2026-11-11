@@ -5359,8 +5359,9 @@ def test_step_16_and_17_imports():
     calibrate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                          and node.module == "collection_estimation.hurdle.calibrate"]
     assert len(calibrate_imports) == 1
+    # U16.7 added candidate_name (show_grid_test names the frozen corrections with it).
     assert [(a.name, a.asname) for a in calibrate_imports[0].names] == [
-        ("calibration_reliability", None), ("choose_calibration", None)]
+        ("calibration_reliability", None), ("candidate_name", None), ("choose_calibration", None)]
     assert module.body.index(calibrate_imports[0]) == module.body.index(evaluate_imports[0]) + 1
 
 
@@ -5479,9 +5480,19 @@ def test_step_17_uses_the_validation_origins_only():
     assert len(origins) == 1
     assert ast.unparse(origins[0].value) == "list(settings.evaluation.validation_origins)"
     assert block.body.index(origins[0]) == 0
-    # The test origins are scored only in U16: never named anywhere in main().
-    assert "test_origins" not in main_source()
-    assert "test_origins" not in ast.unparse(main_tree())
+    # The test origins are scored only in U16: never named anywhere in main() but inside the
+    # v1 test's `if settings.grid.run_test:` (U16.7), step 18's last statement.
+    tree = main_tree()   # one parse: the `if` is removed from this tree below
+    step_18 = tree.body[-1]
+    v1_test = step_18.body[-1]
+    assert isinstance(v1_test, ast.If) and ast.unparse(v1_test.test) == "settings.grid.run_test"
+    # Every occurrence lies in that `if`, in the source and in the syntax tree.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert main_source().count("test_origins") == " ".join(
+        ast.get_source_segment(source, v1_test).split()).count("test_origins") > 0
+    assert ast.unparse(tree).count("test_origins") == ast.unparse(v1_test).count("test_origins")
+    step_18.body = step_18.body[:-1]
+    assert "test_origins" not in ast.unparse(tree)
 
 
 def test_step_17_calls_rolling_forecasts_once_with_a_progress_callback():
@@ -5518,9 +5529,17 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(calls) == 1
     assert [ast.unparse(a) for a in calls[0].args] == [
         "weekly", "weeks", "levels", "companies", "origins", "settings.receivables.horizons"]
-    # Step 16, step 17 and (since U16.5) step 18's grid_actual.
-    assert len(calls_to(main_tree(), "actual_totals")) == 3
-    assert len(calls_to(step_18_block(), "actual_totals")) == 1
+    # Step 16, step 17, (since U16.5) step 18's grid_actual and (since U16.7) the v1 test's
+    # test_actual, inside step 18's last `if settings.grid.run_test:`, at the test origins.
+    assert len(calls_to(main_tree(), "actual_totals")) == 4
+    step_18 = step_18_block()
+    assert len(calls_to(step_18, "actual_totals")) == 2
+    v1_test = step_18.body[-1]
+    assert isinstance(v1_test, ast.If) and ast.unparse(v1_test.test) == "settings.grid.run_test"
+    test_calls = calls_in(v1_test.body, "actual_totals")
+    assert len(test_calls) == 1 and calls_in(v1_test.orelse, "actual_totals") == []
+    assert ast.unparse(test_calls[0].args[4]) == "test_origins"
+    assert len(calls_in(step_18.body[:-1], "actual_totals")) == 1
     shows = calls_to(block, "show_rolling_forecasts")
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
@@ -8271,6 +8290,28 @@ STEP_18_CHOICE = ("choice = grid_choice(predictions, candidates, grid_table, gri
                   "weeks=weeks, levels=levels, calendar=calendar, ledger=ledger, rates=rates, "
                   "new_cash=new_cash, refunds=refunds, unidentified=unidentified)")
 STEP_18_SHOW_CHOICE = "show_grid_choice(choice, candidates, grid_table, settings)"
+# U16.7: the v1 test, an `if` on [grid] run_test that ends step 18.
+STEP_18_TEST_ORIGINS = "test_origins = list(settings.evaluation.test_origins)"
+STEP_18_TEST_BANNER = (
+    "print(f'        V1 TEST over the test origins {test_origins[0]}-{test_origins[-1]} "
+    "({len(test_origins)} origins): a report, not a choice; do not change the settings "
+    "because of it')")
+STEP_18_TEST_ACTUAL = ("test_actual = actual_totals(weekly, weeks, levels, companies, "
+                       "test_origins, settings.receivables.horizons)")
+STEP_18_TEST_CALL = (
+    "test = grid_test(choice, test_actual, settings, table=table, "
+    "block_columns=block_feature_columns(history, calendar, owed), companies=companies, "
+    "week_zero=week_zero, weekly=weekly, weeks=weeks, levels=levels, calendar=calendar, "
+    "ledger=ledger, rates=rates, new_cash=new_cash, refunds=refunds, "
+    "unidentified=unidentified, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
+    "on_fit_done=fit_progress)")
+STEP_18_SHOW_TEST = "show_grid_test(test, choice, settings)"
+STEP_18_TEST_BODY = [STEP_18_TEST_ORIGINS, STEP_18_TEST_BANNER, "started = time.perf_counter()",
+                     STEP_18_TEST_ACTUAL, STEP_18_TEST_CALL, STEP_18_SHOW_TEST]
+STEP_18_TEST_NOT_RUN = "print('        the v1 test is not run ([grid] run_test = false)')"
+STEP_18_TEST_IF = ("if settings.grid.run_test:\n"
+                   + "".join(f"    {line}\n" for line in STEP_18_TEST_BODY)
+                   + f"else:\n    {STEP_18_TEST_NOT_RUN}")
 STEP_18_STATEMENTS = [
     "grid_origins = list(settings.evaluation.validation_origins)",
     "candidates = grid_candidates(settings)",
@@ -8289,10 +8330,11 @@ STEP_18_STATEMENTS = [
     STEP_18_SHOW_SCORES,
     STEP_18_CHOICE,
     STEP_18_SHOW_CHOICE,
+    STEP_18_TEST_IF,
 ]
 STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
                  "show_grid_predictions", "grid_gates", "grid_scores", "show_grid_scores",
-                 "grid_choice", "show_grid_choice")
+                 "grid_choice", "show_grid_choice", "grid_test", "show_grid_test")
 STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
                 "p_alone", "m_alone", "p_seconds", "m_seconds")
 
@@ -8328,8 +8370,9 @@ def test_step_18_statements_in_order_inside_its_if():
 
 
 def test_step_18_switch_is_read_once_in_main():
-    # [grid] run gates step 18 only; nothing else in main() reads it.
-    assert main_source().count("settings.grid.run") == 1
+    # [grid] run gates step 18 only; nothing else in main() reads it. (U16.7: run_test, read
+    # inside step 18, is another name; the word boundary keeps it out of the count.)
+    assert len(re.findall(r"settings\.grid\.run\b", main_source())) == 1
     assert index_of_if(main_body(), "settings.grid.run") == len(main_body()) - 1
 
 
@@ -8338,7 +8381,134 @@ def test_step_18_names_are_called_once_only_inside_step_18():
         assert len(calls_to(main_tree(), name)) == 1, name
         assert calls_in(step_18_body(), name), name
         assert calls_to(step_17_block(), name) == [], name
-    assert not any(isinstance(node, ast.If) for node in step_18_body())
+    # U16.7: the only `if` in step 18 is the v1 test's, its last statement.
+    body = step_18_body()   # one parse: nodes are matched by identity below
+    ifs = [node for node in body if isinstance(node, ast.If)]
+    assert len(ifs) == 1 and ifs[0] is body[-1]
+
+
+# --- U16.7: the v1 test inside step 18 ---------------------------------------------------------
+
+def step_18_test_if():
+    return step_18_body()[-1]
+
+
+def test_step_18_ends_with_one_if_on_grid_run_test():
+    block = step_18_test_if()
+    assert isinstance(block, ast.If)
+    assert ast.unparse(block.test) == "settings.grid.run_test"
+    assert ast.unparse(block) == STEP_18_TEST_IF
+
+
+def test_step_18_test_if_body_in_order():
+    assert [ast.unparse(node) for node in step_18_test_if().body] == STEP_18_TEST_BODY
+
+
+def test_step_18_test_if_else_says_the_test_is_not_run():
+    assert [ast.unparse(node) for node in step_18_test_if().orelse] == [STEP_18_TEST_NOT_RUN]
+
+
+def test_step_18_run_test_is_read_once_in_main_inside_step_18():
+    assert main_source().count("settings.grid.run_test") == 1
+    assert "run_test" in ast.unparse(step_18_test_if().test)
+
+
+def test_step_18_test_follows_the_choice_printout():
+    statements = [ast.unparse(node) for node in step_18_body()]
+    assert statements[-2:] == [STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
+
+
+def test_step_18_test_uses_the_test_origins_and_only_there():
+    block = step_18_test_if()
+    assert ast.unparse(block.body[0]) == STEP_18_TEST_ORIGINS
+    for node in step_18_body()[:-1]:
+        assert "test_origins" not in ast.unparse(node)
+    assert "validation_origins" not in ast.unparse(block)
+    assert "grid_origins" not in ast.unparse(block)
+
+
+def test_step_18_test_actual_is_actual_totals_at_the_test_origins():
+    calls = calls_in(step_18_test_if().body, "actual_totals")
+    assert len(calls) == 1 and calls[0].keywords == []
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "weekly", "weeks", "levels", "companies", "test_origins", "settings.receivables.horizons"]
+    # The same inputs as the grid's actual cash, but the origins.
+    grid = calls_in(step_18_body()[:-1], "actual_totals")[0]
+    assert [ast.unparse(a) for a in grid.args][:4] == [ast.unparse(a) for a in calls[0].args][:4]
+    assert [ast.unparse(a) for a in grid.args][5] == [ast.unparse(a) for a in calls[0].args][5]
+
+
+def test_step_18_grid_test_positional_arguments():
+    calls = calls_in(step_18_test_if().body, "grid_test")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["choice", "test_actual", "settings"]
+
+
+def test_step_18_grid_test_keywords_are_the_grids_and_the_choices():
+    call = keywords_of(calls_in(step_18_test_if().body, "grid_test")[0])
+    predictions = keywords_of(calls_in(step_18_body(), "grid_predictions")[0])
+    choice = keywords_of(calls_in(step_18_body(), "grid_choice")[0])
+    assert call["table"] == "table"
+    for name in ("block_columns", "companies", "new_cash", "refunds", "unidentified", "levels",
+                 "calendar", "cache_folder", "on_fit_done"):
+        assert call[name] == predictions[name], name
+    for name, value in choice.items():
+        assert call[name] == value, name
+    assert set(call) == {"table"} | set(choice) | {"block_columns", "cache_folder",
+                                                    "on_fit_done"}
+
+
+def test_step_18_grid_test_shares_the_grids_cache_folder_and_progress_callback():
+    call = keywords_of(calls_in(step_18_test_if().body, "grid_test")[0])
+    assert call["cache_folder"] == "settings.data.cache_folder / 'hurdle_grid'"
+    assert call["on_fit_done"] == "fit_progress"
+
+
+def test_step_18_test_restarts_the_clock_after_the_banner_and_before_the_fits():
+    statements = [ast.unparse(node) for node in step_18_test_if().body]
+    clock = statements.index("started = time.perf_counter()")
+    assert statements.index(STEP_18_TEST_BANNER) < clock < statements.index(STEP_18_TEST_CALL)
+    assert clock < statements.index(STEP_18_TEST_ACTUAL)
+
+
+def test_step_18_show_grid_test_gets_the_test_the_choice_and_settings():
+    calls = calls_in(step_18_test_if().body, "show_grid_test")
+    assert len(calls) == 1 and calls[0].keywords == []
+    assert [ast.unparse(a) for a in calls[0].args] == ["test", "choice", "settings"]
+
+
+def test_show_grid_test_is_a_module_level_function_with_three_parameters():
+    found = [node for node in script_functions() if node.name == "show_grid_test"]
+    assert len(found) == 1
+    assert [a.arg for a in found[0].args.args] == ["test", "choice", "settings"]
+    assert found[0].args.defaults == [] and found[0].args.vararg is None
+    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
+
+
+def test_show_grid_test_sits_right_after_show_grid_choice():
+    names = [node.name for node in script_functions()]
+    assert names[names.index("show_grid_choice") + 1] == "show_grid_test"
+
+
+SHOW_TEST_GLOBALS = {"HURDLE", "UNCORRECTED", "candidate_name", "show_evaluation_scores",
+                     "show_paired_bootstrap"}
+
+
+def test_show_grid_test_reads_only_names_the_script_imports_or_defines():
+    import builtins
+    function = [node for node in script_functions() if node.name == "show_grid_test"][0]
+    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Load)}
+    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Store)}
+    params = {a.arg for a in function.args.args}
+    assert loaded - stored - params - set(dir(builtins)) == SHOW_TEST_GLOBALS
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
+                for a in node.names}
+    defined = {node.name for node in script_functions()}
+    assert {"HURDLE", "UNCORRECTED", "candidate_name"} <= imported
+    assert {"show_evaluation_scores", "show_paired_bootstrap"} <= defined
 
 
 def test_step_18_the_u16_1_check_is_gone_from_the_script():
@@ -8366,7 +8536,9 @@ def test_step_18_show_grid_candidates_gets_the_candidates_and_the_origin_count()
 def test_step_18_uses_the_validation_origins_never_the_test_origins():
     assert ast.unparse(step_18_body()[0]) == (
         "grid_origins = list(settings.evaluation.validation_origins)")
-    assert "test_origins" not in ast.unparse(step_18_block())
+    # U16.7: only the v1 test's `if`, step 18's last statement, reads the test origins.
+    for node in step_18_body()[:-1]:
+        assert "test_origins" not in ast.unparse(node)
 
 
 def test_step_18_grid_predictions_positional_arguments():
@@ -8423,11 +8595,11 @@ def test_step_18_shows_the_candidates_before_the_grid_then_the_predictions_then_
     assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
         statements.index(STEP_18_GRID_CALL))
     # U16.4: the gates come right after the predictions printout; U16.5: the scores after
-    # them; U16.6: the choice after those ends step 18.
+    # them; U16.6: the choice after those; U16.7: the v1 test's `if` ends step 18.
     at = statements.index("show_grid_predictions(predictions, rolled)")
-    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-8:-5]
+    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-9:-6]
     assert statements[at + 4:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
-                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
+                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
     assert statements.index(STEP_18_GRID_CALL) < at
 
 
@@ -8463,16 +8635,18 @@ def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
         assert reads == [], ast.unparse(node)
 
 
-def test_grid_is_imported_once_with_its_six_functions():
+def test_grid_is_imported_once_with_its_names():
     # U16.5 added grid_scores (the test was "..._four_functions" before); U16.6 grid_choice
-    # (it was "..._five_functions").
+    # (it was "..._five_functions"); U16.7 UNCORRECTED and grid_test (it was
+    # "..._six_functions").
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                and node.module == "collection_estimation.hurdle.grid"]
     assert len(imports) == 1
     assert [(a.name, a.asname) for a in imports[0].names] == [
-        ("grid_candidates", None), ("grid_choice", None), ("grid_gates", None),
-        ("grid_predictions", None), ("grid_scores", None), ("with_params", None)]
+        ("UNCORRECTED", None), ("grid_candidates", None), ("grid_choice", None),
+        ("grid_gates", None), ("grid_predictions", None), ("grid_scores", None),
+        ("grid_test", None), ("with_params", None)]
 
 
 def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
@@ -8526,6 +8700,16 @@ inspect.signature(script.grid_choice).bind(
     weekly=None, weeks=None, levels=None, calendar=None, ledger=None, rates=None,
     new_cash=None, refunds=None, unidentified=None)
 inspect.signature(script.show_grid_choice).bind("choice", "candidates", "table", "settings")
+assert script.grid_test is grid.grid_test
+assert script.UNCORRECTED == grid.UNCORRECTED
+inspect.signature(script.grid_test).bind(
+    "choice", "actual", "settings", table=None, block_columns={}, companies=[],
+    week_zero=None, weekly=None, weeks=None, levels=None, calendar=None, ledger=None,
+    rates=None, new_cash=None, refunds=None, unidentified=None, cache_folder="c",
+    on_fit_done=None)
+inspect.signature(script.show_grid_test).bind("test", "choice", "settings")
+from collection_estimation.hurdle import calibrate
+assert script.candidate_name is calibrate.candidate_name
 from collection_estimation.hurdle import evaluate
 assert script.STACK_COLUMNS is evaluate.STACK_COLUMNS
 assert script.evaluation_scores is evaluate.evaluation_scores
@@ -8554,10 +8738,14 @@ def test_module_docstring_lists_step_18_after_the_forecast_line():
 
 # Running step 18's `if` with fakes.
 
+TEST_NOT_RUN_LINE = "        the v1 test is not run ([grid] run_test = false)"
+
 def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolled="<rolled>",
-                progress_calls=()):
+                progress_calls=(), run_test=False, test_origins="<never read>",
+                test_progress_calls=()):
     """Run step 18's `if` with fake inputs and functions; return (calls, printed). The fake
-    grid_predictions calls its on_fit_done once per item of `progress_calls`."""
+    grid_predictions calls its on_fit_done once per item of `progress_calls`, the fake
+    grid_test once per item of `test_progress_calls` (U16.7, with `run_test`)."""
     calls, printed = [], []
     clock = iter(ticks)
 
@@ -8573,9 +8761,15 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
             kwargs["on_fit_done"](*item)
         return "<predictions>"
 
-    settings = SimpleNamespace(grid=SimpleNamespace(run=run),
+    def fake_test(*args, **kwargs):
+        calls.append(("grid_test", args, kwargs))
+        for item in test_progress_calls:
+            kwargs["on_fit_done"](*item)
+        return "<test>"
+
+    settings = SimpleNamespace(grid=SimpleNamespace(run=run, run_test=run_test),
                                evaluation=SimpleNamespace(validation_origins=validation_origins,
-                                                          test_origins="<never read>"),
+                                                          test_origins=test_origins),
                                data=SimpleNamespace(cache_folder=Path("cache_root")),
                                receivables=SimpleNamespace(horizons=5))
     namespace = {
@@ -8600,7 +8794,17 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
         "grid_gates": recorder("grid_gates", SimpleNamespace(stage1="<gates 1>",
                                                              stage2="<gates 2>")),
         "show_grid_gates": recorder("show_grid_gates", None),
+        "grid_test": fake_test,
+        "show_grid_test": recorder("show_grid_test", None),
     }
+    if run_test:
+        # Step 18's two actual_totals calls: the grid's, then the test's.
+        answers = iter(["<grid actual>", "<test actual>"])
+
+        def actual_totals(*args, **kwargs):
+            calls.append(("actual_totals", args, kwargs))
+            return next(answers)
+        namespace["actual_totals"] = actual_totals
     module = ast.Module(body=[step_18_block()], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
     return calls, printed
@@ -8629,8 +8833,9 @@ def test_step_18_run_with_the_grid_switched_off_does_nothing():
     (tuple(range(20, 45)), "over the validation origins 20-44 (25 origins)"),
 ])
 def test_step_18_run_prints_the_header_once(origins, header):
+    # U16.7: with run_test = false, step 18 ends by saying the v1 test is not run.
     _, printed = run_step_18(validation_origins=origins)
-    assert printed == [f"Step 18: settings grid (U16) {header}"]
+    assert printed == [f"Step 18: settings grid (U16) {header}", TEST_NOT_RUN_LINE]
 
 
 def test_step_18_run_grid_candidates_get_the_settings_themselves():
@@ -8684,12 +8889,14 @@ def test_step_18_run_progress_lines():
         "  ... stage 1 setting 0, origin 37: 1 of 8 done (60 s), about 7 min left",
         # 300 s / 2 x 6 = 900 s = 15 min.
         "  ... stage 2 setting 3, origin 37: 2 of 8 done (0 s), about 15 min left",
+        TEST_NOT_RUN_LINE,
     ]
 
 
 def test_step_18_run_last_progress_line_has_nothing_left():
     _, printed = run_step_18(ticks=(0.0, 3000.0), progress_calls=[(4, 4, "stage 2", 44, 1, 12.0)])
-    assert printed[-1] == "  ... stage 2 setting 1, origin 44: 4 of 4 done (12 s), about 0 min left"
+    assert printed[-2] == "  ... stage 2 setting 1, origin 44: 4 of 4 done (12 s), about 0 min left"
+    assert printed[-1] == TEST_NOT_RUN_LINE
 
 
 def test_step_18_run_never_reads_the_test_origins():
@@ -9056,8 +9263,10 @@ def test_show_grid_gates_scores_and_choice_sit_right_before_step_15s_show_gates(
     # before_step_15s_show_gates" before); U16.6 show_grid_choice after it (the test was
     # "show_grid_gates_and_show_grid_scores_sit_right_before_step_15s_show_gates").
     names = [node.name for node in script_functions()]
+    # U16.7 show_grid_test after show_grid_choice.
     at = names.index("show_grid_gates")
-    assert names[at + 1:at + 4] == ["show_grid_scores", "show_grid_choice", "show_gates"]
+    assert names[at + 1:at + 5] == ["show_grid_scores", "show_grid_choice", "show_grid_test",
+                                    "show_gates"]
 
 
 def test_step_18_run_grid_gates_gets_the_predictions_candidates_and_settings():
@@ -9313,7 +9522,8 @@ def test_show_grid_gates_prints_bad_elsewhere_and_does_not_count_it_as_a_gate(ca
 # show_grid_scores) ------------------------------------------------------------------------
 
 def test_step_18_grid_actual_is_actual_totals_at_the_grid_origins():
-    calls = calls_in(step_18_body(), "actual_totals")
+    # U16.7: the v1 test's `if` (the last statement) makes its own, at the test origins.
+    calls = calls_in(step_18_body()[:-1], "actual_totals")
     assert len(calls) == 1 and calls[0].keywords == []
     assert [ast.unparse(a) for a in calls[0].args] == [
         "weekly", "weeks", "levels", "companies", "grid_origins", "settings.receivables.horizons"]
@@ -9357,11 +9567,12 @@ def test_step_18_scores_come_right_after_the_gates_in_order_then_the_choice_ends
     at = statements.index("show_grid_gates('stage 2', gates.stage2, 'deviance skill', "
                           "ascending=False)")
     assert statements[at + 1:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
-                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
+                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
 
 
 def test_step_18_scores_and_choice_never_read_the_test_origins():
-    for node in step_18_body()[-5:]:
+    # U16.7: the v1 test's `if` after them does.
+    for node in step_18_body()[-6:-1]:
         assert "test_origins" not in ast.unparse(node)
 
 
@@ -9686,8 +9897,9 @@ def test_step_18_show_grid_choice_gets_the_choice_candidates_table_and_settings(
 
 def test_step_18_choice_comes_right_after_show_grid_scores_and_its_printout_ends_step_18():
     statements = [ast.unparse(node) for node in step_18_body()]
+    # U16.7: then the v1 test's `if` ends it.
     at = statements.index(STEP_18_SHOW_SCORES)
-    assert statements[at + 1:] == [STEP_18_CHOICE, STEP_18_SHOW_CHOICE]
+    assert statements[at + 1:] == [STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
 
 
 def test_show_grid_choice_is_a_module_level_function_with_four_parameters():
@@ -9757,6 +9969,176 @@ def test_step_18_run_the_choice_reads_the_same_table_and_settings_as_the_scores(
 def test_step_18_run_switched_off_chooses_nothing():
     calls, _ = run_step_18(run=False, ticks=())
     assert not any(name in ("grid_choice", "show_grid_choice") for name, _, _ in calls)
+
+
+# --- U16.7: running the v1 test's `if` with fakes ---------------------------------------------
+
+def run_step_18_test(test_origins=(49, 60), ticks=(100.0, 500.0), **kwargs):
+    return run_step_18(run_test=True, test_origins=test_origins, ticks=ticks, **kwargs)
+
+
+def test_step_18_run_with_run_test_calls_in_order():
+    calls, _ = run_step_18_test()
+    assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
+                                              "block_feature_columns", "grid_predictions",
+                                              "show_grid_predictions", "grid_gates",
+                                              "show_grid_gates", "show_grid_gates",
+                                              "actual_totals", "grid_scores",
+                                              "show_grid_scores", "grid_choice",
+                                              "show_grid_choice", "actual_totals",
+                                              "block_feature_columns", "grid_test",
+                                              "show_grid_test"]
+
+
+def test_step_18_run_without_run_test_makes_no_test():
+    calls, printed = run_step_18()
+    assert not any(name in ("grid_test", "show_grid_test") for name, _, _ in calls)
+    assert [name for name, _, _ in calls].count("actual_totals") == 1
+    assert printed[-1] == TEST_NOT_RUN_LINE
+
+
+def test_step_18_run_with_run_test_but_the_grid_switched_off_does_nothing():
+    # Settings refuse this pair; the script, given it, still runs nothing.
+    calls, printed = run_step_18(run=False, run_test=True, test_origins=(49, 60), ticks=())
+    assert calls == [] and printed == []
+
+
+@pytest.mark.parametrize("origins, text", [
+    ((49, 60), "49-60 (2 origins)"), ((57,), "57-57 (1 origins)"),
+    (tuple(range(49, 61)), "49-60 (12 origins)")])
+def test_step_18_run_with_run_test_prints_the_v1_banner_and_not_the_not_run_line(origins, text):
+    _, printed = run_step_18_test(test_origins=origins)
+    assert printed[-1] == (f"        V1 TEST over the test origins {text}: a report, not a "
+                           f"choice; do not change the settings because of it")
+    assert TEST_NOT_RUN_LINE not in printed
+    assert printed[0].startswith("Step 18: settings grid (U16) over the validation origins")
+
+
+def test_step_18_run_test_actual_is_at_the_test_origins():
+    calls, _ = run_step_18_test(test_origins=(49, 60))
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "actual_totals"]
+    assert found == [(("<weekly>", "<weeks>", "<levels>", "<companies>", [37, 40, 44], 5), {}),
+                     (("<weekly>", "<weeks>", "<levels>", "<companies>", [49, 60], 5), {})]
+    assert type(found[1][0][4]) is list
+
+
+def test_step_18_run_grid_test_gets_its_arguments():
+    calls, _ = run_step_18_test()
+    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_test"]
+    assert len(found) == 1
+    (choice, actual, settings), kwargs = found[0]
+    assert (choice, actual) == ("<choice>", "<test actual>")
+    assert settings.grid.run_test is True
+    on_fit_done = kwargs.pop("on_fit_done")
+    assert callable(on_fit_done)
+    assert kwargs == {"table": "<table>", "block_columns": "<blocks>",
+                      "companies": "<companies>", "week_zero": "<week zero>",
+                      "weekly": "<weekly>", "weeks": "<weeks>", "levels": "<levels>",
+                      "calendar": "<calendar>", "ledger": "<ledger>", "rates": "<rates>",
+                      "new_cash": "<new cash>", "refunds": "<refunds>",
+                      "unidentified": "<unidentified>",
+                      "cache_folder": Path("cache_root") / "hurdle_grid"}
+
+
+def test_step_18_run_grid_test_gets_the_same_settings_and_callback_as_the_grid():
+    calls, _ = run_step_18_test()
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert by_name["grid_test"][0][2] is by_name["grid_predictions"][0][3]
+    assert by_name["grid_test"][1]["on_fit_done"] is by_name["grid_predictions"][1]["on_fit_done"]
+    assert by_name["grid_test"][1]["cache_folder"] == by_name["grid_predictions"][1]["cache_folder"]
+
+
+def test_step_18_run_shows_the_test_with_the_choice_and_settings():
+    calls, _ = run_step_18_test()
+    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_test"]
+    assert len(shown) == 1
+    (test, choice, settings), kwargs = shown[0]
+    assert kwargs == {} and (test, choice) == ("<test>", "<choice>")
+    by_name = {name: args for name, args, _ in calls}
+    assert settings is by_name["grid_choice"][4]
+
+
+def test_step_18_run_test_progress_counts_from_the_restarted_clock():
+    # The grid's clock starts at 100 s; the test's restarts at 500 s; its one fit of 4 ends at
+    # 560 s: 60 s per fit x 3 left = 180 s = 3 min (from the grid's start it would be 6 min).
+    _, printed = run_step_18_test(ticks=(100.0, 500.0, 560.0),
+                                  test_progress_calls=[(1, 4, "stage 1", 49, 0, 58.0)])
+    assert printed[-1] == "  ... stage 1 setting 0, origin 49: 1 of 4 done (58 s), about 3 min left"
+    assert printed[-2].startswith("        V1 TEST over the test origins 49-60")
+
+
+# show_grid_test, the function alone: compiled from the script, with the two printers it calls
+# replaced by fakes that print what they were given (each is tested on its own above).
+
+def grid_test_printer(printed):
+    from collection_estimation.hurdle import calibrate, evaluate, grid
+    found = [node for node in script_functions() if node.name == "show_grid_test"]
+    assert len(found) == 1
+
+    def fake(name):
+        def show(*args):
+            printed.append((name, args))
+            print(f"<{name}>")
+        return show
+
+    namespace = {"HURDLE": evaluate.HURDLE, "UNCORRECTED": grid.UNCORRECTED,
+                 "candidate_name": calibrate.candidate_name,
+                 "show_evaluation_scores": fake("show_evaluation_scores"),
+                 "show_paired_bootstrap": fake("show_paired_bootstrap")}
+    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_test>", "exec"), namespace)
+    return namespace["show_grid_test"]
+
+
+def hand_test_choice(p_kind="none", m_kind="scale"):
+    from collection_estimation.hurdle.calibrate import MCorrection, PCorrection
+    from collection_estimation.hurdle.settings import TopupSettings
+    topups = TopupSettings(method="mean", window=13, with_level=True, compare=False,
+                           compare_first_origin=0, compare_last_origin=0, compare_windows=(4,))
+    calibration = SimpleNamespace(p_correction=PCorrection(p_kind),
+                                  m_correction=MCorrection(m_kind, 1.036))
+    return SimpleNamespace(stage1=SimpleNamespace(params={"max_iter": 900, "learning_rate": 0.01}),
+                           stage2=SimpleNamespace(params={"loss": "poisson",
+                                                          "learning_rate": 0.05}),
+                           topups=topups, calibration=calibration)
+
+
+def printed_test(capsys, test, choice, settings):
+    printed = []
+    capsys.readouterr()
+    assert grid_test_printer(printed)(test, choice, settings) is None
+    return capsys.readouterr().out.splitlines(), printed
+
+
+def test_show_grid_test_exact_printout(capsys):
+    test = SimpleNamespace(scores="<sc>", bootstrap="<bs>")
+    lines, _ = printed_test(capsys, test, hand_test_choice(),
+                            SimpleNamespace(receivables=SimpleNamespace(horizons=5)))
+    assert lines == [
+        "        frozen on validation: stage 1 {'max_iter': 900, 'learning_rate': 0.01}, "
+        "stage 2 {'loss': 'poisson', 'learning_rate': 0.05}, top-ups mean (window 13, "
+        "with_level True); corrections p none, m scale",
+        "        on the test origins (hurdle = corrected; hurdle uncorrected for information "
+        "only):",
+        "<show_evaluation_scores>",
+        "<show_paired_bootstrap>"]
+
+
+def test_show_grid_test_names_the_corrections_with_candidate_name(capsys):
+    from collection_estimation.hurdle.calibrate import candidate_name
+    choice = hand_test_choice(p_kind="per h", m_kind="by size")
+    lines, _ = printed_test(capsys, SimpleNamespace(scores=1, bootstrap=2), choice,
+                            SimpleNamespace(receivables=SimpleNamespace(horizons=5)))
+    name = candidate_name(choice.calibration.p_correction, choice.calibration.m_correction)
+    assert lines[0].endswith(f"; corrections {name}")
+    assert name == "p per h, m by size"
+
+
+def test_show_grid_test_passes_the_test_scores_horizons_and_bootstrap(capsys):
+    test = SimpleNamespace(scores="<sc>", bootstrap="<bs>", forecast="<f>", uncorrected="<u>")
+    _, printed = printed_test(capsys, test, hand_test_choice(),
+                              SimpleNamespace(receivables=SimpleNamespace(horizons=4)))
+    assert printed == [("show_evaluation_scores", ("<sc>", 4)),
+                       ("show_paired_bootstrap", ("<bs>",))]
 
 
 # show_grid_choice, the function alone: compiled from the script, with the printers it calls
