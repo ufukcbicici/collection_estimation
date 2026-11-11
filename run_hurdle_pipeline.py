@@ -21,6 +21,10 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
    13  forecast, evaluation, calibration                           (U13-U15)
    18  settings grid                                               (U16)  <- in progress
 
+Steps 1-11 are one call, `inputs.prepare_inputs` (shared with the other entry points); their
+printouts follow it (`show_preparation`), in the same order and with the same text. To look
+at one of their tables, put the breakpoint in hurdle/inputs.py.
+
 The settings (data paths, company codes, ...) are in settings/synthetic.toml. To run on
 other data (e.g. the real EY files), write another settings file and point the environment
 variable HURDLE_SETTINGS to it; nothing in the code needs to change.
@@ -45,27 +49,9 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import pandas as pd  # noqa: E402
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score  # noqa: E402
 
-from collection_estimation.hurdle.read_collections import (  # noqa: E402
-    list_daily_files,
-    load_collections,
-    read_one_file,
-)
-from collection_estimation.hurdle.fill_from_ledger import fill_missing_days  # noqa: E402
-from collection_estimation.hurdle.features_calendar import (  # noqa: E402
-    calendar_features,
-    holiday_position_features,
-)
-from collection_estimation.hurdle.features_receivables import (  # noqa: E402
-    before_first_ledger_week,
-    receivables_features,
-)
-from collection_estimation.hurdle.features_history import (  # noqa: E402
-    first_history_week,
-    history_features,
-    ledger_receipts_before,
-    weekly_matrix,
-)
-from collection_estimation.hurdle.holidays import load_holidays, public_holidays  # noqa: E402
+from collection_estimation.hurdle.read_collections import read_one_file  # noqa: E402
+from collection_estimation.hurdle.features_receivables import before_first_ledger_week  # noqa: E402
+from collection_estimation.hurdle.holidays import public_holidays  # noqa: E402
 from collection_estimation.hurdle import inflation  # noqa: E402
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast  # noqa: E402
 from collection_estimation.hurdle.evaluate import (  # noqa: E402
@@ -94,13 +80,7 @@ from collection_estimation.hurdle.calibrate import (  # noqa: E402
     choose_calibration,
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
-from collection_estimation.hurdle.keys import add_keys  # noqa: E402
-from collection_estimation.hurdle.known import known_weeks  # noqa: E402
-from collection_estimation.hurdle.panel import (  # noqa: E402
-    add_deflated_label,
-    add_labels,
-    panel_rows,
-)
+from collection_estimation.hurdle.inputs import prepare_inputs  # noqa: E402
 from collection_estimation.hurdle.benchmark import (  # noqa: E402
     benchmark_forecasts,
     cash_totals,
@@ -157,38 +137,15 @@ from collection_estimation.hurdle.stage2 import (  # noqa: E402
     predict_amount,
     total_ratio,
 )
-from collection_estimation.hurdle.training_table import (  # noqa: E402
-    block_feature_columns,
-    join_features,
-    rows_at_origin,
-    rows_known_at,
-)
+from collection_estimation.hurdle.training_table import rows_at_origin, rows_known_at  # noqa: E402
 from collection_estimation.hurdle.topups import score_topups, topup_actuals, topup_forecasts  # noqa: E402
-from collection_estimation.hurdle.side_tables import (  # noqa: E402
-    check_side_tables,
-    is_unidentified,
-    new_customer_cash,
-    refunds_by_week,
-    unidentified_cash_by_week,
-)
-from collection_estimation.hurdle.receivables_asof import (  # noqa: E402
-    exchange_rates,
-    overdue_age_columns,
-    receivables_by_week,
-)
-from collection_estimation.hurdle.read_ledger import (  # noqa: E402
-    check_ledger_against_collections,
-    load_ledger,
-)
+from collection_estimation.hurdle.receivables_asof import overdue_age_columns  # noqa: E402
 from collection_estimation.hurdle.prices import (  # noqa: E402
-    price_weeks, projected_levels, published_levels, published_month)
-from collection_estimation.hurdle.settings import load_settings  # noqa: E402
-from collection_estimation.hurdle.series import (  # noqa: E402
-    add_week_index,
-    week_numbers,
-    week_calendar,
-    weekly_amounts,
+    price_weeks,
+    projected_levels,
+    published_month,
 )
+from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 
 # ----------------------------------------------------------------------------------------
 # Settings: read from a TOML file. The environment variable HURDLE_SETTINGS can point to
@@ -203,233 +160,36 @@ def main():
     print(f"Settings: {settings.settings_file}")
     print(f"Corpus folder: {settings.data.corpus_folder}")
 
-    # Step 1: which days have a file. A day without a file is missing, not zero.
-    layout = settings.collections_layout
-    daily_files = list_daily_files(settings.data.corpus_folder,
-                                   layout.file_name_date_format)
-    show_daily_files(daily_files)
+    # Steps 1-11, in hurdle/inputs.py: the daily files and the ledger, the weeks, the
+    # receivables, the panel and its side tables, the price levels and the features. Each
+    # step's checks run inside it; its printouts follow, step by step, once it is done.
+    inputs, details = prepare_inputs(settings, with_details=True)
+    show_preparation(inputs, details, settings)
+    companies, week_zero = inputs.companies, inputs.week_zero
+    weeks, weekly, ledger, rates = inputs.weeks, inputs.weekly, inputs.ledger, inputs.rates
+    levels, calendar, table = inputs.levels, inputs.calendar, inputs.table
+    block_columns = inputs.block_columns
+    new_cash, refunds, unidentified = inputs.new_cash, inputs.refunds, inputs.unidentified
 
-    # Step 2: the payment lines of one day, checked against the file's grand total.
-    day = settings.debug.one_day
-    if day not in daily_files:
-        raise ValueError(f"{settings.settings_file.name} [debug]: one_day {day} has no daily file")
-    one_day = read_one_file(daily_files[day], layout)
-    show_one_day(day, one_day)
-
-    # Step 3: the payment lines of every day, each file checked as in step 2, and every
-    # line's date checked against its file's date. Read from the cache if the files have
-    # not changed since the last run.
-    collections = load_collections(daily_files, layout, settings.data.cache_folder)
-    show_collections(collections)
-
-    # Step 4: one key per company and customer, e.g. 'TR02-11226452'.
-    collections = add_keys(collections, list(settings.companies.known))
-    show_keys(collections)
-
-    # Step 5: the AR ledger lines, with the same keys as the payment lines. Read from the
-    # cache if nothing has changed since the last run. Its payments must equal the daily
-    # files' totals on every day with a file.
-    ledger = load_ledger(settings.data.ledger_file, settings.data.ledger_as_of,
-                         settings.ledger_layout, settings.data.cache_folder)
-    ledger = add_keys(ledger, list(settings.companies.known))
-    show_ledger(ledger)
-    tie = check_ledger_against_collections(ledger, collections, list(daily_files))
-    show_tie(tie)
-
-    # Step 6: days without a daily file. If [data] fill_missing_days_from_ledger is true,
-    # their payments are taken from the ledger (flagged filled_from_ledger); otherwise
-    # their weeks stay missing.
-    if settings.data.fill_missing_days_from_ledger:
-        collections, filled_days = fill_missing_days(collections, ledger, list(daily_files))
-    else:
-        collections = collections.assign(filled_from_ledger=False)
-        filled_days = []
-    show_filled(collections, filled_days, settings.data.fill_missing_days_from_ledger)
-
-    # Step 7: weekly series. Weeks run Monday to Sunday; week 0 is the week of the first
-    # daily file.
-    first_day = min(daily_files)
-    week_zero = first_day - timedelta(days=first_day.weekday())
-    collections = add_week_index(collections, week_zero)
-    print(f"Step 7: week 0 starts {week_zero}; lines run from week "
-          f"{collections['week'].min()} to week {collections['week'].max()}")
-
-    # The week calendar: which weeks are complete. A week with any business day with
-    # neither a file nor filled payments is missing: its amounts are unknown, not zero.
-    holidays = load_holidays(settings.data.holidays_file)
-    weeks = week_calendar(list(daily_files), week_zero, holidays, filled_days)
-    show_weeks(weeks)
     # Step 12 checks stage 1 at [debug] demo_origin: its target weeks must have answers.
     # Checked here, before the long steps, rather than when step 12 is reached.
-    if settings.debug.demo_origin + settings.receivables.horizons > int(weeks["week"].max()):
+    if settings.debug.demo_origin + settings.receivables.horizons > inputs.last_week:
         raise ValueError(f"[debug] demo_origin {settings.debug.demo_origin}: its target weeks "
                          f"reach week {settings.debug.demo_origin + settings.receivables.horizons}"
-                         f", after the last week {int(weeks['week'].max())}, so step 12 would "
-                         f"have no answers")
+                         f", after the last week {inputs.last_week}, so step 12 would have no "
+                         f"answers")
     # The same for step 13's diagnostic, which needs answers up to origin + 2 horizons.
     # Step 15's joint diagnostic uses the same splits.
     diagnostic_end = settings.diagnostic.origin + 2 * settings.receivables.horizons
     if ((settings.diagnostic.run or settings.joint_diagnostic.run)
-            and diagnostic_end > int(weeks["week"].max())):
+            and diagnostic_end > inputs.last_week):
         raise ValueError(f"[diagnostic] origin {settings.diagnostic.origin}: its test weeks "
-                         f"reach week {diagnostic_end}, after the last week "
-                         f"{int(weeks['week'].max())}")
-
-    # The weekly amounts per key: gross receipts (the target), refunds, unapplied lines.
-    # Checked inside: the weekly table holds every TRY and every line of steps 3 and 6.
-    weekly = weekly_amounts(collections)
-    show_weekly(weekly)
-
-    # Step 8: each key's receivables as known at the end of every week, in TRY at the rates
-    # known then (one row per key and week). Weeks named in [receivables] leak_check_weeks
-    # are rebuilt from a ledger cut off at that week and compared.
-    rates = exchange_rates(collections, ledger)
-    show_rates(rates)
-    receivables = receivables_by_week(
-        ledger, rates, week_zero, last_week=int(weeks["week"].max()),
-        as_of=settings.data.ledger_as_of, horizons=settings.receivables.horizons,
-        min_cleared=settings.receivables.min_cleared_for_delay,
-        leak_check_weeks=settings.receivables.leak_check_weeks,
-        age_edges=settings.receivables.overdue_age_days)
-    show_receivables_by_week(receivables, settings.receivables.leak_check_weeks,
-                             settings.debug.sample_week, settings.receivables.overdue_age_days)
-
-    # Step 9: the panel. Built unit by unit; for now, when each key becomes known (the
-    # week of its first interaction, in the ledger or the daily files). From that week on
-    # it gets panel rows.
-    known = known_weeks(collections, ledger, week_zero)
-    show_known(known, collections, int(weeks["week"].max()))
-
-    # Placeholder customers of unidentified cash ([companies] unidentified_customers) are not
-    # customers: they get no panel rows, and their cash goes to table G below.
-    unidentified_customers = settings.companies.unidentified_customers
-    known = known[~is_unidentified(known, unidentified_customers)]
-    unidentified_weekly = weekly[is_unidentified(weekly, unidentified_customers)]
-    identified_weekly = weekly[~is_unidentified(weekly, unidentified_customers)]
-    # The companies we expect (from the settings), not the ones left in `known`: a company
-    # whose only keys are placeholders must still get its rows in tables R and G.
-    companies = list(settings.companies.known)
-
-    # The panel's rows (no labels yet): for every forecast week t, every key known by then,
-    # once for each week ahead h = 1 ... horizons.
-    panel = panel_rows(known, int(weeks["week"].max()), settings.receivables.horizons)
-    show_panel_rows(panel)
-
-    # The labels: what each key paid in the target week (gross receipts, TRY), or unknown
-    # when the target week is missing or after the last week.
-    panel = add_labels(panel, identified_weekly, weeks)
-    show_labels(panel, identified_weekly)
-
-    # The side tables: the cash the panel does not hold. A: gross receipts in week t+h of keys
-    # not yet known at forecast week t.
-    new_cash = new_customer_cash(identified_weekly, known, weeks, settings.receivables.horizons,
-                                 companies)
-    show_new_customer_cash(new_cash, weekly)
-
-    # R: each company's refunds per week (negative), all keys together.
-    refunds = refunds_by_week(weekly, weeks, companies)
-    show_refunds(refunds)
-
-    # G: each company's cash per week with no identifiable customer.
-    unidentified = unidentified_cash_by_week(unidentified_weekly, weeks, companies)
-    print(f"        unidentified cash (G): {len(unidentified):,} rows, "
-          f"{unidentified['unidentified_cash'].sum():,.2f} TRY from "
-          f"{len(unidentified_customers)} placeholder customers")
-
-    # The tie-out: panel + A + G must equal every company's gross receipts in every labelled
-    # target week, and R its refunds, so no cash is lost or counted twice.
-    checked = check_side_tables(panel, new_cash, unidentified, refunds, weekly, companies)
-    print(f"        tie-out passed: {checked:,} company-week-horizon checks "
-          f"(panel + A + G = gross receipts; R = refunds)")
-
-    # Step 10: TÜFE price levels by week, from the first ledger line (history goes back that
-    # far), or week 0 if the ledger starts later, to the last week: the levels are normalised
-    # to week 0, so it must be in the range. The copied inflation.py is called directly here
-    # so it can be followed line by line; prices.py wraps it with our week numbers and a
-    # coverage guard.
-    last_week = int(weeks["week"].max())
-    first_ledger_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]),
-                                         week_zero).iloc[0])
-    first_price_week = min(first_ledger_week, 0)
-    weeks_for_prices = price_weeks(week_zero, first_price_week, last_week)
-    actual_level = inflation.weekly_price_level(weeks_for_prices)        # hindsight only
-    published_level = inflation.published_price_level(weeks_for_prices)  # known at the time
-    projected_level = inflation.projected_price_level(weeks_for_prices)  # P[origin, target]
-    levels = published_levels(week_zero, first_price_week, last_week)
-    show_prices(weeks_for_prices, actual_level, published_level, projected_level, levels)
-    # U13.1: the levels a forecast re-inflates with, at the demo origin (a past week, so the
-    # published figures can be checked) and at the last week (target weeks after the data).
-    for forecast_week in (settings.debug.demo_origin, last_week):
-        show_projected_levels(week_zero, forecast_week, settings.receivables.horizons)
-
-    # Step 11: the features. Built unit by unit; for now, the ledger's payments before the
-    # first daily file, used as payment history if [history] use_ledger_before_first_file.
-    if settings.history.use_ledger_before_first_file:
-        # Week 0 at the latest: a ledger that starts after the first daily file gives no
-        # history before it, and the matrix must still hold the daily files from week 0.
-        history_start = min(first_history_week(ledger, week_zero), 0)
-        early_receipts = ledger_receipts_before(ledger, min(daily_files), week_zero)
-        early_receipts = early_receipts[early_receipts["week"] >= history_start]
-    else:
-        history_start = 0
-        early_receipts = ledger_receipts_before(ledger, min(daily_files), week_zero).iloc[0:0]
-    show_early_receipts(early_receipts, history_start)
-
-    # The weekly matrix: each key's deflated gross receipts per week (0.0 = paid nothing,
-    # NaN = no data that week), from the history start to the last week.
-    matrix = weekly_matrix(identified_weekly, early_receipts, known["key"], weeks, levels,
-                           history_start, last_week)
-    show_matrix(matrix)
-
-    # The history features: per key and origin week, what its payments looked like up to t.
-    history = history_features(matrix, known, last_week, settings.history.windows)
-    show_history(history, matrix)
-
-    # The calendar features of every target week, up to the last week + the horizons.
-    calendar = calendar_features(week_zero, 0, last_week + settings.receivables.horizons,
-                                 holidays)
-    show_calendar(calendar, week_zero, holidays)
-
-    # Where the holidays fall around each week ([calendar] holiday_encodings), joined to the
-    # calendar block: tells a week whose cash moves into the next one from one that keeps it.
-    positions = holiday_position_features(
-        week_zero, 0, last_week + settings.receivables.horizons, holidays,
-        settings.calendar.holiday_encodings, settings.calendar.drain_window,
-        settings.calendar.catch_up_window)
-    calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")
-    show_holiday_positions(positions, week_zero, holidays)
-
-    # The receivables features: per panel row, what the customer owed at t, split at its
-    # target week t+h (deflated, like the history features).
-    owed = receivables_features(panel, receivables, levels, settings.receivables.horizons,
-                                settings.receivables.overdue_age_days)
-    show_owed(owed, int(before_first_ledger_week(panel, receivables).sum()))
-
-    # The label in TRY of week 0, like the features: divided by its target week's level.
-    panel = add_deflated_label(panel, levels)
-    show_deflated_label(panel, levels)
-
-    # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
-    # trailing mean ([topups] window) and by the ridge (with and without the recent level),
-    # beside what came.
-    show_topups(new_cash, refunds, unidentified, levels, calendar, settings.diagnostic.origin,
-                settings.receivables.horizons, settings.topups.window)
-
-    # U12.3, the choice of the top-up method ([topups] compare): every candidate forecast at
-    # every origin of the comparison and scored against what came; the method is set by hand.
-    if settings.topups.compare:
-        compare_topups(new_cash, refunds, unidentified, levels, calendar, settings.topups,
-                       settings.receivables.horizons)
-
-    # The training table: one row per panel row, with its label and every feature block.
-    table = join_features(panel, history, calendar, owed)
-    show_table(table, panel)
+                         f"reach week {diagnostic_end}, after the last week {inputs.last_week}")
 
     # Step 12: stage 1, "will it pay?", checked at one forecast week ([debug] demo_origin).
     # Built unit by unit; for now, the rows and the model's input.
-    origin = settings.debug.demo_origin   # checked in step 7: its answers are known
-    columns = feature_columns(block_feature_columns(history, calendar, owed),
-                              settings.stage1.feature_blocks)
+    origin = settings.debug.demo_origin   # checked above: its answers are known
+    columns = feature_columns(block_columns, settings.stage1.feature_blocks)
     train_rows = rows_known_at(table, origin)
     forecast_rows = rows_at_origin(table, origin)
     train_x = stage1_features(train_rows, columns, companies, settings.stage1.company_as_feature)
@@ -457,27 +217,29 @@ def main():
                                    settings.receivables.horizons)
         show_diagnostic_splits(splits, settings.diagnostic.origin,
                                settings.receivables.horizons)
-        inputs = {part: (stage1_features(rows, columns, companies,
-                                         settings.stage1.company_as_feature),
-                         rows["paid"].astype(bool))
-                  for part, rows in (("train", splits.train), ("validation", splits.validation),
-                                     ("refit", splits.refit), ("test", splits.test))}
+        split_inputs = {part: (stage1_features(rows, columns, companies,
+                                               settings.stage1.company_as_feature),
+                               rows["paid"].astype(bool))
+                        for part, rows in (("train", splits.train),
+                                           ("validation", splits.validation),
+                                           ("refit", splits.refit), ("test", splits.test))}
         tables, tests = {}, []
         calibration_p = {"validation": {}, "test": {}}   # label -> p, for the calibration
         for name, fit, candidates in (
                 ("HGB", fit_stage1, hgb_candidates(settings.stage1, settings.diagnostic)),
                 ("LR", fit_stage1_baseline, lr_candidates(settings.stage1,
                                                           settings.diagnostic))):
-            grid = grid_search(name, fit, candidates, *inputs["train"], *inputs["validation"],
+            grid = grid_search(name, fit, candidates, *split_inputs["train"],
+                               *split_inputs["validation"],
                                metric=settings.diagnostic.selection_metric)
-            tests.append(choose_and_test(name, fit, candidates, grid, *inputs["refit"],
-                                         *inputs["test"]))
+            tests.append(choose_and_test(name, fit, candidates, grid, *split_inputs["refit"],
+                                         *split_inputs["test"]))
             # The importance of the chosen setting, fitted on the training rows, measured on
             # the validation rows (the test rows stay untouched).
             chosen = candidates[int(grid.iloc[0]["candidate"])]
-            model = fit(*inputs["train"], chosen.settings,
+            model = fit(*split_inputs["train"], chosen.settings,
                         class_weight=class_weight_argument(chosen.class_weight))
-            importance = permutation_importances(model, *inputs["validation"],
+            importance = permutation_importances(model, *split_inputs["validation"],
                                                  settings.diagnostic.importance_repeats,
                                                  settings.stage1.random_seed)
             tables[f"{name.lower()}_grid"] = grid
@@ -491,19 +253,19 @@ def main():
                 print(f"        {name}: the grid has no unweighted setting; calibration skipped")
                 continue
             if unweighted is not chosen:
-                model = fit(*inputs["train"], unweighted.settings)
-            a, b = fit_platt(inputs["validation"][1],
-                             predict_paid(model, inputs["validation"][0]))
+                model = fit(*split_inputs["train"], unweighted.settings)
+            a, b = fit_platt(split_inputs["validation"][1],
+                             predict_paid(model, split_inputs["validation"][0]))
             print(f"        {name}: Platt correction fitted on validation: a {a:.4f}, b {b:.4f}")
             for part in ("validation", "test"):
-                p = predict_paid(model, inputs[part][0])
+                p = predict_paid(model, split_inputs[part][0])
                 calibration_p[part][name] = p
                 calibration_p[part][f"{name} + Platt"] = apply_platt(p, a, b)
         # The models' calibration beside the three references, per horizon and pooled; skill
         # against the training rows' share paid.
         summaries, reliabilities = [], []
         for part in ("validation", "test"):
-            rows, paid = getattr(splits, part), inputs[part][1]
+            rows, paid = getattr(splits, part), split_inputs[part][1]
             references = reference_probabilities(splits.train, rows,
                                                  settings.diagnostic.reference_window,
                                                  settings.diagnostic.reference_prior_weeks)
@@ -527,8 +289,7 @@ def main():
     # learns from the paid training rows only; the target is the deflated amount (TRY of
     # week 0). Built unit by unit; for now, the fit, its total on the training rows, and m
     # for the forecast rows of step 12, times step 12's p, against the cash that came.
-    stage2_columns = feature_columns(block_feature_columns(history, calendar, owed),
-                                     settings.stage2.feature_blocks)
+    stage2_columns = feature_columns(block_columns, settings.stage2.feature_blocks)
     paid_rows = train_rows[train_rows["paid"].astype(bool)]
     paid_x = stage1_features(paid_rows, stage2_columns, companies,
                              settings.stage1.company_as_feature)
@@ -589,7 +350,7 @@ def main():
     # nominal cash that really came.
     started = time.perf_counter()
     result = forecast(table, origin, settings,
-                      block_columns=block_feature_columns(history, calendar, owed),
+                      block_columns=block_columns,
                       companies=companies, new_cash=new_cash, refunds=refunds,
                       unidentified=unidentified, levels=levels, calendar=calendar,
                       week_zero=week_zero)
@@ -622,8 +383,6 @@ def main():
                 left = (time.perf_counter() - started) / done * (total - done)
                 print(f"  ... origin {at}: {done} of {total} done ({seconds:.0f} s), about "
                       f"{left / 60:.0f} min left")
-
-            block_columns = block_feature_columns(history, calendar, owed)
 
             def fit_every_origin():
                 return rolling_forecasts(
@@ -716,7 +475,7 @@ def main():
 
         predictions = grid_predictions(
             table, grid_origins, candidates, settings,
-            block_columns=block_feature_columns(history, calendar, owed), companies=companies,
+            block_columns=block_columns, companies=companies,
             new_cash=new_cash, refunds=refunds, unidentified=unidentified, levels=levels,
             calendar=calendar, cache_folder=settings.data.cache_folder / "hurdle_grid",
             on_fit_done=fit_progress)
@@ -747,7 +506,7 @@ def main():
             test_actual = actual_totals(weekly, weeks, levels, companies, test_origins,
                                         settings.receivables.horizons)
             test = grid_test(choice, test_actual, settings, table=table,
-                             block_columns=block_feature_columns(history, calendar, owed),
+                             block_columns=block_columns,
                              companies=companies, week_zero=week_zero, weekly=weekly,
                              weeks=weeks, levels=levels, calendar=calendar, ledger=ledger,
                              rates=rates, new_cash=new_cash, refunds=refunds,
@@ -759,6 +518,81 @@ def main():
             print("        the v1 test is not run ([grid] run_test = false)")
 
     # Later steps follow as each unit is built.
+
+
+def show_preparation(inputs, details, settings):
+    """The printouts of steps 1-11, in their order, from what `prepare_inputs` made. What is
+    only there to be looked at is made here, not there: step 2 (one day's file read on its
+    own), the copied inflation module's own figures beside the levels used (step 10) and the
+    top-up comparisons (U12.2, U12.3)."""
+    show_daily_files(details.daily_files)
+
+    # Step 2: the payment lines of one day, checked against the file's grand total.
+    day = settings.debug.one_day
+    if day not in details.daily_files:
+        raise ValueError(f"{settings.settings_file.name} [debug]: one_day {day} has no daily file")
+    show_one_day(day, read_one_file(details.daily_files[day], settings.collections_layout))
+
+    show_collections(details.collections_keyed)   # step 3 (adding the keys keeps every line)
+    show_keys(details.collections_keyed)
+    show_ledger(inputs.ledger)
+    show_tie(details.tie)
+    show_filled(details.collections, details.filled_days,
+                settings.data.fill_missing_days_from_ledger)
+    print(f"Step 7: week 0 starts {inputs.week_zero}; lines run from week "
+          f"{details.collections['week'].min()} to week {details.collections['week'].max()}")
+    show_weeks(inputs.weeks)
+    show_weekly(inputs.weekly)
+
+    show_rates(inputs.rates)
+    show_receivables_by_week(details.receivables, settings.receivables.leak_check_weeks,
+                             settings.debug.sample_week, settings.receivables.overdue_age_days)
+
+    show_known(details.known, details.collections, inputs.last_week)
+    show_panel_rows(details.panel)   # the labels keep every row and its order
+    show_labels(details.panel, details.identified_weekly)
+    show_new_customer_cash(inputs.new_cash, inputs.weekly)
+    show_refunds(inputs.refunds)
+    print(f"        unidentified cash (G): {len(inputs.unidentified):,} rows, "
+          f"{inputs.unidentified['unidentified_cash'].sum():,.2f} TRY from "
+          f"{len(settings.companies.unidentified_customers)} placeholder customers")
+    print(f"        tie-out passed: {details.checked:,} company-week-horizon checks "
+          f"(panel + A + G = gross receipts; R = refunds)")
+
+    # Step 10: the copied inflation.py called directly, so it can be followed line by line;
+    # prices.py wraps it with our week numbers and a coverage guard (the levels used).
+    weeks_for_prices = price_weeks(inputs.week_zero, details.first_price_week, inputs.last_week)
+    actual_level = inflation.weekly_price_level(weeks_for_prices)        # hindsight only
+    published_level = inflation.published_price_level(weeks_for_prices)  # known at the time
+    projected_level = inflation.projected_price_level(weeks_for_prices)  # P[origin, target]
+    show_prices(weeks_for_prices, actual_level, published_level, projected_level, inputs.levels)
+    # U13.1: the levels a forecast re-inflates with, at the demo origin (a past week, so the
+    # published figures can be checked) and at the last week (target weeks after the data).
+    for forecast_week in (settings.debug.demo_origin, inputs.last_week):
+        show_projected_levels(inputs.week_zero, forecast_week, settings.receivables.horizons)
+
+    show_early_receipts(details.early_receipts, details.history_start)
+    show_matrix(details.matrix)
+    show_history(details.history, details.matrix)
+    show_calendar(inputs.calendar, inputs.week_zero, details.holidays)
+    show_holiday_positions(details.positions, inputs.week_zero, details.holidays)
+    show_owed(details.owed, int(before_first_ledger_week(details.panel,
+                                                         details.receivables).sum()))
+    show_deflated_label(details.panel, inputs.levels)
+
+    # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
+    # trailing mean ([topups] window) and by the ridge (with and without the recent level),
+    # beside what came.
+    show_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels,
+                inputs.calendar, settings.diagnostic.origin, settings.receivables.horizons,
+                settings.topups.window)
+    # U12.3, the choice of the top-up method ([topups] compare): every candidate forecast at
+    # every origin of the comparison and scored against what came; the method is set by hand.
+    if settings.topups.compare:
+        compare_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels,
+                       inputs.calendar, settings.topups, settings.receivables.horizons)
+
+    show_table(inputs.table, details.panel)
 
 
 def run_joint_diagnostic(settings, table, columns, stage2_columns, companies, calendar):

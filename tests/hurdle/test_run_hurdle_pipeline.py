@@ -19,38 +19,42 @@ SCRIPT = REPO_ROOT / "run_hurdle_pipeline.py"
 CHECK = """
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 assert callable(script.main)
 assert script.DEFAULT_SETTINGS_FILE.name == "synthetic.toml"
+# Steps 1-11 moved to inputs.prepare_inputs; the script calls that one.
+assert script.prepare_inputs is prep.prepare_inputs
+assert callable(script.show_preparation)
 # The names the script calls must have the signatures it uses after L.2.
-inspect.signature(script.list_daily_files).bind("folder", "%d%m%Y")
+inspect.signature(prep.list_daily_files).bind("folder", "%d%m%Y")
 inspect.signature(script.read_one_file).bind("path", "layout")
-inspect.signature(script.load_collections).bind({}, "layout", "cache")
+inspect.signature(prep.load_collections).bind({}, "layout", "cache")
 # After L.3: the ledger layout comes from the settings file.
-inspect.signature(script.load_ledger).bind("path", "as_of", "layout", "cache")
+inspect.signature(prep.load_ledger).bind("path", "as_of", "layout", "cache")
 try:
-    inspect.signature(script.load_ledger).bind("path", "as_of", "cache")
+    inspect.signature(prep.load_ledger).bind("path", "as_of", "cache")
 except TypeError:
     pass
 else:
     raise AssertionError("load_ledger still accepts the old three-argument call")
-inspect.signature(script.check_ledger_against_collections).bind("ledger", "collections", [])
+inspect.signature(prep.check_ledger_against_collections).bind("ledger", "collections", [])
 # After L.4: the holidays come from the holidays file named in the settings.
-inspect.signature(script.load_holidays).bind("path")
-inspect.signature(script.week_calendar).bind([], "week_zero", "holidays")
+inspect.signature(prep.load_holidays).bind("path")
+inspect.signature(prep.week_calendar).bind([], "week_zero", "holidays")
 try:
-    inspect.signature(script.week_calendar).bind([], "week_zero")
+    inspect.signature(prep.week_calendar).bind([], "week_zero")
 except TypeError:
     pass
 else:
     raise AssertionError("week_calendar still accepts the old two-argument call")
 # After U9b.5: step 7 builds every week's receivables in one call.
-inspect.signature(script.exchange_rates).bind("collections", "ledger")
-inspect.signature(script.receivables_by_week).bind(
+inspect.signature(prep.exchange_rates).bind("collections", "ledger")
+inspect.signature(prep.receivables_by_week).bind(
     "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5, min_cleared=3,
     leak_check_weeks=(0, 30, 64), age_edges=(30, 90))
 # After U9c.1: the aging-bucket edges are required.
 try:
-    inspect.signature(script.receivables_by_week).bind(
+    inspect.signature(prep.receivables_by_week).bind(
         "ledger", "rates", "week_zero", last_week=64, as_of="as_of", horizons=5,
         min_cleared=3, leak_check_weeks=(0, 30, 64))
 except TypeError:
@@ -58,18 +62,18 @@ except TypeError:
 else:
     raise AssertionError("receivables_by_week accepts a call without the age edges")
 # Step 8: when each key becomes known, from the daily files and the ledger.
-inspect.signature(script.known_weeks).bind("collections", "ledger", "week_zero")
+inspect.signature(prep.known_weeks).bind("collections", "ledger", "week_zero")
 # Step 9: the panel's rows, from the known keys, the last week and the horizons.
-inspect.signature(script.panel_rows).bind("known", 64, 5)
+inspect.signature(prep.panel_rows).bind("known", 64, 5)
 assert callable(script.show_panel_rows)
 # Step 9, U4.2: the labels, from the panel, the weekly amounts and the week calendar.
-inspect.signature(script.add_labels).bind("panel", "weekly", "weeks")
+inspect.signature(prep.add_labels).bind("panel", "weekly", "weeks")
 assert callable(script.show_labels)
 # Step 9, side table A: new-customer cash, from the weekly amounts, the known keys, the
 # calendar, the horizons and the companies (required: the grid is built from them).
-inspect.signature(script.new_customer_cash).bind("weekly", "known", "weeks", 5, ["TR02"])
+inspect.signature(prep.new_customer_cash).bind("weekly", "known", "weeks", 5, ["TR02"])
 try:
-    inspect.signature(script.new_customer_cash).bind("weekly", "known", "weeks", 5)
+    inspect.signature(prep.new_customer_cash).bind("weekly", "known", "weeks", 5)
 except TypeError:
     pass
 else:
@@ -77,40 +81,40 @@ else:
 assert callable(script.show_new_customer_cash)
 # Side table R: refunds per company and week, from the weekly amounts, the calendar and
 # the companies.
-inspect.signature(script.refunds_by_week).bind("weekly", "weeks", ["TR02"])
+inspect.signature(prep.refunds_by_week).bind("weekly", "weeks", ["TR02"])
 assert callable(script.show_refunds)
 # Side table G: placeholder customers are split off by customer_id, and their gross
 # receipts summed per company and week.
-inspect.signature(script.is_unidentified).bind("table", ("99999",))
-inspect.signature(script.unidentified_cash_by_week).bind("unidentified", "weeks", ["TR02"])
+inspect.signature(prep.is_unidentified).bind("table", ("99999",))
+inspect.signature(prep.unidentified_cash_by_week).bind("unidentified", "weeks", ["TR02"])
 # The tie-out: the panel and the side tables A, G and R against all the weekly amounts.
-inspect.signature(script.check_side_tables).bind("panel", "new_cash", "unidentified",
+inspect.signature(prep.check_side_tables).bind("panel", "new_cash", "unidentified",
                                                  "refunds", "weekly", ["TR02"])
 # Step 6: days without a file filled from the ledger; the calendar takes the filled days.
-inspect.signature(script.fill_missing_days).bind("collections", "ledger", [])
+inspect.signature(prep.fill_missing_days).bind("collections", "ledger", [])
 try:
-    inspect.signature(script.fill_missing_days).bind("collections", "ledger")
+    inspect.signature(prep.fill_missing_days).bind("collections", "ledger")
 except TypeError:
     pass
 else:
     raise AssertionError("fill_missing_days accepts a call without the days with a file")
-inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", [])
-inspect.signature(script.week_calendar).bind([], "week_zero", "holidays", filled_days=[])
+inspect.signature(prep.week_calendar).bind([], "week_zero", "holidays", [])
+inspect.signature(prep.week_calendar).bind([], "week_zero", "holidays", filled_days=[])
 assert callable(script.show_filled)
 # Step 10: TÜFE price levels by week, from week zero and the first and last week numbers.
 inspect.signature(script.price_weeks).bind("week_zero", -32, 64)
-inspect.signature(script.published_levels).bind("week_zero", -32, 64)
+inspect.signature(prep.published_levels).bind("week_zero", -32, 64)
 assert callable(script.show_prices)
 # Step 11: the ledger's payments before the first daily file, as payment history.
-inspect.signature(script.first_history_week).bind("ledger", "week_zero")
-inspect.signature(script.ledger_receipts_before).bind("ledger", "first_file_day", "week_zero")
+inspect.signature(prep.first_history_week).bind("ledger", "week_zero")
+inspect.signature(prep.ledger_receipts_before).bind("ledger", "first_file_day", "week_zero")
 assert callable(script.show_early_receipts)
 # Step 11, U6.1b: the weekly matrix, from the weekly amounts, the early receipts, the keys,
 # the calendar, the price levels and the first and last weeks.
-inspect.signature(script.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels",
+inspect.signature(prep.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels",
                                              -31, 64)
 try:
-    inspect.signature(script.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels")
+    inspect.signature(prep.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels")
 except TypeError:
     pass
 else:
@@ -120,15 +124,19 @@ print("ok")
 """
 
 
-# Step 6 of main(), with every reader before it replaced by a stub, so that no file is read
-# and nothing is written (no corpus, no ledger, no data/interim cache). main() is stopped at
-# week_calendar, the first call after step 6 that receives the filled days.
+# Step 6, now in `inputs.prepare_inputs` (steps 1-11 moved there from main()), with every
+# reader before it replaced by a stub in the inputs module, so that no file is read and
+# nothing is written (no corpus, no ledger, no data/interim cache). prepare_inputs is stopped
+# at week_calendar, the first call after step 6 that receives the filled days. The step-6
+# printout is then made from what prepare_inputs passed on, with the script's show_filled;
+# that show_preparation passes the same three values is checked on its syntax tree below.
 STEP_6 = """
 import sys
 from datetime import date
 from types import SimpleNamespace
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 SWITCH = {switch}
 DAYS = [date(2026, 3, 2), date(2026, 3, 3), date(2026, 3, 5)]
@@ -156,10 +164,6 @@ def fake_fill(collections, ledger, days):
     seen["fill_args"] = (collections, ledger, days)
     return FILLED, [date(2026, 3, 4)]
 
-def fake_show_filled(collections, filled_days, switched_on):
-    seen["show_filled"] = (collections, filled_days, switched_on)
-    real_show_filled(collections, filled_days, switched_on)
-
 def fake_add_week_index(collections, week_zero):
     seen["week_index_input"] = collections
     return collections.assign(week=0)
@@ -168,34 +172,25 @@ def fake_week_calendar(days, week_zero, holidays, filled_days=None):
     seen["calendar_filled_days"] = filled_days
     raise Stop
 
-real_show_filled = script.show_filled
-script.load_settings = lambda path, root: settings
-script.list_daily_files = lambda folder, fmt: {{day: f"file-{{day}}" for day in DAYS}}
-script.read_one_file = lambda path, layout: COLLECTIONS.iloc[:1]
-script.load_collections = lambda files, layout, cache: COLLECTIONS
-script.add_keys = lambda table, companies: table
-script.load_ledger = lambda path, as_of, layout, cache: LEDGER
-script.check_ledger_against_collections = lambda ledger, collections, days: {{}}
-script.fill_missing_days = fake_fill
-script.show_filled = fake_show_filled
-script.add_week_index = fake_add_week_index
-script.load_holidays = lambda path: []
-script.week_calendar = fake_week_calendar
-for name in ("show_daily_files", "show_one_day", "show_collections", "show_keys",
-             "show_ledger", "show_tie"):
-    setattr(script, name, lambda *args, **kwargs: None)
+prep.list_daily_files = lambda folder, fmt: {{day: f"file-{{day}}" for day in DAYS}}
+prep.load_collections = lambda files, layout, cache: COLLECTIONS
+prep.add_keys = lambda table, companies: table
+prep.load_ledger = lambda path, as_of, layout, cache: LEDGER
+prep.check_ledger_against_collections = lambda ledger, collections, days: {{}}
+prep.fill_missing_days = fake_fill
+prep.add_week_index = fake_add_week_index
+prep.load_holidays = lambda path: []
+prep.week_calendar = fake_week_calendar
 
 try:
-    script.main()
+    prep.prepare_inputs(settings, with_details=True)
 except Stop:
     pass
 else:
-    raise AssertionError("main() did not reach week_calendar")
+    raise AssertionError("prepare_inputs() did not reach week_calendar")
 
-collections, filled_days, switched_on = seen["show_filled"]
-assert switched_on is SWITCH
-assert seen["week_index_input"] is collections
-assert seen["calendar_filled_days"] == filled_days
+collections, filled_days = seen["week_index_input"], seen["calendar_filled_days"]
+script.show_filled(collections, filled_days, settings.data.fill_missing_days_from_ledger)
 if SWITCH:
     assert seen["fill_args"][0] is COLLECTIONS
     assert seen["fill_args"][1] is LEDGER
@@ -234,6 +229,249 @@ def test_step_6_switched_on_takes_the_lines_and_days_from_fill_missing_days():
     assert "1 days without a daily file filled from the ledger" in result.stdout
 
 
+# Steps 1-11 as one call (`inputs.prepare_inputs`) and their printouts (`show_preparation`):
+# main()'s side of the move, checked on the syntax trees (helpers further down: main_tree,
+# show_preparation_tree, prepare_tree). What prepare_inputs computes is tested on real tiny
+# data in test_inputs.py.
+
+# Every step 1-11 function main() used to call itself; now only prepare_inputs calls them.
+STEPS_1_TO_11 = ("list_daily_files", "load_collections", "add_keys", "load_ledger",
+                 "check_ledger_against_collections", "fill_missing_days", "add_week_index",
+                 "load_holidays", "week_calendar", "weekly_amounts", "exchange_rates",
+                 "receivables_by_week", "known_weeks", "is_unidentified", "panel_rows",
+                 "add_labels", "new_customer_cash", "refunds_by_week",
+                 "unidentified_cash_by_week", "check_side_tables", "week_numbers",
+                 "published_levels", "ledger_receipts_before", "first_history_week",
+                 "weekly_matrix", "history_features", "calendar_features",
+                 "holiday_position_features", "receivables_features", "add_deflated_label",
+                 "join_features", "block_feature_columns")
+
+# main()'s names after the move, each unpacked from the inputs field of the same name.
+UNPACKED = ("companies", "week_zero", "weeks", "weekly", "ledger", "rates", "levels",
+            "calendar", "table", "block_columns", "new_cash", "refunds", "unidentified")
+
+# The printouts of steps 1-11 in the order main() used to make them.
+PREPARATION_PRINTOUTS = [
+    "show_daily_files", "show_one_day", "show_collections", "show_keys", "show_ledger",
+    "show_tie", "show_filled", "print", "show_weeks", "show_weekly", "show_rates",
+    "show_receivables_by_week", "show_known", "show_panel_rows", "show_labels",
+    "show_new_customer_cash", "show_refunds", "print", "print", "show_prices",
+    "show_projected_levels", "show_early_receipts", "show_matrix", "show_history",
+    "show_calendar", "show_holiday_positions", "show_owed", "show_deflated_label",
+    "show_topups", "compare_topups", "show_table"]
+
+
+def printouts_in_order(tree):
+    """The names of the show_* / compare_topups / print calls in `tree`, in source order."""
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and (node.func.id.startswith("show_") or node.func.id in ("compare_topups",
+                                                                         "print"))]
+    return [call.func.id for call in sorted(calls, key=lambda c: (c.lineno, c.col_offset))]
+
+
+def call_args(tree, name):
+    calls = calls_to(tree, name)
+    assert len(calls) == 1, (name, len(calls))
+    return [ast.unparse(arg) for arg in calls[0].args]
+
+
+def test_main_calls_prepare_inputs_once_with_details_then_show_preparation():
+    body = main_tree().body
+    calls = calls_to(main_tree(), "prepare_inputs")
+    assert len(calls) == 1
+    assert [ast.unparse(a) for a in calls[0].args] == ["settings"]
+    assert keywords_of(calls[0]) == {"with_details": "True"}
+    at = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+          and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
+                                   "with_details=True)"]
+    assert len(at) == 1
+    assert ast.unparse(body[at[0] + 1]) == "show_preparation(inputs, details, settings)"
+    # Only the settings come before it (and their two lines of printout).
+    assert ast.unparse(body[0]) == "settings = load_settings(SETTINGS_FILE, REPO_ROOT)"
+    assert all(isinstance(node, ast.Expr) for node in body[1:at[0]])
+
+
+def test_main_calls_none_of_the_step_1_to_11_functions_itself():
+    tree = main_tree()
+    for name in STEPS_1_TO_11:
+        assert calls_to(tree, name) == [], name
+
+
+def test_prepare_inputs_calls_each_step_1_to_11_function():
+    tree = prepare_tree()
+    for name in STEPS_1_TO_11:
+        assert calls_to(tree, name), name
+
+
+def test_the_script_no_longer_imports_the_step_1_to_11_functions():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported = {alias.asname or alias.name for node in ast.walk(module)
+                if isinstance(node, ast.ImportFrom) for alias in node.names}
+    for name in STEPS_1_TO_11:
+        assert name not in imported, name
+    assert "prepare_inputs" in imported
+
+
+def test_main_unpacks_each_input_from_the_field_of_its_name():
+    tree = main_tree()
+    found = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        targets = target.elts if isinstance(target, ast.Tuple) else [target]
+        values = value.elts if isinstance(value, ast.Tuple) else [value]
+        if len(targets) != len(values):
+            continue
+        for t, v in zip(targets, values):
+            if isinstance(t, ast.Name) and ast.unparse(v).startswith("inputs."):
+                found.setdefault(t.id, []).append(ast.unparse(v))
+    assert set(found) == set(UNPACKED), sorted(found)
+    for name in UNPACKED:
+        assert found[name] == [f"inputs.{name}"], (name, found[name])
+
+
+def test_main_unpacking_comes_before_any_other_use_of_the_names():
+    # history, owed, panel and the other intermediates of steps 1-11 are not main() names.
+    tree = main_tree()
+    stored = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+              and isinstance(n.ctx, ast.Store)}
+    for name in ("history", "owed", "panel", "known", "matrix", "positions", "receivables",
+                 "collections", "daily_files", "identified_weekly", "first_price_week",
+                 "history_start", "early_receipts", "holidays"):
+        assert name not in stored, name
+
+
+def test_main_never_rebinds_inputs_after_prepare_inputs():
+    # The ModelInputs object stays bound to `inputs` for the whole of main(): no other
+    # assignment, loop or with target, walrus or del of the name anywhere
+    # (step 13's split dict is `split_inputs`, not `inputs`).
+    tree = main_tree()
+    stores = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+              and node.id == "inputs" and isinstance(node.ctx, (ast.Store, ast.Del))]
+    assert len(stores) == 1, [getattr(n, "lineno", None) for n in stores]
+    owner = [node for node in tree.body if isinstance(node, ast.Assign)
+             and any(n is stores[0] for t in node.targets for n in ast.walk(t))]
+    assert len(owner) == 1
+    assert ast.unparse(owner[0]) == ("inputs, details = prepare_inputs(settings, "
+                                     "with_details=True)")
+    # No nested function or class of main() takes `inputs` as a parameter either.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.Lambda)) and node is not tree:
+            assert "inputs" not in [a.arg for a in node.args.args + node.args.kwonlyargs]
+    assert "split_inputs = {part:" in main_source()
+
+
+def test_inputs_module_prints_nothing():
+    module = ast.parse(INPUTS_MODULE.read_text(encoding="utf-8"))
+    assert [node for node in ast.walk(module) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "print"] == []
+
+
+def test_show_preparation_has_three_parameters():
+    tree = show_preparation_tree()
+    assert [a.arg for a in tree.args.args] == ["inputs", "details", "settings"]
+    assert tree.args.defaults == [] and tree.args.vararg is None
+    assert tree.args.kwonlyargs == []
+
+
+def test_show_preparation_printouts_in_the_old_step_order():
+    assert printouts_in_order(show_preparation_tree()) == PREPARATION_PRINTOUTS
+
+
+def test_show_preparation_is_the_only_place_of_the_step_1_to_11_printouts():
+    main_printouts = set(printouts_in_order(main_tree()))
+    for name in set(PREPARATION_PRINTOUTS) - {"print"}:
+        assert name not in main_printouts, name
+
+
+def test_show_preparation_step_6_printout_gets_the_filled_collections_and_days():
+    assert call_args(show_preparation_tree(), "show_filled") == [
+        "details.collections", "details.filled_days",
+        "settings.data.fill_missing_days_from_ledger"]
+
+
+def test_show_preparation_steps_3_and_4_printouts_get_the_keyed_lines():
+    tree = show_preparation_tree()
+    assert call_args(tree, "show_collections") == ["details.collections_keyed"]
+    assert call_args(tree, "show_keys") == ["details.collections_keyed"]
+
+
+def test_show_preparation_step_9_known_printout_keeps_the_placeholders():
+    # details.known is every key known, placeholders too (as main() printed it before the
+    # placeholders were split off); the labels use the identified weekly amounts.
+    assert call_args(show_preparation_tree(), "show_known") == [
+        "details.known", "details.collections", "inputs.last_week"]
+    assert call_args(show_preparation_tree(), "show_labels") == [
+        "details.panel", "details.identified_weekly"]
+    assert "known=known_all" in prepare_source()
+    assert "identified_weekly=identified_weekly" in prepare_source()
+
+
+def test_show_preparation_step_2_reads_the_one_day_file_itself():
+    tree = show_preparation_tree()
+    assert call_args(tree, "read_one_file") == ["details.daily_files[day]",
+                                                "settings.collections_layout"]
+    assert calls_to(prepare_tree(), "read_one_file") == []
+    guard = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+             and ast.unparse(node.test) == "day not in details.daily_files"]
+    assert len(guard) == 1
+    assert isinstance(guard[0].body[0], ast.Raise)
+    assert ast.unparse(guard[0].body[0].exc.func) == "ValueError"
+    shows = show_preparation_source()
+    assert shows.index("if day not in details.daily_files") < shows.index("read_one_file(")
+
+
+def test_show_preparation_step_10_inflation_figures_are_made_for_the_printout_only():
+    tree = show_preparation_tree()
+    for name in ("weekly_price_level", "published_price_level", "projected_price_level"):
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func) == f"inflation.{name}"]
+        assert len(found) == 1, name
+        assert [ast.unparse(a) for a in found[0].args] == ["weeks_for_prices"], name
+    assert "inflation" not in prepare_source()
+    assert call_args(tree, "show_prices") == ["weeks_for_prices", "actual_level",
+                                              "published_level", "projected_level",
+                                              "inputs.levels"]
+
+
+def test_show_preparation_projected_levels_at_the_demo_origin_and_the_last_week():
+    loops = [node for node in ast.walk(show_preparation_tree()) if isinstance(node, ast.For)]
+    assert len(loops) == 1
+    assert ast.unparse(loops[0].iter) == "(settings.debug.demo_origin, inputs.last_week)"
+    assert [ast.unparse(n) for n in loops[0].body] == [
+        "show_projected_levels(inputs.week_zero, forecast_week, settings.receivables.horizons)"]
+
+
+SHOW_PREPARATION_ONE_DAY = """
+from datetime import date
+from types import SimpleNamespace
+from pathlib import Path
+import run_hurdle_pipeline as script
+
+shown = []
+script.show_daily_files = lambda files: shown.append(files)
+details = SimpleNamespace(daily_files={date(2026, 3, 2): Path("a.xlsx")})
+settings = SimpleNamespace(settings_file=Path("settings") / "stub.toml",
+                           debug=SimpleNamespace(one_day=date(2026, 3, 3)))
+try:
+    script.show_preparation(SimpleNamespace(), details, settings)
+except ValueError as error:
+    print("ERROR " + str(error))
+assert shown == [details.daily_files], shown
+print("ok")
+"""
+
+
+def test_show_preparation_one_day_without_a_file_raises_after_listing_the_files():
+    result = subprocess.run([sys.executable, "-c", SHOW_PREPARATION_ONE_DAY], cwd=REPO_ROOT,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "ERROR stub.toml [debug]: one_day 2026-03-03 has no daily file", "ok"]
+
+
 def test_the_pipeline_script_exists():
     assert SCRIPT.is_file()
 
@@ -252,19 +490,22 @@ HISTORY = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
-inspect.signature(script.history_features).bind("matrix", "known", 64, (4, 13, 52))
+inspect.signature(prep.history_features).bind("matrix", "known", 64, (4, 13, 52))
 try:
-    inspect.signature(script.history_features).bind("matrix", "known", 64)
+    inspect.signature(prep.history_features).bind("matrix", "known", 64)
 except TypeError:
     pass
 else:
     raise AssertionError("history_features accepts a call without the windows")
 assert callable(script.show_history)
-source = inspect.getsource(script.main)
-assert "history_features(matrix, known, last_week, settings.history.windows)" in source
-assert "show_history(history, matrix)" in source
-assert source.index("show_matrix(matrix)") < source.index("history_features(")
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+assert "history = history_features(matrix, known, last_week, settings.history.windows)" in calc
+assert "show_history(details.history, details.matrix)" in shows
+assert calc.index("matrix = weekly_matrix(") < calc.index("history_features(")
+assert shows.index("show_matrix(details.matrix)") < shows.index("show_history(")
 
 matrix = pd.DataFrame(0.0, index=pd.Index(["A", "B"], name="key", dtype=object),
                       columns=pd.Index(list(range(0, 14)), name="week"))
@@ -272,7 +513,7 @@ matrix.loc["A", 2] = 20.0
 matrix.loc["A", 8] = 50.0
 matrix.loc["B", 13] = 30.0
 known = pd.DataFrame({"key": pd.Series(["A", "B"], dtype=object), "known_week": [-5, 9]})
-history = script.history_features(matrix, known, 13, (4, 13))
+history = prep.history_features(matrix, known, 13, (4, 13))
 script.show_history(history, matrix)
 print("ok")
 """
@@ -297,26 +538,28 @@ CALENDAR = """
 import inspect
 from datetime import date
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
-inspect.signature(script.calendar_features).bind("week_zero", 0, 69, "holidays")
+inspect.signature(prep.calendar_features).bind("week_zero", 0, 69, "holidays")
 try:
-    inspect.signature(script.calendar_features).bind("week_zero", 0, 69)
+    inspect.signature(prep.calendar_features).bind("week_zero", 0, 69)
 except TypeError:
     pass
 else:
     raise AssertionError("calendar_features accepts a call without the holidays")
 inspect.signature(script.show_calendar).bind("calendar", "week_zero", "holidays")
-source = " ".join(inspect.getsource(script.main).split())
-call = ("calendar = calendar_features(week_zero, 0, last_week + settings.receivables.horizons,"
-        " holidays)")
-assert call in source, "calendar_features is not called as expected"
-assert "show_calendar(calendar, week_zero, holidays)" in source
-assert source.index("show_history(history, matrix)") < source.index("calendar_features(")
-assert source.index("calendar_features(") < source.index("show_calendar(")
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+assert "horizons = settings.receivables.horizons" in calc
+call = "calendar = calendar_features(week_zero, 0, last_week + horizons, holidays)"
+assert call in calc, "calendar_features is not called as expected"
+assert "show_calendar(inputs.calendar, inputs.week_zero, details.holidays)" in shows
+assert calc.index("history = history_features(") < calc.index("calendar_features(")
+assert shows.index("show_history(details.history") < shows.index("show_calendar(")
 
-holidays = script.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
+holidays = prep.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
 week_zero = date(2025, 6, 2)
-calendar = script.calendar_features(week_zero, 0, 69, holidays)
+calendar = prep.calendar_features(week_zero, 0, 69, holidays)
 script.show_calendar(calendar, week_zero, holidays)
 print("ok")
 """
@@ -346,26 +589,29 @@ RECEIVABLES = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.receivables_asof import receivables_columns
 
-source = " ".join(inspect.getsource(script.main).split())
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
 assert ("leak_check_weeks=settings.receivables.leak_check_weeks, "
-        "age_edges=settings.receivables.overdue_age_days)") in source, "step 8 call"
-assert ("show_receivables_by_week(receivables, settings.receivables.leak_check_weeks, "
-        "settings.debug.sample_week, settings.receivables.overdue_age_days)") in source
-call = ("owed = receivables_features(panel, receivables, levels, "
-        "settings.receivables.horizons, settings.receivables.overdue_age_days)")
-assert call in source, "receivables_features is not called as expected"
-show = "show_owed(owed, int(before_first_ledger_week(panel, receivables).sum()))"
-assert show in source, "show_owed is not called with the not-yet-in-ledger count"
-assert source.index("show_calendar(") < source.index("receivables_features(")
-assert source.index("receivables_features(") < source.index("show_owed(owed")
+        "age_edges=settings.receivables.overdue_age_days)") in calc, "step 8 call"
+assert ("show_receivables_by_week(details.receivables, settings.receivables.leak_check_weeks, "
+        "settings.debug.sample_week, settings.receivables.overdue_age_days)") in shows
+call = ("owed = receivables_features(panel, receivables, levels, horizons, "
+        "settings.receivables.overdue_age_days)")
+assert call in calc, "receivables_features is not called as expected"
+show = ("show_owed(details.owed, int(before_first_ledger_week(details.panel, "
+        "details.receivables).sum()))")
+assert show in shows, "show_owed is not called with the not-yet-in-ledger count"
+assert calc.index("calendar = calendar_features(") < calc.index("receivables_features(")
+assert shows.index("show_calendar(") < shows.index("show_owed(details.owed")
 assert callable(script.before_first_ledger_week)
 inspect.signature(script.show_owed).bind("owed", 0)
-assert source.index("receivables_by_week(") < source.index("receivables_features(")
-inspect.signature(script.receivables_features).bind("panel", "receivables", "levels", 5, (30, 90))
+assert calc.index("receivables_by_week(") < calc.index("receivables_features(")
+inspect.signature(prep.receivables_features).bind("panel", "receivables", "levels", 5, (30, 90))
 try:
-    inspect.signature(script.receivables_features).bind("panel", "receivables", "levels", 5)
+    inspect.signature(prep.receivables_features).bind("panel", "receivables", "levels", 5)
 except TypeError:
     pass
 else:
@@ -406,7 +652,7 @@ receivables = pd.concat([receivables, c_table], ignore_index=True)
 panel = pd.DataFrame({"key": ["A", "A", "B", "C", "C"], "origin_week": [3, 3, 16, 3, 4],
                       "h": [1, 2, 5, 1, 3]})
 levels = pd.Series(1.0, index=range(0, 17))
-owed = script.receivables_features(panel, receivables, levels, 5, (30, 90))
+owed = prep.receivables_features(panel, receivables, levels, 5, (30, 90))
 filled = int(script.before_first_ledger_week(panel, receivables).sum())
 assert filled == 2, filled
 script.show_owed(owed, filled)
@@ -414,7 +660,7 @@ script.show_owed(owed, filled)
 absent = pd.concat([panel, pd.DataFrame({"key": ["D"], "origin_week": [3], "h": [1]})],
                    ignore_index=True)
 try:
-    script.receivables_features(absent, receivables, levels, 5, (30, 90))
+    prep.receivables_features(absent, receivables, levels, 5, (30, 90))
 except ValueError as error:
     assert str(error) == "1 panel keys have no receivables row at all (first: ['D'])", error
 else:
@@ -457,6 +703,7 @@ PRICES = """
 from datetime import date
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 week_zero = date(2025, 6, 2)
 weeks = script.price_weeks(week_zero, -32, 64)
@@ -466,7 +713,7 @@ projected = script.inflation.projected_price_level(weeks)
 if {old_basis}:
     levels = pd.Series(published, index=weeks["week"].to_numpy(), name="price_level")
 else:
-    levels = script.published_levels(week_zero, -32, 64)
+    levels = prep.published_levels(week_zero, -32, 64)
 script.show_prices(weeks, actual, published, projected, levels)
 
 matrix = pd.DataFrame(0.0, index=pd.Index(["A", "B"], name="key", dtype=object),
@@ -522,22 +769,52 @@ def test_matrix_printout_says_try_of_week_zero():
 # Steps 10 and 11 with a ledger that starts AFTER the first daily file (week 0): the price
 # range and the history start are floored at week 0, so published_levels() (normalised to
 # week 0) and weekly_matrix() (which must hold the daily files' weeks from 0) do not raise.
-# Checked on main()'s syntax tree, read from the file without importing or running it; the
-# behaviour itself is tested in test_ledger_starting_late.py.
+# Steps 1-11 now live in hurdle/inputs.py (`prepare_inputs`), their printouts in the script's
+# `show_preparation`; both are checked on their syntax trees, read from the files without
+# importing or running them. The behaviour itself is tested in test_ledger_starting_late.py
+# and test_inputs.py.
 import ast  # noqa: E402
+
+INPUTS_MODULE = REPO_ROOT / "src" / "collection_estimation" / "hurdle" / "inputs.py"
+
+
+def function_tree(path, name):
+    """The top-level `def name` of the file at `path`, as a syntax tree."""
+    module = ast.parse(path.read_text(encoding="utf-8"))
+    found = [node for node in module.body
+             if isinstance(node, ast.FunctionDef) and node.name == name]
+    assert len(found) == 1, name
+    return found[0]
+
+
+def function_source(path, name):
+    """The source of `def name` in `path`, with every run of whitespace made one space."""
+    return " ".join(ast.get_source_segment(path.read_text(encoding="utf-8"),
+                                           function_tree(path, name)).split())
 
 
 def main_tree():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    mains = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "main"]
-    assert len(mains) == 1
-    return mains[0]
+    return function_tree(SCRIPT, "main")
 
 
 def main_source():
-    return " ".join(ast.get_source_segment(SCRIPT.read_text(encoding="utf-8"),
-                                           main_tree()).split())
+    return function_source(SCRIPT, "main")
+
+
+def prepare_tree():
+    return function_tree(INPUTS_MODULE, "prepare_inputs")
+
+
+def prepare_source():
+    return function_source(INPUTS_MODULE, "prepare_inputs")
+
+
+def show_preparation_tree():
+    return function_tree(SCRIPT, "show_preparation")
+
+
+def show_preparation_source():
+    return function_source(SCRIPT, "show_preparation")
 
 
 def assignments_to(tree, name):
@@ -559,49 +836,62 @@ def is_min_with_zero(value, first_arg_check):
 
 
 def test_step_10_first_ledger_week_is_the_week_of_the_first_posting():
-    source = main_source()
+    source = prepare_source()
     assert ('first_ledger_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]), '
             'week_zero).iloc[0])') in source
-    assert len(assignments_to(main_tree(), "first_ledger_week")) == 1
+    assert len(assignments_to(prepare_tree(), "first_ledger_week")) == 1
 
 
 def test_step_10_first_price_week_is_floored_at_week_zero():
-    found = assignments_to(main_tree(), "first_price_week")
+    found = assignments_to(prepare_tree(), "first_price_week")
     assert len(found) == 1, "first_price_week must be assigned exactly once"
     assert is_min_with_zero(found[0].value,
                             lambda arg: isinstance(arg, ast.Name)
                             and arg.id == "first_ledger_week"), ast.dump(found[0].value)
-    assert "first_price_week = min(first_ledger_week, 0)" in main_source()
+    assert "first_price_week = min(first_ledger_week, 0)" in prepare_source()
 
 
-def test_step_10_price_weeks_and_published_levels_take_the_floored_week():
-    tree = main_tree()
-    for name in ("price_weeks", "published_levels"):
-        calls = calls_to(tree, name)
-        assert len(calls) == 1, name
-        args = [ast.unparse(arg) for arg in calls[0].args]
-        assert args == ["week_zero", "first_price_week", "last_week"], (name, args)
-    source = main_source()
-    assert "weeks_for_prices = price_weeks(week_zero, first_price_week, last_week)" in source
-    assert "levels = published_levels(week_zero, first_price_week, last_week)" in source
+def test_step_10_published_levels_takes_the_floored_week():
+    calls = calls_to(prepare_tree(), "published_levels")
+    assert len(calls) == 1
+    args = [ast.unparse(arg) for arg in calls[0].args]
+    assert args == ["week_zero", "first_price_week", "last_week"], args
+    assert ("levels = published_levels(week_zero, first_price_week, last_week)"
+            in prepare_source())
+
+
+def test_step_10_price_weeks_of_the_printout_take_the_floored_week():
+    # The copied inflation module is called only for the printout (show_preparation), on
+    # the same weeks as the levels: the floored week prepare_inputs kept in the details.
+    calls = calls_to(show_preparation_tree(), "price_weeks")
+    assert len(calls) == 1
+    args = [ast.unparse(arg) for arg in calls[0].args]
+    assert args == ["inputs.week_zero", "details.first_price_week", "inputs.last_week"], args
+    assert ("weeks_for_prices = price_weeks(inputs.week_zero, details.first_price_week, "
+            "inputs.last_week)") in show_preparation_source()
+    assert calls_to(prepare_tree(), "price_weeks") == []
+
+
+def test_step_10_details_keep_the_floored_first_price_week():
+    assert "first_price_week=first_price_week" in prepare_source()
 
 
 def test_step_10_order_ledger_week_then_floor_then_prices():
-    source = main_source()
+    source = prepare_source()
     assert (source.index("first_ledger_week = ")
             < source.index("first_price_week = min(first_ledger_week, 0)")
-            < source.index("price_weeks(week_zero, first_price_week")
-            < source.index("published_levels(week_zero, first_price_week")
-            < source.index("show_prices("))
+            < source.index("published_levels(week_zero, first_price_week"))
     # The floor comes after last_week is known and after the ledger is loaded.
     assert source.index("ledger = load_ledger(") < source.index("first_ledger_week = ")
     assert source.index("last_week = int(weeks[\"week\"].max())") < source.index(
         "first_price_week = ")
+    shows = show_preparation_source()
+    assert shows.index("price_weeks(inputs.week_zero") < shows.index("show_prices(")
 
 
 def history_switch():
-    """The `if settings.history.use_ledger_before_first_file:` statement in main()."""
-    found = [node for node in ast.walk(main_tree()) if isinstance(node, ast.If)
+    """The `if settings.history.use_ledger_before_first_file:` statement in prepare_inputs."""
+    found = [node for node in ast.walk(prepare_tree()) if isinstance(node, ast.If)
              and ast.unparse(node.test) == "settings.history.use_ledger_before_first_file"]
     assert len(found) == 1
     return found[0]
@@ -615,7 +905,7 @@ def test_step_11_switched_on_history_start_is_floored_at_week_zero():
     assert is_min_with_zero(found[0].value,
                             lambda arg: ast.unparse(arg) == "first_history_week(ledger, "
                                                             "week_zero)"), ast.dump(found[0].value)
-    assert "history_start = min(first_history_week(ledger, week_zero), 0)" in main_source()
+    assert "history_start = min(first_history_week(ledger, week_zero), 0)" in prepare_source()
 
 
 def test_step_11_switched_off_history_start_is_still_zero():
@@ -627,13 +917,31 @@ def test_step_11_switched_off_history_start_is_still_zero():
 
 
 def test_step_11_history_start_is_assigned_only_in_the_switch():
-    assert len(assignments_to(main_tree(), "history_start")) == 2
+    assert len(assignments_to(prepare_tree(), "history_start")) == 2
+
+
+def test_step_11_switched_off_early_receipts_are_emptied():
+    switch = history_switch()
+    found = [node for statement in switch.orelse for node in assignments_to(statement,
+                                                                            "early_receipts")]
+    assert len(found) == 1
+    assert ast.unparse(found[0].value) == "early_receipts.iloc[0:0]"
+
+
+def test_step_11_early_receipts_are_read_once_before_the_switch():
+    calls = calls_to(prepare_tree(), "ledger_receipts_before")
+    assert len(calls) == 1
+    assert [ast.unparse(arg) for arg in calls[0].args] == ["ledger", "min(daily_files)",
+                                                          "week_zero"]
+    source = prepare_source()
+    assert source.index("early_receipts = ledger_receipts_before(") < source.index(
+        "if settings.history.use_ledger_before_first_file:")
 
 
 def test_step_11_early_receipts_are_cut_at_the_history_start_and_the_matrix_starts_there():
-    source = main_source()
+    source = prepare_source()
     assert 'early_receipts = early_receipts[early_receipts["week"] >= history_start]' in source
-    calls = calls_to(main_tree(), "weekly_matrix")
+    calls = calls_to(prepare_tree(), "weekly_matrix")
     assert len(calls) == 1
     args = [ast.unparse(arg) for arg in calls[0].args]
     assert args == ["identified_weekly", "early_receipts", "known['key']", "weeks", "levels",
@@ -654,16 +962,19 @@ DEFLATED = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
-source = " ".join(inspect.getsource(script.main).split())
-assert "panel = add_deflated_label(panel, levels)" in source, "add_deflated_label not called"
-assert "show_deflated_label(panel, levels)" in source, "show_deflated_label not called"
-assert (source.index("show_owed(owed")
-        < source.index("panel = add_deflated_label(panel, levels)")
-        < source.index("show_deflated_label(panel, levels)"))
-assert source.index("levels = published_levels(") < source.index("add_deflated_label(")
-assert source.index("panel = add_labels(") < source.index("add_deflated_label(")
-inspect.signature(script.add_deflated_label).bind("panel", "levels")
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+assert "panel = add_deflated_label(panel, levels)" in calc, "add_deflated_label not called"
+assert "show_deflated_label(details.panel, inputs.levels)" in shows, (
+    "show_deflated_label not called")
+assert calc.index("owed = receivables_features(") < calc.index(
+    "panel = add_deflated_label(panel, levels)")
+assert shows.index("show_owed(details.owed") < shows.index("show_deflated_label(")
+assert calc.index("levels = published_levels(") < calc.index("add_deflated_label(")
+assert calc.index("panel = add_labels(") < calc.index("add_deflated_label(")
+inspect.signature(prep.add_deflated_label).bind("panel", "levels")
 inspect.signature(script.show_deflated_label).bind("panel", "levels")
 
 nan = float("nan")
@@ -677,7 +988,7 @@ panel = pd.DataFrame({
 panel["target_week"] = panel["origin_week"] + panel["h"]
 # No level for the future week 65: it must not be looked up.
 levels = pd.Series({0: 1.0, 16: 1.25, 17: 2.0, 32: 1.6})
-panel = script.add_deflated_label(panel, levels)
+panel = prep.add_deflated_label(panel, levels)
 assert panel["amount_deflated"].tolist()[:6] == [1e6, 1e6, 4e6, 1.5e6, 1e6, 5e6]
 script.show_deflated_label(panel, levels)
 print("ok")
@@ -730,18 +1041,23 @@ TABLE = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
-source = " ".join(inspect.getsource(script.main).split())
-assert "table = join_features(panel, history, calendar, owed)" in source, "join_features"
-assert "show_table(table, panel)" in source, "show_table not called"
-assert (source.index("show_deflated_label(panel, levels)")
-        < source.index("table = join_features(panel, history, calendar, owed)")
-        < source.index("show_table(table, panel)"))
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+assert "table = join_features(panel, history, calendar, owed)" in calc, "join_features"
+assert "show_table(inputs.table, details.panel)" in shows, "show_table not called"
+assert calc.index("panel = add_deflated_label(panel, levels)") < calc.index(
+    "table = join_features(panel, history, calendar, owed)")
+assert shows.index("show_deflated_label(") < shows.index("show_table(inputs.table, details.panel)")
+# show_table is the last printout of steps 1-11.
+assert shows.rstrip().endswith("show_table(inputs.table, details.panel)")
 # Every block is built before the join, and the panel has its deflated label by then.
 for built in ("history = history_features(", "calendar = calendar_features(",
-              "owed = receivables_features(", "panel = add_deflated_label("):
-    assert source.index(built) < source.index("table = join_features("), built
-inspect.signature(script.join_features).bind("panel", "history", "calendar", "owed")
+              "calendar = calendar.merge(positions", "owed = receivables_features(",
+              "panel = add_deflated_label("):
+    assert calc.index(built) < calc.index("table = join_features("), built
+inspect.signature(prep.join_features).bind("panel", "history", "calendar", "owed")
 inspect.signature(script.show_table).bind("table", "panel")
 
 nan = float("nan")
@@ -765,7 +1081,7 @@ owed = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], 
                      "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
                      "h": pd.Series([1, 2, 1, 2], dtype="int64"),
                      "open_balance": [10.0, 10.0, 20.0, 20.0]})
-table = script.join_features(panel, history, calendar, owed)
+table = prep.join_features(panel, history, calendar, owed)
 assert len(table) == 4 and table.shape[1] == 11, table.shape
 script.show_table(table, panel)
 print("ok")
@@ -828,6 +1144,7 @@ def test_training_table_printout_shows_one_labelled_paid_row():
 NO_PAID = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 variants = {{
     "no_labelled": (["missing_week", "future", "missing_week", "future"],
@@ -884,8 +1201,9 @@ def test_training_table_printout_with_a_paid_row_does_not_say_none_to_show():
 
 
 # Step 12 (U10.1): stage 1's rows and model input at [debug] demo_origin. The wiring is
-# checked on main()'s source; the guard on demo_origin (in step 7, right after
-# show_weeks(weeks)) is run from main()'s own syntax tree; the printout is run on a small hand-built training table in a separate process.
+# checked on main()'s source; the guard on demo_origin (right after steps 1-11, i.e. after
+# prepare_inputs and the unpacking of its inputs) is run from main()'s own syntax tree; the
+# printout is run on a small hand-built training table in a separate process.
 # The table: keys TR02-A (always paid) and TR04-B (never paid), origins 0..3, h = 1, 2, last
 # week 3 (targets 4 and 5 are future). At origin 2 the training rows are (0,1), (0,2), (1,1)
 # per key = 6 rows, half of them paid; the forecast rows are 2 keys x 2 h = 4 rows. Features:
@@ -894,13 +1212,16 @@ STAGE1 = """
 import inspect
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 source = " ".join(inspect.getsource(script.main).split())
 steps = [
-    "show_table(table, panel)",
+    "inputs, details = prepare_inputs(settings, with_details=True)",
+    "show_preparation(inputs, details, settings)",
+    "levels, calendar, table = inputs.levels, inputs.calendar, inputs.table",
+    "block_columns = inputs.block_columns",
     "origin = settings.debug.demo_origin",
-    ("columns = feature_columns(block_feature_columns(history, calendar, owed), "
-     "settings.stage1.feature_blocks)"),
+    "columns = feature_columns(block_columns, settings.stage1.feature_blocks)",
     "train_rows = rows_known_at(table, origin)",
     "forecast_rows = rows_at_origin(table, origin)",
     ("train_x = stage1_features(train_rows, columns, companies, "
@@ -913,12 +1234,13 @@ for step in steps:
     assert step in source, step
 positions = [source.index(step) for step in steps]
 assert positions == sorted(positions), positions
-assert source.index("table = join_features(") < source.index("train_rows = rows_known_at(")
-assert source.index("companies = list(settings.companies.known)") < source.index(
+assert source.index("companies, week_zero = inputs.companies, inputs.week_zero") < source.index(
     "train_x = stage1_features(")
+# The block columns are made once, in prepare_inputs, not again in main().
+assert "block_feature_columns(" not in source
 inspect.signature(script.show_stage1_rows).bind("origin", "train", "forecast", "train_x")
 inspect.signature(script.feature_columns).bind({}, ())
-inspect.signature(script.block_feature_columns).bind("history", "calendar", "owed")
+inspect.signature(prep.block_feature_columns).bind("history", "calendar", "owed")
 inspect.signature(script.rows_known_at).bind("table", 40)
 inspect.signature(script.rows_at_origin).bind("table", 40)
 inspect.signature(script.stage1_features).bind("rows", [], [], True)
@@ -948,7 +1270,7 @@ history = table[["key", "origin_week", "mean_receipts_4"]].drop_duplicates(["key
 calendar = (table[["target_week", "has_month_end"]].drop_duplicates("target_week")
             .rename(columns={"target_week": "week"}))
 owed = table[["key", "origin_week", "h", "open_invoices"]]
-columns = script.feature_columns(script.block_feature_columns(history, calendar, owed),
+columns = script.feature_columns(prep.block_feature_columns(history, calendar, owed),
                                  ("history", "calendar", "receivables"))
 assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices"], columns
 origin = ORIGIN
@@ -1003,8 +1325,7 @@ def test_step_12_printout_model_input_without_the_company():
     assert lines[2:] == ["ok"]
 
 
-GUARD_TEST = ("settings.debug.demo_origin + settings.receivables.horizons > "
-              "int(weeks['week'].max())")
+GUARD_TEST = "settings.debug.demo_origin + settings.receivables.horizons > inputs.last_week"
 
 
 def is_demo_origin_guard(node):
@@ -1012,24 +1333,48 @@ def is_demo_origin_guard(node):
 
 
 def demo_origin_guard():
-    """The `if settings.debug.demo_origin + ... > int(weeks['week'].max()):` statement, which
-    since the move sits in step 7 of main()."""
+    """The `if settings.debug.demo_origin + ... > inputs.last_week:` statement of main(),
+    right after steps 1-11 (prepare_inputs) and the unpacking of their inputs."""
     found = [node for node in ast.walk(main_tree()) if is_demo_origin_guard(node)]
     assert len(found) == 1
     return found[0]
 
 
-def run_guard(origin, horizons, last_week, first_week=0, week_dtype="int64"):
-    """Run main()'s guard statement on its own, with the two names it reads: settings and a
-    week calendar whose weeks run first_week..last_week."""
-    from types import SimpleNamespace
+def last_week_statement():
+    """prepare_inputs' own `last_week = ...` statement (step 7), the last week the guards
+    compare with (as ModelInputs.last_week)."""
+    found = assignments_to(prepare_tree(), "last_week")
+    assert len(found) == 1
+    return found[0]
+
+
+def last_week_of(weeks):
+    """Run prepare_inputs' `last_week = ...` statement on a week calendar."""
+    module = ast.Module(body=[last_week_statement()], type_ignores=[])
+    code = compile(ast.fix_missing_locations(module), str(INPUTS_MODULE), "exec")
+    names = {"weeks": weeks}
+    exec(code, names)
+    return names["last_week"]
+
+
+def week_table(first_week, last_week, week_dtype="int64"):
     import pandas as pd
+    return pd.DataFrame({"week": pd.Series(range(first_week, last_week + 1), dtype=week_dtype)})
+
+
+def run_guard(origin, horizons, last_week, first_week=0, week_dtype="int64", weeks=None):
+    """Run main()'s guard statement on its own, with the two names it reads: settings and the
+    inputs, whose last_week is what prepare_inputs' own statement makes of a week calendar
+    with weeks first_week..last_week (or of `weeks`)."""
+    from types import SimpleNamespace
+    if weeks is None:
+        weeks = week_table(first_week, last_week, week_dtype)
     module = ast.Module(body=[demo_origin_guard()], type_ignores=[])
     code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
     settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=origin),
                                receivables=SimpleNamespace(horizons=horizons))
-    weeks = pd.DataFrame({"week": pd.Series(range(first_week, last_week + 1), dtype=week_dtype)})
-    exec(code, {"settings": settings, "weeks": weeks})
+    inputs = SimpleNamespace(last_week=last_week_of(weeks))
+    exec(code, {"settings": settings, "inputs": inputs})
 
 
 def test_step_12_origin_is_read_from_debug_demo_origin():
@@ -1038,12 +1383,29 @@ def test_step_12_origin_is_read_from_debug_demo_origin():
     assert ast.unparse(found[0].value) == "settings.debug.demo_origin"
 
 
-def test_demo_origin_guard_sits_right_after_show_weeks():
+def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
+    # Steps 1-11 are one call now: the guard follows it, its printouts and the unpacking of
+    # the inputs into main()'s names, and nothing else.
     body = main_tree().body
-    shows = [i for i, node in enumerate(body)
-             if isinstance(node, ast.Expr) and ast.unparse(node) == "show_weeks(weeks)"]
-    assert len(shows) == 1
-    assert is_demo_origin_guard(body[shows[0] + 1]), ast.unparse(body[shows[0] + 1])
+    calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+             and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
+                                      "with_details=True)"]
+    assert len(calls) == 1
+    guards = [i for i, node in enumerate(body) if is_demo_origin_guard(node)]
+    assert len(guards) == 1
+    between = body[calls[0] + 1:guards[0]]
+    assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
+    for node in between[1:]:
+        assert isinstance(node, ast.Assign), ast.unparse(node)
+        values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
+        for value in values:
+            assert ast.unparse(value).startswith("inputs."), ast.unparse(node)
+
+
+def test_last_week_is_the_largest_week_as_a_plain_int():
+    # The guards read ModelInputs.last_week, made once in prepare_inputs (step 7).
+    assert ast.unparse(last_week_statement()) == "last_week = int(weeks['week'].max())"
+    assert "last_week=last_week" in prepare_source()
 
 
 def test_demo_origin_guard_is_a_top_level_statement_of_main():
@@ -1051,18 +1413,19 @@ def test_demo_origin_guard_is_a_top_level_statement_of_main():
     assert sum(is_demo_origin_guard(node) for node in main_tree().body) == 1
 
 
-def test_demo_origin_guard_comes_before_step_8_receivables():
+def test_demo_origin_guard_comes_right_after_steps_1_to_11():
+    # It used to run in step 7, before the receivables; steps 1-11 are one call now
+    # (prepare_inputs), so it runs after that call and its printouts, before step 12.
     source = main_source()
     guard = source.index("if settings.debug.demo_origin + settings.receivables.horizons")
-    assert source.index("show_weeks(weeks)") < guard
-    assert guard < source.index("receivables = receivables_by_week(")
-    assert guard < source.index("exchange_rates(")
+    assert source.index("inputs, details = prepare_inputs(") < guard
+    assert source.index("show_preparation(inputs, details, settings)") < guard
 
 
 def test_demo_origin_guard_comes_before_any_stage_1_work():
     source = main_source()
     guard = source.index("if settings.debug.demo_origin + settings.receivables.horizons")
-    for later in ("table = join_features(", "origin = settings.debug.demo_origin",
+    for later in ("origin = settings.debug.demo_origin",
                   "feature_columns(", "rows_known_at(", "rows_at_origin(", "stage1_features(",
                   "show_stage1_rows("):
         assert guard < source.index(later), later
@@ -1108,14 +1471,12 @@ def test_demo_origin_guard_allows_targets_up_to_the_last_week():
 
 def test_demo_origin_guard_uses_the_largest_week_not_the_last_row():
     # Weeks out of order: max() is 64 although the last row is 10.
-    from types import SimpleNamespace
     import pandas as pd
-    module = ast.Module(body=[demo_origin_guard()], type_ignores=[])
-    code = compile(ast.fix_missing_locations(module), str(SCRIPT), "exec")
-    settings = SimpleNamespace(debug=SimpleNamespace(demo_origin=59),
-                               receivables=SimpleNamespace(horizons=5))
     weeks = pd.DataFrame({"week": [64, 0, 10]})
-    exec(code, {"settings": settings, "weeks": weeks})
+    assert last_week_of(weeks) == 64
+    run_guard(origin=59, horizons=5, last_week=None, weeks=weeks)
+    with pytest.raises(ValueError, match="after the last week 64"):
+        run_guard(origin=60, horizons=5, last_week=None, weeks=weeks)
 
 
 @pytest.mark.parametrize("origin, horizons, last_week", [(60, 5, 64), (64, 5, 64),
@@ -1159,6 +1520,7 @@ import inspect
 import time
 import sklearn.metrics
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 assert script.time is time
 assert script.log_loss is sklearn.metrics.log_loss
@@ -1207,6 +1569,7 @@ import ast
 import inspect
 import textwrap
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
 loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
@@ -1231,6 +1594,7 @@ SCORES = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 forecast_rows = pd.DataFrame({
     "key": ["TR02-A", "TR04-B", "TR02-C", "TR02-A", "TR04-B", "TR02-C"],
@@ -1446,6 +1810,7 @@ ONE_CLASS = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 forecast_rows = pd.DataFrame({"key": list("abcd"), "h": np.array([1, 1, 2, 2]),
                               "label_status": ["labelled"] * 3 + ["missing_week"],
@@ -1482,6 +1847,7 @@ NO_LABELLED = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 statuses = STATUSES
 forecast_rows = pd.DataFrame({
@@ -1587,12 +1953,13 @@ def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
         "        fitted in stage 1 (HGB) 1.0 s; scored on 1 forecast rows (100.0% paid)")
 
 
-# Step 7's second guard (U10.4a): when [diagnostic] run is on, its test weeks (up to origin +
+# The second guard (U10.4a): when [diagnostic] run is on, its test weeks (up to origin +
 # 2 horizons) must have answers. Run from main()'s own syntax tree, like the demo_origin guard.
 # U11.5: step 15's joint diagnostic uses the same splits, so its run switch arms the guard too.
+# Since steps 1-11 moved to prepare_inputs, both guards read inputs.last_week.
 DIAGNOSTIC_END = "settings.diagnostic.origin + 2 * settings.receivables.horizons"
 DIAGNOSTIC_GUARD_TEST = ("(settings.diagnostic.run or settings.joint_diagnostic.run) and "
-                         "diagnostic_end > int(weeks['week'].max())")
+                         "diagnostic_end > inputs.last_week")
 
 
 def is_diagnostic_guard(node):
@@ -1617,9 +1984,9 @@ def diagnostic_guard_statements():
 def run_diagnostic_guard(run, origin, horizons, last_week, demo_origin=0, week_dtype="int64",
                          weeks=None, with_demo_guard=False, joint_run=False):
     """Run the diagnostic guard (and, if asked, the demo_origin guard before it) with
-    settings and a week calendar whose weeks run 0..last_week."""
+    settings and the inputs, whose last_week is what prepare_inputs' own statement makes of a
+    week calendar whose weeks run 0..last_week (or of `weeks`)."""
     from types import SimpleNamespace
-    import pandas as pd
     statements = list(diagnostic_guard_statements())
     if with_demo_guard:
         statements = [demo_origin_guard()] + statements
@@ -1630,8 +1997,9 @@ def run_diagnostic_guard(run, origin, horizons, last_week, demo_origin=0, week_d
                                joint_diagnostic=SimpleNamespace(run=joint_run),
                                receivables=SimpleNamespace(horizons=horizons))
     if weeks is None:
-        weeks = pd.DataFrame({"week": pd.Series(range(0, last_week + 1), dtype=week_dtype)})
-    exec(code, {"settings": settings, "weeks": weeks})
+        weeks = week_table(0, last_week, week_dtype)
+    inputs = SimpleNamespace(last_week=last_week_of(weeks))
+    exec(code, {"settings": settings, "inputs": inputs})
 
 
 def diagnostic_guard_message(origin, end, last_week):
@@ -1751,11 +2119,14 @@ def test_diagnostic_guard_body_is_a_single_raise_of_value_error():
 
 
 def test_diagnostic_guard_comes_before_the_long_steps():
+    # It used to run in step 7, before the receivables; steps 1-11 are one call now
+    # (prepare_inputs), so it runs after that call, before step 12 and the diagnostics.
     source = main_source()
-    guard = source.index("and diagnostic_end > int(weeks")
-    assert source.index("show_weeks(weeks)") < guard
-    for later in ("weekly = weekly_amounts(", "exchange_rates(", "receivables_by_week(",
-                  "table = join_features(", "diagnostic_splits("):
+    guard = source.index("and diagnostic_end > inputs.last_week")
+    assert source.index("inputs, details = prepare_inputs(") < guard
+    assert source.index("show_preparation(inputs, details, settings)") < guard
+    for later in ("origin = settings.debug.demo_origin", "train_rows = rows_known_at(",
+                  "diagnostic_splits(", "run_joint_diagnostic(", "forecast(table, origin"):
         assert guard < source.index(later), later
 
 
@@ -1776,6 +2147,7 @@ STEP_13_SPLIT_TABLE = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.diagnostic import diagnostic_splits
 
 # T = 2, H = 2. Target weeks 0, 1, 2 (paid T, F, T) -> train 3 rows, 66.7% paid; 3 (T) and
@@ -1822,6 +2194,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.settings import Stage1Settings
 
 tree = ast.parse(textwrap.dedent(inspect.getsource(script.main)))
@@ -2425,6 +2798,7 @@ import ast
 import inspect
 import textwrap
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import diagnostic
 
 for name in ("diagnostic_splits", "grid_search", "choose_and_test", "class_weight_argument",
@@ -2462,12 +2836,15 @@ for name in ("demo_origin", "predictions", "forecast_rows", "train_rows", "forec
              "best_threshold", "classification_scores"):
     assert name not in text, name
 # The test rows are used once, by choose_and_test; the importance is measured on validation.
-assert text.count("inputs['test']") == 1, text
-assert "permutation_importances(model, *inputs['validation']" in text
+assert text.count("split_inputs['test']") == 1, text
+assert "permutation_importances(model, *split_inputs['validation']" in text
 assert "settings.diagnostic.importance_repeats, settings.stage1.random_seed)" in text
 assert "write_tables(settings.diagnostic.output_folder, tables)" in text
 # The grid is ranked, and the printout labelled, by the settings' selection metric.
-assert "*inputs['validation'], metric=settings.diagnostic.selection_metric)" in text, text
+assert "*split_inputs['validation'], metric=settings.diagnostic.selection_metric)" in text, text
+# The splits' model inputs have their own name: `inputs` stays main()'s ModelInputs.
+assert "split_inputs = {part:" in text, text
+assert "inputs[" not in text.replace("split_inputs[", ""), text
 assert ("show_diagnostic_grid(name, grid, importance, settings.diagnostic.selection_metric)"
         in text), text
 # The two models, in this order, with their fits and candidate lists.
@@ -2512,6 +2889,7 @@ SHOW = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 grid = pd.DataFrame({
     "candidate": [3, 0, 6, 1, 5, 2, 4][:N_GRID],
@@ -2889,6 +3267,7 @@ SHOW_CALIBRATION = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 keys = ["mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
         "calibration error", "resolution", "uncertainty", "decomposition gap",
@@ -2985,6 +3364,7 @@ import ast
 import inspect
 import textwrap
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import stage2
 
 assert script.fit_stage2 is stage2.fit_stage2
@@ -3011,8 +3391,7 @@ assert diagnostic[0] < joint[0], (diagnostic, joint)
 scores_part = body[joint[0] - 4:joint[0] - 2]
 step_14 = statements[diagnostic[0] + 1:joint[0] - 4]
 assert step_14 == [
-    "stage2_columns = feature_columns(block_feature_columns(history, calendar, owed), "
-    "settings.stage2.feature_blocks)",
+    "stage2_columns = feature_columns(block_columns, settings.stage2.feature_blocks)",
     "paid_rows = train_rows[train_rows['paid'].astype(bool)]",
     "paid_x = stage1_features(paid_rows, stage2_columns, companies, "
     "settings.stage1.company_as_feature)",
@@ -3143,6 +3522,7 @@ SHOW_STAGE2 = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 paid_rows = pd.DataFrame({"amount_deflated": [1_000.0, 2_000.0, 3_000.0, 1_000_000.0],
                           "amount": [9.0, 9.0, 9.0, 9.0]}, index=[3, 7, 8, 20])
@@ -3211,7 +3591,7 @@ if SCALE == "open balance":
     # training amount, 100), so every E is lifted to 100 and s = 1.
     train_rows = train_rows.assign(open_balance=50.0)
     forecast_rows = forecast_rows.assign(open_balance=50.0)
-stage2_columns = script.feature_columns(script.block_feature_columns(history, calendar, owed),
+stage2_columns = script.feature_columns(prep.block_feature_columns(history, calendar, owed),
                                         settings_stage2.feature_blocks)
 assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
 paid_rows = train_rows[train_rows["paid"].astype(bool)]
@@ -3301,6 +3681,7 @@ SHOW_FORECAST = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 nan = float("nan")
 forecast_rows = pd.DataFrame({
@@ -3431,6 +3812,7 @@ SHOW_SCORES = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.stage2 import amount_scores
 
 index = pd.Index([10, 11, 12, 13])
@@ -3534,6 +3916,7 @@ import inspect
 import textwrap
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
 statement = [node for node in body if isinstance(node, ast.Assign)
@@ -3576,6 +3959,7 @@ import inspect
 import textwrap
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
 branch = [node for node in body if isinstance(node, ast.If)
@@ -3654,6 +4038,7 @@ SHOW_EXPOSURE = """
 import pandas as pd
 from types import SimpleNamespace
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 stage2 = SimpleNamespace(scale=SCALE, balance_floor=FLOOR)
 paid_rows = pd.DataFrame({"open_balance": [50.0, 200.0, -10.0, 1500.0]}, index=[1, 2, 3, 4])
@@ -3715,6 +4100,7 @@ SHOW_U11_4 = """
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.diagnostic import amount_reliability, cash_by_p_group
 
 actual = pd.Series([22.4, 12.0, 35.0, 24.0, 44.0, 35.0])
@@ -3766,6 +4152,7 @@ STEP_15_WIRING = """
 import ast
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import benchmark, diagnostic, diagnostic_joint
 
 for name in ("benchmark_forecasts", "cash_totals"):
@@ -3857,6 +4244,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.settings import (JointDiagnosticSettings, Stage1Settings,
                                                    Stage2Settings)
 
@@ -4536,33 +4924,40 @@ import inspect
 from datetime import date, timedelta
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.features_calendar import CALENDAR_COLUMNS
 
-assert script.holiday_position_features.__module__ == (
+assert prep.holiday_position_features.__module__ == (
     "collection_estimation.hurdle.features_calendar")
 inspect.signature(script.show_holiday_positions).bind("positions", "week_zero", "holidays")
-source = " ".join(inspect.getsource(script.main).split())
-call = ("positions = holiday_position_features( week_zero, 0, last_week + "
-        "settings.receivables.horizons, holidays, settings.calendar.holiday_encodings, "
-        "settings.calendar.drain_window, settings.calendar.catch_up_window)")
-assert call in source, "holiday_position_features is not called as expected"
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+call = ("positions = holiday_position_features( week_zero, 0, last_week + horizons, holidays, "
+        "settings.calendar.holiday_encodings, settings.calendar.drain_window, "
+        "settings.calendar.catch_up_window)")
+assert call in calc, "holiday_position_features is not called as expected"
 merge = 'calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")'
-assert merge in source, "the positions are not merged into the calendar as expected"
-show = "show_holiday_positions(positions, week_zero, holidays)"
-assert show in source, "show_holiday_positions is not called as expected"
-assert source.count("holiday_position_features(") == 1
-assert source.count(show) == 1
-order = [source.index("show_calendar(calendar, week_zero, holidays)"),
-         source.index("holiday_position_features("), source.index(merge), source.index(show),
-         source.index("receivables_features("),
-         source.index("table = join_features(panel, history, calendar, owed)")]
+assert merge in calc, "the positions are not merged into the calendar as expected"
+show = "show_holiday_positions(details.positions, inputs.week_zero, details.holidays)"
+assert show in shows, "show_holiday_positions is not called as expected"
+assert calc.count("holiday_position_features(") == 1
+assert shows.count("show_holiday_positions(") == 1
+order = [calc.index("calendar = calendar_features("),
+         calc.index("holiday_position_features("), calc.index(merge),
+         calc.index("receivables_features("),
+         calc.index("table = join_features(panel, history, calendar, owed)")]
 assert order == sorted(order), order
+order = [shows.index("show_calendar(inputs.calendar, inputs.week_zero, details.holidays)"),
+         shows.index(show), shows.index("show_owed(")]
+assert order == sorted(order), order
+# The details keep the positions alone (not merged), for the printout.
+assert "positions=positions" in calc
 
-holidays = script.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
+holidays = prep.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
 week_zero = date(2025, 6, 2)
-calendar = script.calendar_features(week_zero, 0, 69, holidays)
+calendar = prep.calendar_features(week_zero, 0, 69, holidays)
 for encodings in (("drain",), ("days",), ("drain", "days"), ()):
-    positions = script.holiday_position_features(week_zero, 0, 69, holidays, encodings, 3, 5)
+    positions = prep.holiday_position_features(week_zero, 0, 69, holidays, encodings, 3, 5)
     merged = calendar.merge(positions, on="week", how="left", validate="one_to_one")
     added = [column for column in positions.columns if column != "week"]
     assert list(merged.columns) == CALENDAR_COLUMNS + added, list(merged.columns)
@@ -4725,20 +5120,26 @@ def actual(rows, week_key, value_key, h, target, company=None):
 TOPUPS = TOPUP_DATA + """
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import prices, topups
 
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
 source = " ".join(inspect.getsource(script.main).split())
-call = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
-        "settings.diagnostic.origin, settings.receivables.horizons, settings.topups.window)")
-assert call in source, "show_topups is not called as expected"
-assert source.count("show_topups(") == 1
-assert (source.index("show_deflated_label(panel, levels)") < source.index(call)
-        < source.index("table = join_features(panel, history, calendar, owed)"))
+call = ("show_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels, "
+        "inputs.calendar, settings.diagnostic.origin, settings.receivables.horizons, "
+        "settings.topups.window)")
+assert call in shows, "show_topups is not called as expected"
+assert shows.count("show_topups(") == 1
+assert "show_topups(" not in source and "show_topups(" not in calc
+assert (shows.index("show_deflated_label(details.panel, inputs.levels)") < shows.index(call)
+        < shows.index("show_table(inputs.table, details.panel)"))
+# The tables it is given are the inputs' (the calendar with the holiday positions merged).
 for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
               "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
               "calendar = calendar.merge(positions"):
-    assert source.index(built) < source.index(call), built
-assert "show_trailing_means" not in source
+    assert calc.index(built) < calc.index("inputs = ModelInputs("), built
+assert "show_trailing_means" not in source and "show_trailing_means" not in shows
 assert not hasattr(script, "show_trailing_means")
 assert not hasattr(script, "TOPUP_WINDOWS")
 # U12.3: the window comes from [topups]; the constant is gone.
@@ -4978,18 +5379,22 @@ COMPARE_TOPUPS = TOPUP_DATA + """
 import dataclasses
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import topups
 from collection_estimation.hurdle.settings import TopupSettings
 
-source = " ".join(inspect.getsource(script.main).split())
-call = ("compare_topups(new_cash, refunds, unidentified, levels, calendar, settings.topups, "
-        "settings.receivables.horizons)")
+calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
+shows = " ".join(inspect.getsource(script.show_preparation).split())
+call = ("compare_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels, "
+        "inputs.calendar, settings.topups, settings.receivables.horizons)")
 guarded = "if settings.topups.compare: " + call
-assert guarded in source, "compare_topups is not called, guarded by [topups] compare"
-assert source.count("compare_topups(") == 1
-show = "show_topups(new_cash, refunds, unidentified, levels, calendar,"
-assert (source.index(show) < source.index(guarded)
-        < source.index("table = join_features(panel, history, calendar, owed)"))
+assert guarded in shows, "compare_topups is not called, guarded by [topups] compare"
+assert shows.count("compare_topups(") == 1
+assert "compare_topups(" not in " ".join(inspect.getsource(script.main).split())
+assert "compare_topups(" not in calc
+show = "show_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels,"
+assert (shows.index(show) < shows.index(guarded)
+        < shows.index("show_table(inputs.table, details.panel)"))
 assert script.score_topups is topups.score_topups
 assert script.topup_actuals is topups.topup_actuals
 inspect.signature(script.compare_topups).bind(
@@ -5218,7 +5623,7 @@ def test_compare_topups_prints_nothing_between_the_rows_and_the_last_line(compar
 # separate process (importing the script reconfigures sys.stdout and sys.path).
 
 FORECAST_KEYWORDS = {
-    "block_columns": "block_feature_columns(history, calendar, owed)",
+    "block_columns": "block_columns",
     "companies": "companies", "new_cash": "new_cash", "refunds": "refunds",
     "unidentified": "unidentified", "levels": "levels", "calendar": "calendar",
     "week_zero": "week_zero"}
@@ -5284,8 +5689,8 @@ def test_step_16_calls_forecast_once_with_the_origin_and_its_keyword_arguments()
 def test_step_16_statements_in_order():
     assert [ast.unparse(node) for node in step_16_body()] == [
         "started = time.perf_counter()",
-        "result = forecast(table, origin, settings, block_columns=block_feature_columns("
-        "history, calendar, owed), companies=companies, new_cash=new_cash, refunds=refunds, "
+        "result = forecast(table, origin, settings, block_columns=block_columns, "
+        "companies=companies, new_cash=new_cash, refunds=refunds, "
         "unidentified=unidentified, levels=levels, calendar=calendar, week_zero=week_zero)",
         "show_customer_forecasts(result.customers, forecast_rows, time.perf_counter() - "
         "started, predictions['stage 1 (HGB)'] * m)",
@@ -5368,6 +5773,7 @@ def test_step_16_and_17_imports():
 STEP_16_17_NAMES = """
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import evaluate
 from collection_estimation.hurdle import forecast as forecast_module
 
@@ -5570,6 +5976,7 @@ def row_cells(lines, first):
 SHOW_VS_ACTUAL = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 totals = pd.DataFrame({
     "company_code": ["TR02", "TR02", "TR03", "TR03", "ALL", "ALL"],
@@ -5635,6 +6042,7 @@ def test_show_forecast_vs_actual_ratio_per_company(vs_actual_lines):
 SHOW_ACTUAL = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 
 actual = pd.DataFrame({
     "company_code": ["TR02", "TR02", "ALL", "ALL"], "origin_week": [10] * 4,
@@ -5667,6 +6075,7 @@ def test_show_actual_totals_by_hand():
 SHOW_ROLLING = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.forecast import Forecast
 
 keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
@@ -5843,6 +6252,7 @@ def test_show_deflated_reference_is_a_module_level_function_with_three_parameter
 SHOW_REFERENCE = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.forecast import Forecast
 
 keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
@@ -6027,12 +6437,16 @@ def test_step_17_rule_reference_is_shown_against_the_rolled_actual_made_before_i
 
 def test_rule_reference_inputs_are_assigned_in_main_before_step_17():
     # ledger and rates, the two inputs only the rule needs, exist before the evaluation block.
+    # Since steps 1-11 moved to prepare_inputs they are unpacked from its inputs, several
+    # names per statement (a tuple target).
     body = main_body()
     step_17 = index_of_if(body, "settings.evaluation.run")
     for name in ("ledger", "rates"):
         assigned = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
-                    and name in [ast.unparse(t) for t in node.targets]]
+                    and name in [n.id for t in node.targets for n in ast.walk(t)
+                                 if isinstance(n, ast.Name)]]
         assert assigned and max(assigned) < step_17, name
+        assert ast.unparse(body[max(assigned)]).count(f"inputs.{name}") == 1, name
 
 
 def test_rule_reference_is_imported_once_from_evaluate():
@@ -6067,6 +6481,7 @@ def test_show_rule_reference_is_a_module_level_function_with_two_parameters():
 SHOW_RULE = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import RuleReference
 
 keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
@@ -6256,21 +6671,20 @@ def test_step_17_statement_order_with_the_with_model_branch():
 
 def test_step_17_with_model_branch_body_in_order():
     branch = with_model_if().body
-    # Since the cache (2026-11-03): the block columns, the fit as a function, the
-    # fingerprint, and the forecasts from load_with_cache.
-    assert [type(node).__name__ for node in branch] == ["Assign", "FunctionDef", "Assign",
+    # Since the cache (2026-11-03): the fit as a function, the fingerprint, and the forecasts
+    # from load_with_cache. The block columns are no longer made here: they come with the
+    # inputs of steps 1-11 (inputs.block_columns, unpacked at the top of main()).
+    assert [type(node).__name__ for node in branch] == ["Assign", "FunctionDef",
                                                         "FunctionDef", "Assign", "Assign",
                                                         "Expr"]
     assert ast.unparse(branch[0]) == "started = time.perf_counter()"
     assert branch[1].name == "progress"
-    assert ast.unparse(branch[2]) == ("block_columns = block_feature_columns(history, calendar, "
-                                      "owed)")
-    assert branch[3].name == "fit_every_origin"
-    assert ast.unparse(branch[4]).startswith("fingerprint = rolling_fingerprint(")
-    assert ast.unparse(branch[5]) == ("rolled = load_with_cache('hurdle_rolling_forecasts', "
+    assert branch[2].name == "fit_every_origin"
+    assert ast.unparse(branch[3]).startswith("fingerprint = rolling_fingerprint(")
+    assert ast.unparse(branch[4]) == ("rolled = load_with_cache('hurdle_rolling_forecasts', "
                                       "fingerprint, fit_every_origin, "
                                       "settings.data.cache_folder)")
-    assert ast.unparse(branch[6]) == "show_rolling_forecasts(rolled, rolled_actual)"
+    assert ast.unparse(branch[5]) == "show_rolling_forecasts(rolled, rolled_actual)"
 
 
 def test_step_17_the_else_branch_prints_the_skip_line_only():
@@ -6328,8 +6742,10 @@ def test_step_17_the_references_get_rolled_whatever_the_branch():
 
 # Running step 17's block (both branches) with fakes: every name it reads is a recorder.
 
-STEP_17_NAMES = ["weekly", "weeks", "levels", "companies", "table", "history", "calendar",
-                 "owed", "new_cash", "refunds", "unidentified", "week_zero", "ledger", "rates"]
+# main()'s names that step 17 reads, as unpacked from prepare_inputs' inputs (history and owed
+# stay inside prepare_inputs; block_columns is given below as "<blocks>").
+STEP_17_NAMES = ["weekly", "weeks", "levels", "companies", "table", "calendar", "new_cash",
+                 "refunds", "unidentified", "week_zero", "ledger", "rates"]
 
 
 STEP_17_FINGERPRINT = ["<fingerprint>", 1]
@@ -6400,7 +6816,8 @@ def run_step_17(with_model, cache_folder="<cache folder>", load_with_cache=None,
         # The cache of the rolling forecasts (2026-11-03).
         rolling_fingerprint=recorder("rolling_fingerprint", STEP_17_FINGERPRINT),
         load_with_cache=always_miss if load_with_cache is None else load_with_cache,
-        block_feature_columns=recorder("block_feature_columns", "<blocks>"),
+        # The block columns come with the inputs (made once, in prepare_inputs).
+        block_columns="<blocks>",
         show_rolling_forecasts=recorder("show_rolling_forecasts", None),
         deflated_reference=recorder("deflated_reference", "<reference>"),
         show_deflated_reference=recorder("show_deflated_reference", None),
@@ -6749,6 +7166,7 @@ def test_step_17_each_score_function_runs_once(with_model):
 SHOW_EVAL_SCORES = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import SCORE_COLUMNS
 
 nan = float("nan")
@@ -6957,12 +7375,17 @@ def test_step_17_load_with_cache_gets_the_name_fingerprint_fit_and_cache_folder(
 
 
 def test_step_17_block_columns_are_made_once_and_used_by_both():
+    # Made once, in prepare_inputs (inputs.block_columns), unpacked at the top of main(), and
+    # passed as they are to both the fingerprint and the fit.
     branch = with_model_if()
-    made = [node for node in branch.body if isinstance(node, ast.Assign)
-            and [ast.unparse(t) for t in node.targets] == ["block_columns"]]
-    assert len(made) == 1
-    assert ast.unparse(made[0].value) == "block_feature_columns(history, calendar, owed)"
-    assert len(calls_to(branch, "block_feature_columns")) == 1
+    tree = main_tree()
+    assert calls_to(tree, "block_feature_columns") == []
+    assert assignments_to(branch, "block_columns") == []
+    made = assignments_to(tree, "block_columns")
+    assert len(made) == 1 and any(node is made[0] for node in tree.body)
+    assert ast.unparse(made[0].value) == "inputs.block_columns"
+    assert len(calls_to(prepare_tree(), "block_feature_columns")) == 1
+    assert "block_columns=block_feature_columns(history, calendar, owed)" in prepare_source()
     for name in ("rolling_forecasts", "rolling_fingerprint"):
         assert keywords_of(calls_to(branch, name)[0])["block_columns"] == "block_columns", name
 
@@ -7323,6 +7746,7 @@ def test_step_17_run_the_bootstrap_settings_follow_the_settings_object():
 SHOW_BOOTSTRAP = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
 
 given = [
@@ -7613,6 +8037,7 @@ def test_step_17_run_the_payer_split_comes_after_the_bias_with_its_printout():
 SHOW_BIAS = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import COMPONENT_COLUMNS
 
 no_ratio = float("nan")
@@ -7694,6 +8119,7 @@ def test_show_component_bias_names_the_rule_by_its_open_invoices(bias_lines):
 SHOW_SPLIT = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import PAYER_COLUMNS
 
 no_ratio = float("nan")
@@ -7760,6 +8186,7 @@ def test_show_payer_split_per_company_rows_are_the_pooled_ones_without_all(split
 # The real functions, end to end: their tables are what the printouts expect.
 SHOW_REAL_TABLES = """
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from tests.hurdle.test_evaluate import cb_run, ps_run
 
 script.show_component_bias(cb_run(), 2)
@@ -7907,6 +8334,7 @@ def test_step_17_run_a_cached_model_gives_the_balance_check_its_customers():
 SHOW_COHERENCE = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.evaluate import COHERENCE_COLUMNS
 
 no_ratio = float("nan")
@@ -7959,6 +8387,7 @@ def test_show_balance_coherence_a_whole_factor_prints_without_a_point():
 # test_evaluate's worked example: 824 / 490 = 1.682, 940 / 490 = 1.918; TR02 394 / 290 = 1.359.
 SHOW_REAL_COHERENCE = """
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from tests.hurdle.test_evaluate import bc_run
 
 script.show_balance_coherence(bc_run(), 1.5)
@@ -8091,6 +8520,7 @@ def test_step_17_run_a_cached_model_gives_the_calibration_its_forecasts():
 SHOW_RELIABILITY = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.calibrate import calibration_reliability
 from tests.hurdle.test_calibrate import reliability_case
 
@@ -8132,6 +8562,7 @@ def test_show_calibration_reliability_exact_printout():
 SHOW_CHOICE = """
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
                                                     MCorrection, PCorrection)
 from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
@@ -8231,6 +8662,7 @@ def test_show_calibration_choice_by_size_shows_the_factor_at_each_m():
 # test_calibrate: no correction 0.856; `scale` 0.714; frozen `scale` 30700 / 9200 = 3.337.
 SHOW_REAL_CHOICE = """
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from tests.hurdle.test_calibrate import choose, validation_case
 
 script.show_calibration_choice(choose(validation_case(), min_gain=0.06), 0.06)
@@ -8275,7 +8707,7 @@ STEP_18_FIT_PROGRESS = (
     "({seconds:.0f} s), about {left / 60:.0f} min left')")
 STEP_18_GRID_CALL = (
     "predictions = grid_predictions(table, grid_origins, candidates, settings, "
-    "block_columns=block_feature_columns(history, calendar, owed), companies=companies, "
+    "block_columns=block_columns, companies=companies, "
     "new_cash=new_cash, refunds=refunds, unidentified=unidentified, levels=levels, "
     "calendar=calendar, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
     "on_fit_done=fit_progress)")
@@ -8300,7 +8732,7 @@ STEP_18_TEST_ACTUAL = ("test_actual = actual_totals(weekly, weeks, levels, compa
                        "test_origins, settings.receivables.horizons)")
 STEP_18_TEST_CALL = (
     "test = grid_test(choice, test_actual, settings, table=table, "
-    "block_columns=block_feature_columns(history, calendar, owed), companies=companies, "
+    "block_columns=block_columns, companies=companies, "
     "week_zero=week_zero, weekly=weekly, weeks=weeks, levels=levels, calendar=calendar, "
     "ledger=ledger, rates=rates, new_cash=new_cash, refunds=refunds, "
     "unidentified=unidentified, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
@@ -8675,6 +9107,7 @@ def test_step_18_printouts_sit_after_the_calibration_ones():
 GRID_NAMES = """
 import inspect
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import grid
 assert script.grid_candidates is grid.grid_candidates
 assert script.grid_predictions is grid.grid_predictions
@@ -8773,8 +9206,8 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
                                data=SimpleNamespace(cache_folder=Path("cache_root")),
                                receivables=SimpleNamespace(horizons=5))
     namespace = {
-        "settings": settings, "table": "<table>", "history": "<history>",
-        "calendar": "<calendar>", "owed": "<owed>", "companies": "<companies>",
+        "settings": settings, "table": "<table>", "block_columns": "<blocks>",
+        "calendar": "<calendar>", "companies": "<companies>",
         "new_cash": "<new cash>", "refunds": "<refunds>", "unidentified": "<unidentified>",
         "levels": "<levels>", "rolled": rolled,
         "weekly": "<weekly>", "weeks": "<weeks>", "week_zero": "<week zero>",
@@ -8786,7 +9219,6 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
         "show_grid_choice": recorder("show_grid_choice", None),
         "time": SimpleNamespace(perf_counter=lambda: next(clock)),
         "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
-        "block_feature_columns": recorder("block_feature_columns", "<blocks>"),
         "grid_candidates": recorder("grid_candidates", "<candidates>"),
         "show_grid_candidates": recorder("show_grid_candidates", None),
         "grid_predictions": fake_grid,
@@ -8813,7 +9245,7 @@ def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolle
 def test_step_18_run_calls_in_order():
     calls, _ = run_step_18()
     assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
-                                              "block_feature_columns", "grid_predictions",
+                                              "grid_predictions",
                                               "show_grid_predictions", "grid_gates",
                                               "show_grid_gates", "show_grid_gates",
                                               "actual_totals", "grid_scores",
@@ -8857,7 +9289,8 @@ def test_step_18_run_shows_the_candidates_with_the_origin_count(origins, count):
 def test_step_18_run_grid_predictions_gets_its_arguments():
     calls, _ = run_step_18(validation_origins=(40, 37, 44))
     by_name = {name: (args, kwargs) for name, args, kwargs in calls}
-    assert by_name["block_feature_columns"] == (("<history>", "<calendar>", "<owed>"), {})
+    # The block columns are main()'s, from prepare_inputs; step 18 makes none of its own.
+    assert "block_feature_columns" not in by_name
     args, kwargs = by_name["grid_predictions"]
     assert args[0] == "<table>"
     # The origins as the settings list them (grid_predictions sorts them itself), as a list.
@@ -9980,14 +10413,13 @@ def run_step_18_test(test_origins=(49, 60), ticks=(100.0, 500.0), **kwargs):
 def test_step_18_run_with_run_test_calls_in_order():
     calls, _ = run_step_18_test()
     assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
-                                              "block_feature_columns", "grid_predictions",
+                                              "grid_predictions",
                                               "show_grid_predictions", "grid_gates",
                                               "show_grid_gates", "show_grid_gates",
                                               "actual_totals", "grid_scores",
                                               "show_grid_scores", "grid_choice",
                                               "show_grid_choice", "actual_totals",
-                                              "block_feature_columns", "grid_test",
-                                              "show_grid_test"]
+                                              "grid_test", "show_grid_test"]
 
 
 def test_step_18_run_without_run_test_makes_no_test():
@@ -10332,6 +10764,7 @@ SHOW_GRID_CHOICE = """
 from types import SimpleNamespace
 import pandas as pd
 import run_hurdle_pipeline as script
+from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import grid as grid_module
 from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
                                                     MCorrection, PCorrection)
