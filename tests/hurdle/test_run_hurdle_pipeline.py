@@ -1,10 +1,14 @@
-"""Smoke tests for `run_hurdle_pipeline.py` (the step-by-step script).
+"""Tests of `run_hurdle_pipeline.py` (the step-by-step script): main() and the script's own
+functions (step 15's joint diagnostic and the top-up experiments).
 
 Running the real `main()` reads the whole synthetic corpus and writes to data/interim, so it
-is not run here. The import checks, and the step-6 branch tests (main() with every reader
-stubbed and stopped right after step 6), run in a separate Python process: the script
-reconfigures sys.stdout and puts src/ on sys.path, which should not leak into the rest of the
-test session.
+is not run here: main() is checked on its syntax tree, and parts of it (the guards, step 13's
+and step 17's blocks, step 18's `if`) are run on their own with fakes. Code that imports the
+script runs in a separate Python process: the script reconfigures sys.stdout and puts src/ on
+sys.path, which should not leak into the rest of the test session.
+
+The printouts the script imports are tested in tests/hurdle/reports/, step 18 (`run_grid`) in
+tests/hurdle/test_grid_run.py, and the source of prepare_inputs in test_inputs_source.py.
 """
 import re
 import subprocess
@@ -12,6 +16,9 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.hurdle.code_checks import module_functions
+from tests.hurdle.test_inputs_source import STEPS_1_TO_11
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "run_hurdle_pipeline.py"
@@ -24,10 +31,11 @@ assert callable(script.main)
 assert script.DEFAULT_SETTINGS_FILE.name == "synthetic.toml"
 # Steps 1-11 moved to inputs.prepare_inputs; the script calls that one.
 assert script.prepare_inputs is prep.prepare_inputs
-assert callable(script.show_preparation)
+# Every printout comes from hurdle/reports/ (the script defines only show_topups).
+from collection_estimation.hurdle.reports import preparation
+assert script.show_preparation is preparation.show_preparation
 # The names the script calls must have the signatures it uses after L.2.
 inspect.signature(prep.list_daily_files).bind("folder", "%d%m%Y")
-inspect.signature(script.read_one_file).bind("path", "layout")
 inspect.signature(prep.load_collections).bind({}, "layout", "cache")
 # After L.3: the ledger layout comes from the settings file.
 inspect.signature(prep.load_ledger).bind("path", "as_of", "layout", "cache")
@@ -65,10 +73,8 @@ else:
 inspect.signature(prep.known_weeks).bind("collections", "ledger", "week_zero")
 # Step 9: the panel's rows, from the known keys, the last week and the horizons.
 inspect.signature(prep.panel_rows).bind("known", 64, 5)
-assert callable(script.show_panel_rows)
 # Step 9, U4.2: the labels, from the panel, the weekly amounts and the week calendar.
 inspect.signature(prep.add_labels).bind("panel", "weekly", "weeks")
-assert callable(script.show_labels)
 # Step 9, side table A: new-customer cash, from the weekly amounts, the known keys, the
 # calendar, the horizons and the companies (required: the grid is built from them).
 inspect.signature(prep.new_customer_cash).bind("weekly", "known", "weeks", 5, ["TR02"])
@@ -78,11 +84,9 @@ except TypeError:
     pass
 else:
     raise AssertionError("new_customer_cash still accepts the old four-argument call")
-assert callable(script.show_new_customer_cash)
 # Side table R: refunds per company and week, from the weekly amounts, the calendar and
 # the companies.
 inspect.signature(prep.refunds_by_week).bind("weekly", "weeks", ["TR02"])
-assert callable(script.show_refunds)
 # Side table G: placeholder customers are split off by customer_id, and their gross
 # receipts summed per company and week.
 inspect.signature(prep.is_unidentified).bind("table", ("99999",))
@@ -100,15 +104,11 @@ else:
     raise AssertionError("fill_missing_days accepts a call without the days with a file")
 inspect.signature(prep.week_calendar).bind([], "week_zero", "holidays", [])
 inspect.signature(prep.week_calendar).bind([], "week_zero", "holidays", filled_days=[])
-assert callable(script.show_filled)
 # Step 10: TÜFE price levels by week, from week zero and the first and last week numbers.
-inspect.signature(script.price_weeks).bind("week_zero", -32, 64)
 inspect.signature(prep.published_levels).bind("week_zero", -32, 64)
-assert callable(script.show_prices)
 # Step 11: the ledger's payments before the first daily file, as payment history.
 inspect.signature(prep.first_history_week).bind("ledger", "week_zero")
 inspect.signature(prep.ledger_receipts_before).bind("ledger", "first_file_day", "week_zero")
-assert callable(script.show_early_receipts)
 # Step 11, U6.1b: the weekly matrix, from the weekly amounts, the early receipts, the keys,
 # the calendar, the price levels and the first and last weeks.
 inspect.signature(prep.weekly_matrix).bind("weekly", "early", "keys", "weeks", "levels",
@@ -119,138 +119,20 @@ except TypeError:
     pass
 else:
     raise AssertionError("weekly_matrix accepts a call without the first and last weeks")
-assert callable(script.show_matrix)
 print("ok")
 """
-
-
-# Step 6, now in `inputs.prepare_inputs` (steps 1-11 moved there from main()), with every
-# reader before it replaced by a stub in the inputs module, so that no file is read and
-# nothing is written (no corpus, no ledger, no data/interim cache). prepare_inputs is stopped
-# at week_calendar, the first call after step 6 that receives the filled days. The step-6
-# printout is then made from what prepare_inputs passed on, with the script's show_filled;
-# that show_preparation passes the same three values is checked on its syntax tree below.
-STEP_6 = """
-import sys
-from datetime import date
-from types import SimpleNamespace
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-SWITCH = {switch}
-DAYS = [date(2026, 3, 2), date(2026, 3, 3), date(2026, 3, 5)]
-COLLECTIONS = pd.DataFrame({{"key": ["TR02-1", "TR02-2"], "amount_try": [100.0, 30.0],
-                            "document_date": pd.to_datetime(["2026-03-02", "2026-03-03"])}})
-LEDGER = pd.DataFrame({{"key": ["TR02-1"]}})
-FILLED = COLLECTIONS.assign(filled_from_ledger=[False, False])
-seen = {{}}
-
-class Stop(Exception):
-    pass
-
-settings = SimpleNamespace(
-    settings_file=script.REPO_ROOT / "settings" / "stub.toml",
-    data=SimpleNamespace(corpus_folder="stub-corpus", cache_folder="stub-cache",
-                         ledger_file="stub-ledger", ledger_as_of=date(2026, 3, 31),
-                         holidays_file="stub-holidays", fill_missing_days_from_ledger=SWITCH),
-    collections_layout=SimpleNamespace(file_name_date_format="%d%m%Y"),
-    ledger_layout="stub-layout",
-    debug=SimpleNamespace(one_day=DAYS[0]),
-    companies=SimpleNamespace(known={{"TR02": "stub"}}),
-)
-
-def fake_fill(collections, ledger, days):
-    seen["fill_args"] = (collections, ledger, days)
-    return FILLED, [date(2026, 3, 4)]
-
-def fake_add_week_index(collections, week_zero):
-    seen["week_index_input"] = collections
-    return collections.assign(week=0)
-
-def fake_week_calendar(days, week_zero, holidays, filled_days=None):
-    seen["calendar_filled_days"] = filled_days
-    raise Stop
-
-prep.list_daily_files = lambda folder, fmt: {{day: f"file-{{day}}" for day in DAYS}}
-prep.load_collections = lambda files, layout, cache: COLLECTIONS
-prep.add_keys = lambda table, companies: table
-prep.load_ledger = lambda path, as_of, layout, cache: LEDGER
-prep.check_ledger_against_collections = lambda ledger, collections, days: {{}}
-prep.fill_missing_days = fake_fill
-prep.add_week_index = fake_add_week_index
-prep.load_holidays = lambda path: []
-prep.week_calendar = fake_week_calendar
-
-try:
-    prep.prepare_inputs(settings, with_details=True)
-except Stop:
-    pass
-else:
-    raise AssertionError("prepare_inputs() did not reach week_calendar")
-
-collections, filled_days = seen["week_index_input"], seen["calendar_filled_days"]
-script.show_filled(collections, filled_days, settings.data.fill_missing_days_from_ledger)
-if SWITCH:
-    assert seen["fill_args"][0] is COLLECTIONS
-    assert seen["fill_args"][1] is LEDGER
-    assert seen["fill_args"][2] == DAYS
-    assert collections is FILLED
-    assert filled_days == [date(2026, 3, 4)]
-else:
-    assert "fill_args" not in seen, "fill_missing_days ran although switched off"
-    assert filled_days == []
-    assert list(collections.columns) == list(COLLECTIONS.columns) + ["filled_from_ledger"]
-    assert collections["filled_from_ledger"].dtype == bool
-    assert not collections["filled_from_ledger"].any()
-    pd.testing.assert_frame_equal(collections.drop(columns="filled_from_ledger"), COLLECTIONS)
-    # assign gives a new table: the loaded collections are not modified.
-    assert "filled_from_ledger" not in COLLECTIONS.columns
-print("ok")
-"""
-
-
-def run_step_6(switch):
-    return subprocess.run([sys.executable, "-c", STEP_6.format(switch=switch)], cwd=REPO_ROOT,
-                          capture_output=True, text=True, timeout=120)
-
-
-def test_step_6_switched_off_flags_every_line_false_and_fills_no_day():
-    result = run_step_6(False)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    assert "filling from the ledger is switched off" in result.stdout
-
-
-def test_step_6_switched_on_takes_the_lines_and_days_from_fill_missing_days():
-    result = run_step_6(True)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    assert "1 days without a daily file filled from the ledger" in result.stdout
 
 
 # Steps 1-11 as one call (`inputs.prepare_inputs`) and their printouts (`show_preparation`):
-# main()'s side of the move, checked on the syntax trees (helpers further down: main_tree,
-# show_preparation_tree, prepare_tree). What prepare_inputs computes is tested on real tiny
-# data in test_inputs.py.
-
-# Every step 1-11 function main() used to call itself; now only prepare_inputs calls them.
-STEPS_1_TO_11 = ("list_daily_files", "load_collections", "add_keys", "load_ledger",
-                 "check_ledger_against_collections", "fill_missing_days", "add_week_index",
-                 "load_holidays", "week_calendar", "weekly_amounts", "exchange_rates",
-                 "receivables_by_week", "known_weeks", "is_unidentified", "panel_rows",
-                 "add_labels", "new_customer_cash", "refunds_by_week",
-                 "unidentified_cash_by_week", "check_side_tables", "week_numbers",
-                 "published_levels", "ledger_receipts_before", "first_history_week",
-                 "weekly_matrix", "history_features", "calendar_features",
-                 "holiday_position_features", "receivables_features", "add_deflated_label",
-                 "join_features", "block_feature_columns")
+# main()'s side of the move, checked on its syntax tree (helpers further down: main_tree,
+# prepare_tree). show_preparation is tested in reports/test_preparation.py, what
+# prepare_inputs computes on real tiny data in test_inputs.py.
 
 # main()'s names after the move, each unpacked from the inputs field of the same name.
 UNPACKED = ("companies", "week_zero", "weeks", "weekly", "ledger", "rates", "levels",
             "calendar", "table", "block_columns", "new_cash", "refunds", "unidentified")
 
-# The printouts of steps 1-11 in the order main() used to make them.
+# The printouts of steps 1-11, show_preparation's (the top-ups are main()'s own, below).
 PREPARATION_PRINTOUTS = [
     "show_daily_files", "show_one_day", "show_collections", "show_keys", "show_ledger",
     "show_tie", "show_filled", "print", "show_weeks", "show_weekly", "show_rates",
@@ -258,7 +140,7 @@ PREPARATION_PRINTOUTS = [
     "show_new_customer_cash", "show_refunds", "print", "print", "show_prices",
     "show_projected_levels", "show_early_receipts", "show_matrix", "show_history",
     "show_calendar", "show_holiday_positions", "show_owed", "show_deflated_label",
-    "show_topups", "compare_topups", "show_table"]
+    "show_table"]
 
 
 def printouts_in_order(tree):
@@ -268,12 +150,6 @@ def printouts_in_order(tree):
              and (node.func.id.startswith("show_") or node.func.id in ("compare_topups",
                                                                          "print"))]
     return [call.func.id for call in sorted(calls, key=lambda c: (c.lineno, c.col_offset))]
-
-
-def call_args(tree, name):
-    calls = calls_to(tree, name)
-    assert len(calls) == 1, (name, len(calls))
-    return [ast.unparse(arg) for arg in calls[0].args]
 
 
 def test_main_calls_prepare_inputs_once_with_details_then_show_preparation():
@@ -296,12 +172,6 @@ def test_main_calls_none_of_the_step_1_to_11_functions_itself():
     tree = main_tree()
     for name in STEPS_1_TO_11:
         assert calls_to(tree, name) == [], name
-
-
-def test_prepare_inputs_calls_each_step_1_to_11_function():
-    tree = prepare_tree()
-    for name in STEPS_1_TO_11:
-        assert calls_to(tree, name), name
 
 
 def test_the_script_no_longer_imports_the_step_1_to_11_functions():
@@ -363,113 +233,10 @@ def test_main_never_rebinds_inputs_after_prepare_inputs():
     assert "split_inputs = {part:" in main_source()
 
 
-def test_inputs_module_prints_nothing():
-    module = ast.parse(INPUTS_MODULE.read_text(encoding="utf-8"))
-    assert [node for node in ast.walk(module) if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name) and node.func.id == "print"] == []
-
-
-def test_show_preparation_has_three_parameters():
-    tree = show_preparation_tree()
-    assert [a.arg for a in tree.args.args] == ["inputs", "details", "settings"]
-    assert tree.args.defaults == [] and tree.args.vararg is None
-    assert tree.args.kwonlyargs == []
-
-
-def test_show_preparation_printouts_in_the_old_step_order():
-    assert printouts_in_order(show_preparation_tree()) == PREPARATION_PRINTOUTS
-
-
 def test_show_preparation_is_the_only_place_of_the_step_1_to_11_printouts():
     main_printouts = set(printouts_in_order(main_tree()))
     for name in set(PREPARATION_PRINTOUTS) - {"print"}:
         assert name not in main_printouts, name
-
-
-def test_show_preparation_step_6_printout_gets_the_filled_collections_and_days():
-    assert call_args(show_preparation_tree(), "show_filled") == [
-        "details.collections", "details.filled_days",
-        "settings.data.fill_missing_days_from_ledger"]
-
-
-def test_show_preparation_steps_3_and_4_printouts_get_the_keyed_lines():
-    tree = show_preparation_tree()
-    assert call_args(tree, "show_collections") == ["details.collections_keyed"]
-    assert call_args(tree, "show_keys") == ["details.collections_keyed"]
-
-
-def test_show_preparation_step_9_known_printout_keeps_the_placeholders():
-    # details.known is every key known, placeholders too (as main() printed it before the
-    # placeholders were split off); the labels use the identified weekly amounts.
-    assert call_args(show_preparation_tree(), "show_known") == [
-        "details.known", "details.collections", "inputs.last_week"]
-    assert call_args(show_preparation_tree(), "show_labels") == [
-        "details.panel", "details.identified_weekly"]
-    assert "known=known_all" in prepare_source()
-    assert "identified_weekly=identified_weekly" in prepare_source()
-
-
-def test_show_preparation_step_2_reads_the_one_day_file_itself():
-    tree = show_preparation_tree()
-    assert call_args(tree, "read_one_file") == ["details.daily_files[day]",
-                                                "settings.collections_layout"]
-    assert calls_to(prepare_tree(), "read_one_file") == []
-    guard = [node for node in ast.walk(tree) if isinstance(node, ast.If)
-             and ast.unparse(node.test) == "day not in details.daily_files"]
-    assert len(guard) == 1
-    assert isinstance(guard[0].body[0], ast.Raise)
-    assert ast.unparse(guard[0].body[0].exc.func) == "ValueError"
-    shows = show_preparation_source()
-    assert shows.index("if day not in details.daily_files") < shows.index("read_one_file(")
-
-
-def test_show_preparation_step_10_inflation_figures_are_made_for_the_printout_only():
-    tree = show_preparation_tree()
-    for name in ("weekly_price_level", "published_price_level", "projected_price_level"):
-        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                 and ast.unparse(node.func) == f"inflation.{name}"]
-        assert len(found) == 1, name
-        assert [ast.unparse(a) for a in found[0].args] == ["weeks_for_prices"], name
-    assert "inflation" not in prepare_source()
-    assert call_args(tree, "show_prices") == ["weeks_for_prices", "actual_level",
-                                              "published_level", "projected_level",
-                                              "inputs.levels"]
-
-
-def test_show_preparation_projected_levels_at_the_demo_origin_and_the_last_week():
-    loops = [node for node in ast.walk(show_preparation_tree()) if isinstance(node, ast.For)]
-    assert len(loops) == 1
-    assert ast.unparse(loops[0].iter) == "(settings.debug.demo_origin, inputs.last_week)"
-    assert [ast.unparse(n) for n in loops[0].body] == [
-        "show_projected_levels(inputs.week_zero, forecast_week, settings.receivables.horizons)"]
-
-
-SHOW_PREPARATION_ONE_DAY = """
-from datetime import date
-from types import SimpleNamespace
-from pathlib import Path
-import run_hurdle_pipeline as script
-
-shown = []
-script.show_daily_files = lambda files: shown.append(files)
-details = SimpleNamespace(daily_files={date(2026, 3, 2): Path("a.xlsx")})
-settings = SimpleNamespace(settings_file=Path("settings") / "stub.toml",
-                           debug=SimpleNamespace(one_day=date(2026, 3, 3)))
-try:
-    script.show_preparation(SimpleNamespace(), details, settings)
-except ValueError as error:
-    print("ERROR " + str(error))
-assert shown == [details.daily_files], shown
-print("ok")
-"""
-
-
-def test_show_preparation_one_day_without_a_file_raises_after_listing_the_files():
-    result = subprocess.run([sys.executable, "-c", SHOW_PREPARATION_ONE_DAY], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "ERROR stub.toml [debug]: one_day 2026-03-03 has no daily file", "ok"]
 
 
 def test_the_pipeline_script_exists():
@@ -483,296 +250,10 @@ def test_the_pipeline_script_imports_without_running():
     assert result.stdout.strip().endswith("ok")
 
 
-# Step 11, U6.2: the history features, from the weekly matrix, the known keys, the last week
-# and the windows from the settings; and the printout of them. Run on a small hand-built
-# matrix, in a separate process like the checks above.
-HISTORY = """
-import inspect
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-inspect.signature(prep.history_features).bind("matrix", "known", 64, (4, 13, 52))
-try:
-    inspect.signature(prep.history_features).bind("matrix", "known", 64)
-except TypeError:
-    pass
-else:
-    raise AssertionError("history_features accepts a call without the windows")
-assert callable(script.show_history)
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-assert "history = history_features(matrix, known, last_week, settings.history.windows)" in calc
-assert "show_history(details.history, details.matrix)" in shows
-assert calc.index("matrix = weekly_matrix(") < calc.index("history_features(")
-assert shows.index("show_matrix(details.matrix)") < shows.index("show_history(")
-
-matrix = pd.DataFrame(0.0, index=pd.Index(["A", "B"], name="key", dtype=object),
-                      columns=pd.Index(list(range(0, 14)), name="week"))
-matrix.loc["A", 2] = 20.0
-matrix.loc["A", 8] = 50.0
-matrix.loc["B", 13] = 30.0
-known = pd.DataFrame({"key": pd.Series(["A", "B"], dtype=object), "known_week": [-5, 9]})
-history = prep.history_features(matrix, known, 13, (4, 13))
-script.show_history(history, matrix)
-print("ok")
-"""
-
-
-def test_history_features_are_wired_in_and_printed():
-    result = subprocess.run([sys.executable, "-c", HISTORY], cwd=REPO_ROOT,
-                            capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    # A: origin weeks 0..13 (14 rows), B: 9..13 (5 rows); 12 columns less key and origin.
-    assert "history features: 19 rows (key x origin week), 10 features" in result.stdout
-    assert "share NaN" in result.stdout
-    assert "the key with the most receipts at origin weeks 0, 13 and 52" in result.stdout
-    assert "median_payment_13" in result.stdout
-
-
-# Step 11, U7: the calendar features of every target week, from week zero, week 0 to the
-# last week + the horizons, and the holidays; and the printout of them. Run on the real
-# settings/holidays_tr.toml (read only), in a separate process like the checks above.
-CALENDAR = """
-import inspect
-from datetime import date
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-inspect.signature(prep.calendar_features).bind("week_zero", 0, 69, "holidays")
-try:
-    inspect.signature(prep.calendar_features).bind("week_zero", 0, 69)
-except TypeError:
-    pass
-else:
-    raise AssertionError("calendar_features accepts a call without the holidays")
-inspect.signature(script.show_calendar).bind("calendar", "week_zero", "holidays")
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-assert "horizons = settings.receivables.horizons" in calc
-call = "calendar = calendar_features(week_zero, 0, last_week + horizons, holidays)"
-assert call in calc, "calendar_features is not called as expected"
-assert "show_calendar(inputs.calendar, inputs.week_zero, details.holidays)" in shows
-assert calc.index("history = history_features(") < calc.index("calendar_features(")
-assert shows.index("show_history(details.history") < shows.index("show_calendar(")
-
-holidays = prep.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
-week_zero = date(2025, 6, 2)
-calendar = prep.calendar_features(week_zero, 0, 69, holidays)
-script.show_calendar(calendar, week_zero, holidays)
-print("ok")
-"""
-
-
-def test_calendar_features_are_wired_in_and_printed():
-    # The script writes UTF-8 (it reconfigures sys.stdout); the holiday names are Turkish.
-    result = subprocess.run([sys.executable, "-c", CALENDAR], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    assert ("calendar features: weeks 0 to 69; weeks with a month-end: 16, a quarter-end: 6, "
-            "the 15th: 16") in result.stdout
-    assert "weeks with fewer than 5 business days:" in result.stdout
-    assert "week 51 (Monday 2026-05-25): 2 business days (Kurban Bayramı)" in result.stdout
-    assert ("quarter-end weeks start on: 2025-06-30, 2025-09-29, 2025-12-29, 2026-03-30, "
-            "2026-06-29, 2026-09-28") in result.stdout
-    assert "52: 3" in result.stdout
-    assert "np.int64" not in result.stdout
-
-
-# Step 8, U9c.1: the receivables are built with the aging edges from the settings, and the
-# printout shows the aging table. Step 11, U9c.2: the receivables features, after the
-# calendar features, and their printout. Run on small hand-built tables, in a separate
-# process like the checks above.
-RECEIVABLES = """
-import inspect
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.receivables_asof import receivables_columns
-
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-assert ("leak_check_weeks=settings.receivables.leak_check_weeks, "
-        "age_edges=settings.receivables.overdue_age_days)") in calc, "step 8 call"
-assert ("show_receivables_by_week(details.receivables, settings.receivables.leak_check_weeks, "
-        "settings.debug.sample_week, settings.receivables.overdue_age_days)") in shows
-call = ("owed = receivables_features(panel, receivables, levels, horizons, "
-        "settings.receivables.overdue_age_days)")
-assert call in calc, "receivables_features is not called as expected"
-show = ("show_owed(details.owed, int(before_first_ledger_week(details.panel, "
-        "details.receivables).sum()))")
-assert show in shows, "show_owed is not called with the not-yet-in-ledger count"
-assert calc.index("calendar = calendar_features(") < calc.index("receivables_features(")
-assert shows.index("show_calendar(") < shows.index("show_owed(details.owed")
-assert callable(script.before_first_ledger_week)
-inspect.signature(script.show_owed).bind("owed", 0)
-assert calc.index("receivables_by_week(") < calc.index("receivables_features(")
-inspect.signature(prep.receivables_features).bind("panel", "receivables", "levels", 5, (30, 90))
-try:
-    inspect.signature(prep.receivables_features).bind("panel", "receivables", "levels", 5)
-except TypeError:
-    pass
-else:
-    raise AssertionError("receivables_features accepts a call without the age edges")
-inspect.signature(script.show_receivables_by_week).bind("r", (0,), 30, (30, 90))
-assert callable(script.show_owed)
-
-columns = receivables_columns(5, (30, 90))
-rows = []
-for key in ["A", "B"]:
-    for week in range(0, 17):
-        row = dict.fromkeys(columns, 0.0)
-        row.update(key=key, week=week, open_invoices=1, cleared_invoices=0,
-                   usual_delay_days=float("nan"))
-        row["due_in_week_1"] = 1e6
-        row["overdue"] = 3e6
-        row["overdue_up_to_30"], row["overdue_31_to_90"], row["overdue_over_90"] = 1e6, 0.5e6, 1.5e6
-        rows.append(row)
-receivables = pd.DataFrame(rows, columns=columns)
-for column in ("week", "open_invoices", "cleared_invoices"):
-    receivables[column] = receivables[column].astype("int64")
-script.show_receivables_by_week(receivables, (0, 16), 8, (30, 90))
-
-# Key C is known but not yet in the ledger: its ledger starts in week 10, after its panel
-# weeks 3 and 4, so those two rows are filled as nothing owed. (A key with no receivables
-# row at all would make receivables_features raise.) Added after the aging printout so the
-# aging totals above stay those of A and B.
-c_rows = []
-for week in range(10, 17):
-    row = dict.fromkeys(columns, 0.0)
-    row.update(key="C", week=week, open_invoices=0, cleared_invoices=0,
-               usual_delay_days=float("nan"))
-    c_rows.append(row)
-c_table = pd.DataFrame(c_rows, columns=columns)
-for column in ("week", "open_invoices", "cleared_invoices"):
-    c_table[column] = c_table[column].astype("int64")
-receivables = pd.concat([receivables, c_table], ignore_index=True)
-panel = pd.DataFrame({"key": ["A", "A", "B", "C", "C"], "origin_week": [3, 3, 16, 3, 4],
-                      "h": [1, 2, 5, 1, 3]})
-levels = pd.Series(1.0, index=range(0, 17))
-owed = prep.receivables_features(panel, receivables, levels, 5, (30, 90))
-filled = int(script.before_first_ledger_week(panel, receivables).sum())
-assert filled == 2, filled
-script.show_owed(owed, filled)
-# A key with no receivables row at all is refused, not filled.
-absent = pd.concat([panel, pd.DataFrame({"key": ["D"], "origin_week": [3], "h": [1]})],
-                   ignore_index=True)
-try:
-    prep.receivables_features(absent, receivables, levels, 5, (30, 90))
-except ValueError as error:
-    assert str(error) == "1 panel keys have no receivables row at all (first: ['D'])", error
-else:
-    raise AssertionError("a key with no receivables row was filled")
-print("ok")
-"""
-
-
-def test_receivables_aging_and_features_are_wired_in_and_printed():
-    result = subprocess.run([sys.executable, "-c", RECEIVABLES], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    assert "overdue by days past due, million TRY (every 8th week):" in result.stdout
-    for column in ("overdue_up_to_30", "overdue_31_to_90", "overdue_over_90"):
-        assert column in result.stdout
-    # Two keys of 3.0 million overdue each: 6.0 million, split 2.0 / 1.0 / 3.0 per week.
-    aging = result.stdout.split("overdue by days past due")[1].splitlines()
-    assert aging[1].split() == ["overdue", "overdue_up_to_30", "overdue_31_to_90",
-                                "overdue_over_90"]
-    assert [line.split() for line in aging[3:6]] == [
-        [week, "6.0", "2.0", "1.0", "3.0"] for week in ("0", "8", "16")]
-    assert "receivables features: 5 rows (key x origin week x h), 12 features" in result.stdout
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    assert "rows of keys not yet in the ledger (filled as nothing owed): 2" in lines
-    assert "share NaN" in result.stdout
-    assert "due before / in / after the target week, by h" in result.stdout
-    # Since the price levels are normalised to week 0, amounts read as TRY of week 0.
-    assert ("due before / in / after the target week, by h (billion TRY of week 0, summed "
-            "over rows):") in lines
-    assert "TRY of the last week" not in result.stdout
-
-
-# Step 10: the price-level printout. published_levels() is the copied module's published
-# level rescaled to 1.0 at week 0; the printout checks that and shows week 0 and the last
-# week. Run on the real TÜFE table for the synthetic weeks -32 to 64, in a separate process.
-# PRICES is run twice: once with the real published_levels(), once with the copied
-# module's level (the OLD normalisation) passed as `levels`, which must print a mismatch.
-PRICES = """
-from datetime import date
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-week_zero = date(2025, 6, 2)
-weeks = script.price_weeks(week_zero, -32, 64)
-actual = script.inflation.weekly_price_level(weeks)
-published = script.inflation.published_price_level(weeks)
-projected = script.inflation.projected_price_level(weeks)
-if {old_basis}:
-    levels = pd.Series(published, index=weeks["week"].to_numpy(), name="price_level")
-else:
-    levels = prep.published_levels(week_zero, -32, 64)
-script.show_prices(weeks, actual, published, projected, levels)
-
-matrix = pd.DataFrame(0.0, index=pd.Index(["A", "B"], name="key", dtype=object),
-                      columns=pd.Index(list(range(-2, 4)), name="week"))
-matrix.loc["A", 1] = 20.0
-matrix.loc["A", 3] = 5.0
-script.show_matrix(matrix)
-print("ok")
-"""
-
-
-def run_prices(old_basis):
-    return subprocess.run([sys.executable, "-c", PRICES.format(old_basis=old_basis)],
-                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-                          timeout=120)
-
-
-def test_price_printout_says_the_copied_module_is_rescaled_to_week_zero():
-    result = run_prices(False)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    first_line = result.stdout.splitlines()[0]
-    assert first_line.startswith("Step 10: price levels for weeks -32 to 64 "
-                                 "(2024-10-21 to 2026-08-30)")
-    assert first_line.endswith("the copied module gives 1.0 = the last week, "
-                               "published_levels() rescales to 1.0 = week 0")
-
-
-def test_price_printout_reports_a_match_and_week_zero_and_last_week_levels():
-    result = run_prices(False)
-    assert result.returncode == 0, result.stderr
-    # Week 0 is 1.000; the last week publishes July 2026, 1.363 times May 2025.
-    assert "published_levels() matches: True; week 0 = 1.000, last week = 1.363" in result.stdout
-
-
-def test_price_printout_reports_a_mismatch_for_the_old_normalisation():
-    # The copied module's level (1.0 = the last week's actual level) is not what
-    # published_levels() should give any more: the check must say so.
-    result = run_prices(True)
-    assert result.returncode == 0, result.stderr
-    assert "published_levels() matches: False" in result.stdout
-    assert "week 0 = 0.720, last week = 0.982" in result.stdout
-
-
-def test_matrix_printout_says_try_of_week_zero():
-    result = run_prices(False)
-    assert result.returncode == 0, result.stderr
-    assert ("the key with the most receipts, its first weeks with a payment (TRY of week 0):"
-            in result.stdout)
-    assert "TRY of the last week" not in result.stdout
-
-
-# Steps 10 and 11 with a ledger that starts AFTER the first daily file (week 0): the price
-# range and the history start are floored at week 0, so published_levels() (normalised to
-# week 0) and weekly_matrix() (which must hold the daily files' weeks from 0) do not raise.
-# Steps 1-11 now live in hurdle/inputs.py (`prepare_inputs`), their printouts in the script's
-# `show_preparation`; both are checked on their syntax trees, read from the files without
-# importing or running them. The behaviour itself is tested in test_ledger_starting_late.py
-# and test_inputs.py.
+# Steps 1-11 now live in hurdle/inputs.py (`prepare_inputs`), their printouts in
+# hurdle/reports/preparation.py (`show_preparation`); main() is checked on its syntax tree,
+# read from the file without importing or running it. The behaviour itself is tested in
+# test_ledger_starting_late.py and test_inputs.py.
 import ast  # noqa: E402
 
 INPUTS_MODULE = REPO_ROOT / "src" / "collection_estimation" / "hurdle" / "inputs.py"
@@ -809,14 +290,6 @@ def prepare_source():
     return function_source(INPUTS_MODULE, "prepare_inputs")
 
 
-def show_preparation_tree():
-    return function_tree(SCRIPT, "show_preparation")
-
-
-def show_preparation_source():
-    return function_source(SCRIPT, "show_preparation")
-
-
 def assignments_to(tree, name):
     return [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)]
@@ -827,390 +300,12 @@ def calls_to(tree, name):
             and isinstance(node.func, ast.Name) and node.func.id == name]
 
 
-def is_min_with_zero(value, first_arg_check):
-    """value is `min(<first>, 0)` with exactly two positional arguments."""
-    return (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
-            and value.func.id == "min" and len(value.args) == 2 and not value.keywords
-            and first_arg_check(value.args[0])
-            and isinstance(value.args[1], ast.Constant) and value.args[1].value == 0)
-
-
-def test_step_10_first_ledger_week_is_the_week_of_the_first_posting():
-    source = prepare_source()
-    assert ('first_ledger_week = int(week_numbers(pd.Series([ledger["posting_date"].min()]), '
-            'week_zero).iloc[0])') in source
-    assert len(assignments_to(prepare_tree(), "first_ledger_week")) == 1
-
-
-def test_step_10_first_price_week_is_floored_at_week_zero():
-    found = assignments_to(prepare_tree(), "first_price_week")
-    assert len(found) == 1, "first_price_week must be assigned exactly once"
-    assert is_min_with_zero(found[0].value,
-                            lambda arg: isinstance(arg, ast.Name)
-                            and arg.id == "first_ledger_week"), ast.dump(found[0].value)
-    assert "first_price_week = min(first_ledger_week, 0)" in prepare_source()
-
-
-def test_step_10_published_levels_takes_the_floored_week():
-    calls = calls_to(prepare_tree(), "published_levels")
-    assert len(calls) == 1
-    args = [ast.unparse(arg) for arg in calls[0].args]
-    assert args == ["week_zero", "first_price_week", "last_week"], args
-    assert ("levels = published_levels(week_zero, first_price_week, last_week)"
-            in prepare_source())
-
-
-def test_step_10_price_weeks_of_the_printout_take_the_floored_week():
-    # The copied inflation module is called only for the printout (show_preparation), on
-    # the same weeks as the levels: the floored week prepare_inputs kept in the details.
-    calls = calls_to(show_preparation_tree(), "price_weeks")
-    assert len(calls) == 1
-    args = [ast.unparse(arg) for arg in calls[0].args]
-    assert args == ["inputs.week_zero", "details.first_price_week", "inputs.last_week"], args
-    assert ("weeks_for_prices = price_weeks(inputs.week_zero, details.first_price_week, "
-            "inputs.last_week)") in show_preparation_source()
-    assert calls_to(prepare_tree(), "price_weeks") == []
-
-
-def test_step_10_details_keep_the_floored_first_price_week():
-    assert "first_price_week=first_price_week" in prepare_source()
-
-
-def test_step_10_order_ledger_week_then_floor_then_prices():
-    source = prepare_source()
-    assert (source.index("first_ledger_week = ")
-            < source.index("first_price_week = min(first_ledger_week, 0)")
-            < source.index("published_levels(week_zero, first_price_week"))
-    # The floor comes after last_week is known and after the ledger is loaded.
-    assert source.index("ledger = load_ledger(") < source.index("first_ledger_week = ")
-    assert source.index("last_week = int(weeks[\"week\"].max())") < source.index(
-        "first_price_week = ")
-    shows = show_preparation_source()
-    assert shows.index("price_weeks(inputs.week_zero") < shows.index("show_prices(")
-
-
-def history_switch():
-    """The `if settings.history.use_ledger_before_first_file:` statement in prepare_inputs."""
-    found = [node for node in ast.walk(prepare_tree()) if isinstance(node, ast.If)
-             and ast.unparse(node.test) == "settings.history.use_ledger_before_first_file"]
-    assert len(found) == 1
-    return found[0]
-
-
-def test_step_11_switched_on_history_start_is_floored_at_week_zero():
-    switch = history_switch()
-    found = [node for statement in switch.body for node in assignments_to(statement,
-                                                                          "history_start")]
-    assert len(found) == 1
-    assert is_min_with_zero(found[0].value,
-                            lambda arg: ast.unparse(arg) == "first_history_week(ledger, "
-                                                            "week_zero)"), ast.dump(found[0].value)
-    assert "history_start = min(first_history_week(ledger, week_zero), 0)" in prepare_source()
-
-
-def test_step_11_switched_off_history_start_is_still_zero():
-    switch = history_switch()
-    found = [node for statement in switch.orelse for node in assignments_to(statement,
-                                                                            "history_start")]
-    assert len(found) == 1
-    assert isinstance(found[0].value, ast.Constant) and found[0].value.value == 0
-
-
-def test_step_11_history_start_is_assigned_only_in_the_switch():
-    assert len(assignments_to(prepare_tree(), "history_start")) == 2
-
-
-def test_step_11_switched_off_early_receipts_are_emptied():
-    switch = history_switch()
-    found = [node for statement in switch.orelse for node in assignments_to(statement,
-                                                                            "early_receipts")]
-    assert len(found) == 1
-    assert ast.unparse(found[0].value) == "early_receipts.iloc[0:0]"
-
-
-def test_step_11_early_receipts_are_read_once_before_the_switch():
-    calls = calls_to(prepare_tree(), "ledger_receipts_before")
-    assert len(calls) == 1
-    assert [ast.unparse(arg) for arg in calls[0].args] == ["ledger", "min(daily_files)",
-                                                          "week_zero"]
-    source = prepare_source()
-    assert source.index("early_receipts = ledger_receipts_before(") < source.index(
-        "if settings.history.use_ledger_before_first_file:")
-
-
-def test_step_11_early_receipts_are_cut_at_the_history_start_and_the_matrix_starts_there():
-    source = prepare_source()
-    assert 'early_receipts = early_receipts[early_receipts["week"] >= history_start]' in source
-    calls = calls_to(prepare_tree(), "weekly_matrix")
-    assert len(calls) == 1
-    args = [ast.unparse(arg) for arg in calls[0].args]
-    assert args == ["identified_weekly", "early_receipts", "known['key']", "weeks", "levels",
-                    "history_start", "last_week"], args
-    assert (source.index("history_start = min(first_history_week(ledger, week_zero), 0)")
-            < source.index('early_receipts = early_receipts[early_receipts["week"] >= '
-                           'history_start]')
-            < source.index("matrix = weekly_matrix("))
-    # The price levels the matrix divides by are built (step 10) before the matrix (step 11).
-    assert source.index("levels = published_levels(") < source.index("matrix = weekly_matrix(")
-
-
-# Step 11: the deflated label, added to the panel after the receivables features and printed.
-# The wiring is checked on main()'s source; the printout is run on a hand-built panel in a
-# separate process: target weeks 0, 16, 17, 32 labelled, one missing-week and one future row,
-# and one h=2 row (target 17) that the h=1 table must leave out.
-DEFLATED = """
-import inspect
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-assert "panel = add_deflated_label(panel, levels)" in calc, "add_deflated_label not called"
-assert "show_deflated_label(details.panel, inputs.levels)" in shows, (
-    "show_deflated_label not called")
-assert calc.index("owed = receivables_features(") < calc.index(
-    "panel = add_deflated_label(panel, levels)")
-assert shows.index("show_owed(details.owed") < shows.index("show_deflated_label(")
-assert calc.index("levels = published_levels(") < calc.index("add_deflated_label(")
-assert calc.index("panel = add_labels(") < calc.index("add_deflated_label(")
-inspect.signature(prep.add_deflated_label).bind("panel", "levels")
-inspect.signature(script.show_deflated_label).bind("panel", "levels")
-
-nan = float("nan")
-panel = pd.DataFrame({
-    "key": ["A", "B", "A", "B", "A", "A", "B", "A"],
-    "origin_week": [-1, -1, 15, 15, 16, 31, 31, 64],
-    "h": [1, 1, 1, 2, 1, 1, 1, 1],
-    "label_status": ["labelled"] * 6 + ["missing_week", "future"],
-    "amount": [1e6, 1e6, 5e6, 3e6, 2e6, 8e6, nan, nan],
-})
-panel["target_week"] = panel["origin_week"] + panel["h"]
-# No level for the future week 65: it must not be looked up.
-levels = pd.Series({0: 1.0, 16: 1.25, 17: 2.0, 32: 1.6})
-panel = prep.add_deflated_label(panel, levels)
-assert panel["amount_deflated"].tolist()[:6] == [1e6, 1e6, 4e6, 1.5e6, 1e6, 5e6]
-script.show_deflated_label(panel, levels)
-print("ok")
-"""
-
-
-def run_deflated():
-    return subprocess.run([sys.executable, "-c", DEFLATED], cwd=REPO_ROOT,
-                          capture_output=True, text=True, encoding="utf-8", timeout=120)
-
-
-def test_deflated_label_is_wired_in_after_the_receivables_features():
-    result = run_deflated()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-
-
-def test_deflated_label_printout_counts():
-    result = run_deflated()
-    assert result.returncode == 0, result.stderr
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    assert "deflated label: 6 labelled rows, 2 NaN (rows not labelled: 2)" in lines
-
-
-def test_deflated_label_printout_h1_table_every_16th_week():
-    result = run_deflated()
-    assert result.returncode == 0, result.stderr
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    title = ("at h=1, label per target week, million TRY (nominal / of week 0), every 16th:")
-    assert title in lines
-    table = lines[lines.index(title) + 1:]
-    assert table[0].split() == ["amount", "amount_deflated", "ratio", "level"]
-    assert table[1].split() == ["target_week"]
-    # Week 0: 1 + 1 million, level 1.0. Week 16: 5 million at 1.25. Week 32: 8 million at
-    # 1.6. Week 17 (not a multiple of 16) is left out; the h=2 row never counts.
-    rows = [line.split() for line in table[2:5]]
-    assert [[float(value) for value in row] for row in rows] == [
-        [0, 2.0, 2.0, 1.0, 1.0],
-        [16, 5.0, 4.0, 1.25, 1.25],
-        [32, 8.0, 5.0, 1.6, 1.6],
-    ]
-    assert table[5] == "ok"
-
-
-# Step 11: the training table, joined after the deflated label and printed. The wiring is
-# checked on main()'s source; the printout is run on a small hand-built panel and blocks in a
-# separate process: 4 panel rows (2 labelled, one of them paid; one missing week; one
-# future), one NaN in a history feature, none in the calendar or receivables features.
-TABLE = """
-import inspect
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-assert "table = join_features(panel, history, calendar, owed)" in calc, "join_features"
-assert "show_table(inputs.table, details.panel)" in shows, "show_table not called"
-assert calc.index("panel = add_deflated_label(panel, levels)") < calc.index(
-    "table = join_features(panel, history, calendar, owed)")
-assert shows.index("show_deflated_label(") < shows.index("show_table(inputs.table, details.panel)")
-# show_table is the last printout of steps 1-11.
-assert shows.rstrip().endswith("show_table(inputs.table, details.panel)")
-# Every block is built before the join, and the panel has its deflated label by then.
-for built in ("history = history_features(", "calendar = calendar_features(",
-              "calendar = calendar.merge(positions", "owed = receivables_features(",
-              "panel = add_deflated_label("):
-    assert calc.index(built) < calc.index("table = join_features("), built
-inspect.signature(prep.join_features).bind("panel", "history", "calendar", "owed")
-inspect.signature(script.show_table).bind("table", "panel")
-
-nan = float("nan")
-panel = pd.DataFrame({
-    "key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], dtype=object),
-    "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
-    "h": pd.Series([1, 2, 1, 2], dtype="int64"),
-    "label_status": pd.Series(["labelled", "missing_week", "labelled", "future"],
-                              dtype=object),
-    "amount": [250.0, nan, 0.0, nan],
-})
-panel["target_week"] = panel["origin_week"] + panel["h"]
-panel["amount_deflated"] = panel["amount"] / 2
-panel["paid"] = pd.array([True, None, False, None], dtype="boolean")
-history = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-B"], dtype=object),
-                        "origin_week": pd.Series([0, 1], dtype="int64"),
-                        "weeks_since_last_payment": [3.0, nan]})
-calendar = pd.DataFrame({"week": pd.Series([1, 2, 3], dtype="int64"),
-                         "business_days": pd.Series([5, 4, 5], dtype="int64")})
-owed = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], dtype=object),
-                     "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
-                     "h": pd.Series([1, 2, 1, 2], dtype="int64"),
-                     "open_balance": [10.0, 10.0, 20.0, 20.0]})
-table = prep.join_features(panel, history, calendar, owed)
-assert len(table) == 4 and table.shape[1] == 11, table.shape
-script.show_table(table, panel)
-print("ok")
-"""
-
-
-def run_table():
-    return subprocess.run([sys.executable, "-c", TABLE], cwd=REPO_ROOT,
-                          capture_output=True, text=True, encoding="utf-8", timeout=120)
-
-
-def test_training_table_is_wired_in_after_the_deflated_label():
-    result = run_table()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-
-
-def test_training_table_printout_rows_columns_and_size():
-    result = run_table()
-    assert result.returncode == 0, result.stderr
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    assert "training table: 4 rows (panel: 4), 11 columns, about 0 MB" in lines
-
-
-def test_training_table_printout_nan_shares_of_columns_with_any():
-    result = run_table()
-    assert result.returncode == 0, result.stderr
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    title = "share NaN, columns that have any:"
-    assert title in lines
-    shares = {}
-    for line in lines[lines.index(title) + 1:]:
-        if line == "one labelled, paid row:":
-            break
-        name, value = line.split()
-        shares[name] = float(value)
-    # amount, amount_deflated and paid: 2 of 4 rows; weeks_since_last_payment: B's 2 rows.
-    assert shares == {"amount": 0.5, "amount_deflated": 0.5, "paid": 0.5,
-                      "weeks_since_last_payment": 0.5}
-
-
-def test_training_table_printout_shows_one_labelled_paid_row():
-    result = run_table()
-    assert result.returncode == 0, result.stderr
-    lines = [line.strip() for line in result.stdout.splitlines()]
-    title = "one labelled, paid row:"
-    assert title in lines
-    row = dict(line.split(maxsplit=1) for line in lines[lines.index(title) + 1:-1])
-    assert row["key"] == "TR02-A"
-    assert row["label_status"] == "labelled"
-    assert row["paid"] == "True"
-    assert float(row["amount"]) == 250.0
-    assert float(row["open_balance"]) == 10.0
-    assert int(row["business_days"]) == 5
-
-
-# show_table on a table with no labelled, paid row: it says so and returns (it used to raise
-# IndexError on .iloc[0]). Run in a separate process on hand-built tables; the variant picks
-# which label_status / paid values the four rows carry.
-NO_PAID = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-variants = {{
-    "no_labelled": (["missing_week", "future", "missing_week", "future"],
-                    [None, None, None, None]),
-    "all_unpaid": (["labelled", "labelled", "missing_week", "future"],
-                   [False, False, None, None]),
-    "paid_but_not_labelled": (["future", "missing_week", "labelled", "future"],
-                              [True, True, False, None]),
-    "labelled_with_na_paid": (["labelled", "labelled", "future", "future"],
-                              [None, False, True, None]),
-    "empty": ([], []),
-}}
-status, paid = variants["{variant}"]
-n = len(status)
-table = pd.DataFrame({{
-    "key": pd.Series(["TR02-A"] * n, dtype=object),
-    "origin_week": pd.Series(range(n), dtype="int64"),
-    "h": pd.Series([1] * n, dtype="int64"),
-    "label_status": pd.Series(status, dtype=object),
-    "amount": pd.Series([0.0 if p is False else float("nan") for p in paid], dtype="float64"),
-    "paid": pd.array(paid, dtype="boolean"),
-    "business_days": pd.Series([5] * n, dtype="int64"),
-}})
-script.show_table(table, table)
-print("ok")
-"""
-
-
-def run_no_paid(variant):
-    return subprocess.run([sys.executable, "-c", NO_PAID.format(variant=variant)],
-                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-                          timeout=120)
-
-
-NO_PAID_LINE = "        no labelled, paid row to show"
-
-
-@pytest.mark.parametrize("variant", ["no_labelled", "all_unpaid", "paid_but_not_labelled",
-                                     "labelled_with_na_paid", "empty"])
-def test_training_table_printout_without_a_labelled_paid_row_says_so_and_returns(variant):
-    result = run_no_paid(variant)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    # The exact line (8-space indent), last before "ok", and no row is shown.
-    assert lines[-2:] == [NO_PAID_LINE, "ok"], lines
-    assert "one labelled, paid row:" not in [line.strip() for line in lines]
-    assert lines[0].strip().startswith("training table:")
-
-
-def test_training_table_printout_with_a_paid_row_does_not_say_none_to_show():
-    result = run_table()
-    assert result.returncode == 0, result.stderr
-    assert NO_PAID_LINE.strip() not in [line.strip() for line in result.stdout.splitlines()]
-
-
 # Step 12 (U10.1): stage 1's rows and model input at [debug] demo_origin. The wiring is
 # checked on main()'s source; the guard on demo_origin (right after steps 1-11, i.e. after
-# prepare_inputs and the unpacking of its inputs) is run from main()'s own syntax tree; the
-# printout is run on a small hand-built training table in a separate process.
-# The table: keys TR02-A (always paid) and TR04-B (never paid), origins 0..3, h = 1, 2, last
-# week 3 (targets 4 and 5 are future). At origin 2 the training rows are (0,1), (0,2), (1,1)
-# per key = 6 rows, half of them paid; the forecast rows are 2 keys x 2 h = 4 rows. Features:
-# h, mean_receipts_4 (NaN for B), has_month_end (bool), open_invoices (int).
+# prepare_inputs, the unpacking of its inputs and the top-ups) is run from main()'s own syntax
+# tree. The printout is tested in reports/test_stages.py.
 STAGE1 = """
 import inspect
-import pandas as pd
 import run_hurdle_pipeline as script
 from collection_estimation.hurdle import inputs as prep
 
@@ -1245,84 +340,14 @@ inspect.signature(script.rows_known_at).bind("table", 40)
 inspect.signature(script.rows_at_origin).bind("table", 40)
 inspect.signature(script.stage1_features).bind("rows", [], [], True)
 
-nan = float("nan")
-rows = [(key, t, h) for key in ("TR02-A", "TR04-B") for t in range(0, 4) for h in (1, 2)]
-table = pd.DataFrame({
-    "key": pd.Series([r[0] for r in rows], dtype=object),
-    "company_code": pd.Series([r[0][:4] for r in rows], dtype=object),
-    "customer_id": pd.Series([r[0][5:] for r in rows], dtype=object),
-    "origin_week": pd.Series([r[1] for r in rows], dtype="int64"),
-    "h": pd.Series([r[2] for r in rows], dtype="int64"),
-})
-table["target_week"] = table["origin_week"] + table["h"]
-future = table["target_week"] > 3
-table["label_status"] = pd.Series(["future" if f else "labelled" for f in future], dtype=object)
-is_a = table["key"] == "TR02-A"
-table["amount"] = [nan if f else (100.0 if a else 0.0) for f, a in zip(future, is_a)]
-table["amount_deflated"] = table["amount"]
-table["paid"] = pd.array([None if f else bool(a) for f, a in zip(future, is_a)],
-                         dtype="boolean")
-table["mean_receipts_4"] = [1.0 if a else nan for a in is_a]
-table["has_month_end"] = table["target_week"] % 2 == 1
-table["open_invoices"] = pd.Series(table["origin_week"] * 2, dtype="int64")
-
-history = table[["key", "origin_week", "mean_receipts_4"]].drop_duplicates(["key", "origin_week"])
-calendar = (table[["target_week", "has_month_end"]].drop_duplicates("target_week")
-            .rename(columns={"target_week": "week"}))
-owed = table[["key", "origin_week", "h", "open_invoices"]]
-columns = script.feature_columns(prep.block_feature_columns(history, calendar, owed),
-                                 ("history", "calendar", "receivables"))
-assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices"], columns
-origin = ORIGIN
-train_rows = script.rows_known_at(table, origin)
-forecast_rows = script.rows_at_origin(table, origin)
-companies = ["TR02", "TR04", "TR05"]
-train_x = script.stage1_features(train_rows, columns, companies, COMPANY_AS_FEATURE)
-script.show_stage1_rows(origin, train_rows, forecast_rows, train_x)
 print("ok")
 """
 
 
-def run_stage1(company=True, origin=2):
-    # str.replace, not str.format: the script holds dict literals.
-    script = STAGE1.replace("COMPANY_AS_FEATURE", str(company)).replace("ORIGIN", str(origin))
-    return subprocess.run([sys.executable, "-c", script],
-                          cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-                          timeout=120)
-
-
 def test_step_12_is_wired_in_after_the_training_table():
-    result = run_stage1()
+    result = run_code(STAGE1)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
-
-
-def test_step_12_printout_rows_and_paid_share():
-    result = run_stage1()
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[0] == ("Step 12: stage 1 at forecast week 2: 6 training rows (labelled, "
-                        "target week <= 2; 50.0% paid), 4 forecast rows (origin 2, "
-                        "2 customers x h)")
-
-
-def test_step_12_printout_model_input_with_the_company():
-    result = run_stage1()
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[1] == ("        model input: 5 columns {'float64': 4, 'category': 1}; "
-                        "columns with NaN: 1")
-    assert lines[2] == "        company_code categories: ['TR02', 'TR04', 'TR05']"
-    assert lines[3:] == ["ok"]
-
-
-def test_step_12_printout_model_input_without_the_company():
-    result = run_stage1(company=False)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[1] == "        model input: 4 columns {'float64': 4}; columns with NaN: 1"
-    assert "company_code categories" not in result.stdout
-    assert lines[2:] == ["ok"]
 
 
 GUARD_TEST = "settings.debug.demo_origin + settings.receivables.horizons > inputs.last_week"
@@ -1384,8 +409,8 @@ def test_step_12_origin_is_read_from_debug_demo_origin():
 
 
 def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
-    # Steps 1-11 are one call now: the guard follows it, its printouts and the unpacking of
-    # the inputs into main()'s names, and nothing else.
+    # Steps 1-11 are one call now: the guard follows it, its printouts, the unpacking of the
+    # inputs into main()'s names and the top-ups (U12.2, U12.3), and nothing else.
     body = main_tree().body
     calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
              and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
@@ -1395,7 +420,8 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     assert len(guards) == 1
     between = body[calls[0] + 1:guards[0]]
     assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
-    for node in between[1:]:
+    assert [ast.unparse(node) for node in between[-2:]] == [SHOW_TOPUPS, COMPARE_TOPUPS_IF]
+    for node in between[1:-2]:
         assert isinstance(node, ast.Assign), ast.unparse(node)
         values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
         for value in values:
@@ -1490,17 +516,6 @@ def test_demo_origin_guard_raises_once_a_target_is_after_the_last_week(origin, h
                                 f"step 12 would have no answers")
 
 
-def test_step_12_printout_with_no_training_rows_does_not_crash():
-    # Origin 0: the earliest target is week 1, so nothing is known yet. The printout must
-    # still run (main()'s guard only bounds demo_origin from above).
-    result = run_stage1(origin=0)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[0].startswith("Step 12: stage 1 at forecast week 0: 0 training rows ")
-    assert "4 forecast rows (origin 0, 2 customers x h)" in lines[0]
-    assert lines[-1] == "ok"
-
-
 # Step 12 (U10.2, U10.3): fit stage 1 (HGB) and the logistic-regression baseline at the demo
 # origin, predict its forecast rows, score them. The wiring is checked on main()'s source; the
 # printout runs in a separate process on a hand-made frame with hand-made p's, so every number
@@ -1518,14 +533,9 @@ def test_step_12_printout_with_no_training_rows_does_not_crash():
 SCORES_WIRING = """
 import inspect
 import time
-import sklearn.metrics
 import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
 
 assert script.time is time
-assert script.log_loss is sklearn.metrics.log_loss
-assert script.brier_score_loss is sklearn.metrics.brier_score_loss
-assert script.roc_auc_score is sklearn.metrics.roc_auc_score
 from collection_estimation.hurdle import stage1
 assert script.fit_stage1 is stage1.fit_stage1
 assert script.fit_stage1_baseline is stage1.fit_stage1_baseline
@@ -1587,65 +597,6 @@ assert loop.orelse == []
 print("ok")
 """
 
-MODEL_A = "[0.8, 0.4, 0.99, 0.6, 0.2, 0.01]"
-MODEL_B = "[0.3, 0.9, 0.01, 0.6, 0.4, 0.99]"
-
-SCORES = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-forecast_rows = pd.DataFrame({
-    "key": ["TR02-A", "TR04-B", "TR02-C", "TR02-A", "TR04-B", "TR02-C"],
-    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
-    "label_status": ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"],
-    "paid": pd.array([True, False, None, True, False, None], dtype="boolean"),
-}, index=pd.Index([10, 11, 12, 13, 14, 15]))
-predictions = {name: pd.Series(values, index=forecast_rows.index, name="p")
-               for name, values in MODELS}
-fit_seconds = FIT_SECONDS
-train_rows = pd.DataFrame({"paid": pd.array([True, False, False, False], dtype="boolean")},
-                          index=pd.Index([1, 2, 3, 4]))
-copies = (forecast_rows.copy(deep=True), {n: p.copy() for n, p in predictions.items()},
-          train_rows.copy(deep=True), dict(fit_seconds))
-returned = script.show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
-assert returned is None
-pd.testing.assert_frame_equal(forecast_rows, copies[0])
-assert list(predictions) == list(copies[1])
-for name in predictions:
-    pd.testing.assert_series_equal(predictions[name], copies[1][name])
-pd.testing.assert_frame_equal(train_rows, copies[2])
-assert fit_seconds == copies[3]
-print("ok")
-"""
-
-ONE_MODEL = [("stage 1 (HGB)", MODEL_A)]
-TWO_MODELS = [("stage 1 (HGB)", MODEL_A), ("baseline (LR)", MODEL_B)]
-
-
-def run_scores(models=None, fit_seconds=None):
-    """Run SCORES with `models` [(name, p list text)] (default: model A alone) and
-    `fit_seconds` {name: seconds} (default: 1.23 s per model)."""
-    models = ONE_MODEL if models is None else models
-    if fit_seconds is None:
-        fit_seconds = {name: 1.23 for name, _ in models}
-    models_text = "[" + ", ".join(f"({name!r}, {values})" for name, values in models) + "]"
-    script = SCORES.replace("MODELS", models_text).replace("FIT_SECONDS", repr(fit_seconds))
-    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
-                          text=True, encoding="utf-8", timeout=120)
-
-
-def score_table(lines, n_rows):
-    """The header words of the score table and its `n_rows` rows as {name: [log loss, Brier,
-    AUC]}, in printed order."""
-    header = lines[1].split()
-    table = {}
-    for line in lines[2:2 + n_rows]:
-        parts = line.rsplit(maxsplit=3)
-        table[parts[0].strip()] = [float(n) for n in parts[1:]]
-    return header, table
-
 
 def test_step_12_fit_predict_and_scores_are_wired_in_after_the_rows():
     result = subprocess.run([sys.executable, "-c", SCORES_WIRING], cwd=REPO_ROOT,
@@ -1659,298 +610,6 @@ def test_step_12_loops_over_hgb_then_the_baseline_and_collects_both_dicts():
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
-
-
-def test_step_12_scores_runs_and_does_not_change_its_inputs():
-    result = run_scores(TWO_MODELS)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[-1] == "ok"
-
-
-def test_step_12_scores_first_line_counts_only_labelled_rows():
-    result = run_scores()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == ("        fitted in stage 1 (HGB) 1.2 s; scored on 4 "
-                                             "forecast rows (50.0% paid)")
-
-
-def test_step_12_scores_first_line_names_every_model_time_in_order():
-    result = run_scores(TWO_MODELS, {"stage 1 (HGB)": 12.34, "baseline (LR)": 0.26})
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == (
-        "        fitted in stage 1 (HGB) 12.3 s, baseline (LR) 0.3 s; scored on 4 forecast "
-        "rows (50.0% paid)")
-
-
-def test_step_12_scores_fit_time_has_one_decimal():
-    result = run_scores(fit_seconds={"stage 1 (HGB)": 0.04})
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0].startswith("        fitted in stage 1 (HGB) 0.0 s; ")
-
-
-def test_step_12_scores_table_by_hand():
-    result = run_scores()
-    assert result.returncode == 0, result.stderr
-    header, table = score_table(result.stdout.splitlines(), 2)
-    assert header == ["log", "loss", "Brier", "AUC"]
-    assert list(table) == ["stage 1 (HGB)", "base rate"]
-    assert table["stage 1 (HGB)"] == [0.367, 0.1, 1.0]
-    assert table["base rate"] == [0.837, 0.3125, 0.5]
-
-
-def test_step_12_scores_table_with_two_models_by_hand():
-    result = run_scores(TWO_MODELS)
-    assert result.returncode == 0, result.stderr
-    header, table = score_table(result.stdout.splitlines(), 3)
-    assert header == ["log", "loss", "Brier", "AUC"]
-    assert list(table) == ["stage 1 (HGB)", "baseline (LR)", "base rate"]
-    assert table["stage 1 (HGB)"] == [0.367, 0.1, 1.0]
-    assert table["baseline (LR)"] == [1.1321, 0.405, 0.25]
-    assert table["base rate"] == [0.837, 0.3125, 0.5]
-
-
-def test_step_12_scores_rows_follow_the_order_of_the_predictions_dict():
-    result = run_scores(list(reversed(TWO_MODELS)))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[0].startswith("        fitted in baseline (LR) 1.2 s, stage 1 (HGB) 1.2 s; ")
-    _, table = score_table(lines, 3)
-    assert list(table) == ["baseline (LR)", "stage 1 (HGB)", "base rate"]
-    assert lines[6].split() == ["mean", "p,", "baseline", "(LR)", "mean", "p,", "stage", "1",
-                                "(HGB)", "share", "paid"]
-
-
-def test_step_12_scores_a_model_is_not_scored_on_another_models_p():
-    # Two models, each scored on its own p: swapping them swaps their rows.
-    one = run_scores(TWO_MODELS)
-    two = run_scores([("stage 1 (HGB)", MODEL_B), ("baseline (LR)", MODEL_A)])
-    assert one.returncode == 0 and two.returncode == 0, (one.stderr, two.stderr)
-    _, first = score_table(one.stdout.splitlines(), 3)
-    _, second = score_table(two.stdout.splitlines(), 3)
-    assert first["stage 1 (HGB)"] == second["baseline (LR)"]
-    assert first["baseline (LR)"] == second["stage 1 (HGB)"]
-
-
-def test_step_12_scores_per_h_table_by_hand():
-    # If the missing_week (p 0.99) or future (p 0.01) row were scored, mean p would move.
-    result = run_scores()
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[4] == "        per h, mean p vs share that actually paid:"
-    assert lines[5].split() == ["mean", "p,", "stage", "1", "(HGB)", "share", "paid"]
-    assert lines[6].split() == ["h"]
-    assert lines[7].split() == ["1", "0.6", "0.5"]
-    assert lines[8].split() == ["2", "0.4", "0.5"]
-    assert lines[9:] == ["ok"]
-
-
-def test_step_12_scores_per_h_table_with_two_models_by_hand():
-    # Model B's unscored rows are 0.01 and 0.99, the other way round from A's: if either
-    # were included, its h's mean p would move.
-    result = run_scores(TWO_MODELS)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[5] == "        per h, mean p vs share that actually paid:"
-    assert lines[6].split() == ["mean", "p,", "stage", "1", "(HGB)", "mean", "p,", "baseline",
-                                "(LR)", "share", "paid"]
-    assert lines[7].split() == ["h"]
-    assert lines[8].split() == ["1", "0.6", "0.6", "0.5"]
-    assert lines[9].split() == ["2", "0.4", "0.5", "0.5"]
-    assert lines[10:] == ["ok"]
-
-
-def test_step_12_scores_per_h_table_has_no_base_rate_column():
-    result = run_scores(TWO_MODELS)
-    assert result.returncode == 0, result.stderr
-    per_h = result.stdout.split("per h, mean p vs share that actually paid:")[1]
-    assert "base rate" not in per_h
-
-
-# The real chain on the tiny STAGE1 table: fit_stage1 and fit_stage1_baseline -> predict_paid
-# -> show_stage1_scores. At origin 2 the forecast targets are weeks 3 (labelled) and 4
-# (future, last week 3): two labelled rows, TR02-A paid and TR04-B not, so the score table
-# is defined.
-STAGE1_FIT = STAGE1.replace('print("ok")', """
-from collection_estimation.hurdle.settings import Stage1Settings
-settings = Stage1Settings(max_iter=5, learning_rate=0.1, max_leaf_nodes=3, min_samples_leaf=1,
-                          random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-                          company_as_feature=COMPANY_AS_FEATURE, baseline_c=1.0)
-forecast_x = script.stage1_features(forecast_rows, columns, companies, COMPANY_AS_FEATURE)
-predictions = {}
-for name, fit in (("stage 1 (HGB)", script.fit_stage1),
-                  ("baseline (LR)", script.fit_stage1_baseline)):
-    model = fit(train_x, train_rows["paid"], settings)
-    predictions[name] = script.predict_paid(model, forecast_x)
-    assert list(predictions[name].index) == list(forecast_rows.index)
-    assert predictions[name].between(0, 1).all()
-script.show_stage1_scores(forecast_rows, predictions, train_rows,
-                          {"stage 1 (HGB)": 0.5, "baseline (LR)": 0.25})
-print("ok")
-""")
-
-
-@pytest.mark.parametrize("company", [True, False])
-def test_step_12_real_fit_predict_and_scores_on_the_tiny_table(company):
-    script = STAGE1_FIT.replace("COMPANY_AS_FEATURE", str(company)).replace("ORIGIN", "2")
-    result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    scores = [line for line in lines if line.startswith("        fitted in")]
-    assert scores == ["        fitted in stage 1 (HGB) 0.5 s, baseline (LR) 0.2 s; scored on 2 "
-                      "forecast rows (50.0% paid)"]
-    start = lines.index("        per h, mean p vs share that actually paid:")
-    assert [line.split()[0] for line in lines[start - 3:start]] == ["stage", "baseline", "base"]
-    # Only h=1 is labelled at origin 2 (h=2 targets week 4, after the last week 3).
-    assert [line.split()[0] for line in lines[start + 3:-1]] == ["1"]
-    assert lines[-1] == "ok"
-
-
-ONE_CLASS = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-forecast_rows = pd.DataFrame({"key": list("abcd"), "h": np.array([1, 1, 2, 2]),
-                              "label_status": ["labelled"] * 3 + ["missing_week"],
-                              "paid": pd.array([True, True, True, None], dtype="boolean")},
-                             index=[5, 6, 7, 8])
-predictions = {"stage 1 (HGB)": pd.Series([0.7, 0.3, 0.6, 0.2], index=forecast_rows.index),
-               "baseline (LR)": pd.Series([0.5, 0.5, 0.5, 0.5], index=forecast_rows.index)}
-train_rows = pd.DataFrame({"paid": pd.array([True, False], dtype="boolean")})
-script.show_stage1_scores(forecast_rows, predictions, train_rows,
-                          {"stage 1 (HGB)": 0.1, "baseline (LR)": 0.1})
-print("ok")
-"""
-
-
-def test_step_12_scores_with_one_class_among_labelled_rows_shows_nan_auc_and_runs():
-    # sklearn 1.9's roc_auc_score warns and returns NaN for a single class; the printout
-    # must still finish, for every model.
-    result = subprocess.run([sys.executable, "-c", ONE_CLASS], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[0] == ("        fitted in stage 1 (HGB) 0.1 s, baseline (LR) 0.1 s; scored on 3 "
-                        "forecast rows (100.0% paid)")
-    assert lines[2].split()[-1] == "NaN" and lines[2].startswith("stage 1 (HGB)")
-    assert lines[3].split()[-1] == "NaN" and lines[3].startswith("baseline (LR)")
-    assert lines[4].split()[-1] == "0.5" and lines[4].startswith("base rate")
-    assert lines[-1] == "ok"
-
-
-# No labelled forecast row: show_stage1_scores prints one line and returns. Every target week
-# of the origin can be a missing week, after the last week (future), a mix of both, or there
-# may be no forecast row at all.
-NO_LABELLED = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-statuses = STATUSES
-forecast_rows = pd.DataFrame({
-    "key": [f"TR02-{i}" for i in range(len(statuses))],
-    "h": np.array([1 + i % 2 for i in range(len(statuses))], dtype="int64"),
-    "label_status": pd.array(statuses, dtype=object),
-    "paid": pd.array([None] * len(statuses), dtype="boolean"),
-}, index=pd.Index(range(20, 20 + len(statuses))))
-fit_seconds = FIT_SECONDS
-predictions = {name: pd.Series(np.linspace(0.1, 0.9, len(statuses)), index=forecast_rows.index,
-                               name="p") for name in fit_seconds}
-train_rows = pd.DataFrame({"paid": pd.array([True, False, False], dtype="boolean")})
-copies = (forecast_rows.copy(deep=True), {n: p.copy() for n, p in predictions.items()},
-          train_rows.copy(deep=True), dict(fit_seconds))
-assert list(forecast_rows["label_status"]) == statuses  # the frame holds what we meant
-returned = script.show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)
-assert returned is None
-pd.testing.assert_frame_equal(forecast_rows, copies[0])
-for name in predictions:
-    pd.testing.assert_series_equal(predictions[name], copies[1][name])
-pd.testing.assert_frame_equal(train_rows, copies[2])
-assert fit_seconds == copies[3]
-print("ok")
-"""
-
-NO_LABELLED_CASES = {
-    "all_missing_week": ["missing_week"] * 4,
-    "all_future": ["future"] * 3,
-    "missing_week_and_future": ["missing_week", "future", "missing_week", "future", "future"],
-    "empty": [],
-}
-
-TWO_TIMES = {"stage 1 (HGB)": 2.345, "baseline (LR)": 0.06}
-
-
-def run_no_labelled(case, fit_seconds=None):
-    fit_seconds = TWO_TIMES if fit_seconds is None else fit_seconds
-    script = (NO_LABELLED.replace("STATUSES", repr(NO_LABELLED_CASES[case]))
-              .replace("FIT_SECONDS", repr(fit_seconds)))
-    return subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
-                          text=True, encoding="utf-8", timeout=120)
-
-
-@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
-def test_step_12_scores_without_labelled_rows_does_not_raise(case):
-    result = run_no_labelled(case)
-    assert result.returncode == 0, result.stderr
-    assert "Traceback" not in result.stderr
-
-
-@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
-def test_step_12_scores_without_labelled_rows_prints_only_the_one_line(case):
-    # The exact line, then nothing from the function: the next line is the caller's "ok".
-    result = run_no_labelled(case)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "        fitted in stage 1 (HGB) 2.3 s, baseline (LR) 0.1 s; no labelled forecast "
-        "rows to score", "ok"]
-
-
-@pytest.mark.parametrize("case", list(NO_LABELLED_CASES))
-def test_step_12_scores_without_labelled_rows_prints_no_table(case):
-    result = run_no_labelled(case)
-    assert result.returncode == 0, result.stderr
-    for word in ("scored on", "log loss", "Brier", "AUC", "base rate", "per h", "mean p"):
-        assert word not in result.stdout, word
-
-
-def test_step_12_scores_without_labelled_rows_fit_time_has_one_decimal():
-    result = run_no_labelled("all_missing_week", fit_seconds={"stage 1 (HGB)": 0.04})
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == (
-        "        fitted in stage 1 (HGB) 0.0 s; no labelled forecast rows to score")
-
-
-def test_step_12_scores_with_labelled_rows_does_not_print_the_no_rows_line():
-    # The normal case (SCORES: four labelled rows) keeps its full printout.
-    result = run_scores(TWO_MODELS)
-    assert result.returncode == 0, result.stderr
-    assert "no labelled forecast rows to score" not in result.stdout
-    lines = result.stdout.splitlines()
-    assert lines[0] == ("        fitted in stage 1 (HGB) 1.2 s, baseline (LR) 1.2 s; scored on 4 "
-                        "forecast rows (50.0% paid)")
-    assert lines[1].split() == ["log", "loss", "Brier", "AUC"]
-    assert lines[2].startswith("stage 1 (HGB)") and lines[3].startswith("baseline (LR)")
-    assert lines[4].startswith("base rate")
-    assert lines[5] == "        per h, mean p vs share that actually paid:"
-    assert len(lines) == 11 and lines[-1] == "ok"
-
-
-def test_step_12_scores_with_one_labelled_row_among_unlabelled_still_scores():
-    # The guard is on "no labelled row", not on "any unlabelled row".
-    script = NO_LABELLED.replace(
-        "STATUSES", repr(["missing_week", "labelled", "future"])).replace(
-        "FIT_SECONDS", repr({"stage 1 (HGB)": 1.0}))
-    script = script.replace('"paid": pd.array([None] * len(statuses), dtype="boolean")',
-                            '"paid": pd.array([None, True, None], dtype="boolean")')
-    result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True,
-                            text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert "no labelled forecast rows to score" not in result.stdout
-    assert result.stdout.splitlines()[0] == (
-        "        fitted in stage 1 (HGB) 1.0 s; scored on 1 forecast rows (100.0% paid)")
 
 
 # The second guard (U10.4a): when [diagnostic] run is on, its test weeks (up to origin +
@@ -2130,11 +789,16 @@ def test_diagnostic_guard_comes_before_the_long_steps():
         assert guard < source.index(later), later
 
 
+def run_code(code):
+    return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True,
+                          text=True, encoding="utf-8", timeout=300)
+
+
 # Step 13 (U10.4b/c): the stage 1 diagnostic. For HGB, then LR: grid_search on validation,
 # choose_and_test on the test rows, the chosen setting refitted on train for the permutation
 # importance on validation, then show_diagnostic_grid; after both, show_diagnostic_test and
 # write_tables. (The U10.4a demo on step 12's predictions, with its "too few outcomes" skip,
-# is gone; its tests went with it.)
+# is gone; its tests went with it.) The printouts are tested in reports/test_stages.py.
 #
 # Wiring is checked on main()'s syntax tree. The block itself is run in a separate process
 # (exec of main()'s own `if settings.diagnostic.run:` statement) on a tiny hand-made table:
@@ -2142,49 +806,6 @@ def test_diagnostic_guard_comes_before_the_long_steps():
 # row -> 27 labelled rows per week: train weeks 0..4 = 135 rows, validation 5..6 = 54, refit
 # 189, test 7..8 = 54; week 9 is after the test weeks. Grids: HGB 2 x 1 x 1 x 2 = 4 settings
 # of at most 10 trees, LR 2 x 2 = 4 settings. CSV output goes to pytest's tmp_path only.
-
-STEP_13_SPLIT_TABLE = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.diagnostic import diagnostic_splits
-
-# T = 2, H = 2. Target weeks 0, 1, 2 (paid T, F, T) -> train 3 rows, 66.7% paid; 3 (T) and
-# 4 (F) -> validation 2 rows, 50.0% (a missing_week row at week 3 is left out); refit 5 rows,
-# 60.0%; 5, 6 (T, T) -> test 2 rows, 100.0%; week 7 is after the test weeks.
-weeks = [0, 1, 2, 3, 3, 4, 5, 6, 7]
-statuses = ["labelled"] * 4 + ["missing_week"] + ["labelled"] * 4
-table = pd.DataFrame({
-    "target_week": np.array(weeks, dtype="int64"),
-    "label_status": np.array(statuses, dtype=object),
-    "paid": pd.array([True, False, True, True, None, False, True, True, False],
-                     dtype="boolean"),
-})
-script.show_diagnostic_splits(diagnostic_splits(table, 2, 2), 2, 2)
-print("ok")
-"""
-
-STEP_13_SPLIT_LINES = [
-    "Step 13: stage 1 diagnostic at origin 2 (diagnostic only, never the forecast)",
-    "        train              3 rows,  66.7% paid (target <= 2)",
-    "        validation         2 rows,  50.0% paid (2 < target <= 4)",
-    "        refit              5 rows,  60.0% paid (target <= 4)",
-    "        test               2 rows, 100.0% paid (4 < target <= 6)",
-]
-
-
-def run_code(code):
-    return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True,
-                          text=True, encoding="utf-8", timeout=300)
-
-
-def test_step_13_split_printout_by_hand():
-    result = run_code(STEP_13_SPLIT_TABLE)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == STEP_13_SPLIT_LINES + ["ok"]
-
-
 STEP_13 = """
 import ast
 import inspect
@@ -2884,134 +1505,6 @@ def test_step_13_old_too_few_outcomes_skip_is_gone():
     assert "at step 12's origin, best F1 threshold" not in source
 
 
-# show_diagnostic_grid / show_diagnostic_test on tiny hand-made frames.
-SHOW = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-grid = pd.DataFrame({
-    "candidate": [3, 0, 6, 1, 5, 2, 4][:N_GRID],
-    "C": [10.0, 0.01, 1.0, 0.1, 100.0, 0.5, 2.0][:N_GRID],
-    "class_weight": ["balanced", "none", "none", "balanced", "none", "balanced", "none"][:N_GRID],
-    "avg precision": [0.987654321, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05][:N_GRID],
-    "fit seconds": [1.23456, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0][:N_GRID],
-})
-importance = pd.DataFrame({"feature": [f"f{i}" for i in range(N_IMPORTANCE)],
-                           "log loss rise": np.linspace(0.0123456789, -0.001, N_IMPORTANCE),
-                           "std": np.full(N_IMPORTANCE, 0.000123456)})
-copies = (grid.copy(deep=True), importance.copy(deep=True))
-WHAT
-pd.testing.assert_frame_equal(grid, copies[0])
-pd.testing.assert_frame_equal(importance, copies[1])
-print("ok")
-"""
-
-
-def run_show(what, n_grid=7, n_importance=20):
-    return run_code(SHOW.replace("N_GRID", str(n_grid))
-                    .replace("N_IMPORTANCE", str(n_importance)).replace("WHAT", what))
-
-
-def expected_grid_printout(name, n_grid, n_importance, metric="avg precision"):
-    import numpy as np
-    import pandas as pd
-    grid = pd.DataFrame({
-        "C": [10.0, 0.01, 1.0, 0.1, 100.0, 0.5, 2.0][:n_grid],
-        "class_weight": ["balanced", "none", "none", "balanced", "none", "balanced",
-                         "none"][:n_grid],
-        "avg precision": [0.987654321, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05][:n_grid],
-        "fit seconds": [1.23456, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0][:n_grid],
-    })
-    importance = pd.DataFrame({"feature": [f"f{i}" for i in range(n_importance)],
-                               "log loss rise": np.linspace(0.0123456789, -0.001, n_importance),
-                               "std": np.full(n_importance, 0.000123456)})
-    return ([f"        {name}: the 5 best of {n_grid} settings by validation {metric}"]
-            + grid.head(5).round(4).to_string(index=False).splitlines()
-            + [f"        {name}: the 15 most important features (rise in validation log loss "
-               f"when shuffled)"]
-            + importance.head(15).round(5).to_string(index=False).splitlines())
-
-
-def test_show_diagnostic_grid_printout():
-    result = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')")
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines == expected_grid_printout("LR", 7, 20) + ["ok"]
-
-
-def test_show_diagnostic_grid_drops_the_candidate_column_and_rounds():
-    result = run_show("script.show_diagnostic_grid('HGB', grid, importance, 'avg precision')")
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    header = lines[1]
-    assert "candidate" not in header
-    assert header.split() == ["C", "class_weight", "avg", "precision", "fit", "seconds"]
-    assert len(lines) == 1 + 1 + 5 + 1 + 1 + 15 + 1
-    assert "0.9877" in lines[2] and "1.2346" in lines[2]
-    assert "0.987654" not in result.stdout
-    assert "0.01235" in lines[9]          # importance rounded to 5 places
-    assert "f14" in lines[-2] and "f15" not in result.stdout
-
-
-def test_show_diagnostic_grid_with_fewer_rows_than_shown_prints_them_all():
-    result = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')",
-                      n_grid=2, n_importance=3)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines == expected_grid_printout("LR", 2, 3) + ["ok"]
-    # The header still says "the 5 best" (pinned: it states the cap, not the count shown).
-    assert lines[0] == "        LR: the 5 best of 2 settings by validation avg precision"
-
-
-def test_show_diagnostic_test_printout():
-    code = ("test = pd.DataFrame([{'model': 'HGB', 'max_iter': 300, 'F1': 0.123456, "
-            "'threshold': 0.55555}, {'model': 'LR', 'max_iter': np.nan, 'F1': 0.5, "
-            "'threshold': 0.25}])\n"
-            "before = test.copy(deep=True)\n"
-            "script.show_diagnostic_test(test)\n"
-            "pd.testing.assert_frame_equal(test, before)\n"
-            "print('EXPECTED')\n"
-            "print(test.round(4).to_string(index=False))\n")
-    result = run_show(code)
-    assert result.returncode == 0, result.stderr
-    out, expected = result.stdout.split("EXPECTED\n")
-    lines = out.splitlines()
-    assert lines[0] == ("        TEST (target weeks after the validation weeks), each model's "
-                        "chosen setting at its validation threshold:")
-    assert lines[1:] == expected.splitlines()[:-1]   # minus the final "ok"
-    assert "0.1235" in lines[2] and "0.5556" in lines[2]
-    assert lines[2].split()[0] == "HGB" and lines[3].split()[0] == "LR"
-
-
-# --- U10.4b': step 13 ranks each grid by [diagnostic] selection_metric -----------------------
-
-@pytest.mark.parametrize("metric", ["log loss", "brier"])
-def test_show_diagnostic_grid_header_names_the_metric(metric):
-    result = run_show(f"script.show_diagnostic_grid('HGB', grid, importance, {metric!r})")
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[0] == f"        HGB: the 5 best of 7 settings by validation {metric}"
-    assert lines == expected_grid_printout("HGB", 7, 20, metric) + ["ok"]
-    assert "average precision" not in lines[0]
-
-
-def test_show_diagnostic_grid_metric_does_not_reorder_the_grid():
-    # The printout shows the grid as given (grid_search already sorted it); the metric is only
-    # named in the header. The hand-made grid has no log loss column at all.
-    by_ap = run_show("script.show_diagnostic_grid('LR', grid, importance, 'avg precision')")
-    by_ll = run_show("script.show_diagnostic_grid('LR', grid, importance, 'log loss')")
-    assert by_ap.returncode == 0 and by_ll.returncode == 0, (by_ap.stderr, by_ll.stderr)
-    assert by_ap.stdout.splitlines()[1:] == by_ll.stdout.splitlines()[1:]
-
-
-def test_show_diagnostic_grid_needs_the_metric():
-    result = run_show("script.show_diagnostic_grid('LR', grid, importance)")
-    assert result.returncode != 0
-    assert "TypeError" in result.stderr
-
-
 @pytest.mark.parametrize("metric", ["log loss", "brier", "avg precision"])
 def test_step_13_spy_passes_the_settings_metric_through(metric, tmp_path):
     # SPY_CHECKS assert grid_search got metric=settings.diagnostic.selection_metric by keyword
@@ -3261,103 +1754,12 @@ def test_step_13_real_run_with_only_weighted_settings_skips_both_calibrations(tm
     assert lines[skip + 1].startswith("  ... LR 1 of 2"), lines[skip + 1]
 
 
-# --- show_calibration ----------------------------------------------------------------------------
-
-SHOW_CALIBRATION = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-keys = ["mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
-        "calibration error", "resolution", "uncertainty", "decomposition gap",
-        "log loss skill", "brier skill", "AUC"]
-rows = []
-for part, offset in (("validation", 0.5), ("test", 0.0)):
-    for m, label in enumerate(["Zeta", "Alpha + Platt", "base rate"]):
-        for k, h in enumerate([1, 2, "all"]):
-            values = {key: offset + 0.0123456789 * (i + 1) + 0.1 * m + 0.01 * k
-                      for i, key in enumerate(keys)}
-            rows.append({"part": part, "model": label, "h": h, **values})
-calibration = pd.DataFrame(rows)
-before = calibration.copy(deep=True)
-script.show_calibration(calibration)
-pd.testing.assert_frame_equal(calibration, before)
-print("EXPECTED")
-test = before[before["part"] == "test"]
-columns = ["model", "mean p", "share paid", "ECE", "slope", "intercept", "log loss", "brier",
-           "log loss skill", "brier skill", "AUC"]
-print(test[test["h"] == "all"][columns].round(4).to_string(index=False))
-print("PIVOT")
-for label in ["Zeta", "Alpha + Platt", "base rate"]:
-    print(label + " [" + ", ".join(
-        str(round(v, 4)) for v in test[test["model"] == label]["log loss skill"]) + "]")
-"""
-
-
-def test_show_calibration_printout():
-    result = run_code(SHOW_CALIBRATION)
-    assert result.returncode == 0, result.stderr
-    out, rest = result.stdout.split("EXPECTED\n")
-    table, pivot_rows = rest.split("PIVOT\n")
-    lines = out.splitlines()
-    assert lines[0] == ("        CALIBRATION on test, all horizons (train-only models; skill "
-                        "against the base rate):")
-    shown = table.splitlines()
-    assert len(shown) == 1 + 3
-    assert lines[1:1 + len(shown)] == shown
-    assert lines[1 + len(shown)] == "        log-loss skill per horizon, on test:"
-    pivot = lines[2 + len(shown):]
-    # Two header lines (h, then model), then one line per model in first-seen order (Zeta
-    # before Alpha: not sorted), its log-loss skill for h 1, 2 and all.
-    assert len(pivot) == 2 + 3, pivot
-    assert pivot[0].split() == ["h", "1", "2", "all"]
-    assert pivot[1].split() == ["model"]
-    expected = {}
-    for line in pivot_rows.splitlines():
-        label, values = line.split(" [")
-        expected[label] = [float(v) for v in values.rstrip("]").split(", ")]
-    for line, label in zip(pivot[2:], ["Zeta", "Alpha + Platt", "base rate"]):
-        assert line.startswith(label), (line, label)
-        assert [float(v) for v in line[len(label):].split()] == expected[label]
-
-
-def test_show_calibration_shows_only_test_rows_pooled_and_rounds():
-    result = run_code(SHOW_CALIBRATION)
-    assert result.returncode == 0, result.stderr
-    out = result.stdout.split("EXPECTED\n")[0]
-    lines = out.splitlines()
-    table = lines[2:5]
-    assert [line.split()[0] for line in table] == ["Zeta", "Alpha", "base"]
-    # Validation values are 0.5 higher: Zeta's pooled mean p there is 0.5 + .0123 + .02 =
-    # 0.5323; on test 0.0323 (rounded to 4 places).
-    assert "0.5323" not in out
-    assert table[0].split()[1] == "0.0323"
-    assert "0.032345" not in out
-    header = lines[1]
-    for gone in ("calibration error", "resolution", "uncertainty", "decomposition gap"):
-        assert gone not in header
-    assert header.split()[0] == "model" and "part" not in header
-
-
-def test_show_calibration_without_test_rows_does_not_fail():
-    code = ("import pandas as pd\nimport run_hurdle_pipeline as script\n"
-            "script.show_calibration(pd.DataFrame({'part': ['validation'], 'model': ['M'], "
-            "'h': ['all'], 'mean p': [0.1], 'share paid': [0.1], 'ECE': [0.0], 'slope': [1.0], "
-            "'intercept': [0.0], 'log loss': [0.3], 'brier': [0.1], 'log loss skill': [0.0], "
-            "'brier skill': [0.0], 'AUC': [0.5]}))\nprint('ok')\n")
-    result = run_code(code)
-    # Pinned behaviour: with no test rows the printout's tables are empty, nothing fails.
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[-1] == "ok"
-
-
 # --- Step 14 (U11.1): fit stage 2 on the paid training rows at the demo origin -----------------
 # The wiring is checked on main()'s syntax tree: step 14 is the last part of main(), at its top
 # level after step 13's `if settings.diagnostic.run:` block (so it runs whether or not the
 # diagnostic does), with stage 2's own feature blocks and settings, and stage 1's company
-# switch. The printout runs on a hand-made frame, every number worked out by hand; the real
-# chain runs on step 12's tiny STAGE1 table.
+# switch. The printouts and the real chain on a tiny table are tested in
+# reports/test_stages.py.
 
 STEP_14_WIRING = """
 import ast
@@ -3514,400 +1916,6 @@ def test_step_14_never_fits_stage_2_with_the_stage_1_settings():
     assert 'paid_rows["amount"]' not in source   # the target is the deflated amount
 
 
-# show_stage2_fit on a hand-made frame. Paid amounts 1,000, 2,000, 3,000 and 1,000,000:
-# median (2,000 + 3,000) / 2 = 2,500; mean 1,006,000 / 4 = 251,500; 99th percentile (linear,
-# position 0.99 x 3 = 2.97) 3,000 + 0.97 x 997,000 = 970,090; max 1,000,000. 1,234 training
-# rows, 5 input columns, 1.25 s shown as 1.2 s (one decimal).
-SHOW_STAGE2 = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-paid_rows = pd.DataFrame({"amount_deflated": [1_000.0, 2_000.0, 3_000.0, 1_000_000.0],
-                          "amount": [9.0, 9.0, 9.0, 9.0]}, index=[3, 7, 8, 20])
-train_rows = pd.DataFrame({"paid": np.zeros(1234, dtype=bool)})
-paid_x = pd.DataFrame(np.ones((4, 5)), columns=list("abcde"), index=paid_rows.index)
-copies = (paid_rows.copy(deep=True), train_rows.copy(deep=True), paid_x.copy(deep=True))
-returned = script.show_stage2_fit(40, paid_rows, train_rows, paid_x, LOSS, FIT_SECONDS)
-assert returned is None
-pd.testing.assert_frame_equal(paid_rows, copies[0])
-pd.testing.assert_frame_equal(train_rows, copies[1])
-pd.testing.assert_frame_equal(paid_x, copies[2])
-print("ok")
-"""
-
-
-def run_show_stage2(loss="poisson", fit_seconds=1.25):
-    return run_code(SHOW_STAGE2.replace("LOSS", repr(loss))
-                    .replace("FIT_SECONDS", repr(fit_seconds)))
-
-
-def test_show_stage2_fit_printout_by_hand():
-    result = run_show_stage2()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "Step 14: stage 2 at forecast week 40: 4 paid training rows (of 1,234), 5 input "
-        "columns, loss 'poisson', fitted in 1.2 s",
-        "        deflated amount per paid row: median 2,500, mean 251,500, 99th percentile "
-        "970,090, max 1,000,000",
-        "ok",
-    ]
-
-
-@pytest.mark.parametrize("loss", ["gamma", "squared_error"])
-def test_show_stage2_fit_names_the_loss_it_is_given(loss):
-    result = run_show_stage2(loss=loss)
-    assert result.returncode == 0, result.stderr
-    assert f"loss {loss!r}, fitted in" in result.stdout.splitlines()[0]
-
-
-@pytest.mark.parametrize("seconds, shown", [(0.04, "0.0"), (0.06, "0.1"), (12.345, "12.3")])
-def test_show_stage2_fit_time_has_one_decimal(seconds, shown):
-    result = run_show_stage2(fit_seconds=seconds)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0].endswith(f"fitted in {shown} s")
-
-
-def test_show_stage2_fit_reads_the_deflated_amount_not_the_nominal_one():
-    # The frame's `amount` column is 9 everywhere: none of the printed numbers is 9.
-    result = run_show_stage2()
-    assert result.returncode == 0, result.stderr
-    assert " 9," not in result.stdout and " 9\n" not in result.stdout
-
-
-# The real chain on step 12's tiny STAGE1 table at origin 2: 6 training rows, of which the 3
-# TR02-A rows are paid, each with amount_deflated 100. Stage 2's blocks are ("history",) only,
-# unlike stage 1's three: input h, mean_receipts_4 and (with the company) company_code.
-STEP_14_CHAIN = """
-import time
-from collection_estimation.hurdle.settings import Stage2Settings
-settings_stage2 = Stage2Settings(loss=LOSS, max_iter=5, learning_rate=0.1, max_leaf_nodes=2,
-                                 min_samples_leaf=1, random_seed=1, feature_blocks=("history",),
-                                 scale=SCALE, balance_floor="median", own_mean_window=4,
-                                 own_mean_prior_weeks=1.0)
-if SCALE == "open balance":
-    # The tiny table has no open balance: 50 everywhere, below the floor (the median paid
-    # training amount, 100), so every E is lifted to 100 and s = 1.
-    train_rows = train_rows.assign(open_balance=50.0)
-    forecast_rows = forecast_rows.assign(open_balance=50.0)
-stage2_columns = script.feature_columns(prep.block_feature_columns(history, calendar, owed),
-                                        settings_stage2.feature_blocks)
-assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
-paid_rows = train_rows[train_rows["paid"].astype(bool)]
-paid_x = script.stage1_features(paid_rows, stage2_columns, companies, COMPANY_AS_FEATURE)
-paid_exposure = script.exposure(train_rows, paid_rows, settings_stage2)
-forecast_exposure = script.exposure(train_rows, forecast_rows, settings_stage2)
-assert (paid_exposure == (1.0 if SCALE == "none" else 100.0)).all(), paid_exposure
-started = time.perf_counter()
-stage2_model = script.fit_stage2(paid_x, paid_rows["amount_deflated"], paid_exposure,
-                                 settings_stage2)
-script.show_stage2_fit(origin, paid_rows, train_rows, paid_x, settings_stage2.loss,
-                       time.perf_counter() - started)
-script.show_exposure(settings_stage2, paid_rows, paid_exposure, forecast_rows,
-                     forecast_exposure)
-assert len(paid_rows) == 3 and paid_rows["key"].eq("TR02-A").all()
-m = stage2_model.predict(paid_x) * paid_exposure.to_numpy()
-assert abs(m - 100.0).max() < 1e-6, m
-# U11.2: the training ratio, m on the 4 forecast rows, and p x m with a hand-made p of 0.5.
-training_ratio = script.total_ratio(stage2_model, paid_x, paid_rows["amount_deflated"],
-                                    paid_exposure)
-assert abs(training_ratio - 1.0) < 1e-9, training_ratio
-forecast_m = script.predict_amount(stage2_model, script.stage1_features(
-    forecast_rows, stage2_columns, companies, COMPANY_AS_FEATURE), forecast_exposure)
-assert forecast_m.index.equals(forecast_rows.index) and forecast_m.name == "m"
-p = pd.Series(0.5, index=forecast_rows.index, name="p")
-script.show_stage2_forecast(forecast_rows, forecast_m, p, training_ratio)
-print("chain ok")
-"""
-
-
-def run_step_14_chain(company=True, loss="poisson", scale="none"):
-    stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
-    code = (stage1_part + STEP_14_CHAIN).replace("COMPANY_AS_FEATURE", str(company)) \
-        .replace("ORIGIN", "2").replace("LOSS", repr(loss)).replace("SCALE", repr(scale))
-    return run_code(code)
-
-
-EXPOSURE_LINES = {
-    "none": "        scale 'none': E = 1, stage 2 learns the amount itself",
-    "open balance": ("        scale 'open balance', floor 'median': stage 2 learns the share "
-                     "of the balance paid; lifted to the floor: 3 of 3 paid training rows, "
-                     "4 of 4 forecast rows"),
-}
-
-
-@pytest.mark.parametrize("scale", ["none", "open balance"])
-@pytest.mark.parametrize("company", [True, False])
-@pytest.mark.parametrize("loss", ["poisson", "gamma", "squared_error"])
-def test_step_14_real_chain_on_the_tiny_table(company, loss, scale):
-    result = run_step_14_chain(company=company, loss=loss, scale=scale)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "chain ok"
-    step_14 = [line for line in lines if line.startswith("Step 14")]
-    assert len(step_14) == 1
-    columns = 3 if company else 2
-    assert step_14[0].startswith(f"Step 14: stage 2 at forecast week 2: 3 paid training rows "
-                                 f"(of 6), {columns} input columns, loss {loss!r}, fitted in ")
-    start = lines.index(step_14[0])
-    # At origin 2 the forecast targets are week 3 (h=1, labelled: TR02-A paid 100, TR04-B 0)
-    # and week 4 (h=2, future, left out). m = 100 everywhere, p = 0.5: p x m = 50 + 50 = 100
-    # against 100 actual.
-    assert lines[start + 1:-1] == [
-        "        deflated amount per paid row: median 100, mean 100, 99th percentile 100, "
-        "max 100",
-        EXPOSURE_LINES[scale],
-        "        training total ratio (sum of m / sum of actual, paid rows): 1.0000",
-        "        m on the 4 forecast rows: median 100, mean 100",
-        "        per h, the whole model (sum of p x m) against the actual cash, deflated:",
-        "     mean m  p x m  actual cash  ratio",
-        "h                                     ",
-        "1     100.0  100.0        100.0    1.0",
-        "all   100.0  100.0        100.0    1.0",
-    ]
-
-
-# --- Step 14 (U11.2): show_stage2_forecast on a hand-made frame -----------------------------------
-# Six forecast rows: h=1: labelled (actual 300), labelled (0), missing_week; h=2: labelled
-# (100), labelled (0), future. m = 100, 200, [999], 400, 50, [777]; p = .5, .25, [.9], .5, .2,
-# [.9] (bracketed rows are not labelled and must be left out of the table).
-#   h=1: mean m (100 + 200) / 2 = 150; p x m 50 + 50 = 100; actual 300; ratio 0.333
-#   h=2: mean m (400 + 50) / 2 = 225; p x m 200 + 10 = 210; actual 100; ratio 2.1
-#   all: mean m 750 / 4 = 187.5, shown 188 (half to even); p x m 310; actual 400; ratio 0.775
-# The second line uses every forecast row: m sorted 50, 100, 200, 400, 777, 999, median 300,
-# mean 2,526 / 6 = 421.
-SHOW_FORECAST = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-nan = float("nan")
-forecast_rows = pd.DataFrame({
-    "h": np.array([1, 1, 1, 2, 2, 2], dtype="int64"),
-    "label_status": LABELS,
-    "amount_deflated": [300.0, 0.0, nan, 100.0, 0.0, nan],
-    "amount": [7.0] * 6,
-}, index=pd.Index([10, 11, 12, 13, 14, 15]))
-m = pd.Series([100.0, 200.0, 999.0, 400.0, 50.0, 777.0], index=forecast_rows.index, name="m")
-p = pd.Series([0.5, 0.25, 0.9, 0.5, 0.2, 0.9], index=forecast_rows.index, name="p")
-copies = (forecast_rows.copy(deep=True), m.copy(), p.copy())
-returned = script.show_stage2_forecast(forecast_rows, m, p, RATIO)
-assert returned is None
-pd.testing.assert_frame_equal(forecast_rows, copies[0])
-pd.testing.assert_series_equal(m, copies[1])
-pd.testing.assert_series_equal(p, copies[2])
-print("ok")
-"""
-
-FORECAST_LABELS = ["labelled", "labelled", "missing_week", "labelled", "labelled", "future"]
-FORECAST_HEAD = [
-    "        training total ratio (sum of m / sum of actual, paid rows): 1.0000",
-    "        m on the 6 forecast rows: median 300, mean 421",
-]
-
-
-def run_show_forecast(labels=None, ratio=1.00004):
-    labels = FORECAST_LABELS if labels is None else labels
-    return run_code(SHOW_FORECAST.replace("LABELS", repr(labels)).replace("RATIO", repr(ratio)))
-
-
-def test_show_stage2_forecast_printout_by_hand():
-    result = run_show_forecast()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == FORECAST_HEAD + [
-        "        per h, the whole model (sum of p x m) against the actual cash, deflated:",
-        "     mean m  p x m  actual cash  ratio",
-        "h                                     ",
-        "1     150.0  100.0        300.0  0.333",
-        "2     225.0  210.0        100.0  2.100",
-        "all   188.0  310.0        400.0  0.775",
-        "ok",
-    ]
-
-
-def test_show_stage2_forecast_training_ratio_has_four_decimals():
-    result = run_show_forecast(ratio=0.987654)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == (
-        "        training total ratio (sum of m / sum of actual, paid rows): 0.9877")
-
-
-def test_show_stage2_forecast_leaves_unlabelled_rows_out_of_the_table():
-    # Labelling the missing week and the future row would bring in m 999 / 777 and p 0.9;
-    # neither value appears in the hand-checked table above.
-    result = run_show_forecast()
-    assert result.returncode == 0, result.stdout
-    table = result.stdout.splitlines()[3:-1]
-    for gone in ("999", "777", "899", "699"):
-        assert not any(gone in line for line in table), gone
-
-
-def test_show_stage2_forecast_a_missing_week_is_not_a_zero():
-    # If the missing week were counted as 0 cash, h=1's mean m would be (100+200+999)/3 = 433.
-    result = run_show_forecast()
-    assert result.returncode == 0, result.stderr
-    assert "433" not in result.stdout
-
-
-def test_show_stage2_forecast_an_h_with_one_labelled_row():
-    # Only one h=2 row labelled: the table has h=2 from that row alone.
-    labels = ["labelled", "labelled", "missing_week", "labelled", "future", "future"]
-    result = run_show_forecast(labels=labels)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[5] == "1     150.0  100.0        300.0  0.333"
-    assert lines[6].split() == ["2", "400.0", "200.0", "100.0", "2.000"]
-    # all: mean m 700 / 3 = 233.3 -> 233; p x m 300; actual 400; ratio 0.75
-    assert lines[7].split() == ["all", "233.0", "300.0", "400.0", "0.750"]
-
-
-@pytest.mark.parametrize("labels", [
-    ["missing_week", "missing_week", "missing_week", "future", "future", "future"],
-    ["future"] * 6,
-], ids=["missing-and-future", "all-future"])
-def test_show_stage2_forecast_without_labelled_rows_prints_the_fallback_and_returns(labels):
-    result = run_show_forecast(labels=labels)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == FORECAST_HEAD + [
-        "        no labelled forecast rows: p x m cannot be compared with actual cash",
-        "ok",
-    ]
-
-
-def test_show_stage2_forecast_with_labelled_rows_does_not_print_the_fallback():
-    result = run_show_forecast()
-    assert result.returncode == 0, result.stderr
-    assert "no labelled forecast rows" not in result.stdout
-
-
-def test_show_stage2_forecast_an_h_with_no_cash_shows_an_infinite_ratio():
-    # Pinned behaviour: both labelled h=2 rows paid nothing (actual 0), so h=2's ratio is
-    # p x m / 0 = inf; it is printed, nothing fails.
-    code = SHOW_FORECAST.replace("LABELS", repr(FORECAST_LABELS)).replace("RATIO", "1.0") \
-        .replace("[300.0, 0.0, nan, 100.0, 0.0, nan]", "[300.0, 0.0, nan, 0.0, 0.0, nan]")
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[6].split() == ["2", "225.0", "210.0", "0.0", "inf"]
-
-
-def test_show_stage2_forecast_uses_the_deflated_amount_not_the_nominal_one():
-    # `amount` is 7 on every row; the actual cash column shows 300 / 100 / 400, never 14 or 28.
-    result = run_show_forecast()
-    assert result.returncode == 0, result.stderr
-    assert "14.0" not in result.stdout and "28.0" not in result.stdout
-
-
-# --- Step 14 (U11.3): show_stage2_scores and the paid forecast rows ----------------------------------
-# show_stage2_scores on amount_scores' output for the hand case of test_stage2.py: rows 10..13,
-# h 2, 1, 2, 1, actual 100, 200, 50, 400, stage 2 110, 180, 60, 300, training mean 150.
-#   pooled, stage 2: deviance 8.749 -> 9; skill 1 - 8.749 / 102.195 = 0.914; R2 0.853;
-#     WAPE 140 / 750 = 0.187; MAPE (.1 + .1 + .2 + .25) / 4 = 0.1625 -> 0.162; total 650 / 750
-#   pooled, training mean: deviance 102.195 -> 102; skill 0; R2 -0.078; WAPE 450 / 750 = 0.6;
-#     MAPE (.5 + .25 + 2 + .625) / 4 = 0.844; total 600 / 750 = 0.8
-#   skill per h, stage 2: h=1 0.892, h=2 0.975
-SHOW_SCORES = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.stage2 import amount_scores
-
-index = pd.Index([10, 11, 12, 13])
-actual = pd.Series([100.0, 200.0, 50.0, 400.0], index=index)
-h = pd.Series(np.array(HORIZONS, dtype="int64"), index=index)
-reference = pd.Series(150.0, index=index)
-guesses = {"stage 2": pd.Series([110.0, 180.0, 60.0, 300.0], index=index),
-           "training mean": reference,
-           "own mean": pd.Series([90.0, 250.0, 40.0, 350.0], index=index)}
-predictions = {name: guesses[name] for name in MODELS}
-scores = amount_scores(actual, h, predictions, reference)
-copy = scores.copy(deep=True)
-returned = script.show_stage2_scores(scores)
-assert returned is None
-pd.testing.assert_frame_equal(scores, copy)
-print("ok")
-"""
-
-SCORES_HEADER = ("        STAGE 2 alone, on the paid forecast rows (skill against the training "
-                 "mean; R2's baseline is the rows' own mean):")
-
-
-def run_show_scores(models=("stage 2", "training mean"), h=(2, 1, 2, 1)):
-    return run_code(SHOW_SCORES.replace("MODELS", repr(list(models))).replace("HORIZONS", repr(list(h))))
-
-
-def test_show_stage2_scores_printout_by_hand():
-    result = run_show_scores()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        SCORES_HEADER,
-        "        model  rows  m <= 0  mean deviance  deviance skill  R2 hindsight  WAPE  MAPE  "
-        "total ratio",
-        "      stage 2     4       0            9.0           0.914         0.853 0.187 0.162   "
-        "     0.867",
-        "training mean     4       0          102.0           0.000        -0.078 0.600 0.844   "
-        "     0.800",
-        "        deviance skill per h:",
-        "h                  1      2    all",
-        "model                             ",
-        "stage 2        0.892  0.975  0.914",
-        "training mean  0.000  0.000  0.000",
-        "ok",
-    ]
-
-
-def test_show_stage2_scores_pooled_table_has_no_h_column_and_only_the_all_rows():
-    result = run_show_scores()
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[1].split()[:2] == ["model", "rows"]
-    assert " h " not in f" {lines[1]} "
-    assert [line.split()[-1] for line in lines[2:4]] == ["0.867", "0.800"]
-
-
-def test_show_stage2_scores_keeps_the_models_order_not_alphabetical():
-    # As in main(): stage 2, then the references in amount_references' order.
-    result = run_show_scores(models=("stage 2", "training mean", "own mean"))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    # own mean: 90, 250, 40, 350 against 100, 200, 50, 400: WAPE 120 / 750 = 0.16, total
-    # 730 / 750 = 0.973. Alphabetical would put own mean first.
-    assert lines[2:5] == [
-        "      stage 2     4       0            9.0           0.914         0.853 0.187 0.162 "
-        "       0.867",
-        "training mean     4       0          102.0           0.000        -0.078 0.600 0.844 "
-        "       0.800",
-        "     own mean     4       0            5.0           0.949         0.928 0.160 0.169 "
-        "       0.973",
-    ]
-    assert lines[-4:-1] == ["stage 2        0.892  0.975  0.914",
-                            "training mean  0.000  0.000  0.000",
-                            "own mean       0.941  0.969  0.949"]
-
-
-def test_show_stage2_scores_per_h_columns_are_the_sorted_h_then_all():
-    result = run_show_scores(h=(5, 1, 3, 1))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    header = lines[lines.index("        deviance skill per h:") + 1]
-    assert header.split() == ["h", "1", "3", "5", "all"]
-
-
-def test_show_stage2_scores_shows_minus_inf_skill_for_a_guess_at_or_below_zero():
-    code = SHOW_SCORES.replace("MODELS", repr(["stage 2", "training mean"])) \
-        .replace("HORIZONS", repr([2, 1, 2, 1])) \
-        .replace("[110.0, 180.0, 60.0, 300.0]", "[110.0, 180.0, 60.0, -300.0]")
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    stage2 = lines[2].split()
-    assert stage2[:5] == ["stage", "2", "4", "1", "inf"]
-    assert stage2[5] == "-inf"
-
-
 # The paid forecast rows filter, run from main()'s own statement on a hand frame: labelled and
 # paid only; a missing week and a future row (paid NA) are left out, never an error.
 PAID_FILTER = """
@@ -3976,171 +1984,6 @@ print("ok")
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         "        no paid forecast rows: stage 2 cannot be scored here", "ok"]
-
-
-# The real chain on the tiny table, continued through the scores: at origin 2 the one paid
-# labelled forecast row is TR02-A, h=1, amount 100; m = 100 there. The tiny table has no
-# paying/observed weeks, so they are added here: window 4, 1 paying week of 2 observed, and
-# mean_receipts_4 = 1.0 (from the table): own mean (2 + 100) / 2 = 51; training mean 100.
-STEP_14_SCORES = """
-paid_forecast = forecast_rows[(forecast_rows["label_status"] == "labelled")
-                              & forecast_rows["paid"].fillna(False).astype(bool)]
-assert list(paid_forecast["key"]) == ["TR02-A"] and list(paid_forecast["h"]) == [1]
-paid_forecast = paid_forecast.assign(paying_weeks_4=1, observed_weeks_4=2)
-amount_guesses = script.amount_references(train_rows, paid_forecast, 4, 1.0)
-assert list(amount_guesses.iloc[0]) == [100.0, 51.0], amount_guesses
-stage2_scores = script.amount_scores(paid_forecast["amount_deflated"], paid_forecast["h"],
-                                     {"stage 2": forecast_m[paid_forecast.index],
-                                      **amount_guesses},
-                                     amount_guesses["training mean"])
-script.show_stage2_scores(stage2_scores)
-print("scores ok")
-"""
-
-
-def test_step_14_real_chain_through_the_scores():
-    stage1_part = STAGE1.rsplit('print("ok")', 1)[0]
-    code = (stage1_part + STEP_14_CHAIN + STEP_14_SCORES).replace(
-        "COMPANY_AS_FEATURE", "True").replace("ORIGIN", "2").replace("LOSS", "'poisson'") \
-        .replace("SCALE", "'none'")
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "scores ok"
-    start = lines.index(SCORES_HEADER)
-    # m = actual = training mean = 100: the reference's deviance is 0, so every skill is
-    # undefined (NaN, printed, nothing fails); one row, so R2 is NaN too. Own mean 51 is off
-    # by 49: deviance 2 (100 ln(100 / 51) - 49) = 36.7, WAPE = MAPE = 0.49, total 0.51.
-    assert lines[start + 1:-1] == [
-        "        model  rows  m <= 0  mean deviance  deviance skill  R2 hindsight  WAPE  MAPE  "
-        "total ratio",
-        "      stage 2     1       0            0.0             NaN           NaN  0.00  0.00  "
-        "       1.00",
-        "training mean     1       0            0.0             NaN           NaN  0.00  0.00  "
-        "       1.00",
-        "     own mean     1       0           37.0             NaN           NaN  0.49  0.49  "
-        "       0.51",
-        "        deviance skill per h:",
-        "h               1  all",
-        "model                 ",
-        "stage 2       NaN  NaN",
-        "training mean NaN  NaN",
-        "own mean      NaN  NaN",
-    ]
-
-
-# --- Step 14 (U11.3b): show_exposure on hand-made frames -------------------------------------------
-# Paid training rows: balances 50, 200, -10, 1,500 with E 100, 200, 100, 1,500: lifted where
-# open_balance < E, i.e. 50 and -10 (200 = E is not lifted): 2 of 4. Forecast rows: balances
-# 0, 300, 99.5 with E 100, 300, 100: 2 of 3. 1,234 forecast rows would show a comma: the
-# forecast frame is padded with 1,231 rows at their floor (balance 100 = E, not lifted).
-SHOW_EXPOSURE = """
-import pandas as pd
-from types import SimpleNamespace
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-stage2 = SimpleNamespace(scale=SCALE, balance_floor=FLOOR)
-paid_rows = pd.DataFrame({"open_balance": [50.0, 200.0, -10.0, 1500.0]}, index=[1, 2, 3, 4])
-paid_exposure = pd.Series([100.0, 200.0, 100.0, 1500.0], index=paid_rows.index)
-balances = [0.0, 300.0, 99.5] + [100.0] * 1231
-forecast_rows = pd.DataFrame({"open_balance": balances})
-forecast_exposure = pd.Series([100.0, 300.0, 100.0] + [100.0] * 1231)
-if SCALE == "none":
-    # "none" reads nothing from the rows: no open_balance column at all.
-    paid_rows = paid_rows.drop(columns="open_balance")
-    forecast_rows = forecast_rows.drop(columns="open_balance")
-copies = (paid_rows.copy(deep=True), paid_exposure.copy(), forecast_rows.copy(deep=True),
-          forecast_exposure.copy())
-returned = script.show_exposure(stage2, paid_rows, paid_exposure, forecast_rows,
-                                forecast_exposure)
-assert returned is None
-pd.testing.assert_frame_equal(paid_rows, copies[0])
-pd.testing.assert_series_equal(paid_exposure, copies[1])
-pd.testing.assert_frame_equal(forecast_rows, copies[2])
-pd.testing.assert_series_equal(forecast_exposure, copies[3])
-print("ok")
-"""
-
-
-def run_show_exposure(scale, floor="own mean"):
-    return run_code(SHOW_EXPOSURE.replace("SCALE", repr(scale)).replace("FLOOR", repr(floor)))
-
-
-def test_show_exposure_scale_none_prints_one_line_and_returns():
-    result = run_show_exposure("none")
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "        scale 'none': E = 1, stage 2 learns the amount itself", "ok"]
-
-
-def test_show_exposure_open_balance_counts_the_rows_lifted_to_the_floor_by_hand():
-    result = run_show_exposure("open balance")
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "        scale 'open balance', floor 'own mean': stage 2 learns the share of the "
-        "balance paid; lifted to the floor: 2 of 4 paid training rows, 2 of 1,234 forecast "
-        "rows",
-        "ok",
-    ]
-
-
-@pytest.mark.parametrize("floor", ["median", "mean", "own mean"])
-def test_show_exposure_names_the_floor_it_is_given(floor):
-    result = run_show_exposure("open balance", floor=floor)
-    assert result.returncode == 0, result.stderr
-    assert f"floor {floor!r}: stage 2 learns" in result.stdout.splitlines()[0]
-
-
-# --- Step 14 (U11.4): show_amount_reliability and show_cash_by_p_group -----------------------------
-# The printouts run on tables from the real functions (hand-made inputs); the header lines are
-# exact, the numbers rounded as documented (amounts to whole TRY, ratios to 3 decimals).
-
-SHOW_U11_4 = """
-import numpy as np
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.diagnostic import amount_reliability, cash_by_p_group
-
-actual = pd.Series([22.4, 12.0, 35.0, 24.0, 44.0, 35.0])
-m = pd.Series([50.0, 10.0, 40.0, 20.0, 60.0, 30.0])
-table = amount_reliability(actual, m, 3)
-copy = table.copy(deep=True)
-assert script.show_amount_reliability(table) is None
-pd.testing.assert_frame_equal(table, copy)
-p = pd.Series([0.1, 0.4, 0.2, 0.3, 0.8, 0.6])
-cash = cash_by_p_group(p, pd.Series([100.0, 200.0, 300.0, 400.0, 500.0, 600.0]),
-                       pd.Series([0.0, 500.0, 0.0, 0.0, 1000.0, 0.0]), 3)
-copy = cash.copy(deep=True)
-assert script.show_cash_by_p_group(cash) is None
-pd.testing.assert_frame_equal(cash, copy)
-print("ok")
-"""
-
-
-def test_show_amount_reliability_and_cash_by_p_group_printouts():
-    result = run_code(SHOW_U11_4)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    assert lines[0] == ("        stage 2 reliability, paid forecast rows in equal groups by m "
-                        "(calibrated: ratio = mean actual / mean m near 1 in every group):")
-    header = lines[1].split()
-    assert header == ["group", "m_low", "m_high", "mean_m", "mean_actual", "ratio", "rows"]
-    # Group 1: m 10, 20; actual 12, 24 -> mean 18, ratio 1.2. Group 3: actual 22.4 and 44
-    # -> mean 33.2 shown as 33, ratio 33.2 / 55 = 0.6036 shown as 0.604.
-    assert lines[2].split() == ["1", "10.0", "20.0", "15.0", "18.0", "1.200", "2"] or \
-        lines[2].split() == ["1", "10.0", "20.0", "15.0", "18.0", "1.2", "2"]
-    assert lines[4].split()[4] == "33.0" and lines[4].split()[5] == "0.604"
-    cash_start = lines.index("        whole model, labelled forecast rows in equal groups by p: "
-                             "expected cash (sum of p x m) vs actual cash, deflated (ratio = "
-                             "expected / actual):")
-    assert lines[cash_start + 1].split() == ["group", "p_low", "p_high", "mean_p",
-                                             "expected_cash", "actual_cash", "ratio", "rows"]
-    first = lines[cash_start + 2].split()
-    assert first[0] == "1" and first[4] == "70.0" and first[5] == "0.0" and first[6] == "NaN"
-    assert lines[cash_start + 4].split()[6] == "0.76"
 
 
 # --- Step 15 (U11.5): the joint diagnostic ------------------------------------------------------
@@ -4915,142 +2758,6 @@ def test_step_15_nan_m_on_a_paid_row_in_every_setting_raises_the_gate_error(tmp_
     assert not folder.exists() or list(folder.iterdir()) == []
 
 
-# Step 11, U7b: the holiday positions of every target week, with the [calendar] settings, over
-# the same weeks as the calendar features, merged into the calendar block (on week, one to
-# one), and their printout. Run on the real settings/holidays_tr.toml (read only), in a
-# separate process like the checks above.
-HOLIDAY_POSITIONS = """
-import inspect
-from datetime import date, timedelta
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.features_calendar import CALENDAR_COLUMNS
-
-assert prep.holiday_position_features.__module__ == (
-    "collection_estimation.hurdle.features_calendar")
-inspect.signature(script.show_holiday_positions).bind("positions", "week_zero", "holidays")
-calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
-shows = " ".join(inspect.getsource(script.show_preparation).split())
-call = ("positions = holiday_position_features( week_zero, 0, last_week + horizons, holidays, "
-        "settings.calendar.holiday_encodings, settings.calendar.drain_window, "
-        "settings.calendar.catch_up_window)")
-assert call in calc, "holiday_position_features is not called as expected"
-merge = 'calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")'
-assert merge in calc, "the positions are not merged into the calendar as expected"
-show = "show_holiday_positions(details.positions, inputs.week_zero, details.holidays)"
-assert show in shows, "show_holiday_positions is not called as expected"
-assert calc.count("holiday_position_features(") == 1
-assert shows.count("show_holiday_positions(") == 1
-order = [calc.index("calendar = calendar_features("),
-         calc.index("holiday_position_features("), calc.index(merge),
-         calc.index("receivables_features("),
-         calc.index("table = join_features(panel, history, calendar, owed)")]
-assert order == sorted(order), order
-order = [shows.index("show_calendar(inputs.calendar, inputs.week_zero, details.holidays)"),
-         shows.index(show), shows.index("show_owed(")]
-assert order == sorted(order), order
-# The details keep the positions alone (not merged), for the printout.
-assert "positions=positions" in calc
-
-holidays = prep.load_holidays(script.REPO_ROOT / "settings" / "holidays_tr.toml")
-week_zero = date(2025, 6, 2)
-calendar = prep.calendar_features(week_zero, 0, 69, holidays)
-for encodings in (("drain",), ("days",), ("drain", "days"), ()):
-    positions = prep.holiday_position_features(week_zero, 0, 69, holidays, encodings, 3, 5)
-    merged = calendar.merge(positions, on="week", how="left", validate="one_to_one")
-    added = [column for column in positions.columns if column != "week"]
-    assert list(merged.columns) == CALENDAR_COLUMNS + added, list(merged.columns)
-    assert len(merged) == 70
-    assert merged[added].notna().all().all()
-    assert all(merged[column].dtype == "int64" for column in added)
-    pd.testing.assert_frame_equal(merged[CALENDAR_COLUMNS], calendar)
-    # The number of unusual weeks, counted here independently of the printout.
-    if added:
-        normal = pd.Series({c: 0 if c in ("drain_days", "catch_up_days") else 1 for c in added})
-        unusual = int((positions[added] != normal).any(axis=1).sum())
-    print(f"=== {encodings} unusual {unusual if added else '-'}")
-    script.show_holiday_positions(positions, week_zero, holidays)
-print("ok")
-"""
-
-
-@pytest.fixture(scope="module")
-def holiday_positions_run():
-    result = subprocess.run([sys.executable, "-c", HOLIDAY_POSITIONS], cwd=REPO_ROOT,
-                            capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-    # The printout of each encoding, keyed by the encodings' text.
-    parts = {}
-    for chunk in result.stdout.strip().removesuffix("ok").split("=== ")[1:]:
-        header, _, body = chunk.partition("\n")
-        parts[header.split(" unusual ")[0]] = (header.split(" unusual ")[1], body)
-    return parts
-
-
-def test_holiday_positions_are_wired_in_merged_and_printed(holiday_positions_run):
-    assert set(holiday_positions_run) == {"('drain',)", "('days',)", "('drain', 'days')", "()"}
-
-
-def test_holiday_positions_printout_drain_counts_the_unusual_weeks(holiday_positions_run):
-    unusual, body = holiday_positions_run["('drain',)"]
-    assert unusual == "17"
-    assert ("holiday positions: 2 columns; 17 of 70 weeks differ from a normal week:"
-            in body)
-    assert "np.int64" not in body
-
-
-def test_holiday_positions_printout_drain_shows_the_known_weeks(holiday_positions_run):
-    _, body = holiday_positions_run["('drain',)"]
-    for line in ("week 41 (Monday 2026-03-16): drain_days 3, catch_up_days 0",
-                 "week 42 (Monday 2026-03-23): drain_days 0, catch_up_days 3",
-                 "week 50 (Monday 2026-05-18): drain_days 1, catch_up_days 3",
-                 "week 51 (Monday 2026-05-25): drain_days 2, catch_up_days 0"):
-        assert line in body, line
-    # Victory Day, Sat 30 Aug 2025, changes nothing: weeks 12 and 13 are normal.
-    assert "week 12 (" not in body and "week 13 (" not in body
-    assert "Sat 30 Aug" not in body
-
-
-def test_holiday_positions_printout_names_the_weekday_holidays_around_a_week(
-        holiday_positions_run):
-    _, body = holiday_positions_run["('drain',)"]
-    line = next(line for line in body.splitlines() if "week 41 (" in line)
-    assert "Fri 20 Mar" in line
-    assert "Sat 21 Mar" not in line and "Sun 22 Mar" not in line
-
-
-def test_holiday_positions_printout_days_counts_the_unusual_weeks(holiday_positions_run):
-    unusual, body = holiday_positions_run["('days',)"]
-    assert ("holiday positions: 15 columns; " + unusual + " of 70 weeks differ from a normal "
-            "week:") in body
-    assert unusual == "26"
-    # No drain columns to show; the week is listed with its holidays.
-    assert "drain_days" not in body
-    assert "week 49 (Monday 2026-05-11)" in body  # next_tue = 0 (Tue 19 May)
-
-
-def test_holiday_positions_printout_both_encodings(holiday_positions_run):
-    unusual, body = holiday_positions_run["('drain', 'days')"]
-    assert ("holiday positions: 17 columns; " + unusual + " of 70 weeks differ from a normal "
-            "week:") in body
-    assert "week 51 (Monday 2026-05-25): drain_days 2, catch_up_days 0" in body
-
-
-def test_holiday_positions_printout_without_encodings(holiday_positions_run):
-    _, body = holiday_positions_run["()"]
-    assert body.strip() == "holiday positions: none ([calendar] holiday_encodings is empty)"
-
-
-def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday_positions_run):
-    # Week 50 sees Tue 19 May and the Kurban Bayramı Wed 27 .. Fri 29 May 2026: a date list
-    # should read in date order, not sorted by the weekday's name.
-    _, body = holiday_positions_run["('drain',)"]
-    line = next(line for line in body.splitlines() if "week 50 (" in line)
-    assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line
-
-
 # U12.2: the top-ups at the diagnostic origin, by the trailing mean of [topups] window weeks
 # (passed in as `window`, since U12.3; it was the constant TOPUP_MEAN_WINDOW) and by the ridge
 # with and without the recent level, printed after the deflated label. The wiring is checked on
@@ -5126,14 +2833,15 @@ from collection_estimation.hurdle import prices, topups
 calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
 shows = " ".join(inspect.getsource(script.show_preparation).split())
 source = " ".join(inspect.getsource(script.main).split())
-call = ("show_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels, "
-        "inputs.calendar, settings.diagnostic.origin, settings.receivables.horizons, "
-        "settings.topups.window)")
-assert call in shows, "show_topups is not called as expected"
-assert shows.count("show_topups(") == 1
-assert "show_topups(" not in source and "show_topups(" not in calc
-assert (shows.index("show_deflated_label(details.panel, inputs.levels)") < shows.index(call)
-        < shows.index("show_table(inputs.table, details.panel)"))
+call = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
+        "settings.diagnostic.origin, settings.receivables.horizons, settings.topups.window)")
+assert call in source, "show_topups is not called as expected"
+assert source.count("show_topups(") == 1
+assert "show_topups(" not in shows and "show_topups(" not in calc
+unpacked = ("new_cash, refunds, unidentified = inputs.new_cash, inputs.refunds, "
+            "inputs.unidentified")
+assert (source.index(unpacked) < source.index(call)
+        < source.index("if settings.debug.demo_origin + settings.receivables.horizons"))
 # The tables it is given are the inputs' (the calendar with the holiday positions merged).
 for built in ("new_cash = new_customer_cash(", "refunds = refunds_by_week(",
               "unidentified = unidentified_cash_by_week(", "levels = published_levels(",
@@ -5269,9 +2977,10 @@ def topups_run():
             "window5": extra["WINDOW5"], "missing": extra["MISSING"]}
 
 
-def test_topups_are_wired_in_after_the_deflated_label(topups_run):
+def test_topups_are_wired_in_main_after_the_inputs_are_unpacked(topups_run):
     # The source checks (call text with [topups] window, order, imports, TOPUP_MEAN_WINDOW
-    # gone, the old printout gone) ran in the fixture.
+    # gone, the old printout gone) ran in the fixture. The top-ups used to be printed by
+    # show_preparation, after the deflated label; main() prints them now, after show_table.
     assert len(topups_run["rows"]) == 2
 
 
@@ -5385,16 +3094,17 @@ from collection_estimation.hurdle.settings import TopupSettings
 
 calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
 shows = " ".join(inspect.getsource(script.show_preparation).split())
-call = ("compare_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels, "
-        "inputs.calendar, settings.topups, settings.receivables.horizons)")
+source = " ".join(inspect.getsource(script.main).split())
+call = ("compare_topups(new_cash, refunds, unidentified, levels, calendar, settings.topups, "
+        "settings.receivables.horizons)")
 guarded = "if settings.topups.compare: " + call
-assert guarded in shows, "compare_topups is not called, guarded by [topups] compare"
-assert shows.count("compare_topups(") == 1
-assert "compare_topups(" not in " ".join(inspect.getsource(script.main).split())
+assert guarded in source, "compare_topups is not called, guarded by [topups] compare"
+assert source.count("compare_topups(") == 1
+assert "compare_topups(" not in shows
 assert "compare_topups(" not in calc
-show = "show_topups(inputs.new_cash, inputs.refunds, inputs.unidentified, inputs.levels,"
-assert (shows.index(show) < shows.index(guarded)
-        < shows.index("show_table(inputs.table, details.panel)"))
+show = "show_topups(new_cash, refunds, unidentified, levels, calendar,"
+assert (source.index(show) < source.index(guarded)
+        < source.index("if settings.debug.demo_origin + settings.receivables.horizons"))
 assert script.score_topups is topups.score_topups
 assert script.topup_actuals is topups.topup_actuals
 inspect.signature(script.compare_topups).bind(
@@ -5542,8 +3252,8 @@ def test_topup_candidates_keep_the_windows_order_and_put_the_ridges_last(compare
 
 
 def test_compare_topups_is_wired_in_after_show_topups_guarded_by_compare(compare_topups_run):
-    # The source checks (the guarded call, its order between show_topups and join_features,
-    # the imports and signatures) ran in the fixture.
+    # The source checks (the guarded call, its order between show_topups and the demo-origin
+    # guard, the imports and signatures) ran in the fixture.
     assert set(compare_topups_run["runs"]) == {"mean 4", "ridge", "ridge no level", "mean 13"}
 
 
@@ -5736,9 +3446,9 @@ def test_step_16_and_17_imports():
                         and node.module == "collection_estimation.hurdle.forecast"]
     assert len(forecast_imports) == 1
     # U16.1 added stage1_predictions and stage2_predictions (step 18); U16.3 removed them
-    # (step 18 now fits through grid_predictions).
-    assert [(a.name, a.asname) for a in forecast_imports[0].names] == [
-        ("CONSOLIDATED", None), ("forecast", None)]
+    # (step 18 now fits through grid_predictions). CONSOLIDATED went with the printouts to
+    # hurdle/reports/.
+    assert [(a.name, a.asname) for a in forecast_imports[0].names] == [("forecast", None)]
     evaluate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                         and node.module == "collection_estimation.hurdle.evaluate"]
     assert len(evaluate_imports) == 1
@@ -5746,11 +3456,11 @@ def test_step_16_and_17_imports():
     # added HORIZON_TOTAL, POOLED, evaluation_scores and stack_forecasts; the cache of step 17
     # added rolling_fingerprint; U14.5c added HURDLE and paired_wape_bootstrap; U14.5d added
     # KNOWN_CUSTOMERS, RULE, component_bias and payer_split; U14.6 added balance_coherence;
-    # U16.5 added STACK_COLUMNS (show_grid_scores stacks step 17's totals with it).
+    # U16.5 added STACK_COLUMNS (show_grid_scores stacks step 17's totals with it). The
+    # constants only the printouts read (HORIZON_TOTAL, KNOWN_CUSTOMERS, POOLED, REFERENCES,
+    # RULE, STACK_COLUMNS) went with them to hurdle/reports/; main() still reads HURDLE.
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
-        ("HORIZON_TOTAL", None), ("HURDLE", None), ("KNOWN_CUSTOMERS", None), ("POOLED", None),
-        ("REFERENCES", None), ("RULE", None), ("STACK_COLUMNS", None), ("actual_totals", None),
-        ("balance_coherence", None),
+        ("HURDLE", None), ("actual_totals", None), ("balance_coherence", None),
         ("component_bias", None), ("deflated_reference", None), ("evaluation_scores", None),
         ("paired_wape_bootstrap", None), ("payer_split", None), ("rolling_fingerprint", None),
         ("rolling_forecasts", None), ("rule_reference", None), ("stack_forecasts", None)]
@@ -5764,9 +3474,10 @@ def test_step_16_and_17_imports():
     calibrate_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
                          and node.module == "collection_estimation.hurdle.calibrate"]
     assert len(calibrate_imports) == 1
-    # U16.7 added candidate_name (show_grid_test names the frozen corrections with it).
+    # U16.7 added candidate_name (show_grid_test names the frozen corrections with it); it
+    # went with show_grid_test to hurdle/reports/grid.py.
     assert [(a.name, a.asname) for a in calibrate_imports[0].names] == [
-        ("calibration_reliability", None), ("candidate_name", None), ("choose_calibration", None)]
+        ("calibration_reliability", None), ("choose_calibration", None)]
     assert module.body.index(calibrate_imports[0]) == module.body.index(evaluate_imports[0]) + 1
 
 
@@ -5777,9 +3488,15 @@ from collection_estimation.hurdle import inputs as prep
 from collection_estimation.hurdle import evaluate
 from collection_estimation.hurdle import forecast as forecast_module
 
+from collection_estimation.hurdle.reports import evaluation as reports
 assert script.forecast is forecast_module.forecast
-assert script.CONSOLIDATED is forecast_module.CONSOLIDATED
-assert script.CONSOLIDATED == "ALL"
+# Every printout of steps 16 and 17 is the evaluation report module's own.
+for name in ("show_customer_forecasts", "show_forecast_totals", "show_actual_totals",
+             "show_forecast_vs_actual", "show_rolling_forecasts", "show_deflated_reference",
+             "show_rule_reference", "show_evaluation_scores", "show_paired_bootstrap",
+             "show_component_bias", "show_payer_split", "show_balance_coherence",
+             "show_calibration_reliability", "show_calibration_choice"):
+    assert getattr(script, name) is getattr(reports, name), name
 assert script.actual_totals is evaluate.actual_totals
 assert script.rolling_forecasts is evaluate.rolling_forecasts
 inspect.signature(script.show_customer_forecasts).bind("customers", "forecast_rows", 1.0,
@@ -5803,7 +3520,6 @@ inspect.signature(script.load_with_cache).bind("name", [], print, "folder")
 inspect.signature(script.actual_totals).bind("weekly", "weeks", "levels", [], [0], 5)
 # U14.3.
 assert script.deflated_reference is evaluate.deflated_reference
-assert script.REFERENCES is evaluate.REFERENCES
 inspect.signature(script.deflated_reference).bind("weekly", "weeks", "levels", "calendar", [],
                                                   [0], 5, None)
 inspect.signature(script.show_deflated_reference).bind("reference", "rolled", "actual")
@@ -5816,8 +3532,6 @@ inspect.signature(script.show_rule_reference).bind("rule", "actual")
 # U14.5.
 assert script.stack_forecasts is evaluate.stack_forecasts
 assert script.evaluation_scores is evaluate.evaluation_scores
-assert script.POOLED is evaluate.POOLED and script.POOLED == "pooled"
-assert script.HORIZON_TOTAL is evaluate.HORIZON_TOTAL and script.HORIZON_TOTAL == "total"
 inspect.signature(script.stack_forecasts).bind(None, "reference", "rule")
 inspect.signature(script.evaluation_scores).bind("forecasts", "actual", 5)
 inspect.signature(script.show_evaluation_scores).bind("scores", 5)
@@ -5827,8 +3541,6 @@ assert script.paired_wape_bootstrap is evaluate.paired_wape_bootstrap
 inspect.signature(script.paired_wape_bootstrap).bind("forecasts", "actual", [], 5, 2000, 0)
 inspect.signature(script.show_paired_bootstrap).bind("bootstrap")
 # U14.5d.
-assert script.KNOWN_CUSTOMERS is evaluate.KNOWN_CUSTOMERS
-assert script.RULE is evaluate.RULE
 assert script.component_bias is evaluate.component_bias
 assert script.payer_split is evaluate.payer_split
 inspect.signature(script.component_bias).bind(None, "rule", "actual", "new_cash", "refunds",
@@ -5862,14 +3574,14 @@ def test_step_16_and_17_names_are_the_modules_functions():
 
 def test_step_17_is_the_last_statement_of_main_behind_its_run_switch():
     # Since U16.1 only step 18 follows step 17's `if`; since U16.2 step 18 is one `if` of its
-    # own, on [grid] run.
+    # own, on [grid] run; since step 18 moved to grid_run.py, its one statement is run_grid.
     body = main_body()
     at = index_of_if(body, "settings.evaluation.run")
     block = body[at]
     assert block.orelse == []
     assert len(body[at + 1:]) == 1
     assert ast.unparse(body[at + 1].test) == "settings.grid.run"
-    assert [ast.unparse(node) for node in body[at + 1].body] == STEP_18_STATEMENTS
+    assert [ast.unparse(node) for node in body[at + 1].body] == [RUN_GRID]
     assert len(main_through_step_17()) == at + 1
 
 
@@ -5886,19 +3598,11 @@ def test_step_17_uses_the_validation_origins_only():
     assert len(origins) == 1
     assert ast.unparse(origins[0].value) == "list(settings.evaluation.validation_origins)"
     assert block.body.index(origins[0]) == 0
-    # The test origins are scored only in U16: never named anywhere in main() but inside the
-    # v1 test's `if settings.grid.run_test:` (U16.7), step 18's last statement.
-    tree = main_tree()   # one parse: the `if` is removed from this tree below
-    step_18 = tree.body[-1]
-    v1_test = step_18.body[-1]
-    assert isinstance(v1_test, ast.If) and ast.unparse(v1_test.test) == "settings.grid.run_test"
-    # Every occurrence lies in that `if`, in the source and in the syntax tree.
-    source = SCRIPT.read_text(encoding="utf-8")
-    assert main_source().count("test_origins") == " ".join(
-        ast.get_source_segment(source, v1_test).split()).count("test_origins") > 0
-    assert ast.unparse(tree).count("test_origins") == ast.unparse(v1_test).count("test_origins")
-    step_18.body = step_18.body[:-1]
-    assert "test_origins" not in ast.unparse(tree)
+    # The test origins are scored only in U16 (the v1 test, inside run_grid): main()'s code
+    # never names them, nor run_test (its comments may).
+    code = ast.unparse(main_tree())
+    assert "test_origins" not in code
+    assert "run_test" not in code
 
 
 def test_step_17_calls_rolling_forecasts_once_with_a_progress_callback():
@@ -5935,17 +3639,8 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert len(calls) == 1
     assert [ast.unparse(a) for a in calls[0].args] == [
         "weekly", "weeks", "levels", "companies", "origins", "settings.receivables.horizons"]
-    # Step 16, step 17, (since U16.5) step 18's grid_actual and (since U16.7) the v1 test's
-    # test_actual, inside step 18's last `if settings.grid.run_test:`, at the test origins.
-    assert len(calls_to(main_tree(), "actual_totals")) == 4
-    step_18 = step_18_block()
-    assert len(calls_to(step_18, "actual_totals")) == 2
-    v1_test = step_18.body[-1]
-    assert isinstance(v1_test, ast.If) and ast.unparse(v1_test.test) == "settings.grid.run_test"
-    test_calls = calls_in(v1_test.body, "actual_totals")
-    assert len(test_calls) == 1 and calls_in(v1_test.orelse, "actual_totals") == []
-    assert ast.unparse(test_calls[0].args[4]) == "test_origins"
-    assert len(calls_in(step_18.body[:-1], "actual_totals")) == 1
+    # Step 16's and step 17's; step 18's two (the grid's and the v1 test's) are run_grid's.
+    assert len(calls_to(main_tree(), "actual_totals")) == 2
     shows = calls_to(block, "show_rolling_forecasts")
     assert len(shows) == 1 and len(calls_to(main_tree(), "show_rolling_forecasts")) == 1
     assert [ast.unparse(a) for a in shows[0].args] == ["rolled", "rolled_actual"]
@@ -5958,190 +3653,6 @@ def test_step_17_actual_totals_at_the_validation_origins_then_the_printout():
     assert ast.unparse(step_17_block().body[3].test) == "settings.evaluation.with_model"
     assert "rolled = None" not in statements
     assert ast.unparse(with_model_if().body[-1]) == "show_rolling_forecasts(rolled, rolled_actual)"
-
-
-def row_cells(lines, first):
-    """The whitespace-split cells of the one line whose first cell is `first`."""
-    rows = [line.split() for line in lines if line.split()[:1] == [first]]
-    assert len(rows) == 1, (first, lines)
-    return rows[0]
-
-
-# show_forecast_vs_actual at origin 10, h = 1, 2, companies TR02 and TR03 and ALL. Forecast
-# (nominal TRY) and actual:
-#   ALL  h1 (week 11): 3,000,000 vs 2,000,000 -> 1.5;  h2 (week 12): 1,000,000 vs no row
-#   TR02 h1:           2,000,000 vs 1,000,000 -> 2.0;  h2:            500,000 vs 1,000,000 -> 0.5
-#   TR03 h1:           1,000,000 vs 1,000,000 -> 1.0;  h2:            500,000 vs no row
-# In millions the consolidated table reads 3.0 / 2.0 / 1.5 and 1.0 / no data / no data.
-SHOW_VS_ACTUAL = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-totals = pd.DataFrame({
-    "company_code": ["TR02", "TR02", "TR03", "TR03", "ALL", "ALL"],
-    "origin_week": [10] * 6, "h": [1, 2, 1, 2, 1, 2], "target_week": [11, 12, 11, 12, 11, 12],
-    "total": [2e6, 5e5, 1e6, 5e5, 3e6, 1e6]})
-actual = pd.DataFrame({
-    "company_code": ["TR02", "TR02", "TR03", "ALL"],
-    "origin_week": [10] * 4, "h": [1, 2, 1, 1], "target_week": [11, 12, 11, 11],
-    "actual": [1e6, 1e6, 1e6, 2e6], "actual_real": [0.0] * 4})
-script.show_forecast_vs_actual(totals, actual)
-print("ok")
-"""
-
-
-@pytest.fixture(scope="module")
-def vs_actual_lines():
-    result = run_code(SHOW_VS_ACTUAL)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_forecast_vs_actual_header_lines(vs_actual_lines):
-    assert vs_actual_lines[0] == (
-        "        forecast vs actual at week 10, nominal (actual = gross receipts + refunds; "
-        "ratio = forecast / actual; one origin: an illustration, not a score)")
-    assert vs_actual_lines[1] == "        consolidated, million TRY:"
-    assert vs_actual_lines.count("        ratio per company and h:") == 1
-
-
-def test_show_forecast_vs_actual_consolidated_table(vs_actual_lines):
-    split = vs_actual_lines.index("        ratio per company and h:")
-    table = vs_actual_lines[2:split]
-    assert table[0].split() == ["target_week", "forecast", "actual", "ratio"]
-    assert table[1].split() == ["h"]
-    one = row_cells(table, "1")
-    assert one[1] == "11" and [float(v) for v in one[2:]] == [3.0, 2.0, 1.5]
-    two = row_cells(table, "2")
-    # A target week without an actual shows "no data", never 0.
-    assert two[1] == "12" and float(two[2]) == 1.0
-    assert two[3:] == ["no", "data", "no", "data"]
-    assert len(table) == 4
-
-
-def test_show_forecast_vs_actual_ratio_per_company(vs_actual_lines):
-    split = vs_actual_lines.index("        ratio per company and h:")
-    table = vs_actual_lines[split + 1:]
-    assert table[0].split() == ["h", "1", "2"]
-    assert table[1].split() == ["company_code"]
-    all_row = row_cells(table, "ALL")
-    assert float(all_row[1]) == 1.5 and all_row[2:] == ["no", "data"]
-    assert [float(v) for v in row_cells(table, "TR02")[1:]] == [2.0, 0.5]
-    tr03 = row_cells(table, "TR03")
-    assert float(tr03[1]) == 1.0 and tr03[2:] == ["no", "data"]
-    assert len(table) == 5
-
-
-# show_actual_totals: one origin (10), h = 1, 2. The consolidated actual is 150 + 70 = 220 TRY;
-# the weekly amounts of the target weeks 11 and 12 are (100 - 10) + (60 + 0) + (80 - 10) = 220;
-# week 13 (999) is not a target week and stays out. 4 actual rows, companies TR02 and ALL;
-# 2 of the calendar's 4 weeks are missing.
-SHOW_ACTUAL = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-
-actual = pd.DataFrame({
-    "company_code": ["TR02", "TR02", "ALL", "ALL"], "origin_week": [10] * 4,
-    "h": [1, 2, 1, 2], "target_week": [11, 12, 11, 12],
-    "actual": [80.0, 70.0, 150.0, 70.0], "actual_real": [0.0] * 4})
-weekly = pd.DataFrame({
-    "company_code": ["TR02", "TR03", "TR02", "TR02"], "week": [11, 11, 12, 13],
-    "gross_receipts": [100.0, 60.0, 80.0, 999.0], "refunds": [-10.0, 0.0, -10.0, 0.0]})
-weeks = pd.DataFrame({"week": [10, 11, 12, 13], "is_missing": [False, True, False, True]})
-script.show_actual_totals(actual, weekly, weeks)
-print("ok")
-"""
-
-
-def test_show_actual_totals_by_hand():
-    result = run_code(SHOW_ACTUAL)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "        actual cash (U14.1): 4 rows (2 companies with ALL); consolidated 220.00 TRY vs "
-        "the weekly amounts of its target weeks 220.00 TRY; 2 missing weeks in the calendar "
-        "(no rows)",
-        "ok"]
-
-
-# show_rolling_forecasts at origins 10 and 11, h = 1, 2. Consolidated forecast vs actual:
-#   origin 10: h1 (week 11) 2,000,000 / 1,000,000 = 2.0; h2 (week 12) 1,500,000 / 2,000,000 = 0.75
-#   origin 11: h1 (week 12) 3,000,000 / 2,000,000 = 1.5; h2 (week 13) 1,000,000 / no row
-# Over the 3 with data: forecast 6.5 M vs actual 5.0 M, ratio 1.300. TR02's rows (8 total rows
-# in all, TR02's forecasts 9e9 each) must not enter the pivot or the sums; 7 customer rows.
-SHOW_ROLLING = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.forecast import Forecast
-
-keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
-totals = pd.concat([
-    pd.DataFrame({"company_code": ["TR02"] * 4, **keys, "total": [9e9, 9e9, 9e9, 9e9]}),
-    pd.DataFrame({"company_code": ["ALL"] * 4, **keys,
-                  "total": [2e6, 1.5e6, 3e6, 1e6]})], ignore_index=True)
-customers = pd.DataFrame({"key": [f"TR02-{i}" for i in range(7)]})
-WITH_ACTUAL = __WITH_ACTUAL__
-if WITH_ACTUAL:
-    three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
-    actual = pd.concat([
-        pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
-        pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
-        ignore_index=True)
-else:
-    actual = pd.DataFrame({"company_code": pd.Series([], dtype=object),
-                           **{k: pd.Series([], dtype="int64") for k in keys},
-                           "actual": pd.Series([], dtype="float64")})
-actual["actual_real"] = 0.0
-script.show_rolling_forecasts(Forecast(totals=totals, customers=customers), actual)
-print("ok")
-"""
-
-
-def run_show_rolling(with_actual):
-    result = run_code(SHOW_ROLLING.replace("__WITH_ACTUAL__", str(with_actual)))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-@pytest.fixture(scope="module")
-def rolling_lines():
-    return run_show_rolling(True)
-
-
-def test_show_rolling_forecasts_first_line_counts_the_rows(rolling_lines):
-    assert rolling_lines[0] == ("        7 customer rows, 8 total rows; consolidated forecast / "
-                                "actual per origin and h (nominal):")
-
-
-def test_show_rolling_forecasts_ratio_pivot_per_origin_and_h(rolling_lines):
-    table = rolling_lines[1:-1]
-    assert table[0].split() == ["h", "1", "2"]
-    assert table[1].split() == ["origin_week"]
-    assert [float(v) for v in row_cells(table, "10")[1:]] == [2.0, 0.75]
-    eleven = row_cells(table, "11")
-    # A target week without an actual shows "no data", never 0 or a ratio.
-    assert float(eleven[1]) == 1.5 and eleven[2:] == ["no", "data"]
-    assert len(table) == 4   # TR02's ratios are not in the pivot
-
-
-def test_show_rolling_forecasts_sums_line(rolling_lines):
-    assert rolling_lines[-1] == ("        over all 3 consolidated (origin, h) with data: forecast "
-                                 "6.5 M vs actual 5.0 M TRY (ratio 1.300)")
-
-
-def test_show_rolling_forecasts_without_any_actual_shows_no_data_everywhere():
-    lines = run_show_rolling(False)
-    table = lines[1:-1]
-    assert row_cells(table, "10")[1:] == ["no", "data", "no", "data"]
-    assert row_cells(table, "11")[1:] == ["no", "data", "no", "data"]
-    assert lines[-1].startswith("        over all 0 consolidated (origin, h) with data: "
-                                "forecast 0.0 M vs actual 0.0 M TRY (ratio ")
 
 
 # Step 17, U14.3: the `deflated` reference at the validation origins, right after the rolling
@@ -6223,121 +3734,6 @@ def test_step_17_is_still_the_last_step_after_the_deflated_reference():
     # two statements, the scores' three, the bootstrap's four and the three of the bias.
     assert ast.unparse(body[-1].body[-13]) == (
         "show_deflated_reference(reference, rolled, rolled_actual)")
-
-
-def test_show_deflated_reference_is_a_module_level_function_with_three_parameters():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_deflated_reference"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["reference", "rolled", "actual"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-
-
-# show_deflated_reference at origins 10 and 11, h = 1, 2, companies TR02 and ALL.
-# Consolidated actual: (10, 1) wk 11 1,000,000; (10, 2) wk 12 2,000,000; (11, 1) wk 12
-# 2,000,000; (11, 2) wk 13 has no row. Over the 3 with data, actual 5.0 M.
-#   hurdle model (ALL): 2.0 + 1.5 + 3.0           = 6.5 M, ratio 1.300 (wk 13's 1.0 M left out)
-#   deflated (ALL):     1.0 + 2.0 + 2.0           = 5.0 M, ratio 1.000 (wk 13's 7.0 M left out)
-#   deflated_nolevel:   0.5 + 1.0 + 1.0           = 2.5 M, ratio 0.500 (wk 13's 9e9 left out)
-#   deflated_trend:     1.5 + 2.5 + 3.0           = 7.0 M, ratio 1.400 (wk 13's 8e8 left out)
-# TR02's rows (9e9 everywhere) must enter no sum. The reference has 2 companies x 4 (origin, h)
-# x 3 variants = 24 rows.
-# Fallbacks count over the SAME rows as the sums: the 3 consolidated (origin, h) with data,
-# (10, 1), (10, 2), (11, 1). deflated: ALL [T, F, F] = 1 of 3 (ALL's (11, 2) fallback has no
-# actual, and TR02's fallbacks are not consolidated: neither counts); deflated_nolevel: ALL
-# [F, F, F] = 0 of 3 (TR02's one fallback does not count); deflated_trend: ALL [F, T, F] = 1 of
-# 3 (its (11, 2) fallback and TR02's four do not count). Counting every row of a variant
-# instead would give 3 of 8, 1 of 8 and 6 of 8.
-SHOW_REFERENCE = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.forecast import Forecast
-
-keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
-totals = pd.concat([
-    pd.DataFrame({"company_code": ["TR02"] * 4, **keys, "total": [9e9] * 4}),
-    pd.DataFrame({"company_code": ["ALL"] * 4, **keys, "total": [2e6, 1.5e6, 3e6, 1e6]})],
-    ignore_index=True)
-customers = pd.DataFrame({"key": ["TR02-0"]})
-three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
-actual = pd.concat([
-    pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
-    pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
-    ignore_index=True)
-actual["actual_real"] = 0.0
-values = {("TR02", "deflated"): ([9e9] * 4, [False, False, False, True]),
-          ("TR02", "deflated_nolevel"): ([9e9] * 4, [False, False, True, False]),
-          ("ALL", "deflated"): ([1e6, 2e6, 2e6, 7e6], [True, False, False, True]),
-          ("ALL", "deflated_nolevel"): ([5e5, 1e6, 1e6, 9e9], [False] * 4),
-          ("TR02", "deflated_trend"): ([9e9] * 4, [True] * 4),
-          ("ALL", "deflated_trend"): ([1.5e6, 2.5e6, 3e6, 8e8], [False, True, False, True])}
-rows = []
-for company in ("TR02", "ALL"):
-    for i in range(4):
-        for reference in ("deflated", "deflated_nolevel", "deflated_trend"):
-            forecast, fallback = values[(company, reference)]
-            rows.append({"company_code": company, "origin_week": keys["origin_week"][i],
-                         "h": keys["h"][i], "target_week": keys["target_week"][i],
-                         "reference": reference, "real_forecast": forecast[i] / 2.0,
-                         "price_level": 2.0, "forecast": forecast[i],
-                         "fallback": fallback[i]})
-reference = pd.DataFrame(rows)
-script.show_deflated_reference(reference, Forecast(totals=totals, customers=customers), actual)
-print("ok")
-"""
-
-
-@pytest.fixture(scope="module")
-def reference_lines():
-    result = run_code(SHOW_REFERENCE)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_deflated_reference_prints_five_lines(reference_lines):
-    # The header, the hurdle model, and one line per variant (three).
-    assert len(reference_lines) == 5
-
-
-def test_show_deflated_reference_header_counts_the_rows_and_the_consolidated_pairs(
-        reference_lines):
-    assert reference_lines[0] == (
-        "        the deflated reference (U14.3): 24 rows; over the 3 consolidated (origin, h) "
-        "with data, nominal, million TRY:")
-
-
-def test_show_deflated_reference_hurdle_model_line(reference_lines):
-    assert reference_lines[1] == ("          hurdle model" + " " * 13
-                                  + "6.5 vs actual 5.0 (ratio 1.300)")
-
-
-def test_show_deflated_reference_deflated_line_with_its_fallback_count(reference_lines):
-    assert reference_lines[2] == ("          deflated" + " " * 17 + "5.0 vs actual 5.0 (ratio "
-                                  "1.000), fell back to the recent level in 1 of 3")
-
-
-def test_show_deflated_reference_nolevel_line_with_its_fallback_count(reference_lines):
-    assert reference_lines[3] == ("          deflated_nolevel" + " " * 9 + "2.5 vs actual 5.0 "
-                                  "(ratio 0.500), fell back to the recent level in 0 of 3")
-
-
-def test_show_deflated_reference_trend_line_with_its_fallback_count(reference_lines):
-    # deflated_trend is 14 characters, padded to 17, then the sum right-aligned in 10.
-    assert reference_lines[4] == ("          deflated_trend" + " " * 11 + "7.0 vs actual 5.0 "
-                                  "(ratio 1.400), fell back to the recent level in 1 of 3")
-
-
-def test_show_deflated_reference_lines_follow_the_references_order(reference_lines):
-    names = [line.split()[0] for line in reference_lines[1:]]
-    assert names == ["hurdle", "deflated", "deflated_nolevel", "deflated_trend"]
-
-
-def test_show_deflated_reference_the_hurdle_line_has_no_fallback_count(reference_lines):
-    assert "fell back" not in reference_lines[1]
 
 
 
@@ -6455,155 +3851,6 @@ def test_rule_reference_is_imported_once_from_evaluate():
              if isinstance(node, ast.ImportFrom) for a in node.names
              if a.name == "rule_reference"]
     assert found == [("collection_estimation.hurdle.evaluate", "rule_reference", None)]
-
-
-def test_show_rule_reference_is_a_module_level_function_with_two_parameters():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_rule_reference"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["rule", "actual"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == []
-
-
-# show_rule_reference at origins 10 and 11, h = 1, 2, companies TR02 and ALL.
-# Consolidated actual: (10, 1) wk 11 1,000,000; (10, 2) wk 12 2,000,000; (11, 1) wk 12
-# 2,000,000; (11, 2) wk 13 has no row. Rule (ALL) forecast 1.5 + 1.0 + 3.0 = 5.5 M (wk 13's 9e9
-# left out) vs actual 5.0 M: ratio 1.100.
-#   per h: h1 forecast 1.5 + 3.0 = 4.5, actual 1.0 + 2.0 = 3.0, ratio 1.5, late share
-#          (0.25 + 1.0) / (1.0 + 2.0) = 0.41667 -> 0.417;
-#          h2 forecast 1.0, actual 2.0, ratio 0.5, late share 0 / 0.8 = 0.000.
-# TR02 (9e9 everywhere) enters no sum. The invoices (both origins, summed): expected 2 rows
-# 1.0 + 2.0 = 3.0 M; late 1 row 0.5 M; after horizon 1 row 0.3 M; doubtful 1 row 3.0 M. Delay
-# sources of the open TRY (6.8 M): customer 1.0 + 0.5 + 0.3 = 1.8 -> 26.5%; company 2.0 ->
-# 29.4%; none 3.0 -> 44.1%.
-SHOW_RULE = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import RuleReference
-
-keys = dict(origin_week=[10, 10, 11, 11], h=[1, 2, 1, 2], target_week=[11, 12, 12, 13])
-def block(company, forecast, invoice, late):
-    return pd.DataFrame({"company_code": [company] * 4, **keys, "invoice_cash": invoice,
-                         "late_cash": late, "fallback_delay_cash": [0.0] * 4,
-                         "topup_cash": [f - i for f, i in zip(forecast, invoice)],
-                         "price_level": [1.0] * 4, "forecast": forecast})
-totals = pd.concat([
-    block("TR02", [9e9] * 4, [9e9] * 4, [9e9] * 4),
-    block("ALL", [1.5e6, 1.0e6, 3.0e6, 9e9], [1.0e6, 0.8e6, 2.0e6, 9e9],
-          [0.25e6, 0.0, 1.0e6, 9e9])], ignore_index=True)
-three = dict(origin_week=[10, 10, 11], h=[1, 2, 1], target_week=[11, 12, 12])
-actual = pd.concat([
-    pd.DataFrame({"company_code": ["TR02"] * 3, **three, "actual": [1.0, 1.0, 1.0]}),
-    pd.DataFrame({"company_code": ["ALL"] * 3, **three, "actual": [1e6, 2e6, 2e6]})],
-    ignore_index=True)
-actual["actual_real"] = 0.0
-invoices = pd.DataFrame({
-    "origin_week": [10, 10, 10, 11, 11],
-    "status": __STATUS__,
-    "delay_from": __DELAY_FROM__,
-    "outstanding_try": [1e6, 0.5e6, 0.3e6, 2e6, 3e6]})
-rule = RuleReference(totals=totals, invoices=invoices)
-before = (totals.copy(), invoices.copy(), actual.copy())
-script.show_rule_reference(rule, actual)
-pd.testing.assert_frame_equal(totals, before[0])
-pd.testing.assert_frame_equal(invoices, before[1])
-pd.testing.assert_frame_equal(actual, before[2])
-print("ok")
-"""
-RULE_STATUS = '["expected", "late", "after horizon", "expected", "doubtful"]'
-RULE_DELAY_FROM = '["customer", "customer", "customer", "company", "none"]'
-
-
-def run_show_rule(status=RULE_STATUS, delay_from=RULE_DELAY_FROM):
-    code = SHOW_RULE.replace("__STATUS__", status).replace("__DELAY_FROM__", delay_from)
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-@pytest.fixture(scope="module")
-def rule_lines():
-    return run_show_rule()
-
-
-RULE_PER_H_TITLE = "          the rule per h, consolidated, million TRY:"
-RULE_DECIDED_TITLE = ("          the open invoices at the origins, by what the rule decided "
-                      "(summed over the origins):")
-
-
-def test_show_rule_reference_prints_fourteen_lines(rule_lines):
-    assert len(rule_lines) == 14, rule_lines
-
-
-def test_show_rule_reference_first_line_forecast_vs_actual_and_ratio(rule_lines):
-    assert rule_lines[0] == ("          financial rule" + " " * 11
-                             + "5.5 vs actual 5.0 (ratio 1.100)")
-
-
-def test_show_rule_reference_first_line_has_the_deflated_reference_layout(rule_lines):
-    # The layout of show_deflated_reference's lines: the name in 17, the amount in 10.
-    assert rule_lines[0] == (f"          {'financial rule':<17} {5.5:>10,.1f} vs actual 5.0 "
-                             f"(ratio 1.100)")
-
-
-def test_show_rule_reference_titles(rule_lines):
-    assert rule_lines[1] == RULE_PER_H_TITLE
-    assert rule_lines[6] == RULE_DECIDED_TITLE
-    assert rule_lines.count(RULE_PER_H_TITLE) == 1
-    assert rule_lines.count(RULE_DECIDED_TITLE) == 1
-
-
-def test_show_rule_reference_per_h_table_by_hand(rule_lines):
-    table = rule_lines[2:6]
-    assert table[0].split() == ["forecast", "actual", "ratio", "late", "share"]
-    assert table[1].split() == ["h"]
-    assert [float(v) for v in row_cells(table, "1")[1:]] == [4.5, 3.0, 1.5, 0.417]
-    assert [float(v) for v in row_cells(table, "2")[1:]] == [1.0, 2.0, 0.5, 0.0]
-
-
-def test_show_rule_reference_leaves_out_the_target_week_without_actual(rule_lines):
-    # (11, 2)'s 9e9, and TR02's, would show as 9,000 million or more if a sum kept them.
-    assert not any("9000" in line or "9e" in line or "9,000" in line for line in rule_lines)
-
-
-def test_show_rule_reference_decided_table_by_hand(rule_lines):
-    table = rule_lines[7:13]
-    assert table[0].split() == ["invoices", "million", "TRY"]
-    assert table[1].split() == ["status"]
-    rows = [line.split() for line in table[2:]]
-    # Sorted by status (groupby), counts and million TRY summed over both origins.
-    assert rows == [["after", "horizon", "1", "0.3"], ["doubtful", "1", "3.0"],
-                    ["expected", "2", "3.0"], ["late", "1", "0.5"]]
-
-
-def test_show_rule_reference_delay_source_shares_by_hand(rule_lines):
-    assert rule_lines[13] == (
-        "          the delay came from the customer for 26.5% of the open TRY, its company's "
-        "median for 29.4%, none (0 days) for 44.1%")
-
-
-def test_show_rule_reference_a_delay_source_with_no_invoice_shows_zero():
-    lines = run_show_rule(delay_from='["customer"] * 5')
-    assert lines[-1] == (
-        "          the delay came from the customer for 100.0% of the open TRY, its company's "
-        "median for 0.0%, none (0 days) for 0.0%")
-
-
-def test_show_rule_reference_a_status_with_no_invoice_has_no_row():
-    lines = run_show_rule(status='["expected"] * 5')
-    decided = lines[lines.index(RULE_DECIDED_TITLE) + 1:-1]
-    assert [line.split() for line in decided[2:]] == [["expected", "5", "6.8"]]
-    assert len(lines) == 11
-
-
-def test_show_rule_reference_does_not_change_its_inputs(rule_lines):
-    # SHOW_RULE compares the three tables with copies taken before the call; "ok" means equal.
-    assert rule_lines
 
 
 from types import SimpleNamespace as SimpleNamespace  # noqa: E402
@@ -6943,79 +4190,6 @@ def test_step_17_the_progress_callback_prints_one_line():
     assert printed[-1] == "  ... origin 33: 1 of 3 done (95 s), about 0 min left"
 
 
-# show_deflated_reference with rolled=None: the same data as SHOW_REFERENCE above; the
-# "hurdle model" line is left out, the other four lines are the same as with rolled.
-
-SHOW_REFERENCE_NO_MODEL = SHOW_REFERENCE.replace(
-    "script.show_deflated_reference(reference, Forecast(totals=totals, customers=customers), "
-    "actual)", "script.show_deflated_reference(reference, None, actual)")
-
-
-def test_show_reference_no_model_script_premise():
-    assert SHOW_REFERENCE_NO_MODEL != SHOW_REFERENCE
-    assert "show_deflated_reference(reference, None, actual)" in SHOW_REFERENCE_NO_MODEL
-
-
-@pytest.fixture(scope="module")
-def no_model_reference_lines():
-    result = run_code(SHOW_REFERENCE_NO_MODEL)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_deflated_reference_without_the_model_prints_four_lines(no_model_reference_lines):
-    # The header and one line per variant (three).
-    assert len(no_model_reference_lines) == 4
-    assert not any("hurdle" in line for line in no_model_reference_lines)
-
-
-def test_show_deflated_reference_without_the_model_header_is_the_same(no_model_reference_lines,
-                                                                      reference_lines):
-    assert no_model_reference_lines[0] == reference_lines[0]
-    assert no_model_reference_lines[0] == (
-        "        the deflated reference (U14.3): 24 rows; over the 3 consolidated (origin, h) "
-        "with data, nominal, million TRY:")
-
-
-def test_show_deflated_reference_without_the_model_reference_lines_by_hand(
-        no_model_reference_lines):
-    assert no_model_reference_lines[1] == ("          deflated" + " " * 17 + "5.0 vs actual 5.0 "
-                                           "(ratio 1.000), fell back to the recent level in 1 "
-                                           "of 3")
-    assert no_model_reference_lines[2] == ("          deflated_nolevel" + " " * 9 + "2.5 vs "
-                                           "actual 5.0 (ratio 0.500), fell back to the recent "
-                                           "level in 0 of 3")
-    assert no_model_reference_lines[3] == ("          deflated_trend" + " " * 11 + "7.0 vs "
-                                           "actual 5.0 (ratio 1.400), fell back to the recent "
-                                           "level in 1 of 3")
-
-
-def test_show_deflated_reference_with_and_without_the_model_differ_only_by_its_line(
-        no_model_reference_lines, reference_lines):
-    assert [reference_lines[0]] + reference_lines[2:] == no_model_reference_lines
-    assert reference_lines[1].startswith("          hurdle model")
-
-
-# A consolidated (origin, h) with an actual but no model total: with the model, the inner
-# merge drops it (2 pairs); without the model it stays (3 pairs).
-SHOW_REFERENCE_MODEL_SHORT = SHOW_REFERENCE.replace(
-    'pd.DataFrame({"company_code": ["ALL"] * 4, **keys, "total": [2e6, 1.5e6, 3e6, 1e6]})',
-    'pd.DataFrame({"company_code": ["ALL"] * 4, **keys, '
-    '"total": [2e6, 1.5e6, 3e6, 1e6]}).iloc[1:]')
-
-
-def test_show_deflated_reference_with_the_model_counts_only_pairs_the_model_has():
-    assert SHOW_REFERENCE_MODEL_SHORT != SHOW_REFERENCE
-    result = run_code(SHOW_REFERENCE_MODEL_SHORT)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()[:-1]
-    assert "over the 2 consolidated (origin, h)" in lines[0]
-    # Without (10, 1): hurdle 1.5 + 3.0 = 4.5 vs actual 2.0 + 2.0 = 4.0 -> 1.125.
-    assert lines[1] == "          hurdle model" + " " * 13 + "4.5 vs actual 4.0 (ratio 1.125)"
-
-
 
 # Step 17, U14.5: every method's forecasts stacked, scored against the actual cash, and the
 # scores' printout, right after the rule's printout. Wiring on main()'s syntax tree and by
@@ -7107,22 +4281,6 @@ def test_step_17_scores_against_the_rolled_actual_not_step_16s_actual():
     assert [ast.unparse(a) for a in scored.args][:2] == ["forecasts", "rolled_actual"]
 
 
-def test_show_evaluation_scores_is_a_module_level_function_with_two_parameters():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_evaluation_scores"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["scores", "horizons"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == []
-
-
-def test_show_evaluation_scores_comes_right_after_show_rule_reference_in_the_file():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
-    assert names.index("show_evaluation_scores") == names.index("show_rule_reference") + 1
-
-
 @pytest.mark.parametrize("with_model", [True, False])
 def test_step_17_passes_the_stack_on_to_the_scores_and_the_printout(with_model):
     calls, _, rolled, actual = run_step_17(with_model)
@@ -7152,152 +4310,6 @@ def test_step_17_each_score_function_runs_once(with_model):
     assert names[start:start + 5] == ["stack_forecasts", "evaluation_scores",
                                       "show_evaluation_scores", "paired_wape_bootstrap",
                                       "show_paired_bootstrap"]
-
-
-# show_evaluation_scores on a hand-made scores table, horizons 2, companies TR02, TR03 and ALL.
-# Only the columns it reads carry numbers (method, company_code, horizon, rows, wape, bias,
-# mape); the others are 0.0. Consolidated (ALL):
-#   hurdle   pooled WAPE 0.20, bias -0.10, MAPE 0.25; h1 0.10, h2 0.30; total 0.05
-#   deflated pooled WAPE 0.15, bias  0.05, MAPE 0.20; h1 0.1236 (-> 0.124), h2 0.18; total 0.08
-#   rule     pooled WAPE 0.40, bias -0.35, MAPE 0.50; h1 0.30, no h2 row, no total row (NaN)
-# Per company, pooled WAPE: hurdle 0.31 / 0.42 / 0.20; deflated 0.25 / 0.35 / 0.15;
-# rule 0.60 / 0.70 / 0.40. hurdle's TR02 h1 row (WAPE 9.99) must not reach the per-company
-# table, which holds the pooled rows only.
-SHOW_EVAL_SCORES = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import SCORE_COLUMNS
-
-nan = float("nan")
-# (method, company_code, horizon, rows, wape, bias, mape)
-given = [
-    ("hurdle", "TR02", "1", 3, 9.99, 0.0, nan),
-    ("hurdle", "TR02", "pooled", 6, 0.31, -0.2, nan),
-    ("hurdle", "TR03", "pooled", 6, 0.42, 0.1, nan),
-    ("hurdle", "ALL", "1", 3, 0.1, -0.15, 0.12),
-    ("hurdle", "ALL", "2", 3, 0.3, -0.05, 0.33),
-    ("hurdle", "ALL", "pooled", 6, 0.2, -0.1, 0.25),
-    ("hurdle", "ALL", "total", 2, 0.05, -0.1, 0.06),
-    ("deflated", "TR02", "pooled", 6, 0.25, 0.0, nan),
-    ("deflated", "TR03", "pooled", 6, 0.35, 0.02, nan),
-    ("deflated", "ALL", "1", 3, 0.1236, 0.04, 0.13),
-    ("deflated", "ALL", "2", 3, 0.18, 0.06, 0.2),
-    ("deflated", "ALL", "pooled", 6, 0.15, 0.05, 0.2),
-    ("deflated", "ALL", "total", 2, 0.08, 0.05, 0.09),
-    ("rule", "TR02", "pooled", 6, 0.6, -0.4, nan),
-    ("rule", "TR03", "pooled", 6, 0.7, -0.5, nan),
-    ("rule", "ALL", "1", 3, 0.3, -0.3, 0.4),
-    ("rule", "ALL", "pooled", 6, 0.4, -0.35, 0.5),
-]
-read = ["method", "company_code", "horizon", "rows", "wape", "bias", "mape"]
-scores = pd.DataFrame([dict(zip(read, row)) for row in given])
-for column in SCORE_COLUMNS:
-    if column not in scores:
-        scores[column] = 0.0
-scores = scores[SCORE_COLUMNS]
-if __WITHOUT_MODEL__:
-    scores = scores[scores["method"] != "hurdle"].reset_index(drop=True)
-before = scores.copy()
-script.show_evaluation_scores(scores, __HORIZONS__)
-pd.testing.assert_frame_equal(scores, before)
-print("ok")
-"""
-
-
-def run_show_eval_scores(without_model=False, horizons=2):
-    code = (SHOW_EVAL_SCORES.replace("__WITHOUT_MODEL__", str(without_model))
-            .replace("__HORIZONS__", str(horizons)))
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-@pytest.fixture(scope="module")
-def eval_lines():
-    return run_show_eval_scores()
-
-
-@pytest.fixture(scope="module")
-def no_model_eval_lines():
-    return run_show_eval_scores(without_model=True)
-
-
-EVAL_SCORES_HEADER = ("        scores (U14.5), consolidated, over 6 (origin, h) with data "
-                 "(h1 ... h2: WAPE per h):")
-EVAL_PER_COMPANY_TITLE = "        pooled WAPE per company:"
-
-
-def test_show_evaluation_scores_exact_printout_with_the_hurdle(eval_lines):
-    assert eval_lines == [
-        EVAL_SCORES_HEADER,
-        "          WAPE  bias  MAPE     h1    h2  2-week total WAPE",
-        "method                                                    ",
-        "hurdle    0.20 -0.10  0.25  0.100  0.30               0.05",
-        "deflated  0.15  0.05  0.20  0.124  0.18               0.08",
-        "rule      0.40 -0.35  0.50  0.300   NaN                NaN",
-        EVAL_PER_COMPANY_TITLE,
-        "company_code  TR02  TR03   ALL",
-        "method                        ",
-        "hurdle        0.31  0.42  0.20",
-        "deflated      0.25  0.35  0.15",
-        "rule          0.60  0.70  0.40",
-    ]
-
-
-def test_show_evaluation_scores_exact_printout_without_the_hurdle(no_model_eval_lines):
-    assert no_model_eval_lines == [
-        EVAL_SCORES_HEADER,
-        "          WAPE  bias  MAPE     h1    h2  2-week total WAPE",
-        "method                                                    ",
-        "deflated  0.15  0.05   0.2  0.124  0.18               0.08",
-        "rule      0.40 -0.35   0.5  0.300   NaN                NaN",
-        EVAL_PER_COMPANY_TITLE,
-        "company_code  TR02  TR03   ALL",
-        "method                        ",
-        "deflated      0.25  0.35  0.15",
-        "rule          0.60  0.70  0.40",
-    ]
-
-
-def test_show_evaluation_scores_without_the_hurdle_has_no_hurdle_line(no_model_eval_lines):
-    assert not any(line.startswith("hurdle") for line in no_model_eval_lines)
-    # One consolidated line and one per-company line fewer.
-    assert len(no_model_eval_lines) == 10
-
-
-def test_show_evaluation_scores_the_methods_in_the_order_they_come(eval_lines):
-    consolidated = [line.split()[0] for line in eval_lines[3:6]]
-    per_company = [line.split()[0] for line in eval_lines[9:12]]
-    assert consolidated == per_company == ["hurdle", "deflated", "rule"]
-
-
-def test_show_evaluation_scores_a_missing_h_or_total_shows_nan_not_zero(eval_lines):
-    # rule has no "2" row and no "total" row.
-    assert row_cells(eval_lines[:6], "rule")[-2:] == ["NaN", "NaN"]
-
-
-def test_show_evaluation_scores_rounds_to_three_decimals(eval_lines):
-    # deflated's h1 WAPE 0.1236 shows as 0.124.
-    assert row_cells(eval_lines[:6], "deflated")[4] == "0.124"
-
-
-def test_show_evaluation_scores_per_company_uses_the_pooled_rows_only(eval_lines):
-    # hurdle's TR02 h1 WAPE 9.99 is not the pooled 0.31.
-    assert not any("9.99" in line for line in eval_lines)
-    assert row_cells(eval_lines[6:], "hurdle")[1] == "0.31"
-
-
-def test_show_evaluation_scores_header_follows_the_horizons_argument():
-    # Horizons 3 on the same table: an h3 column (NaN, no "3" rows) and a 3-week total.
-    lines = run_show_eval_scores(horizons=3)
-    assert lines[0] == ("        scores (U14.5), consolidated, over 6 (origin, h) with data "
-                        "(h1 ... h3: WAPE per h):")
-    assert lines[1].split() == ["WAPE", "bias", "MAPE", "h1", "h2", "h3", "3-week", "total",
-                                "WAPE"]
-    assert row_cells(lines[:6], "hurdle")[6] == "NaN"
 
 
 # Step 17, the cache of the rolling forecasts (2026-11-03): inside the with_model branch the
@@ -7623,25 +4635,6 @@ def test_step_17_the_subject_uses_the_hurdle_constant_not_a_literal():
     assert ast.literal_eval(subject.orelse) == "deflated_trend"
 
 
-def test_show_paired_bootstrap_is_a_module_level_function_with_one_parameter():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_paired_bootstrap"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["bootstrap"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_show_paired_bootstrap_sits_between_show_evaluation_scores_and_show_component_bias():
-    # Since U14.5d the two show functions of the bias come between it and show_actual_totals.
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
-    shown = names.index("show_paired_bootstrap")
-    assert names[shown - 1] == "show_evaluation_scores"
-    assert names[shown + 1] == "show_component_bias"
-
-
 # Running step 17's block with the fakes of run_step_17.
 
 def test_step_17_run_with_the_model_pairs_the_hurdle_with_every_other_method():
@@ -7733,97 +4726,6 @@ def test_step_17_run_the_bootstrap_settings_follow_the_settings_object():
     assert args[3:] == (3, 13, 0)
 
 
-# show_paired_bootstrap on a hand-made bootstrap table (BOOTSTRAP_COLUMNS), 2000 samples:
-#   hurdle vs deflated  pooled  WAPE 0.16012 -> 0.16, against 0.1534 -> 0.153,
-#                               difference +0.00672 -> "+0.007", interval [-0.0123, +0.0271]
-#                               -> "[-0.012, +0.027]", better in 0.304 -> "30%"
-#   hurdle vs deflated  total   0.08 / 0.1, -0.02 -> "-0.020", [-0.05, +0.0112] ->
-#                               "[-0.050, +0.011]", 0.9 -> "90%"
-#   hurdle vs rule      pooled  0.16012 / 0.4, -0.23988 -> "-0.240", [-0.3, -0.18] ->
-#                               "[-0.300, -0.180]", 1.0 -> "100%"
-#   hurdle vs twin      pooled  0.2 / 0.2, 0.0 -> "+0.000", [0, 0] -> "[+0.000, +0.000]",
-#                               0.0 -> "0%"
-SHOW_BOOTSTRAP = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
-
-given = [
-    ("hurdle", "deflated", "pooled", 7, 0.16012, 0.1534, 0.00672, -0.0123, 0.0271, 0.304, 2000),
-    ("hurdle", "deflated", "total", 11, 0.08, 0.1, -0.02, -0.05, 0.0112, 0.9, 2000),
-    ("hurdle", "rule", "pooled", 7, 0.16012, 0.4, -0.23988, -0.3, -0.18, 1.0, 2000),
-    ("hurdle", "twin", "pooled", 7, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 2000),
-]
-bootstrap = pd.DataFrame(given, columns=BOOTSTRAP_COLUMNS)
-before = bootstrap.copy()
-script.show_paired_bootstrap(bootstrap)
-pd.testing.assert_frame_equal(bootstrap, before)
-print("ok")
-"""
-
-BOOT_HEADER = ("        paired bootstrap (U14.5c), consolidated, 2000 resamples; difference = "
-               "WAPE of the first - WAPE of the second (below 0: the first is better):")
-
-
-@pytest.fixture(scope="module")
-def bootstrap_lines():
-    result = run_code(SHOW_BOOTSTRAP)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_paired_bootstrap_exact_printout(bootstrap_lines):
-    # Every line 91 characters wide (pandas pads the index title line to the full width).
-    assert bootstrap_lines == [
-        BOOT_HEADER,
-        "                   measure   WAPE WAPE against difference      90% interval "
-        "first better in",
-        "pair" + " " * 87,
-        "hurdle vs deflated  pooled  0.160        0.153     +0.007  [-0.012, +0.027]    "
-        "         30%",
-        "hurdle vs deflated   total  0.080        0.100     -0.020  [-0.050, +0.011]    "
-        "         90%",
-        "hurdle vs rule      pooled  0.160        0.400     -0.240  [-0.300, -0.180]    "
-        "        100%",
-        "hurdle vs twin      pooled  0.200        0.200     +0.000  [+0.000, +0.000]    "
-        "          0%",
-    ]
-
-
-def test_show_paired_bootstrap_both_wapes_have_three_decimals(bootstrap_lines):
-    # 0.16012 -> "0.160" (not "0.16"), 0.08 -> "0.080"; 0.1534 -> "0.153".
-    rows = [line.split() for line in bootstrap_lines[3:]]
-    # From the end: share, interval (two cells), difference, WAPE against, WAPE.
-    wapes = [row[-6] for row in rows]
-    against = [row[-5] for row in rows]
-    assert wapes == ["0.160", "0.080", "0.160", "0.200"]
-    assert against == ["0.153", "0.100", "0.400", "0.200"]
-
-
-def test_show_paired_bootstrap_header_names_the_sample_count(bootstrap_lines):
-    assert bootstrap_lines[0] == BOOT_HEADER
-    assert "2000 resamples" in bootstrap_lines[0]
-
-
-def test_show_paired_bootstrap_one_line_per_row_in_order(bootstrap_lines):
-    # Header, the column titles, the index title, then the four rows as they came.
-    rows = bootstrap_lines[3:]
-    assert len(rows) == 4
-    assert [row.split("  ")[0].strip() for row in rows] == [
-        "hurdle vs deflated", "hurdle vs deflated", "hurdle vs rule", "hurdle vs twin"]
-
-
-def test_show_paired_bootstrap_signs_and_percentages(bootstrap_lines):
-    # A difference is always signed, the interval's ends too; the share is a whole percentage.
-    joined = "\n".join(bootstrap_lines[3:])
-    for text in ("+0.007", "-0.020", "-0.240", "+0.000", "[-0.012, +0.027]",
-                 "[-0.300, -0.180]", "30%", "90%", "100%", " 0%"):
-        assert text in joined, text
-
-
 # Step 17, U14.5d: where the bias comes from, right after the bootstrap's printout. Wiring on
 # main()'s syntax tree, then step 17's block run with the fakes of run_step_17, then the exact
 # printouts of show_component_bias and show_payer_split on hand-made tables, in a separate
@@ -7908,31 +4810,6 @@ def test_step_17_bias_calls_take_no_keywords():
 def test_step_17_bias_and_split_are_assigned_once():
     assert len(assignments_to(step_17_block(), "bias")) == 1
     assert len(assignments_to(step_17_block(), "split")) == 1
-
-
-@pytest.mark.parametrize("name, parameters", [("show_component_bias", ["bias", "horizons"]),
-                                              ("show_payer_split", ["split", "horizons"])])
-def test_the_bias_printouts_are_module_level_functions(name, parameters):
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == name]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == parameters
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_the_bias_printouts_sit_right_before_show_actual_totals():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
-    shown = names.index("show_actual_totals")
-    # U14.6 put show_balance_coherence after show_payer_split; U15 its two printouts after that;
-    # U16.1 show_stage_predictions (step 18) after those; U16.2 show_grid_candidates after it;
-    # U16.3 replaced show_stage_predictions with show_grid_predictions.
-    assert names[shown - 8:shown] == ["show_paired_bootstrap", "show_component_bias",
-                                      "show_payer_split", "show_balance_coherence",
-                                      "show_calibration_reliability", "show_calibration_choice",
-                                      "show_grid_predictions", "show_grid_candidates"]
 
 
 # Running step 17's block with the fakes of run_step_17.
@@ -8026,207 +4903,6 @@ def test_step_17_run_the_payer_split_comes_after_the_bias_with_its_printout():
     assert names[start + 1:start + 3] == ["payer_split", "show_payer_split"]
 
 
-# show_component_bias on a hand-made table, horizons 2. Amounts in TRY, shown in millions:
-#   hurdle, pooled: known 4.0 / 4.0, gap "+0.0", ratio 1.000
-#                   new 1.5 / 0.0, gap "+1.5", ratio NaN -> "nan"
-#                   refunds -0.25 -> "-0.2", -0.5, gap 0.25 -> "+0.2", ratio 0.500
-#                   price level 1234.5 -> "1,234.5", "1,000.0", gap "+234.5", 1.2345 -> "1.234"
-#   rule, pooled:   known 0.7 / 4.0, gap "-3.3", ratio 0.175
-#   per h:          hurdle 0.5 and 1.5; the rule has no h = 2 row, so "nan".
-# The TR02 rows hold 9000 million and must not be shown: only "ALL" is.
-SHOW_BIAS = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import COMPONENT_COLUMNS
-
-no_ratio = float("nan")
-given = [
-    ("hurdle", "ALL", "1", "known customers", 1000000.0, 2000000.0, -1000000.0, 0.5),
-    ("hurdle", "ALL", "2", "known customers", 3000000.0, 2000000.0, 1000000.0, 1.5),
-    ("hurdle", "ALL", "pooled", "known customers", 4000000.0, 4000000.0, 0.0, 1.0),
-    ("hurdle", "ALL", "1", "new customers", 8000000.0, 0.0, 8000000.0, no_ratio),
-    ("hurdle", "ALL", "pooled", "new customers", 1500000.0, 0.0, 1500000.0, no_ratio),
-    ("hurdle", "ALL", "pooled", "refunds", -250000.0, -500000.0, 250000.0, 0.5),
-    ("hurdle", "ALL", "pooled", "price level", 1234500000.0, 1000000000.0, 234500000.0, 1.2345),
-    ("hurdle", "TR02", "1", "known customers", 9e9, 9e9, 0.0, 7.0),
-    ("hurdle", "TR02", "pooled", "known customers", 9e9, 9e9, 0.0, 7.0),
-    ("rule", "ALL", "1", "known customers", 500000.0, 2000000.0, -1500000.0, 0.25),
-    ("rule", "ALL", "pooled", "known customers", 700000.0, 4000000.0, -3300000.0, 0.175),
-]
-bias = pd.DataFrame(given, columns=COMPONENT_COLUMNS)
-before = bias.copy()
-script.show_component_bias(bias, 2)
-pd.testing.assert_frame_equal(bias, before)
-print("ok")
-"""
-
-BIAS_PRINTOUT = [
-    "        bias per part (U14.5d), consolidated, all (origin, h), nominal, million TRY (the "
-    "price level row is part of the total's gap, not added to it):",
-    "                   part forecast   actual     gap  ratio",
-    "method                                                  ",
-    "hurdle  known customers      4.0      4.0    +0.0  1.000",
-    "hurdle    new customers      1.5      0.0    +1.5    nan",
-    "hurdle          refunds     -0.2     -0.5    +0.2  0.500",
-    "hurdle      price level  1,234.5  1,000.0  +234.5  1.234",
-    "rule    known customers      0.7      4.0    -3.3  0.175",
-    "        known customers, forecast / actual per h:",
-    "          hurdle                h1 0.500  h2 1.500",
-    "          rule (open invoices)  h1 0.250  h2 nan",
-]
-
-
-@pytest.fixture(scope="module")
-def bias_lines():
-    result = run_code(SHOW_BIAS)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_component_bias_exact_printout(bias_lines):
-    assert bias_lines == BIAS_PRINTOUT
-
-
-def test_show_component_bias_a_nan_ratio_is_printed_as_nan(bias_lines):
-    # An actual of 0: the gap is there, the ratio says so.
-    new_customers = [line for line in bias_lines if "new customers" in line]
-    assert len(new_customers) == 1
-    assert new_customers[0].split()[-2:] == ["+1.5", "nan"]
-
-
-def test_show_component_bias_shows_only_the_consolidated_rows(bias_lines):
-    # The TR02 rows hold 9000 million and a ratio of 7.
-    joined = "\n".join(bias_lines)
-    assert "9,000" not in joined
-    assert "7.000" not in joined
-
-
-def test_show_component_bias_a_horizon_without_a_row_is_nan(bias_lines):
-    assert bias_lines[-1].endswith("h1 0.250  h2 nan")
-
-
-def test_show_component_bias_names_the_rule_by_its_open_invoices(bias_lines):
-    assert bias_lines[-1].startswith("          rule (open invoices)")
-    assert bias_lines[-4].startswith("rule    known customers")
-
-
-# show_payer_split on a hand-made table, horizons 2. Consolidated, h = 2 has nobody expected
-# (NaN per payer and m ratio); TR04 had no payers at all (NaN ratios). The TR02 h = 1 row is
-# per company but not pooled, so it is in neither table; ALL's per-h rows are not in the second.
-SHOW_SPLIT = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import PAYER_COLUMNS
-
-no_ratio = float("nan")
-given = [
-    ("TR02", "1", 4, 2.0, 3, 7.0, 60.0, 86.0, 7.0, 7.0),
-    ("TR02", "pooled", 6, 3.25, 5, 0.65, 55.3846, 74.0, 0.74844, 0.48649),
-    ("TR04", "pooled", 3, 2.0, 0, no_ratio, 25.0, no_ratio, no_ratio, no_ratio),
-    ("ALL", "1", 6, 3.0, 4, 0.75, 50.0, 70.0, 5 / 7, 150 / 280),
-    ("ALL", "2", 3, 0.0, 3, 0.0, no_ratio, 43.33333, no_ratio, 0.0),
-    ("ALL", "pooled", 9, 5.25, 7, 0.75, 43.80952, 58.57143, 0.74797, 0.56098),
-]
-split = pd.DataFrame(given, columns=PAYER_COLUMNS)
-before = split.copy()
-script.show_payer_split(split, 2)
-pd.testing.assert_frame_equal(split, before)
-print("ok")
-"""
-
-SPLIT_PRINTOUT = [
-    "        known customers, how many pay and how much each pays (real TRY; a ratio is "
-    "forecast / actual), consolidated:",
-    "         payers expected  payers actual  p ratio  per payer expected  per payer actual  "
-    "m ratio  p x m ratio",
-    "horizon" + " " * 101,
-    "1                   3.00              4     0.75               50.00            70.000    "
-    "0.714        0.536",
-    "2                   0.00              3     0.00                 NaN            43.333      "
-    "NaN        0.000",
-    "pooled              5.25              7     0.75               43.81            58.571    "
-    "0.748        0.561",
-    "        the same per company, all (origin, h):",
-    "         p ratio  m ratio  p x m ratio",
-    "company                               ",
-    "TR02        0.65    0.748        0.486",
-    "TR04         NaN      NaN          NaN",
-]
-
-
-@pytest.fixture(scope="module")
-def split_lines():
-    result = run_code(SHOW_SPLIT)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_payer_split_exact_printout(split_lines):
-    assert split_lines == SPLIT_PRINTOUT
-
-
-def test_show_payer_split_nan_ratios_are_printed_as_nan(split_lines):
-    assert split_lines[-1].split() == ["TR04", "NaN", "NaN", "NaN"]
-
-
-def test_show_payer_split_per_company_rows_are_the_pooled_ones_without_all(split_lines):
-    # 1. The second table has TR02 and TR04, once each; ALL is the first table.
-    second = split_lines[split_lines.index("        the same per company, all (origin, h):") + 3:]
-    assert [line.split()[0] for line in second] == ["TR02", "TR04"]
-    # 2. The TR02 h = 1 row, with its ratio of 7, is nowhere.
-    assert "7.0" not in "\n".join(split_lines)
-
-
-# The real functions, end to end: their tables are what the printouts expect.
-SHOW_REAL_TABLES = """
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from tests.hurdle.test_evaluate import cb_run, ps_run
-
-script.show_component_bias(cb_run(), 2)
-script.show_component_bias(cb_run(rolled=None), 2)
-script.show_payer_split(ps_run(), 2)
-print("ok")
-"""
-
-
-@pytest.fixture(scope="module")
-def real_table_lines():
-    result = run_code(SHOW_REAL_TABLES)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_the_printouts_take_the_real_tables_of_the_worked_examples(real_table_lines):
-    # 1. Consolidated known customers per h, forecast / actual, from test_evaluate's worked
-    #    example: 2320 / 3277 = 0.708 and 5000 / 5329 = 0.938; the rule 1870 / 3277 = 0.571 and
-    #    2310 / 5329 = 0.433.
-    assert "          hurdle                h1 0.708  h2 0.938" in real_table_lines
-    assert "          rule (open invoices)  h1 0.571  h2 0.433" in real_table_lines
-    # 2. The payer split's pooled rows: TR02 p 0.65; TR04 1.00 and 1.25; ALL's p 0.75.
-    assert real_table_lines[-2].split() == ["TR02", "0.65", "0.748", "0.486"]
-    assert real_table_lines[-1].split() == ["TR04", "1.00", "1.250", "1.250"]
-
-
-def test_the_printout_of_the_rule_alone_has_only_the_rule(real_table_lines):
-    # Without the model: the table's one row and the one line per h come from the rule.
-    second_start = [i for i, line in enumerate(real_table_lines)
-                    if line.startswith("        bias per part")][1]
-    second_end = [i for i, line in enumerate(real_table_lines)
-                  if line.startswith("        known customers, how many")][0]
-    second = real_table_lines[second_start:second_end]
-    assert not any(line.startswith("hurdle") for line in second)
-    assert second[-1] == "          rule (open invoices)  h1 0.571  h2 0.433"
-
-
 # Step 17, U14.6: the balance check, right after the payer split, only when the model ran. Wiring
 # on main()'s syntax tree, then step 17's block run with the fakes of run_step_17, then the exact
 # printout of show_balance_coherence on a hand-made table, in a separate process.
@@ -8264,21 +4940,6 @@ def test_step_17_the_balance_check_calls_take_no_keywords():
 
 def test_step_17_coherence_is_assigned_once():
     assert len(assignments_to(step_17_block(), "coherence")) == 1
-
-
-def test_show_balance_coherence_is_a_module_level_function_before_show_actual_totals():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == "show_balance_coherence"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["coherence", "factor"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-    names = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
-    assert names.index("show_balance_coherence") == names.index("show_payer_split") + 1
-    # U15 put its two printouts between it and show_actual_totals, U16.1 step 18's one more
-    # (show_grid_predictions since U16.3), U16.2 show_grid_candidates one more.
-    assert names.index("show_balance_coherence") + 5 == names.index("show_actual_totals")
 
 
 def test_step_17_run_the_balance_check_gets_its_arguments_in_order():
@@ -8327,84 +4988,6 @@ def test_step_17_run_a_cached_model_gives_the_balance_check_its_customers():
     cached = SimpleNamespace(customers="<cached customers>")
     calls, _, _, _ = run_step_17(True, load_with_cache=lambda *args, **kwargs: cached)
     assert by_name_of(calls)["balance_coherence"][0][0] == "<cached customers>"
-
-
-# show_balance_coherence on a hand-made table, factor 1.5. TR04 has no balance (NaN shares).
-# ALL's groups: 1,234 rows, 1,560,000 and 520,000 TRY; 25,678 rows, 44,000,000 and 25,000,000.
-SHOW_COHERENCE = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.evaluate import COHERENCE_COLUMNS
-
-no_ratio = float("nan")
-given = [
-    ("TR02", 6, 394.0, 420.0, 290.0, 394 / 290, 420 / 290, 4, 0.25, 0.5, 1, 7e6, 8e6, 2, 9e6, 1e6),
-    ("TR04", 2, 430.0, 520.0, 0.0, no_ratio, no_ratio, 0, no_ratio, no_ratio, 0, 0.0, 0.0, 2,
-     430.0, 520.0),
-    ("ALL", 26912, 824.0, 940.0, 290.0, 824 / 290, 940 / 290, 1234, 0.4, 0.6, 1234, 1.56e6,
-     5.2e5, 25678, 4.4e7, 2.5e7),
-]
-coherence = pd.DataFrame(given, columns=COHERENCE_COLUMNS)
-before = coherence.copy()
-script.show_balance_coherence(coherence, FACTOR)
-pd.testing.assert_frame_equal(coherence, before)
-print("ok")
-"""
-
-COHERENCE_PRINTOUT = [
-    "        balance check (U14.6), each customer's cash over the weeks against what it owes at "
-    "the origin:",
-    "         forecast / balance  actual / balance  forecast > 1.5x  actual > 1.5x",
-    "company                                                                      ",
-    "TR02                  1.359             1.448             0.25            0.5",
-    "TR04                    NaN               NaN              NaN            NaN",
-    "ALL                   2.841             3.241             0.40            0.6",
-    "        above 1.5x the balance: 1,234 rows, forecast 1.6 M against actual 0.5 M",
-    "        nothing open: 25,678 rows, forecast 44.0 M against actual 25.0 M",
-]
-
-
-def coherence_lines(factor):
-    result = run_code(SHOW_COHERENCE.replace("FACTOR", factor))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_balance_coherence_exact_printout():
-    assert coherence_lines("1.5") == COHERENCE_PRINTOUT
-
-
-def test_show_balance_coherence_a_whole_factor_prints_without_a_point():
-    lines = coherence_lines("2.0")
-    assert lines[1].split("  ")[-1].strip() == "actual > 2x"
-    assert lines[6].startswith("        above 2x the balance:")
-
-
-# The real function, end to end: its table is what the printout expects. Consolidated, from
-# test_evaluate's worked example: 824 / 490 = 1.682, 940 / 490 = 1.918; TR02 394 / 290 = 1.359.
-SHOW_REAL_COHERENCE = """
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from tests.hurdle.test_evaluate import bc_run
-
-script.show_balance_coherence(bc_run(), 1.5)
-print("ok")
-"""
-
-
-def test_the_printout_takes_the_real_table_of_the_worked_example():
-    result = run_code(SHOW_REAL_COHERENCE)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    assert lines[3].split() == ["TR02", "1.359", "1.448", "0.25", "0.5"]
-    assert lines[4].split() == ["TR04", "2.150", "2.600", "1.00", "1.0"]
-    assert lines[5].split() == ["ALL", "1.682", "1.918", "0.40", "0.6"]
-    assert lines[6] == "        above 1.5x the balance: 2 rows, forecast 0.0 M against actual 0.0 M"
-    assert lines[7] == "        nothing open: 3 rows, forecast 0.0 M against actual 0.0 M"
 
 
 # Step 17, U15: the reliability and the choice of corrections, after the balance check, only when
@@ -8457,18 +5040,6 @@ def test_step_17_applies_no_correction_to_the_forecasts_it_learned_from():
     assert "corrected_forecast" not in names
 
 
-@pytest.mark.parametrize("name, parameters", [("show_calibration_reliability", ["reliability"]),
-                                              ("show_calibration_choice", ["choice", "min_gain"])])
-def test_the_calibration_printouts_are_module_level_functions(name, parameters):
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    found = [node for node in module.body
-             if isinstance(node, ast.FunctionDef) and node.name == name]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == parameters
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
 def test_step_17_run_the_calibration_comes_last_right_after_the_balance_check():
     calls, _, _, _ = run_step_17(True)
     assert [name for name, _, _ in calls][-6:] == ["balance_coherence", "show_balance_coherence",
@@ -8515,524 +5086,248 @@ def test_step_17_run_a_cached_model_gives_the_calibration_its_forecasts():
     assert by_name["choose_calibration"][0][0] is cached
 
 
-# show_calibration_reliability on the real function's table: the small world of test_calibrate,
-# whose numbers are worked out there. p: 0.25 and 0.65 at h 1, 0.25 and 0.7 at h 2.
-SHOW_RELIABILITY = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.calibrate import calibration_reliability
-from tests.hurdle.test_calibrate import reliability_case
-
-reliability = calibration_reliability(*reliability_case(), groups=2)
-before = reliability.p.copy(), reliability.m.copy()
-script.show_calibration_reliability(reliability)
-pd.testing.assert_frame_equal(reliability.p, before[0])
-pd.testing.assert_frame_equal(reliability.m, before[1])
-print("ok")
-"""
-
-RELIABILITY_PRINTOUT = [
-    "        stage 1 reliability, all rolling forecast rows in equal groups by p, all h "
-    "(calibrated: mean_p near share_paid in every group):",
-    " group  p_low  p_high  mean_p  share_paid  rows",
-    "     1    0.1     0.4   0.250        0.25     4",
-    "     2    0.5     0.9   0.675        0.75     4",
-    "        the same per h, each cell mean p / share paid:",
-    "horizon                1                2",
-    "group                                    ",
-    "1        0.2500 / 0.5000  0.2500 / 0.0000",
-    "2        0.6500 / 0.5000  0.7000 / 1.0000",
-    "        stage 2 reliability, paid forecast rows in equal groups by m (calibrated: ratio = "
-    "mean actual / mean m near 1 in every group):",
-    " group  m_low  m_high  mean_m  mean_actual  ratio  rows",
-    "     1    5.0    20.0    12.0         20.0  1.600     2",
-    "     2   90.0   150.0   120.0        200.0  1.667     2",
-]
-
-
-def test_show_calibration_reliability_exact_printout():
-    result = run_code(SHOW_RELIABILITY)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == RELIABILITY_PRINTOUT + ["ok"]
-
-
-# show_calibration_choice on hand-made choices. A table of two pairs is enough: the printout
-# does not depend on how many there are.
-SHOW_CHOICE = """
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
-                                                    MCorrection, PCorrection)
-from collection_estimation.hurdle.evaluate import BOOTSTRAP_COLUMNS
-
-candidates = pd.DataFrame(
-    [("p none, m none", "none", "none", 0, 0.17034, 0.11119, -0.05, 0.22221),
-     ("p none, m scale", "none", "scale", 1, 0.16301, 0.10008, 0.01, 0.21004)],
-    columns=CANDIDATE_COLUMNS)
-bootstrap = pd.DataFrame(
-    [("p none, m scale", "p none, m none", "pooled", 20, 0.163, 0.17, -0.007, -0.012, -0.002,
-      0.98, 2000)], columns=BOOTSTRAP_COLUMNS)
-empty = bootstrap.iloc[:0]
-choices = {
-    "none": (PCorrection("none"), MCorrection("none"), empty),
-    "scale": (PCorrection("none"), MCorrection("scale", 1.0434), bootstrap),
-    "company": (PCorrection("one map", {"all": (1.1, -0.2)}),
-                MCorrection("per company", 1.05, per_company={"TR02": 1.1, "TR04": 0.9}),
-                bootstrap),
-    "size": (PCorrection("per h", {1: (1.0, 0.1), 2: (0.95, -0.05)}),
-             MCorrection("by size", 1.05, log_m=(0.0, 6.907755278982137),
-                         factors=(1.5, 0.75)), bootstrap),
-}
-p_correction, m_correction, shown_bootstrap = choices["WHICH"]
-choice = CalibrationChoice(p_correction=p_correction, m_correction=m_correction, split_week=41,
-                           judged_origins=[41, 42, 43, 44], candidates=candidates,
-                           winner="WINNER", bootstrap=shown_bootstrap)
-before = candidates.copy()
-script.show_calibration_choice(choice, 0.005)
-pd.testing.assert_frame_equal(candidates, before)
-print("ok")
-"""
-
-CHOICE_TABLE = [
-    "        corrections learned on target weeks up to 41, judged at origins 41-44 (only wape "
-    "decides; min_gain 0.005):",
-    "   p     m  numbers_learned   wape  total_wape  bias  company_wape",
-    "none  none                0 0.1703      0.1112 -0.05        0.2222",
-    "none scale                1 0.1630      0.1001  0.01        0.2100",
-]
-CHOICE_BOOTSTRAP_LINE = (
-    "        paired bootstrap (U14.5c), consolidated, 2000 resamples; difference = WAPE of the "
-    "first - WAPE of the second (below 0: the first is better):")
-FROZEN_LINE = ("        the chosen corrections, learned on all these rows and frozen for the "
-               "test:")
-
-
-def choice_lines(which, winner):
-    code = SHOW_CHOICE.replace("WHICH", which).replace("WINNER", winner)
-    result = run_code(code)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_calibration_choice_no_correction_exact_printout():
-    assert choice_lines("none", "p none, m none") == CHOICE_TABLE + [
-        "        chosen: p none, m none",
-        "        no correction chosen, so nothing to compare it with",
-        FROZEN_LINE,
-        "          p, none: unchanged",
-        "          m, none: common factor 1.000"]
-
-
-def test_show_calibration_choice_scale_shows_the_bootstrap_and_the_factor():
-    lines = choice_lines("scale", "p none, m scale")
-    assert lines[:5] == CHOICE_TABLE + ["        chosen: p none, m scale"]
-    assert lines[5] == CHOICE_BOOTSTRAP_LINE
-    assert not any("no correction chosen" in line for line in lines)
-    joined = "\n".join(lines[6:-3])
-    for text in ("p none, m scale vs p none, m none", "pooled", "0.163", "0.170", "-0.007",
-                 "[-0.012, -0.002]", "98%"):
-        assert text in joined, text
-    assert lines[-3:] == [FROZEN_LINE, "          p, none: unchanged",
-                          "          m, scale: common factor 1.043"]
-
-
-def test_show_calibration_choice_per_company_shows_each_company():
-    lines = choice_lines("company", "p one map, m per company")
-    assert lines[-4:] == [FROZEN_LINE,
-                          "          p, one map: h all: slope 1.100, intercept -0.200",
-                          "          m, per company: common factor 1.050",
-                          "            TR02 1.100, TR04 0.900"]
-
-
-def test_show_calibration_choice_by_size_shows_the_factor_at_each_m():
-    # log m 0 is m = 1; 6.9077... is m = 1,000.
-    lines = choice_lines("size", "p per h, m by size")
-    assert lines[-4:] == [FROZEN_LINE,
-                          "          p, per h: h 1: slope 1.000, intercept 0.100, "
-                          "h 2: slope 0.950, intercept -0.050",
-                          "          m, by size: common factor 1.050",
-                          "            factor at m = 1: 1.500, 1,000: 0.750"]
-
-
-# The real function, end to end: its choice is what the printout expects. By hand in
-# test_calibrate: no correction 0.856; `scale` 0.714; frozen `scale` 30700 / 9200 = 3.337.
-SHOW_REAL_CHOICE = """
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from tests.hurdle.test_calibrate import choose, validation_case
-
-script.show_calibration_choice(choose(validation_case(), min_gain=0.06), 0.06)
-print("ok")
-"""
-
-
-def test_the_choice_printout_takes_the_real_choice_of_the_worked_example():
-    result = run_code(SHOW_REAL_CHOICE)
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    assert lines[0] == ("        corrections learned on target weeks up to 15, judged at origins "
-                        "15-17 (only wape decides; min_gain 0.06):")
-    # The table: a header and the twelve pairs; p none, m none and p none, m scale first.
-    assert lines[2].split()[:4] == ["none", "none", "0", "0.8559"]
-    assert lines[3].split()[:4] == ["none", "scale", "1", "0.7136"]
-    assert lines[14] == "        chosen: p none, m scale"
-    assert lines[15].startswith("        paired bootstrap (U14.5c), consolidated, 50 resamples")
-    assert lines[-4:-1] == [FROZEN_LINE, "          p, none: unchanged",
-                            "          m, scale: common factor 3.337"]
-
-
-# Step 18, the settings grid (U16), behind its own switch, [grid] run, after step 17's `if`
-# and outside it. U16.2: the settings to try (show_grid_candidates). U16.3: every candidate at
-# every validation origin (grid_predictions, each fit cached under hurdle_grid, with a
-# progress callback), then show_grid_predictions, which checks candidate 0 against step 17's
-# rolled forecasts (or says it cannot, when step 17 made none: `rolled = None` now sits right
-# before step 17's `if`). The U16.1 check (show_stage_predictions) is gone. Wiring on main()'s
-# syntax tree, then step 18's `if` run with fakes, then the exact printouts of
-# show_grid_predictions and show_grid_candidates (each compiled alone from the script).
-# U16.4: then grid_gates on the predictions, candidates and settings, and show_grid_gates
-# once per stage (stage 1 by log loss ascending, stage 2 by deviance skill descending).
-# U16.5: then the actual cash at the grid's origins (actual_totals), every combination scored
-# (grid_scores), and show_grid_scores, which checks the current combination against step 17.
-# U16.6: then grid_choice (the combination kept, its calibration, and its comparison with the
-# current settings and the references, made in step 18) and show_grid_choice, which end step 18.
-STEP_18_FIT_PROGRESS = (
-    "def fit_progress(done, total, stage, at, number, seconds):\n"
-    "    left = (time.perf_counter() - started) / done * (total - done)\n"
-    "    print(f'  ... {stage} setting {number}, origin {at}: {done} of {total} done "
-    "({seconds:.0f} s), about {left / 60:.0f} min left')")
-STEP_18_GRID_CALL = (
-    "predictions = grid_predictions(table, grid_origins, candidates, settings, "
-    "block_columns=block_columns, companies=companies, "
-    "new_cash=new_cash, refunds=refunds, unidentified=unidentified, levels=levels, "
-    "calendar=calendar, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
-    "on_fit_done=fit_progress)")
-STEP_18_ACTUAL = ("grid_actual = actual_totals(weekly, weeks, levels, companies, grid_origins, "
-                  "settings.receivables.horizons)")
-STEP_18_SCORES = ("grid_table = grid_scores(predictions, candidates, gates, grid_actual, "
-                  "settings, companies=companies, week_zero=week_zero)")
-STEP_18_SHOW_SCORES = ("show_grid_scores(grid_table, candidates, rolled, grid_actual, "
-                       "settings.receivables.horizons)")
-STEP_18_CHOICE = ("choice = grid_choice(predictions, candidates, grid_table, grid_actual, "
-                  "settings, companies=companies, week_zero=week_zero, weekly=weekly, "
-                  "weeks=weeks, levels=levels, calendar=calendar, ledger=ledger, rates=rates, "
-                  "new_cash=new_cash, refunds=refunds, unidentified=unidentified)")
-STEP_18_SHOW_CHOICE = "show_grid_choice(choice, candidates, grid_table, settings)"
-# U16.7: the v1 test, an `if` on [grid] run_test that ends step 18.
-STEP_18_TEST_ORIGINS = "test_origins = list(settings.evaluation.test_origins)"
-STEP_18_TEST_BANNER = (
-    "print(f'        V1 TEST over the test origins {test_origins[0]}-{test_origins[-1]} "
-    "({len(test_origins)} origins): a report, not a choice; do not change the settings "
-    "because of it')")
-STEP_18_TEST_ACTUAL = ("test_actual = actual_totals(weekly, weeks, levels, companies, "
-                       "test_origins, settings.receivables.horizons)")
-STEP_18_TEST_CALL = (
-    "test = grid_test(choice, test_actual, settings, table=table, "
-    "block_columns=block_columns, companies=companies, "
-    "week_zero=week_zero, weekly=weekly, weeks=weeks, levels=levels, calendar=calendar, "
-    "ledger=ledger, rates=rates, new_cash=new_cash, refunds=refunds, "
-    "unidentified=unidentified, cache_folder=settings.data.cache_folder / 'hurdle_grid', "
-    "on_fit_done=fit_progress)")
-STEP_18_SHOW_TEST = "show_grid_test(test, choice, settings)"
-STEP_18_TEST_BODY = [STEP_18_TEST_ORIGINS, STEP_18_TEST_BANNER, "started = time.perf_counter()",
-                     STEP_18_TEST_ACTUAL, STEP_18_TEST_CALL, STEP_18_SHOW_TEST]
-STEP_18_TEST_NOT_RUN = "print('        the v1 test is not run ([grid] run_test = false)')"
-STEP_18_TEST_IF = ("if settings.grid.run_test:\n"
-                   + "".join(f"    {line}\n" for line in STEP_18_TEST_BODY)
-                   + f"else:\n    {STEP_18_TEST_NOT_RUN}")
-STEP_18_STATEMENTS = [
-    "grid_origins = list(settings.evaluation.validation_origins)",
-    "candidates = grid_candidates(settings)",
-    "print(f'Step 18: settings grid (U16) over the validation origins "
-    "{grid_origins[0]}-{grid_origins[-1]} ({len(grid_origins)} origins)')",
-    "show_grid_candidates(candidates, len(grid_origins))",
-    "started = time.perf_counter()",
-    STEP_18_FIT_PROGRESS,
-    STEP_18_GRID_CALL,
-    "show_grid_predictions(predictions, rolled)",
-    "gates = grid_gates(predictions, candidates, settings)",
-    "show_grid_gates('stage 1', gates.stage1, 'log loss', ascending=True)",
-    "show_grid_gates('stage 2', gates.stage2, 'deviance skill', ascending=False)",
-    STEP_18_ACTUAL,
-    STEP_18_SCORES,
-    STEP_18_SHOW_SCORES,
-    STEP_18_CHOICE,
-    STEP_18_SHOW_CHOICE,
-    STEP_18_TEST_IF,
-]
-STEP_18_NAMES = ("grid_candidates", "show_grid_candidates", "grid_predictions",
-                 "show_grid_predictions", "grid_gates", "grid_scores", "show_grid_scores",
-                 "grid_choice", "show_grid_choice", "grid_test", "show_grid_test")
-STEP_18_GONE = ("stage1_predictions", "stage2_predictions", "show_stage_predictions",
-                "p_alone", "m_alone", "p_seconds", "m_seconds")
-
-
-def step_18_block():
-    """main()'s one statement after step 17's `if`: step 18's `if settings.grid.run:`."""
-    body = main_body()
-    after = body[index_of_if(body, "settings.evaluation.run") + 1:]
-    assert len(after) == 1, [ast.unparse(node) for node in after]
-    return after[0]
-
-
-def step_18_body():
-    """The statements inside step 18's `if`."""
-    return step_18_block().body
-
-
-def script_functions():
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    return [node for node in module.body if isinstance(node, ast.FunctionDef)]
+# --- Step 18: one call of grid_run.run_grid behind [grid] run -------------------------------
+# Step 18 (U16) moved to hurdle/grid_run.py, which run_b.py runs alone too; what run_grid does
+# is tested in test_grid_run.py. Here: main()'s one statement for it, after step 17's `if`,
+# with step 17's forecasts (`rolled`, None unless step 17 made them), and the names main()
+# no longer calls itself.
+RUN_GRID = "run_grid(settings, inputs, rolled=rolled)"
+STEP_18_IF = f"if settings.grid.run:\n    {RUN_GRID}"
+# The grid's functions and printouts, which only run_grid calls now.
+GRID_NAMES = ("grid_candidates", "grid_predictions", "grid_gates", "grid_scores", "grid_choice",
+              "grid_test", "show_grid_candidates", "show_grid_predictions", "show_grid_gates",
+              "show_grid_scores", "show_grid_choice", "show_grid_test")
 
 
 def test_step_18_is_one_if_on_grid_run_right_after_step_17_and_last_in_main():
-    block = step_18_block()
-    assert isinstance(block, ast.If)
-    assert ast.unparse(block.test) == "settings.grid.run"
+    body = main_body()
+    block = body[index_of_if(body, "settings.evaluation.run") + 1]
+    assert ast.unparse(block) == STEP_18_IF
     assert block.orelse == []
-    assert ast.unparse(main_body()[-1]) == ast.unparse(block)
-
-
-def test_step_18_statements_in_order_inside_its_if():
-    assert [ast.unparse(node) for node in step_18_body()] == STEP_18_STATEMENTS
+    assert block is body[-1]
 
 
 def test_step_18_switch_is_read_once_in_main():
-    # [grid] run gates step 18 only; nothing else in main() reads it. (U16.7: run_test, read
-    # inside step 18, is another name; the word boundary keeps it out of the count.)
+    # [grid] run gates step 18 only; [grid] run_test is run_grid's to read.
     assert len(re.findall(r"settings\.grid\.run\b", main_source())) == 1
     assert index_of_if(main_body(), "settings.grid.run") == len(main_body()) - 1
+    assert "run_test" not in ast.unparse(main_tree())
 
 
-def test_step_18_names_are_called_once_only_inside_step_18():
-    for name in STEP_18_NAMES:
-        assert len(calls_to(main_tree(), name)) == 1, name
-        assert calls_in(step_18_body(), name), name
-        assert calls_to(step_17_block(), name) == [], name
-    # U16.7: the only `if` in step 18 is the v1 test's, its last statement.
-    body = step_18_body()   # one parse: nodes are matched by identity below
-    ifs = [node for node in body if isinstance(node, ast.If)]
-    assert len(ifs) == 1 and ifs[0] is body[-1]
-
-
-# --- U16.7: the v1 test inside step 18 ---------------------------------------------------------
-
-def step_18_test_if():
-    return step_18_body()[-1]
-
-
-def test_step_18_ends_with_one_if_on_grid_run_test():
-    block = step_18_test_if()
-    assert isinstance(block, ast.If)
-    assert ast.unparse(block.test) == "settings.grid.run_test"
-    assert ast.unparse(block) == STEP_18_TEST_IF
-
-
-def test_step_18_test_if_body_in_order():
-    assert [ast.unparse(node) for node in step_18_test_if().body] == STEP_18_TEST_BODY
-
-
-def test_step_18_test_if_else_says_the_test_is_not_run():
-    assert [ast.unparse(node) for node in step_18_test_if().orelse] == [STEP_18_TEST_NOT_RUN]
-
-
-def test_step_18_run_test_is_read_once_in_main_inside_step_18():
-    assert main_source().count("settings.grid.run_test") == 1
-    assert "run_test" in ast.unparse(step_18_test_if().test)
-
-
-def test_step_18_test_follows_the_choice_printout():
-    statements = [ast.unparse(node) for node in step_18_body()]
-    assert statements[-2:] == [STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
-
-
-def test_step_18_test_uses_the_test_origins_and_only_there():
-    block = step_18_test_if()
-    assert ast.unparse(block.body[0]) == STEP_18_TEST_ORIGINS
-    for node in step_18_body()[:-1]:
-        assert "test_origins" not in ast.unparse(node)
-    assert "validation_origins" not in ast.unparse(block)
-    assert "grid_origins" not in ast.unparse(block)
-
-
-def test_step_18_test_actual_is_actual_totals_at_the_test_origins():
-    calls = calls_in(step_18_test_if().body, "actual_totals")
-    assert len(calls) == 1 and calls[0].keywords == []
-    assert [ast.unparse(a) for a in calls[0].args] == [
-        "weekly", "weeks", "levels", "companies", "test_origins", "settings.receivables.horizons"]
-    # The same inputs as the grid's actual cash, but the origins.
-    grid = calls_in(step_18_body()[:-1], "actual_totals")[0]
-    assert [ast.unparse(a) for a in grid.args][:4] == [ast.unparse(a) for a in calls[0].args][:4]
-    assert [ast.unparse(a) for a in grid.args][5] == [ast.unparse(a) for a in calls[0].args][5]
-
-
-def test_step_18_grid_test_positional_arguments():
-    calls = calls_in(step_18_test_if().body, "grid_test")
+def test_main_calls_run_grid_once_and_only_inside_step_18():
+    calls = calls_to(main_tree(), "run_grid")
     assert len(calls) == 1
-    assert [ast.unparse(a) for a in calls[0].args] == ["choice", "test_actual", "settings"]
+    assert [ast.unparse(c) for c in calls_to(main_body()[-1], "run_grid")] == [RUN_GRID]
+    assert [ast.unparse(a) for a in calls[0].args] == ["settings", "inputs"]
+    assert keywords_of(calls[0]) == {"rolled": "rolled"}
+    # main() does not use what run_grid returns: the printouts are run_grid's.
+    assert isinstance(main_body()[-1].body[0], ast.Expr)
 
 
-def test_step_18_grid_test_keywords_are_the_grids_and_the_choices():
-    call = keywords_of(calls_in(step_18_test_if().body, "grid_test")[0])
-    predictions = keywords_of(calls_in(step_18_body(), "grid_predictions")[0])
-    choice = keywords_of(calls_in(step_18_body(), "grid_choice")[0])
-    assert call["table"] == "table"
-    for name in ("block_columns", "companies", "new_cash", "refunds", "unidentified", "levels",
-                 "calendar", "cache_folder", "on_fit_done"):
-        assert call[name] == predictions[name], name
-    for name, value in choice.items():
-        assert call[name] == value, name
-    assert set(call) == {"table"} | set(choice) | {"block_columns", "cache_folder",
-                                                    "on_fit_done"}
+def test_main_calls_none_of_the_grid_functions_or_printouts_itself():
+    tree = main_tree()
+    for name in GRID_NAMES:
+        assert calls_to(tree, name) == [], name
+    for name in ("fit_progress", "grid_origins", "grid_actual", "grid_table", "test_actual"):
+        assert name not in {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}, name
 
 
-def test_step_18_grid_test_shares_the_grids_cache_folder_and_progress_callback():
-    call = keywords_of(calls_in(step_18_test_if().body, "grid_test")[0])
-    assert call["cache_folder"] == "settings.data.cache_folder / 'hurdle_grid'"
-    assert call["on_fit_done"] == "fit_progress"
+STEP_18_RUN = """
+from types import SimpleNamespace
+import ast
+import inspect
+import textwrap
+import run_hurdle_pipeline as script
+
+body = ast.parse(textwrap.dedent(inspect.getsource(script.main))).body[0].body
+block = body[-1]
+assert ast.unparse(block.test) == "settings.grid.run"
+calls = []
+def run_grid(*args, **kwargs):
+    calls.append((args, kwargs))
+    return "<choice>", "<test>"
+for run in (True, False):
+    settings = SimpleNamespace(grid=SimpleNamespace(run=run))
+    namespace = {"settings": settings, "inputs": "<inputs>", "rolled": "<rolled>",
+                 "run_grid": run_grid}
+    exec(compile(ast.Module(body=[block], type_ignores=[]), "<step 18>", "exec"), namespace)
+    print(run, len(calls), calls[-1][0][1:] if calls else None,
+          calls[-1][1] if calls else None, calls[-1][0][0] is settings if calls else None)
+print("ok")
+"""
 
 
-def test_step_18_test_restarts_the_clock_after_the_banner_and_before_the_fits():
-    statements = [ast.unparse(node) for node in step_18_test_if().body]
-    clock = statements.index("started = time.perf_counter()")
-    assert statements.index(STEP_18_TEST_BANNER) < clock < statements.index(STEP_18_TEST_CALL)
-    assert clock < statements.index(STEP_18_TEST_ACTUAL)
+def test_step_18_run_calls_run_grid_with_the_settings_inputs_and_rolled_only_when_on():
+    # main()'s own `if` run with a fake run_grid: switched on, one call with main()'s
+    # settings, inputs and rolled; switched off, none (the count stays 1, the last call is
+    # still the first run's, made with the other settings object).
+    result = run_code(STEP_18_RUN)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "True 1 ('<inputs>',) {'rolled': '<rolled>'} True",
+        "False 1 ('<inputs>',) {'rolled': '<rolled>'} False",
+        "ok"]
 
 
-def test_step_18_show_grid_test_gets_the_test_the_choice_and_settings():
-    calls = calls_in(step_18_test_if().body, "show_grid_test")
-    assert len(calls) == 1 and calls[0].keywords == []
-    assert [ast.unparse(a) for a in calls[0].args] == ["test", "choice", "settings"]
-
-
-def test_show_grid_test_is_a_module_level_function_with_three_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_test"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["test", "choice", "settings"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_show_grid_test_sits_right_after_show_grid_choice():
-    names = [node.name for node in script_functions()]
-    assert names[names.index("show_grid_choice") + 1] == "show_grid_test"
-
-
-SHOW_TEST_GLOBALS = {"HURDLE", "UNCORRECTED", "candidate_name", "show_evaluation_scores",
-                     "show_paired_bootstrap"}
-
-
-def test_show_grid_test_reads_only_names_the_script_imports_or_defines():
-    import builtins
-    function = [node for node in script_functions() if node.name == "show_grid_test"][0]
-    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Load)}
-    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Store)}
-    params = {a.arg for a in function.args.args}
-    assert loaded - stored - params - set(dir(builtins)) == SHOW_TEST_GLOBALS
+def test_the_script_imports_run_grid_from_grid_run():
     module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
-                for a in node.names}
-    defined = {node.name for node in script_functions()}
-    assert {"HURDLE", "UNCORRECTED", "candidate_name"} <= imported
-    assert {"show_evaluation_scores", "show_paired_bootstrap"} <= defined
+    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+               and node.module == "collection_estimation.hurdle.grid_run"]
+    assert len(imports) == 1
+    assert [(a.name, a.asname) for a in imports[0].names] == [("run_grid", None)]
+
+
+def test_grid_is_imported_once_with_with_params_only():
+    # Step 15 still calls with_params; every other name of grid is run_grid's now (it was
+    # "test_grid_is_imported_once_with_its_names", eight names).
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
+               and node.module == "collection_estimation.hurdle.grid"]
+    assert len(imports) == 1
+    assert [(a.name, a.asname) for a in imports[0].names] == [("with_params", None)]
 
 
 def test_step_18_the_u16_1_check_is_gone_from_the_script():
-    source = SCRIPT.read_text(encoding="utf-8")
-    tree = ast.parse(source)
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    defined = {node.name for node in script_functions()}
+    defined = {node.name for node in module_functions(SCRIPT)}
     imported = {a.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
                 for a in node.names}
-    for name in STEP_18_GONE:
+    for name in ("stage1_predictions", "stage2_predictions", "show_stage_predictions", "p_alone",
+                 "m_alone", "p_seconds", "m_seconds"):
         assert name not in names | defined | imported, name
 
 
-def test_step_18_grid_candidates_get_the_whole_settings_once():
-    call = calls_in(step_18_body(), "grid_candidates")[0]
-    assert [ast.unparse(a) for a in call.args] == ["settings"] and call.keywords == []
+# --- The script's own functions and its printouts ---------------------------------------------
+
+REPORT_MODULES = ("collection_estimation.hurdle.reports.preparation",
+                  "collection_estimation.hurdle.reports.stages",
+                  "collection_estimation.hurdle.reports.evaluation")
 
 
-def test_step_18_show_grid_candidates_gets_the_candidates_and_the_origin_count():
-    call = calls_in(step_18_body(), "show_grid_candidates")[0]
-    assert [ast.unparse(a) for a in call.args] == ["candidates", "len(grid_origins)"]
-    assert call.keywords == []
+def script_imports():
+    """{module: [names]} of the script's top-level `from ... import`s."""
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = {}
+    for node in module.body:
+        if isinstance(node, ast.ImportFrom):
+            found.setdefault(node.module, []).extend(a.asname or a.name for a in node.names)
+    return found
 
 
-def test_step_18_uses_the_validation_origins_never_the_test_origins():
-    assert ast.unparse(step_18_body()[0]) == (
-        "grid_origins = list(settings.evaluation.validation_origins)")
-    # U16.7: only the v1 test's `if`, step 18's last statement, reads the test origins.
-    for node in step_18_body()[:-1]:
-        assert "test_origins" not in ast.unparse(node)
+def shows_called():
+    """The show_* names called anywhere in the script."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    return {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id.startswith("show_")}
 
 
-def test_step_18_grid_predictions_positional_arguments():
-    call = calls_in(step_18_body(), "grid_predictions")[0]
-    assert [ast.unparse(a) for a in call.args] == ["table", "grid_origins", "candidates",
-                                                   "settings"]
+def test_the_script_defines_main_and_its_experiments_only():
+    # Every printout moved to hurdle/reports/; what stays is main() and what only it runs.
+    assert [node.name for node in module_functions(SCRIPT)] == [
+        "main", "run_joint_diagnostic", "topup_candidates", "show_topups", "compare_topups"]
 
 
-def test_step_18_grid_predictions_gets_step_17s_inputs_without_week_zero():
-    # The same table pieces rolling_forecasts gets in step 17 (no week_zero: the grid does
-    # not re-inflate), its own cache folder and its own callback.
-    call = calls_in(step_18_body(), "grid_predictions")[0]
-    expected = {name: value for name, value in FORECAST_KEYWORDS.items() if name != "week_zero"}
-    expected.update(cache_folder="settings.data.cache_folder / 'hurdle_grid'",
-                    on_fit_done="fit_progress")
-    assert keywords_of(call) == expected
-    rolling = calls_to(with_model_if(), "rolling_forecasts")[0]
-    rolling_keywords = keywords_of(rolling)
-    for name in ("companies", "new_cash", "refunds", "unidentified", "levels", "calendar"):
-        assert keywords_of(call)[name] == rolling_keywords[name], name
+def test_the_script_defines_no_show_function_but_show_topups():
+    defined = [node.name for node in module_functions(SCRIPT) if node.name.startswith("show_")]
+    assert defined == ["show_topups"]
 
 
-def test_step_18_block_columns_are_step_16s():
-    step_16 = calls_in(step_16_body(), "forecast")[0]
-    call = calls_in(step_18_body(), "grid_predictions")[0]
-    assert keywords_of(call)["block_columns"] == keywords_of(step_16)["block_columns"]
+def test_each_printout_the_script_calls_is_imported_from_a_report_module():
+    imports = script_imports()
+    from_reports = {name for module in REPORT_MODULES for name in imports.get(module, [])}
+    assert shows_called() - {"show_topups"} == from_reports
+    # Imported from those modules only, and each from one of them only.
+    for module, names in imports.items():
+        if module not in REPORT_MODULES:
+            assert not [name for name in names if name.startswith("show_")], module
+    counted = [name for module in REPORT_MODULES for name in imports.get(module, [])]
+    assert len(counted) == len(set(counted))
 
 
-def test_step_18_cache_folder_is_a_subfolder_of_the_data_cache():
-    call = calls_in(step_18_body(), "grid_predictions")[0]
-    folder = [k.value for k in call.keywords if k.arg == "cache_folder"][0]
-    assert isinstance(folder, ast.BinOp) and isinstance(folder.op, ast.Div)
-    assert ast.unparse(folder.left) == "settings.data.cache_folder"
-    assert isinstance(folder.right, ast.Constant) and folder.right.value == "hurdle_grid"
+def test_the_script_imports_from_each_report_module_the_printouts_of_its_steps():
+    imports = script_imports()
+    assert imports["collection_estimation.hurdle.reports.preparation"] == ["show_preparation"]
+    assert imports["collection_estimation.hurdle.reports.stages"] == [
+        "show_amount_reliability", "show_calibration", "show_cash_by_p_group",
+        "show_diagnostic_grid", "show_diagnostic_splits", "show_diagnostic_test",
+        "show_exposure", "show_gates", "show_joint_grid", "show_joint_results",
+        "show_stage1_rows", "show_stage1_scores", "show_stage2_fit", "show_stage2_forecast",
+        "show_stage2_scores"]
+    assert imports["collection_estimation.hurdle.reports.evaluation"] == [
+        "show_actual_totals", "show_balance_coherence", "show_calibration_choice",
+        "show_calibration_reliability", "show_component_bias", "show_customer_forecasts",
+        "show_deflated_reference", "show_evaluation_scores", "show_forecast_totals",
+        "show_forecast_vs_actual", "show_paired_bootstrap", "show_payer_split",
+        "show_rolling_forecasts", "show_rule_reference"]
+    assert "collection_estimation.hurdle.reports.grid" not in imports
 
 
-def test_step_18_fit_progress_is_defined_after_the_clock_and_before_the_grid():
-    body = step_18_body()
-    statements = [ast.unparse(node) for node in body]
-    defs = [i for i, node in enumerate(body)
-            if isinstance(node, ast.FunctionDef) and node.name == "fit_progress"]
-    assert len(defs) == 1
-    progress = body[defs[0]]
-    assert [a.arg for a in progress.args.args] == ["done", "total", "stage", "at", "number",
-                                                   "seconds"]
-    assert progress.args.defaults == [] and progress.args.vararg is None
-    started = statements.index("started = time.perf_counter()")
-    grid = statements.index(STEP_18_GRID_CALL)
-    assert started < defs[0] < grid
+def test_every_name_the_script_imports_is_used():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    for module, names in script_imports().items():
+        for name in names:
+            assert name in used, (module, name)
 
 
-def test_step_18_shows_the_candidates_before_the_grid_then_the_predictions_then_gates():
-    statements = [ast.unparse(node) for node in step_18_body()]
-    assert statements.index("show_grid_candidates(candidates, len(grid_origins))") < (
-        statements.index(STEP_18_GRID_CALL))
-    # U16.4: the gates come right after the predictions printout; U16.5: the scores after
-    # them; U16.6: the choice after those; U16.7: the v1 test's `if` ends step 18.
-    at = statements.index("show_grid_predictions(predictions, rolled)")
-    assert statements[at + 1:at + 4] == STEP_18_STATEMENTS[-9:-6]
-    assert statements[at + 4:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
-                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
-    assert statements.index(STEP_18_GRID_CALL) < at
+# --- U12.2, U12.3: main() runs the top-ups right after unpacking the inputs ---------------------
+
+SHOW_TOPUPS = ("show_topups(new_cash, refunds, unidentified, levels, calendar, "
+               "settings.diagnostic.origin, settings.receivables.horizons, "
+               "settings.topups.window)")
+COMPARE_TOPUPS_IF = ("if settings.topups.compare:\n"
+                     "    compare_topups(new_cash, refunds, unidentified, levels, calendar, "
+                     "settings.topups, settings.receivables.horizons)")
+
+
+def unpacking_ends():
+    """The index in main()'s body of the last statement unpacking the inputs."""
+    body = main_body()
+    found = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+             and ast.unparse(node.value).startswith(("inputs.", "(inputs."))]
+    assert found == list(range(found[0], found[-1] + 1)), found
+    return found[-1]
+
+
+def test_main_calls_show_topups_right_after_the_inputs_are_unpacked():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 1]) == SHOW_TOPUPS
+    assert len(calls_to(main_tree(), "show_topups")) == 1
+
+
+def test_main_calls_compare_topups_right_after_show_topups_behind_topups_compare():
+    body = main_body()
+    at = unpacking_ends()
+    block = body[at + 2]
+    assert ast.unparse(block) == COMPARE_TOPUPS_IF
+    assert block.orelse == []
+    assert len(calls_to(main_tree(), "compare_topups")) == 1
+
+
+def test_the_top_ups_read_main_names_unpacked_before_them():
+    body = main_body()
+    at = unpacking_ends()
+    stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    for node in body[at + 1:at + 3]:
+        read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                and isinstance(n.ctx, ast.Load)} - {"settings", "show_topups",
+                                                     "compare_topups"}
+        assert read <= stored, read - stored
+
+
+def test_the_top_ups_come_before_the_demo_origin_guard():
+    body = main_body()
+    at = unpacking_ends()
+    assert is_demo_origin_guard(body[at + 3])
+
+
+def test_show_preparation_no_longer_runs_the_top_ups():
+    from tests.hurdle.code_checks import HURDLE
+    tree = function_tree(HURDLE / "reports" / "preparation.py", "show_preparation")
+    assert calls_to(tree, "show_topups") == [] and calls_to(tree, "compare_topups") == []
 
 
 def test_rolled_is_set_to_none_once_right_before_step_17():
@@ -9067,99 +5362,6 @@ def test_rolled_is_read_by_step_18_and_step_17_only_after_it_is_set():
         assert reads == [], ast.unparse(node)
 
 
-def test_grid_is_imported_once_with_its_names():
-    # U16.5 added grid_scores (the test was "..._four_functions" before); U16.6 grid_choice
-    # (it was "..._five_functions"); U16.7 UNCORRECTED and grid_test (it was
-    # "..._six_functions").
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
-               and node.module == "collection_estimation.hurdle.grid"]
-    assert len(imports) == 1
-    assert [(a.name, a.asname) for a in imports[0].names] == [
-        ("UNCORRECTED", None), ("grid_candidates", None), ("grid_choice", None),
-        ("grid_gates", None), ("grid_predictions", None), ("grid_scores", None),
-        ("grid_test", None), ("with_params", None)]
-
-
-def test_show_grid_predictions_is_a_module_level_function_with_two_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_predictions"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["predictions", "rolled"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_show_grid_candidates_is_a_module_level_function_with_two_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_candidates"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["candidates", "origins"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_step_18_printouts_sit_after_the_calibration_ones():
-    names = [node.name for node in script_functions()]
-    at = names.index("show_calibration_choice")
-    assert names[at + 1:at + 4] == ["show_grid_predictions", "show_grid_candidates",
-                                    "show_actual_totals"]
-
-
-GRID_NAMES = """
-import inspect
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle import grid
-assert script.grid_candidates is grid.grid_candidates
-assert script.grid_predictions is grid.grid_predictions
-inspect.signature(script.grid_candidates).bind("settings")
-inspect.signature(script.grid_predictions).bind(
-    "table", [1], "candidates", "settings", block_columns={}, companies=[], new_cash=None,
-    refunds=None, unidentified=None, levels=None, calendar=None, cache_folder="c",
-    on_fit_done=None)
-inspect.signature(script.show_grid_candidates).bind("candidates", 3)
-inspect.signature(script.show_grid_predictions).bind("predictions", None)
-assert script.grid_gates is grid.grid_gates
-assert script.with_params is grid.with_params
-inspect.signature(script.grid_gates).bind("predictions", "candidates", "settings")
-inspect.signature(script.show_grid_gates).bind("stage 1", "gates", "log loss",
-                                               ascending=True)
-assert script.grid_scores is grid.grid_scores
-inspect.signature(script.grid_scores).bind("predictions", "candidates", "gates", "actual",
-                                           "settings", companies=[], week_zero=None)
-inspect.signature(script.show_grid_scores).bind("table", "candidates", None, "actual", 5)
-assert script.grid_choice is grid.grid_choice
-inspect.signature(script.grid_choice).bind(
-    "predictions", "candidates", "table", "actual", "settings", companies=[], week_zero=None,
-    weekly=None, weeks=None, levels=None, calendar=None, ledger=None, rates=None,
-    new_cash=None, refunds=None, unidentified=None)
-inspect.signature(script.show_grid_choice).bind("choice", "candidates", "table", "settings")
-assert script.grid_test is grid.grid_test
-assert script.UNCORRECTED == grid.UNCORRECTED
-inspect.signature(script.grid_test).bind(
-    "choice", "actual", "settings", table=None, block_columns={}, companies=[],
-    week_zero=None, weekly=None, weeks=None, levels=None, calendar=None, ledger=None,
-    rates=None, new_cash=None, refunds=None, unidentified=None, cache_folder="c",
-    on_fit_done=None)
-inspect.signature(script.show_grid_test).bind("test", "choice", "settings")
-from collection_estimation.hurdle import calibrate
-assert script.candidate_name is calibrate.candidate_name
-from collection_estimation.hurdle import evaluate
-assert script.STACK_COLUMNS is evaluate.STACK_COLUMNS
-assert script.evaluation_scores is evaluate.evaluation_scores
-assert script.HURDLE == evaluate.HURDLE and script.POOLED == evaluate.POOLED
-assert not hasattr(script, "show_stage_predictions")
-assert not hasattr(script, "stage1_predictions")
-assert not hasattr(script, "stage2_predictions")
-print("ok")
-"""
-
-
-def test_step_18_grid_names_are_the_modules_functions():
-    result = run_code(GRID_NAMES)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("ok")
-
-
 def test_module_docstring_lists_step_18_after_the_forecast_line():
     lines = ast.get_docstring(ast.parse(SCRIPT.read_text(encoding="utf-8"))).splitlines()
     step_lines = [line for line in lines if re.match(r"^\s+\d+\s{2}", line)]
@@ -9169,511 +5371,6 @@ def test_module_docstring_lists_step_18_after_the_forecast_line():
                               "       (U16)  <- in progress")
 
 
-# Running step 18's `if` with fakes.
-
-TEST_NOT_RUN_LINE = "        the v1 test is not run ([grid] run_test = false)"
-
-def run_step_18(run=True, validation_origins=(37, 40, 44), ticks=(100.0,), rolled="<rolled>",
-                progress_calls=(), run_test=False, test_origins="<never read>",
-                test_progress_calls=()):
-    """Run step 18's `if` with fake inputs and functions; return (calls, printed). The fake
-    grid_predictions calls its on_fit_done once per item of `progress_calls`, the fake
-    grid_test once per item of `test_progress_calls` (U16.7, with `run_test`)."""
-    calls, printed = [], []
-    clock = iter(ticks)
-
-    def recorder(name, result):
-        def call(*args, **kwargs):
-            calls.append((name, args, kwargs))
-            return result
-        return call
-
-    def fake_grid(*args, **kwargs):
-        calls.append(("grid_predictions", args, kwargs))
-        for item in progress_calls:
-            kwargs["on_fit_done"](*item)
-        return "<predictions>"
-
-    def fake_test(*args, **kwargs):
-        calls.append(("grid_test", args, kwargs))
-        for item in test_progress_calls:
-            kwargs["on_fit_done"](*item)
-        return "<test>"
-
-    settings = SimpleNamespace(grid=SimpleNamespace(run=run, run_test=run_test),
-                               evaluation=SimpleNamespace(validation_origins=validation_origins,
-                                                          test_origins=test_origins),
-                               data=SimpleNamespace(cache_folder=Path("cache_root")),
-                               receivables=SimpleNamespace(horizons=5))
-    namespace = {
-        "settings": settings, "table": "<table>", "block_columns": "<blocks>",
-        "calendar": "<calendar>", "companies": "<companies>",
-        "new_cash": "<new cash>", "refunds": "<refunds>", "unidentified": "<unidentified>",
-        "levels": "<levels>", "rolled": rolled,
-        "weekly": "<weekly>", "weeks": "<weeks>", "week_zero": "<week zero>",
-        "ledger": "<ledger>", "rates": "<rates>",
-        "actual_totals": recorder("actual_totals", "<grid actual>"),
-        "grid_scores": recorder("grid_scores", "<grid table>"),
-        "show_grid_scores": recorder("show_grid_scores", None),
-        "grid_choice": recorder("grid_choice", "<choice>"),
-        "show_grid_choice": recorder("show_grid_choice", None),
-        "time": SimpleNamespace(perf_counter=lambda: next(clock)),
-        "print": lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
-        "grid_candidates": recorder("grid_candidates", "<candidates>"),
-        "show_grid_candidates": recorder("show_grid_candidates", None),
-        "grid_predictions": fake_grid,
-        "show_grid_predictions": recorder("show_grid_predictions", None),
-        "grid_gates": recorder("grid_gates", SimpleNamespace(stage1="<gates 1>",
-                                                             stage2="<gates 2>")),
-        "show_grid_gates": recorder("show_grid_gates", None),
-        "grid_test": fake_test,
-        "show_grid_test": recorder("show_grid_test", None),
-    }
-    if run_test:
-        # Step 18's two actual_totals calls: the grid's, then the test's.
-        answers = iter(["<grid actual>", "<test actual>"])
-
-        def actual_totals(*args, **kwargs):
-            calls.append(("actual_totals", args, kwargs))
-            return next(answers)
-        namespace["actual_totals"] = actual_totals
-    module = ast.Module(body=[step_18_block()], type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), "<step 18>", "exec"), namespace)
-    return calls, printed
-
-
-def test_step_18_run_calls_in_order():
-    calls, _ = run_step_18()
-    assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
-                                              "grid_predictions",
-                                              "show_grid_predictions", "grid_gates",
-                                              "show_grid_gates", "show_grid_gates",
-                                              "actual_totals", "grid_scores",
-                                              "show_grid_scores", "grid_choice",
-                                              "show_grid_choice"]
-
-
-def test_step_18_run_with_the_grid_switched_off_does_nothing():
-    # No call, no printout, and the clock is never read.
-    calls, printed = run_step_18(run=False, ticks=())
-    assert calls == [] and printed == []
-
-
-@pytest.mark.parametrize("origins, header", [
-    ((37, 40, 44), "over the validation origins 37-44 (3 origins)"),
-    ((40,), "over the validation origins 40-40 (1 origins)"),
-    (tuple(range(20, 45)), "over the validation origins 20-44 (25 origins)"),
-])
-def test_step_18_run_prints_the_header_once(origins, header):
-    # U16.7: with run_test = false, step 18 ends by saying the v1 test is not run.
-    _, printed = run_step_18(validation_origins=origins)
-    assert printed == [f"Step 18: settings grid (U16) {header}", TEST_NOT_RUN_LINE]
-
-
-def test_step_18_run_grid_candidates_get_the_settings_themselves():
-    calls, _ = run_step_18()
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_candidates"]
-    assert len(found) == 1
-    (settings,), kwargs = found[0]
-    assert kwargs == {} and settings.grid.run is True
-
-
-@pytest.mark.parametrize("origins, count", [((37, 40, 44), 3), ((40,), 1),
-                                            (tuple(range(20, 45)), 25)])
-def test_step_18_run_shows_the_candidates_with_the_origin_count(origins, count):
-    calls, _ = run_step_18(validation_origins=origins)
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_candidates"]
-    assert shown == [(("<candidates>", count), {})]
-
-
-def test_step_18_run_grid_predictions_gets_its_arguments():
-    calls, _ = run_step_18(validation_origins=(40, 37, 44))
-    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
-    # The block columns are main()'s, from prepare_inputs; step 18 makes none of its own.
-    assert "block_feature_columns" not in by_name
-    args, kwargs = by_name["grid_predictions"]
-    assert args[0] == "<table>"
-    # The origins as the settings list them (grid_predictions sorts them itself), as a list.
-    assert args[1] == [40, 37, 44] and type(args[1]) is list
-    assert args[2] == "<candidates>"
-    assert args[3].grid.run is True
-    on_fit_done = kwargs.pop("on_fit_done")
-    assert callable(on_fit_done)
-    assert kwargs == {"block_columns": "<blocks>", "companies": "<companies>",
-                      "new_cash": "<new cash>", "refunds": "<refunds>",
-                      "unidentified": "<unidentified>", "levels": "<levels>",
-                      "calendar": "<calendar>", "cache_folder": Path("cache_root") / "hurdle_grid"}
-
-
-@pytest.mark.parametrize("rolled", ["<rolled>", None])
-def test_step_18_run_shows_the_predictions_beside_rolled(rolled):
-    calls, _ = run_step_18(rolled=rolled)
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_predictions"]
-    assert shown == [(("<predictions>", rolled), {})]
-
-
-def test_step_18_run_progress_lines():
-    # The clock: 100 s at the start; the fits end at 160 s and 400 s (one tick per call).
-    _, printed = run_step_18(ticks=(100.0, 160.0, 400.0),
-                             progress_calls=[(1, 8, "stage 1", 37, 0, 59.6),
-                                             (2, 8, "stage 2", 37, 3, 0.4)])
-    assert printed[1:] == [
-        # 60 s per fit so far x 7 left = 420 s = 7 min.
-        "  ... stage 1 setting 0, origin 37: 1 of 8 done (60 s), about 7 min left",
-        # 300 s / 2 x 6 = 900 s = 15 min.
-        "  ... stage 2 setting 3, origin 37: 2 of 8 done (0 s), about 15 min left",
-        TEST_NOT_RUN_LINE,
-    ]
-
-
-def test_step_18_run_last_progress_line_has_nothing_left():
-    _, printed = run_step_18(ticks=(0.0, 3000.0), progress_calls=[(4, 4, "stage 2", 44, 1, 12.0)])
-    assert printed[-2] == "  ... stage 2 setting 1, origin 44: 4 of 4 done (12 s), about 0 min left"
-    assert printed[-1] == TEST_NOT_RUN_LINE
-
-
-def test_step_18_run_never_reads_the_test_origins():
-    calls, _ = run_step_18()
-    for _, args, kwargs in calls:
-        assert "<never read>" not in [a for a in args if isinstance(a, str)]
-        assert "<never read>" not in [v for v in kwargs.values() if isinstance(v, str)]
-
-
-# show_grid_predictions, the function alone: compiled from the script's source, so the script
-# itself (which reconfigures sys.stdout) is not imported into this process.
-
-def function_from_script(name):
-    found = [node for node in script_functions() if node.name == name]
-    assert len(found) == 1
-    namespace = {}
-    exec(compile(ast.Module(body=found, type_ignores=[]), f"<{name}>", "exec"), namespace)
-    return namespace[name]
-
-
-def grid_predictions_example(n=1500, origins=(37, 40)):
-    """GridPredictions over `origins` with n rows each: 2 stage-1, 3 stage-2 and 2 top-up
-    candidates, and rolled forecasts whose customers equal candidate 0 row by row."""
-    import numpy as np
-    import pandas as pd
-    from collection_estimation.hurdle.grid import GridPredictions
-    rows_count = n * len(origins)
-    index = pd.Index(5000 + np.arange(rows_count)[::-1])
-    rows = pd.DataFrame({"origin_week": np.repeat(origins, n)}, index=index)
-    p = pd.DataFrame({0: np.full(rows_count, 0.25), 1: np.full(rows_count, 0.5)}, index=index)
-    p.iloc[0, 0] = 0.85
-    m = pd.DataFrame({0: np.full(rows_count, 400000.0), 1: np.full(rows_count, 1e6),
-                      2: np.full(rows_count, 0.0)}, index=index)
-    m.iloc[0, 0] = 35367890.0
-    topups = [pd.DataFrame({"topup": [1.5e6, 2.5e6, -1.0e6]}),
-              pd.DataFrame({"topup": [123456.0, 0.0]})]
-    predictions = GridPredictions(rows=rows, p=p, m=m, topups=topups)
-    customers = pd.DataFrame({"p": p[0].to_numpy(), "m": m[0].to_numpy()}, index=index.copy())
-    return predictions, SimpleNamespace(customers=customers)
-
-
-GRID_HEAD = [
-    "        3,000 customer rows at 2 origins",
-    "        stage 1 setting 0: mean p 0.2502",
-    "        stage 1 setting 1: mean p 0.5000",
-    # (2999 x 400000 + 35367890) / 1e6 = 1,235.0 M
-    "        stage 2 setting 0: sum of m 1,235.0 M (TRY of week 0)",
-    "        stage 2 setting 1: sum of m 3,000.0 M (TRY of week 0)",
-    "        stage 2 setting 2: sum of m 0.0 M (TRY of week 0)",
-    "        top-ups setting 0: sum 3.0 M (TRY of week 0)",
-    "        top-ups setting 1: sum 0.1 M (TRY of week 0)",
-]
-GRID_SAME = "        candidate 0 the same as step 17, row by row: p {}, m {}"
-GRID_NOT_CHECKED = ("        candidate 0 against step 17: not checked (step 17 did not forecast "
-                    "with the model)")
-
-
-def printed_predictions(capsys, predictions, rolled):
-    capsys.readouterr()
-    assert function_from_script("show_grid_predictions")(predictions, rolled) is None
-    return capsys.readouterr().out.splitlines()
-
-
-def test_show_grid_predictions_exact_printout_when_equal(capsys):
-    predictions, rolled = grid_predictions_example()
-    assert printed_predictions(capsys, predictions, rolled) == GRID_HEAD + [
-        GRID_SAME.format("yes", "yes")]
-
-
-def test_show_grid_predictions_exact_printout_when_rolled_is_none(capsys):
-    predictions, _ = grid_predictions_example()
-    assert printed_predictions(capsys, predictions, None) == GRID_HEAD + [GRID_NOT_CHECKED]
-
-
-def next_up(frame, row, column):
-    import numpy as np
-    frame = frame.copy()
-    frame.iloc[row, column] = np.nextafter(frame.iloc[row, column], np.inf)
-    return frame
-
-
-@pytest.mark.parametrize("change, p, m", [
-    ("p one ulp off", "NO", "yes"),
-    ("m one ulp off", "yes", "NO"),
-    ("both off", "NO", "NO"),
-    ("customers index shifted", "NO", "NO"),
-    ("customers index reordered", "NO", "NO"),
-    ("customers one row short", "NO", "NO"),
-    ("customers one row more", "NO", "NO"),
-])
-def test_show_grid_predictions_exact_printout_when_different(capsys, change, p, m):
-    # Exact, row by row: one ulp is a difference, and any other index (labels, order or
-    # length) is "NO" for both, without raising.
-    import pandas as pd
-    predictions, rolled = grid_predictions_example()
-    customers = rolled.customers
-    if change == "p one ulp off":
-        customers = next_up(customers, 700, 0)
-    elif change == "m one ulp off":
-        customers = next_up(customers, 3, 1)
-    elif change == "both off":
-        customers = next_up(next_up(customers, 1, 0), 2, 1)
-    elif change == "customers index shifted":
-        customers = customers.set_axis(customers.index + 1)
-    elif change == "customers index reordered":
-        customers = customers.iloc[::-1]
-    elif change == "customers one row short":
-        customers = customers.iloc[:-1]
-    elif change == "customers one row more":
-        customers = pd.concat([customers, customers.iloc[:1].set_axis([1])])
-    lines = printed_predictions(capsys, predictions, SimpleNamespace(customers=customers))
-    assert lines == GRID_HEAD + [GRID_SAME.format(p, m)]
-
-
-def test_show_grid_predictions_compares_candidate_0_only(capsys):
-    # Other candidates differ from rolled everywhere; only column 0 is compared.
-    predictions, rolled = grid_predictions_example()
-    assert not (predictions.p[1] == rolled.customers["p"]).all()
-    assert printed_predictions(capsys, predictions, rolled)[-1] == GRID_SAME.format("yes", "yes")
-
-
-def test_show_grid_predictions_extra_columns_of_customers_do_not_matter(capsys):
-    predictions, rolled = grid_predictions_example()
-    customers = rolled.customers.assign(expected=1.0, key="k")
-    lines = printed_predictions(capsys, predictions, SimpleNamespace(customers=customers))
-    assert lines[-1] == GRID_SAME.format("yes", "yes")
-
-
-def test_show_grid_predictions_with_one_candidate_each_and_no_topup(capsys):
-    import pandas as pd
-    from collection_estimation.hurdle.grid import GridPredictions
-    index = pd.Index([7, 3])
-    predictions = GridPredictions(rows=pd.DataFrame({"origin_week": [40, 40]}, index=index),
-                                  p=pd.DataFrame({0: [0.1, 0.3]}, index=index),
-                                  m=pd.DataFrame({0: [2e6, 3e6]}, index=index), topups=[])
-    assert printed_predictions(capsys, predictions, None) == [
-        "        2 customer rows at 1 origins",
-        "        stage 1 setting 0: mean p 0.2000",
-        "        stage 2 setting 0: sum of m 5.0 M (TRY of week 0)",
-        GRID_NOT_CHECKED]
-
-
-def test_show_grid_predictions_shows_a_nan_p_without_raising(capsys):
-    # p and m are not checked by the grid (the gates do it): the printout shows them as they are.
-    import numpy as np
-    predictions, rolled = grid_predictions_example(n=2)
-    predictions.p[1] = np.nan
-    lines = printed_predictions(capsys, predictions, rolled)
-    assert lines[2] == "        stage 1 setting 1: mean p nan"
-    assert lines[-1] == GRID_SAME.format("yes", "yes")
-
-
-def test_show_grid_predictions_changes_nothing(capsys):
-    predictions, rolled = grid_predictions_example(n=3)
-    before = (predictions.rows.copy(), predictions.p.copy(), predictions.m.copy(),
-              [t.copy() for t in predictions.topups], rolled.customers.copy())
-    printed_predictions(capsys, predictions, rolled)
-    import pandas as pd
-    pd.testing.assert_frame_equal(predictions.rows, before[0])
-    pd.testing.assert_frame_equal(predictions.p, before[1])
-    pd.testing.assert_frame_equal(predictions.m, before[2])
-    for a, b in zip(predictions.topups, before[3]):
-        pd.testing.assert_frame_equal(a, b)
-    pd.testing.assert_frame_equal(rolled.customers, before[4])
-
-
-# show_grid_candidates, the function alone.
-
-def grid_printer():
-    return function_from_script("show_grid_candidates")
-
-
-def printed_grid(capsys, candidates, origins):
-    capsys.readouterr()
-    grid_printer()(candidates, origins)
-    return capsys.readouterr().out.splitlines()
-
-
-def test_show_grid_candidates_exact_printout_of_the_worked_example(capsys):
-    from collection_estimation.hurdle.grid import grid_candidates
-    from tests.hurdle.test_grid import make
-    lines = printed_grid(capsys, grid_candidates(make()), 3)
-    assert lines == [
-        "        stage 1: 4 settings",
-        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
-        "          1: max_iter 300, learning_rate 0.01, max_leaf_nodes 31",
-        "          2: max_iter 900, learning_rate 0.01, max_leaf_nodes 31",
-        "          3: max_iter 900, learning_rate 0.05, max_leaf_nodes 31",
-        "        stage 2: 4 settings",
-        "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean   <- current",
-        "          1: loss poisson, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
-        "          2: loss gamma, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
-        "          3: loss gamma, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
-        "        top-ups: 2 settings",
-        "          0: mean of 13 weeks   <- current",
-        "          1: mean of 8 weeks",
-        # 4 x 4 x 2 = 32 pairs; 3 x (4 + 4) = 24 fits.
-        "        32 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
-        "origins: 24 fits (those made before are read from the cache)",
-    ]
-
-
-def test_show_grid_candidates_shows_a_ridge_and_a_scale_none_floor_as_a_dash(capsys):
-    import dataclasses
-    from collection_estimation.hurdle.grid import grid_candidates
-    from tests.hurdle.test_grid import STAGE2, TOPUPS, make
-    ridge = dataclasses.replace(TOPUPS, method="ridge")
-    stage2 = dataclasses.replace(STAGE2, scale="none")
-    candidates = grid_candidates(make(stage2=stage2, topups=ridge, topup_windows=(13,),
-                                      stage1_max_iter=(300,), stage1_learning_rate=(0.05,),
-                                      stage2_loss=("poisson",), stage2_learning_rate=(0.05,)))
-    lines = printed_grid(capsys, candidates, 1)
-    assert lines == [
-        "        stage 1: 1 settings",
-        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
-        "        stage 2: 2 settings",
-        "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale none, balance_floor -   <- current",
-        "          1: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
-        "        top-ups: 2 settings",
-        "          0: ridge with the level   <- current",
-        "          1: mean of 13 weeks",
-        "        4 combinations to score; per origin 1 stage-1 and 2 stage-2 fits; 1 "
-        "origins: 3 fits (those made before are read from the cache)",
-    ]
-
-
-def test_show_grid_candidates_top_up_lines_with_both_ridges(capsys):
-    # The synthetic.toml shape: current mean 13, means 8 and 13, both ridges: 4 top-ups.
-    from collection_estimation.hurdle.grid import grid_candidates
-    from tests.hurdle.test_grid import make
-    candidates = grid_candidates(make(topup_windows=(8, 13), topup_ridge_with_level=(True, False)))
-    lines = printed_grid(capsys, candidates, 3)
-    start = lines.index("        top-ups: 4 settings")
-    assert lines[start:] == [
-        "        top-ups: 4 settings",
-        "          0: mean of 13 weeks   <- current",
-        "          1: mean of 8 weeks",
-        "          2: ridge with the level",
-        "          3: ridge without the level",
-        # 4 x 4 x 4 = 64 pairs; the ridges add combinations but no fit: still 24 fits.
-        "        64 combinations to score; per origin 4 stage-1 and 4 stage-2 fits; 3 "
-        "origins: 24 fits (those made before are read from the cache)",
-    ]
-
-
-@pytest.mark.parametrize("with_level, text", [(True, "ridge with the level"),
-                                              (False, "ridge without the level")])
-def test_show_grid_candidates_a_current_ridge_line(capsys, with_level, text):
-    candidates = SimpleNamespace(
-        stage1=[SimpleNamespace(params={"k": 0})], stage2=[SimpleNamespace(params={"k": 0})],
-        topups=[SimpleNamespace(method="ridge", window=8, with_level=with_level),
-                SimpleNamespace(method="ridge", window=8, with_level=not with_level)])
-    lines = printed_grid(capsys, candidates, 1)
-    other = "ridge without the level" if with_level else "ridge with the level"
-    assert lines[-3:-1] == [f"          0: {text}   <- current", f"          1: {other}"]
-    # The ridge's window is not shown.
-    assert not any("8 weeks" in line for line in lines)
-
-
-def fake_candidates(n1, n2, n3):
-    """GridCandidates-like lists of the given sizes (only what the printout reads)."""
-    stage = [SimpleNamespace(params={"k": i}) for i in range(max(n1, n2))]
-    topups = [SimpleNamespace(method="mean", window=i + 1) for i in range(n3)]
-    return SimpleNamespace(stage1=stage[:n1], stage2=stage[:n2], topups=topups)
-
-
-@pytest.mark.parametrize("n1, n2, n3, origins, combos, fits", [
-    (1, 1, 1, 1, 1, 2),
-    (4, 8, 2, 12, 64, 144),
-    (2, 3, 4, 5, 24, 25),
-    (5, 1, 3, 2, 15, 12),
-    (1, 1, 1, 0, 1, 0),
-])
-def test_show_grid_candidates_counts(capsys, n1, n2, n3, origins, combos, fits):
-    last = printed_grid(capsys, fake_candidates(n1, n2, n3), origins)[-1]
-    assert last == (f"        {combos} combinations to score; per origin {n1} stage-1 and {n2} "
-                    f"stage-2 fits; {origins} origins: {fits} fits (those made before are read "
-                    f"from the cache)")
-
-
-def test_show_grid_candidates_fits_count_fits_not_combinations(capsys):
-    # The top-ups cost no fit: more of them change the combinations, not the fits.
-    a = printed_grid(capsys, fake_candidates(2, 2, 1), 3)[-1]
-    b = printed_grid(capsys, fake_candidates(2, 2, 6), 3)[-1]
-    assert "origins: 12 fits" in a and "origins: 12 fits" in b
-    assert "4 combinations" in a and "24 combinations" in b
-
-
-def test_show_grid_candidates_no_longer_shows_a_time(capsys):
-    lines = printed_grid(capsys, fake_candidates(2, 2, 2), 3)
-    assert not any("min" in line.split() for line in lines)
-    assert "about" not in lines[-1]
-
-
-def test_show_grid_candidates_marks_only_slot_0_in_each_list(capsys):
-    lines = printed_grid(capsys, fake_candidates(3, 2, 4), 1)
-    marked = [line for line in lines if line.endswith("   <- current")]
-    assert marked == ["          0: k 0   <- current", "          0: k 0   <- current",
-                      "          0: mean of 1 weeks   <- current"]
-
-
-def test_show_grid_candidates_returns_none_and_changes_nothing(capsys):
-    candidates = fake_candidates(2, 2, 2)
-    before = (list(candidates.stage1), list(candidates.stage2), list(candidates.topups))
-    capsys.readouterr()
-    assert grid_printer()(candidates, 2) is None
-    assert (candidates.stage1, candidates.stage2, candidates.topups) == before
-
-
-# --- U16.4: step 18's gates (grid_gates, then show_grid_gates once per stage) ---------------
-
-def test_step_18_grid_gates_is_called_once_with_the_predictions_candidates_and_settings():
-    calls = calls_in(step_18_body(), "grid_gates")
-    assert len(calls) == 1 and len(calls_to(main_tree(), "grid_gates")) == 1
-    assert [ast.unparse(a) for a in calls[0].args] == ["predictions", "candidates", "settings"]
-    assert calls[0].keywords == []
-
-
-def test_step_18_show_grid_gates_is_called_twice_only_inside_step_18():
-    assert len(calls_to(main_tree(), "show_grid_gates")) == 2
-    assert len(calls_in(step_18_body(), "show_grid_gates")) == 2
-    assert calls_to(step_17_block(), "show_grid_gates") == []
-
-
-def test_step_18_show_grid_gates_stage_1_by_log_loss_ascending_then_stage_2_by_skill():
-    found = [(ast.unparse(c.args[0]), ast.unparse(c.args[1]), ast.unparse(c.args[2]),
-              keywords_of(c)) for c in calls_in(step_18_body(), "show_grid_gates")]
-    assert found == [("'stage 1'", "gates.stage1", "'log loss'", {"ascending": "True"}),
-                     ("'stage 2'", "gates.stage2", "'deviance skill'", {"ascending": "False"})]
-
-
-def test_step_18_gates_are_made_after_the_predictions_are_shown():
-    statements = [ast.unparse(node) for node in step_18_body()]
-    shown = statements.index("show_grid_predictions(predictions, rolled)")
-    gates = statements.index("gates = grid_gates(predictions, candidates, settings)")
-    assert gates == shown + 1
-
-
 def test_step_15_still_calls_with_params_on_both_stages():
     source = SCRIPT.read_text(encoding="utf-8")
     assert source.count('with_params(gates1, grid1, "stage1")') == 1
@@ -9681,1155 +5378,3 @@ def test_step_15_still_calls_with_params_on_both_stages():
     tree = ast.parse(source)
     defined = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
     assert "with_params" not in defined
-
-
-def test_show_grid_gates_is_a_module_level_function_with_four_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_gates"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["stage", "gates", "score", "ascending"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-def test_show_grid_gates_scores_and_choice_sit_right_before_step_15s_show_gates():
-    # U16.5 put show_grid_scores between them (the test was "show_grid_gates_sits_right_
-    # before_step_15s_show_gates" before); U16.6 show_grid_choice after it (the test was
-    # "show_grid_gates_and_show_grid_scores_sit_right_before_step_15s_show_gates").
-    names = [node.name for node in script_functions()]
-    # U16.7 show_grid_test after show_grid_choice.
-    at = names.index("show_grid_gates")
-    assert names[at + 1:at + 5] == ["show_grid_scores", "show_grid_choice", "show_grid_test",
-                                    "show_gates"]
-
-
-def test_step_18_run_grid_gates_gets_the_predictions_candidates_and_settings():
-    calls, _ = run_step_18()
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_gates"]
-    assert len(found) == 1
-    (predictions, candidates, settings), kwargs = found[0]
-    assert kwargs == {}
-    assert predictions == "<predictions>" and candidates == "<candidates>"
-    assert settings.grid.run is True
-
-
-def test_step_18_run_shows_both_stages_gates():
-    calls, _ = run_step_18()
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_gates"]
-    assert shown == [(("stage 1", "<gates 1>", "log loss"), {"ascending": True}),
-                     (("stage 2", "<gates 2>", "deviance skill"), {"ascending": False})]
-
-
-def test_step_18_run_switched_off_makes_no_gates():
-    calls, _ = run_step_18(run=False, ticks=())
-    assert not any(name in ("grid_gates", "show_grid_gates") for name, _, _ in calls)
-
-
-# show_grid_gates, the function alone (compiled from the script).
-
-def gates_printer():
-    return function_from_script("show_grid_gates")
-
-
-def printed_gates(capsys, stage, gates, score, ascending):
-    capsys.readouterr()
-    assert gates_printer()(stage, gates, score, ascending) is None
-    return capsys.readouterr().out.splitlines()
-
-
-def stage1_table(eligible_rows=(1, 2), current=None, n=4):
-    """A stage-1 gate table as grid_gates returns it: candidate 0 fails all three gates (or
-    the gates in `current`, a dict of gate -> passed), 1 and 2 pass, 3 has a bad p."""
-    import numpy as np
-    import pandas as pd
-    base = [
-        # stage1, max_iter, bad p, log loss, skill, slope
-        (0, 300, 0, 0.693147, -0.000072, 0.0),
-        (1, 100, 0, 0.582705, 0.159274, 0.971141),
-        (2, 200, 0, 0.583829, 0.157652, 1.120210),
-        (3, 400, 1, np.nan, np.nan, np.nan),
-    ][:n]
-    table = pd.DataFrame(base, columns=["stage1", "max_iter", "bad p", "log loss",
-                                        "log loss skill", "slope"])
-    for gate in ("log loss gate", "skill gate", "slope gate"):
-        table[gate] = [i in eligible_rows for i in table["stage1"]]
-    if current is not None:
-        for gate, passed in current.items():
-            table.loc[table["stage1"] == 0, gate] = passed
-    table["eligible"] = table["log loss gate"] & table["skill gate"] & table["slope gate"]
-    return table
-
-
-def stage2_table():
-    import numpy as np
-    import pandas as pd
-    table = pd.DataFrame(
-        [(0, "poisson", 50, 0, 0.0, 1.0), (1, "poisson", 100, 0, 0.532846, 0.960442),
-         (2, "gamma", 150, 0, 0.479335, 0.99328), (3, "poisson", 200, 2, np.nan, np.nan)],
-        columns=["stage2", "loss", "max_iter", "bad m", "deviance skill", "total ratio"])
-    table["m gate"] = [True, True, True, False]
-    table["skill gate"] = [False, True, True, False]
-    table["ratio gate"] = [True, True, True, False]
-    table["eligible"] = table["m gate"] & table["skill gate"] & table["ratio gate"]
-    return table
-
-
-def gates_text(table, score, ascending):
-    return table.sort_values(score, ascending=ascending).round(4).to_string(
-        index=False).splitlines()
-
-
-def first_tokens(lines):
-    return [line.split()[0] for line in lines[1:]]     # skip the table's header line
-
-
-STAGE1_HEAD = ("        stage 1 gates: 2 of 4 candidates eligible; candidates failing each "
-               "gate: {'log loss gate': 2, 'skill gate': 2, 'slope gate': 2}")
-
-
-def test_show_grid_gates_exact_printout_when_the_current_settings_fail(capsys):
-    table = stage1_table()
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines == [
-        STAGE1_HEAD,
-        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
-        "are still scored, as the settings to beat",
-    ] + gates_text(table, "log loss", True)
-
-
-def test_show_grid_gates_table_sorted_by_the_score_with_unscored_candidates_last(capsys):
-    lines = printed_gates(capsys, "stage 1", stage1_table(), "log loss", True)
-    assert first_tokens(lines[2:]) == ["1", "2", "0", "3"]
-    assert lines[2].split()[:4] == ["stage1", "max_iter", "bad", "p"]
-
-
-def test_show_grid_gates_rounds_the_table_to_four_decimals(capsys):
-    lines = printed_gates(capsys, "stage 1", stage1_table(), "log loss", True)
-    assert "0.5827" in lines[3] and "0.582705" not in lines[3]
-
-
-def test_show_grid_gates_names_only_the_gates_the_current_settings_miss(capsys):
-    table = stage1_table(current={"log loss gate": True, "skill gate": True})
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines[0] == ("        stage 1 gates: 2 of 4 candidates eligible; candidates failing "
-                        "each gate: {'log loss gate': 1, 'skill gate': 1, 'slope gate': 2}")
-    assert lines[1] == ("        the current stage 1 settings FAIL slope gate; they are still "
-                        "scored, as the settings to beat")
-
-
-def test_show_grid_gates_eligible_current_and_others_prints_no_warning(capsys):
-    table = stage1_table(eligible_rows=(0, 1, 2))
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines == [
-        "        stage 1 gates: 3 of 4 candidates eligible; candidates failing each gate: "
-        "{'log loss gate': 1, 'skill gate': 1, 'slope gate': 1}",
-    ] + gates_text(table, "log loss", True)
-
-
-def test_show_grid_gates_eligible_current_and_no_other_says_only_the_current_goes_on(capsys):
-    table = stage1_table(eligible_rows=(0,))
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines == [
-        "        stage 1 gates: 1 of 4 candidates eligible; candidates failing each gate: "
-        "{'log loss gate': 3, 'skill gate': 3, 'slope gate': 3}",
-        "        no other stage 1 candidate is eligible: only the current settings go on",
-    ] + gates_text(table, "log loss", True)
-
-
-def test_show_grid_gates_nothing_eligible_prints_both_lines(capsys):
-    table = stage1_table(eligible_rows=())
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines[:3] == [
-        "        stage 1 gates: 0 of 4 candidates eligible; candidates failing each gate: "
-        "{'log loss gate': 4, 'skill gate': 4, 'slope gate': 4}",
-        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
-        "are still scored, as the settings to beat",
-        "        no other stage 1 candidate is eligible: only the current settings go on",
-    ]
-    assert lines[3:] == gates_text(table, "log loss", True)
-
-
-def test_show_grid_gates_a_lone_eligible_current_prints_no_no_other_line(capsys):
-    # Only the current settings in the grid: there are no others to be ineligible.
-    table = stage1_table(eligible_rows=(0,), n=1)
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines == [
-        "        stage 1 gates: 1 of 1 candidates eligible; candidates failing each gate: "
-        "{'log loss gate': 0, 'skill gate': 0, 'slope gate': 0}",
-    ] + gates_text(table, "log loss", True)
-    assert not any(line.startswith("        no other") for line in lines)
-
-
-def test_show_grid_gates_a_lone_failing_current_prints_the_fail_line_only(capsys):
-    table = stage1_table(eligible_rows=(), n=1)
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines == [
-        "        stage 1 gates: 0 of 1 candidates eligible; candidates failing each gate: "
-        "{'log loss gate': 1, 'skill gate': 1, 'slope gate': 1}",
-        "        the current stage 1 settings FAIL log loss gate, skill gate, slope gate; they "
-        "are still scored, as the settings to beat",
-    ] + gates_text(table, "log loss", True)
-
-
-def test_show_grid_gates_one_other_eligible_is_enough_for_no_no_other_line(capsys):
-    table = stage1_table(eligible_rows=(0, 3))
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert not any(line.startswith("        no other") for line in lines)
-
-
-def test_show_grid_gates_finds_candidate_0_by_number_not_position(capsys):
-    # Candidate 0 is the third row; it is still the one reported as the current settings.
-    table = stage1_table(eligible_rows=(1, 2, 3)).iloc[[2, 1, 0, 3]].reset_index(drop=True)
-    lines = printed_gates(capsys, "stage 1", table, "log loss", True)
-    assert lines[1] == ("        the current stage 1 settings FAIL log loss gate, skill gate, "
-                        "slope gate; they are still scored, as the settings to beat")
-    eligible_current = stage1_table(eligible_rows=(0,)).iloc[[3, 1, 0, 2]]
-    lines = printed_gates(capsys, "stage 1", eligible_current, "log loss", True)
-    assert lines[1] == ("        no other stage 1 candidate is eligible: only the current "
-                        "settings go on")
-
-
-def test_show_grid_gates_exact_printout_for_stage_2_descending(capsys):
-    table = stage2_table()
-    lines = printed_gates(capsys, "stage 2", table, "deviance skill", False)
-    assert lines == [
-        "        stage 2 gates: 2 of 4 candidates eligible; candidates failing each gate: "
-        "{'m gate': 1, 'skill gate': 2, 'ratio gate': 1}",
-        "        the current stage 2 settings FAIL skill gate; they are still scored, as the "
-        "settings to beat",
-    ] + gates_text(table, "deviance skill", False)
-    # Highest skill first; the candidate without a score last.
-    assert first_tokens(lines[2:]) == ["1", "2", "0", "3"]
-
-
-def test_show_grid_gates_counts_only_columns_ending_in_gate(capsys):
-    # "eligible" and the params are not gates, even a param whose name holds "gate".
-    table = stage2_table().assign(gates_used=1)
-    head = printed_gates(capsys, "stage 2", table, "deviance skill", False)[0]
-    assert head.endswith("{'m gate': 1, 'skill gate': 2, 'ratio gate': 1}")
-
-
-def test_show_grid_gates_changes_nothing(capsys):
-    import pandas as pd
-    table = stage1_table()
-    before = table.copy()
-    printed_gates(capsys, "stage 1", table, "log loss", True)
-    pd.testing.assert_frame_equal(table, before)
-
-
-def test_show_grid_gates_on_grid_gates_own_output(capsys):
-    # The worked example of test_grid.py (stage 1 {1, 2} and stage 2 {1, 2} eligible;
-    # candidate 0 fails all three stage-1 gates and stage 2's skill gate).
-    from collection_estimation.hurdle.grid import grid_gates
-    from tests.hurdle.test_grid import gate_candidates, gate_example, gate_settings
-    gates = grid_gates(gate_example(), gate_candidates(), gate_settings())
-    one = printed_gates(capsys, "stage 1", gates.stage1, "log loss", True)
-    two = printed_gates(capsys, "stage 2", gates.stage2, "deviance skill", False)
-    assert one[0].startswith("        stage 1 gates: 2 of 4 candidates eligible;")
-    assert one[1] == ("        the current stage 1 settings FAIL log loss gate, skill gate, "
-                      "slope gate; they are still scored, as the settings to beat")
-    assert first_tokens(one[2:]) == ["1", "2", "0", "3"]
-    assert two[0].startswith("        stage 2 gates: 2 of 4 candidates eligible;")
-    assert two[1] == ("        the current stage 2 settings FAIL skill gate; they are still "
-                      "scored, as the settings to beat")
-    assert first_tokens(two[2:]) == ["1", "2", "0", "3"]
-    assert not any(line.startswith("        no other") for line in one + two)
-
-
-def test_show_grid_gates_prints_bad_elsewhere_and_does_not_count_it_as_a_gate(capsys):
-    # U16.5 (F2) gave both gate tables a "bad elsewhere" column; the printout shows it in the
-    # table and leaves it out of the gate counts (its name does not end in "gate").
-    from collection_estimation.hurdle.grid import grid_gates
-    from tests.hurdle.test_grid import gate_candidates, gate_example, gate_settings
-    gates = grid_gates(gate_example(poison_unlabelled=True), gate_candidates(), gate_settings())
-    one = printed_gates(capsys, "stage 1", gates.stage1, "log loss", True)
-    two = printed_gates(capsys, "stage 2", gates.stage2, "deviance skill", False)
-    # Candidate 1 is refused (bad elsewhere): only candidate 2 passes stage 1.
-    assert one[0] == ("        stage 1 gates: 1 of 4 candidates eligible; candidates failing "
-                      "each gate: {'log loss gate': 3, 'skill gate': 3, 'slope gate': 3}")
-    assert one[-5:] == gates_text(gates.stage1, "log loss", True)
-    assert two[-5:] == gates_text(gates.stage2, "deviance skill", False)
-    assert "elsewhere" in one[-5] and "elsewhere" in two[-5]
-
-
-# --- U16.5: step 18's scores (actual_totals at the grid's origins, grid_scores, then
-# show_grid_scores) ------------------------------------------------------------------------
-
-def test_step_18_grid_actual_is_actual_totals_at_the_grid_origins():
-    # U16.7: the v1 test's `if` (the last statement) makes its own, at the test origins.
-    calls = calls_in(step_18_body()[:-1], "actual_totals")
-    assert len(calls) == 1 and calls[0].keywords == []
-    assert [ast.unparse(a) for a in calls[0].args] == [
-        "weekly", "weeks", "levels", "companies", "grid_origins", "settings.receivables.horizons"]
-
-
-def test_step_18_grid_actual_reads_what_step_17s_actual_reads_but_the_origins():
-    # The same cash, weeks, levels, companies and horizons as step 17's rolled_actual: the
-    # current combination can then be compared with step 17's model on the same weeks.
-    step_17 = calls_to(step_17_block(), "actual_totals")[0]
-    step_18 = calls_in(step_18_body(), "actual_totals")[0]
-    seventeen = [ast.unparse(a) for a in step_17.args]
-    eighteen = [ast.unparse(a) for a in step_18.args]
-    assert seventeen[4] == "origins" and eighteen[4] == "grid_origins"
-    assert seventeen[:4] + seventeen[5:] == eighteen[:4] + eighteen[5:]
-
-
-def test_step_18_grid_scores_gets_the_predictions_candidates_gates_actual_and_settings():
-    call = calls_in(step_18_body(), "grid_scores")[0]
-    assert [ast.unparse(a) for a in call.args] == ["predictions", "candidates", "gates",
-                                                   "grid_actual", "settings"]
-    assert keywords_of(call) == {"companies": "companies", "week_zero": "week_zero"}
-
-
-def test_step_18_grid_scores_week_zero_and_companies_are_step_17s():
-    call = calls_in(step_18_body(), "grid_scores")[0]
-    rolling = calls_to(with_model_if(), "rolling_forecasts")[0]
-    for name in ("companies", "week_zero"):
-        assert keywords_of(call)[name] == keywords_of(rolling)[name], name
-
-
-def test_step_18_show_grid_scores_gets_the_table_candidates_rolled_actual_and_horizons():
-    calls = calls_in(step_18_body(), "show_grid_scores")
-    assert len(calls) == 1 and calls[0].keywords == []
-    assert [ast.unparse(a) for a in calls[0].args] == [
-        "grid_table", "candidates", "rolled", "grid_actual", "settings.receivables.horizons"]
-
-
-def test_step_18_scores_come_right_after_the_gates_in_order_then_the_choice_ends_step_18():
-    # Since U16.6 the choice follows the scores (the test was "..._in_order_and_end_step_18").
-    statements = [ast.unparse(node) for node in step_18_body()]
-    at = statements.index("show_grid_gates('stage 2', gates.stage2, 'deviance skill', "
-                          "ascending=False)")
-    assert statements[at + 1:] == [STEP_18_ACTUAL, STEP_18_SCORES, STEP_18_SHOW_SCORES,
-                                   STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
-
-
-def test_step_18_scores_and_choice_never_read_the_test_origins():
-    # U16.7: the v1 test's `if` after them does.
-    for node in step_18_body()[-6:-1]:
-        assert "test_origins" not in ast.unparse(node)
-
-
-def test_show_grid_scores_is_a_module_level_function_with_five_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_scores"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["table", "candidates", "rolled", "actual",
-                                                   "horizons"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-SHOW_SCORES_GLOBALS = {"CONSOLIDATED", "HURDLE", "POOLED", "STACK_COLUMNS", "evaluation_scores"}
-
-
-def test_show_grid_scores_reads_only_names_the_script_imports():
-    import builtins
-    function = [node for node in script_functions() if node.name == "show_grid_scores"][0]
-    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Load)}
-    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Store)}
-    params = {a.arg for a in function.args.args}
-    free = loaded - stored - params - set(dir(builtins))
-    assert free == SHOW_SCORES_GLOBALS
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
-                for a in node.names}
-    assert SHOW_SCORES_GLOBALS <= imported
-
-
-def test_step_18_run_reads_the_actual_cash_at_the_grid_origins():
-    calls, _ = run_step_18(validation_origins=(40, 37, 44))
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "actual_totals"]
-    assert found == [(("<weekly>", "<weeks>", "<levels>", "<companies>", [40, 37, 44], 5), {})]
-
-
-def test_step_18_run_grid_scores_gets_its_arguments():
-    calls, _ = run_step_18()
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_scores"]
-    assert len(found) == 1
-    (predictions, candidates, gates, actual, settings), kwargs = found[0]
-    assert predictions == "<predictions>" and candidates == "<candidates>"
-    assert (gates.stage1, gates.stage2) == ("<gates 1>", "<gates 2>")
-    assert actual == "<grid actual>" and settings.grid.run is True
-    assert kwargs == {"companies": "<companies>", "week_zero": "<week zero>"}
-
-
-@pytest.mark.parametrize("rolled", ["<rolled>", None])
-def test_step_18_run_shows_the_scores_beside_rolled(rolled):
-    calls, _ = run_step_18(rolled=rolled)
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_scores"]
-    assert shown == [(("<grid table>", "<candidates>", rolled, "<grid actual>", 5), {})]
-
-
-def test_step_18_run_gates_and_scores_are_the_same_objects_passed_on():
-    calls, _ = run_step_18()
-    by_name = {name: args for name, args, _ in calls}
-    gates_made = [args for name, args, _ in calls if name == "show_grid_gates"]
-    assert by_name["grid_scores"][2].stage1 == gates_made[0][1]
-    assert by_name["grid_scores"][2].stage2 == gates_made[1][1]
-
-
-def test_step_18_run_switched_off_scores_nothing():
-    calls, _ = run_step_18(run=False, ticks=())
-    assert not any(name in ("actual_totals", "grid_scores", "show_grid_scores")
-                   for name, _, _ in calls)
-
-
-# show_grid_scores, the function alone: compiled from the script with the names it reads
-# from the script's imports (evaluate's and forecast's own objects).
-
-def scores_printer():
-    from collection_estimation.hurdle import evaluate, forecast
-    found = [node for node in script_functions() if node.name == "show_grid_scores"]
-    assert len(found) == 1
-    namespace = {"CONSOLIDATED": forecast.CONSOLIDATED, "HURDLE": evaluate.HURDLE,
-                 "POOLED": evaluate.POOLED, "STACK_COLUMNS": evaluate.STACK_COLUMNS,
-                 "evaluation_scores": evaluate.evaluation_scores}
-    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_scores>", "exec"),
-         namespace)
-    return namespace["show_grid_scores"]
-
-
-def grid_score_table(lines=None):
-    """A grid_scores table (sorted by WAPE, index reset); the current settings are rank 2."""
-    import pandas as pd
-    from collection_estimation.hurdle.grid import GRID_SCORE_COLUMNS
-    lines = lines or [(1, 0, 1, False, 0.150004, 0.101234, -0.020001, 0.200049),
-                      (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
-                      (0, 1, 1, False, 0.170001, float("nan"), 0.0, 0.25)]
-    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
-
-
-def score_candidates(n1=2, n2=3, n3=2):
-    return SimpleNamespace(stage1=["s1"] * n1, stage2=["s2"] * n2, topups=["t"] * n3)
-
-
-def score_actual():
-    """Origin 10, h 1 and 2, one company: TR02 and ALL each 100 then 200 TRY."""
-    import pandas as pd
-    from collection_estimation.hurdle.evaluate import ACTUAL_COLUMNS
-    rows = [(company, 10, h, 10 + h, actual, actual) for company in ("TR02", "ALL")
-            for h, actual in ((1, 100.0), (2, 200.0))]
-    return pd.DataFrame(rows, columns=ACTUAL_COLUMNS)
-
-
-def score_rolled(first=110.0, second=180.0):
-    """Step 17's totals: |110 - 100| + |180 - 200| = 30 over 300, WAPE 0.1."""
-    import pandas as pd
-    rows = [(company, 10, h, 10 + h, total, 99.0) for company in ("TR02", "ALL")
-            for h, total in ((1, first), (2, second))]
-    totals = pd.DataFrame(rows, columns=["company_code", "origin_week", "h", "target_week",
-                                         "total", "customers"])
-    return SimpleNamespace(totals=totals, customers="<not read>")
-
-
-def printed_scores(capsys, table, candidates, rolled, actual=None, horizons=2):
-    capsys.readouterr()
-    assert scores_printer()(table, candidates, rolled,
-                            score_actual() if actual is None else actual, horizons) is None
-    return capsys.readouterr().out.splitlines()
-
-
-SCORES_HEAD = ("        3 of 12 combinations scored (stage-1 and stage-2 candidates eligible "
-               "or current, every top-up); the 10 best by WAPE:")
-CURRENT_LINE = ("        current settings: rank 2 of 3, WAPE 0.1000, 5-week WAPE 0.1200, bias "
-                "+0.0310, company WAPE 0.2200")
-NOT_CHECKED = ("        current against step 17: not checked (step 17 did not forecast with "
-               "the model)")
-
-
-def table_text(table, rows=10):
-    return table.head(rows).round(4).to_string(index=False).splitlines()
-
-
-def test_show_grid_scores_exact_printout_when_rolled_is_none(capsys):
-    table = grid_score_table()
-    lines = printed_scores(capsys, table, score_candidates(), None)
-    assert lines == [SCORES_HEAD] + table_text(table) + [CURRENT_LINE, NOT_CHECKED]
-
-
-def test_show_grid_scores_exact_printout_when_the_current_equals_step_17(capsys):
-    table = grid_score_table()
-    lines = printed_scores(capsys, table, score_candidates(), score_rolled())
-    assert lines == [SCORES_HEAD] + table_text(table) + [
-        CURRENT_LINE,
-        "        current WAPE the same as step 17's model: yes (step 17 0.100000, grid "
-        "0.100000)"]
-
-
-def test_show_grid_scores_a_different_step_17_says_no(capsys):
-    lines = printed_scores(capsys, grid_score_table(), score_candidates(), score_rolled(first=130.0))
-    # |130 - 100| + |180 - 200| = 50 over 300.
-    assert lines[-1] == ("        current WAPE the same as step 17's model: NO (step 17 "
-                         "0.166667, grid 0.100000)")
-
-
-def test_show_grid_scores_compares_exactly_not_to_the_printed_digits(capsys):
-    # A difference far below the 6 printed decimals is still NO: the check is exact.
-    table = grid_score_table()
-    table.loc[1, "wape"] = 0.1 + 1e-12
-    lines = printed_scores(capsys, table, score_candidates(), score_rolled())
-    assert lines[-1] == ("        current WAPE the same as step 17's model: NO (step 17 "
-                         "0.100000, grid 0.100000)")
-
-
-def test_show_grid_scores_compares_the_consolidated_pooled_wape_only(capsys):
-    # A company-only error (TR02 h 1 off by 50, ALL right on its own) does not move the check:
-    # step 17's consolidated WAPE is scored on ALL's rows, as the grid's is.
-    totals = score_rolled().totals.copy()
-    totals.loc[(totals["company_code"] == "TR02") & (totals["h"] == 1), "total"] = 160.0
-    lines = printed_scores(capsys, grid_score_table(), score_candidates(),
-                           SimpleNamespace(totals=totals))
-    assert lines[-1].startswith("        current WAPE the same as step 17's model: yes")
-
-
-def test_show_grid_scores_reads_only_the_total_of_step_17(capsys):
-    rolled = score_rolled()
-    rolled.totals["customers"] = float("nan")     # every other column is not read
-    lines = printed_scores(capsys, grid_score_table(), score_candidates(), rolled)
-    assert lines[-1].startswith("        current WAPE the same as step 17's model: yes")
-
-
-def test_show_grid_scores_counts_every_combination_of_the_candidates(capsys):
-    lines = printed_scores(capsys, grid_score_table(), score_candidates(4, 5, 3), None)
-    assert lines[0] == ("        3 of 60 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
-
-
-def many_lines(n, current_at):
-    lines = [(i + 1, 0, 0, False, 0.1 + 0.01 * i, 0.1, 0.0, 0.2) for i in range(n)]
-    lines[current_at] = (0, 0, 0, True) + lines[current_at][4:]
-    return lines
-
-
-def test_show_grid_scores_shows_the_10_best_only(capsys):
-    table = grid_score_table(many_lines(14, current_at=12))
-    lines = printed_scores(capsys, table, score_candidates(5, 3, 1), None)
-    assert lines[1:12] == table_text(table)
-    assert len(table_text(table)) == 11            # the header and 10 rows
-    assert lines[12].startswith("        current settings: rank 13 of 14, WAPE 0.2200")
-    assert len(lines) == 14
-
-
-def test_show_grid_scores_rank_1_when_the_current_is_best(capsys):
-    table = grid_score_table(many_lines(4, current_at=0))
-    lines = printed_scores(capsys, table, score_candidates(2, 2, 1), None)
-    assert lines[-2].startswith("        current settings: rank 1 of 4, WAPE 0.1000")
-
-
-def test_show_grid_scores_a_lone_current_combination(capsys):
-    table = grid_score_table([(0, 0, 0, True, 0.25, 0.3, -0.05, 0.4)])
-    lines = printed_scores(capsys, table, score_candidates(1, 1, 1), None)
-    assert lines[0] == ("        1 of 1 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
-    assert lines[-2] == ("        current settings: rank 1 of 1, WAPE 0.2500, 5-week WAPE "
-                         "0.3000, bias -0.0500, company WAPE 0.4000")
-
-
-def test_show_grid_scores_a_missing_5_week_wape_prints_nan(capsys):
-    table = grid_score_table([(0, 0, 0, True, 0.25, float("nan"), 0.0, 0.4)])
-    lines = printed_scores(capsys, table, score_candidates(1, 1, 1), None)
-    assert lines[-2] == ("        current settings: rank 1 of 1, WAPE 0.2500, 5-week WAPE "
-                         "nan, bias +0.0000, company WAPE 0.4000")
-
-
-def test_show_grid_scores_rounds_the_table_to_four_decimals(capsys):
-    lines = printed_scores(capsys, grid_score_table(), score_candidates(), None)
-    body = "\n".join(lines[1:5])
-    assert "0.15" in body and "0.150004" not in body and "0.101234" not in body
-
-
-def test_show_grid_scores_rolled_missing_a_row_with_actual_cash_raises(capsys):
-    # Step 17's totals at another origin than the grid's: evaluation_scores refuses them.
-    rolled = score_rolled()
-    rolled.totals["origin_week"] = 11
-    rolled.totals["target_week"] = 11 + rolled.totals["h"]
-    with pytest.raises(ValueError, match="has no forecast for"):
-        scores_printer()(grid_score_table(), score_candidates(), rolled, score_actual(), 2)
-
-
-def test_show_grid_scores_changes_nothing(capsys):
-    import pandas as pd
-    table, rolled, actual = grid_score_table(), score_rolled(), score_actual()
-    before = (table.copy(), rolled.totals.copy(), actual.copy())
-    printed_scores(capsys, table, score_candidates(), rolled, actual)
-    pd.testing.assert_frame_equal(table, before[0])
-    pd.testing.assert_frame_equal(rolled.totals, before[1])
-    pd.testing.assert_frame_equal(actual, before[2])
-
-
-def test_show_grid_scores_on_grid_scores_own_output(capsys):
-    # test_grid.py's hand-made example: 3 x 3 x 2 combinations, all scored.
-    from tests.hurdle.test_grid import sc_candidates, sc_run
-    table = sc_run()
-    lines = printed_scores(capsys, table, sc_candidates(), None, horizons=5)
-    assert lines[0] == ("        18 of 18 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
-    assert lines[1].split()[:4] == ["stage1", "stage2", "topups", "current"]
-    rank = int(table.index[table["current"]][0]) + 1
-    current = table[table["current"]].iloc[0]
-    assert lines[-2] == (f"        current settings: rank {rank} of 18, WAPE "
-                         f"{current['wape']:.4f}, 5-week WAPE {current['total_wape']:.4f}, bias "
-                         f"{current['bias']:+.4f}, company WAPE {current['company_wape']:.4f}")
-    assert lines[-1] == NOT_CHECKED
-
-
-# --- U16.6: step 18's choice (grid_choice) and its printout (show_grid_choice) -----------------
-
-CHOICE_KEYWORDS = {"companies": "companies", "week_zero": "week_zero", "weekly": "weekly",
-                   "weeks": "weeks", "levels": "levels", "calendar": "calendar",
-                   "ledger": "ledger", "rates": "rates", "new_cash": "new_cash",
-                   "refunds": "refunds", "unidentified": "unidentified"}
-
-
-def test_step_18_grid_choice_positional_arguments():
-    calls = calls_in(step_18_body(), "grid_choice")
-    assert len(calls) == 1
-    assert [ast.unparse(a) for a in calls[0].args] == ["predictions", "candidates", "grid_table",
-                                                       "grid_actual", "settings"]
-
-
-def test_step_18_grid_choice_keywords():
-    call = calls_in(step_18_body(), "grid_choice")[0]
-    assert keywords_of(call) == CHOICE_KEYWORDS
-
-
-def test_step_18_grid_choice_reads_what_step_17s_references_read():
-    # The references are made inside grid_choice from the same inputs step 17 gives them.
-    call = keywords_of(calls_in(step_18_body(), "grid_choice")[0])
-    rule = calls_to(step_17_block(), "rule_reference")[0]
-    assert [ast.unparse(a) for a in rule.args][:2] == [call["ledger"], call["rates"]]
-    for name, value in keywords_of(rule).items():
-        assert call[name] == value, name
-    reference = calls_to(step_17_block(), "deflated_reference")[0]
-    reference_args = [ast.unparse(a) for a in reference.args]
-    assert reference_args[:5] == [call["weekly"], call["weeks"], call["levels"],
-                                  call["calendar"], call["companies"]]
-    assert reference_args[-1] == call["week_zero"]
-
-
-def test_step_18_grid_choice_does_not_read_step_17s_results():
-    # The grid makes its own references: nothing step 17 computes is handed to it.
-    source = ast.unparse(calls_in(step_18_body(), "grid_choice")[0])
-    for name in ("rolled", "reference", "rule", "rolled_actual", "scores", "bootstrap",
-                 "forecasts", "origins"):
-        assert not re.search(rf"\b{name}\b", source.replace("grid_actual", "")), name
-
-
-def test_step_18_choice_is_assigned_once_in_step_18():
-    statements = [ast.unparse(node) for node in step_18_body()]
-    assert sum(s.startswith("choice = ") for s in statements) == 1
-
-
-def test_step_18_show_grid_choice_gets_the_choice_candidates_table_and_settings():
-    calls = calls_in(step_18_body(), "show_grid_choice")
-    assert len(calls) == 1 and calls[0].keywords == []
-    assert [ast.unparse(a) for a in calls[0].args] == ["choice", "candidates", "grid_table",
-                                                       "settings"]
-
-
-def test_step_18_choice_comes_right_after_show_grid_scores_and_its_printout_ends_step_18():
-    statements = [ast.unparse(node) for node in step_18_body()]
-    # U16.7: then the v1 test's `if` ends it.
-    at = statements.index(STEP_18_SHOW_SCORES)
-    assert statements[at + 1:] == [STEP_18_CHOICE, STEP_18_SHOW_CHOICE, STEP_18_TEST_IF]
-
-
-def test_show_grid_choice_is_a_module_level_function_with_four_parameters():
-    found = [node for node in script_functions() if node.name == "show_grid_choice"]
-    assert len(found) == 1
-    assert [a.arg for a in found[0].args.args] == ["choice", "candidates", "table", "settings"]
-    assert found[0].args.defaults == [] and found[0].args.vararg is None
-    assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
-
-
-SHOW_CHOICE_GLOBALS = {"HURDLE", "show_calibration_choice", "show_evaluation_scores",
-                       "show_paired_bootstrap"}
-
-
-def test_show_grid_choice_reads_only_names_the_script_imports_or_defines():
-    import builtins
-    function = [node for node in script_functions() if node.name == "show_grid_choice"][0]
-    loaded = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Load)}
-    stored = {n.id for n in ast.walk(function) if isinstance(n, ast.Name)
-              and isinstance(n.ctx, ast.Store)}
-    params = {a.arg for a in function.args.args}
-    free = loaded - stored - params - set(dir(builtins))
-    assert free == SHOW_CHOICE_GLOBALS
-    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    imported = {a.asname or a.name for node in module.body if isinstance(node, ast.ImportFrom)
-                for a in node.names}
-    defined = {node.name for node in script_functions()}
-    assert "HURDLE" in imported
-    assert SHOW_CHOICE_GLOBALS - {"HURDLE"} <= defined
-
-
-def test_step_18_run_grid_choice_gets_its_arguments():
-    calls, _ = run_step_18()
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_choice"]
-    assert len(found) == 1
-    (predictions, candidates, table, actual, settings), kwargs = found[0]
-    assert (predictions, candidates, table, actual) == ("<predictions>", "<candidates>",
-                                                        "<grid table>", "<grid actual>")
-    assert settings.grid.run is True
-    assert kwargs == {"companies": "<companies>", "week_zero": "<week zero>",
-                      "weekly": "<weekly>", "weeks": "<weeks>", "levels": "<levels>",
-                      "calendar": "<calendar>", "ledger": "<ledger>", "rates": "<rates>",
-                      "new_cash": "<new cash>", "refunds": "<refunds>",
-                      "unidentified": "<unidentified>"}
-
-
-@pytest.mark.parametrize("rolled", ["<rolled>", None])
-def test_step_18_run_shows_the_choice_with_the_candidates_table_and_settings(rolled):
-    calls, _ = run_step_18(rolled=rolled)
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_choice"]
-    assert len(shown) == 1
-    (choice, candidates, table, settings), kwargs = shown[0]
-    assert kwargs == {}
-    assert (choice, candidates, table) == ("<choice>", "<candidates>", "<grid table>")
-    assert settings.grid.run is True
-
-
-def test_step_18_run_the_choice_reads_the_same_table_and_settings_as_the_scores():
-    calls, _ = run_step_18()
-    by_name = {name: args for name, args, _ in calls}
-    assert by_name["grid_choice"][4] is by_name["grid_scores"][4]
-    assert by_name["show_grid_choice"][3] is by_name["grid_choice"][4]
-    assert by_name["grid_choice"][3] == by_name["grid_scores"][3] == "<grid actual>"
-
-
-def test_step_18_run_switched_off_chooses_nothing():
-    calls, _ = run_step_18(run=False, ticks=())
-    assert not any(name in ("grid_choice", "show_grid_choice") for name, _, _ in calls)
-
-
-# --- U16.7: running the v1 test's `if` with fakes ---------------------------------------------
-
-def run_step_18_test(test_origins=(49, 60), ticks=(100.0, 500.0), **kwargs):
-    return run_step_18(run_test=True, test_origins=test_origins, ticks=ticks, **kwargs)
-
-
-def test_step_18_run_with_run_test_calls_in_order():
-    calls, _ = run_step_18_test()
-    assert [name for name, _, _ in calls] == ["grid_candidates", "show_grid_candidates",
-                                              "grid_predictions",
-                                              "show_grid_predictions", "grid_gates",
-                                              "show_grid_gates", "show_grid_gates",
-                                              "actual_totals", "grid_scores",
-                                              "show_grid_scores", "grid_choice",
-                                              "show_grid_choice", "actual_totals",
-                                              "grid_test", "show_grid_test"]
-
-
-def test_step_18_run_without_run_test_makes_no_test():
-    calls, printed = run_step_18()
-    assert not any(name in ("grid_test", "show_grid_test") for name, _, _ in calls)
-    assert [name for name, _, _ in calls].count("actual_totals") == 1
-    assert printed[-1] == TEST_NOT_RUN_LINE
-
-
-def test_step_18_run_with_run_test_but_the_grid_switched_off_does_nothing():
-    # Settings refuse this pair; the script, given it, still runs nothing.
-    calls, printed = run_step_18(run=False, run_test=True, test_origins=(49, 60), ticks=())
-    assert calls == [] and printed == []
-
-
-@pytest.mark.parametrize("origins, text", [
-    ((49, 60), "49-60 (2 origins)"), ((57,), "57-57 (1 origins)"),
-    (tuple(range(49, 61)), "49-60 (12 origins)")])
-def test_step_18_run_with_run_test_prints_the_v1_banner_and_not_the_not_run_line(origins, text):
-    _, printed = run_step_18_test(test_origins=origins)
-    assert printed[-1] == (f"        V1 TEST over the test origins {text}: a report, not a "
-                           f"choice; do not change the settings because of it")
-    assert TEST_NOT_RUN_LINE not in printed
-    assert printed[0].startswith("Step 18: settings grid (U16) over the validation origins")
-
-
-def test_step_18_run_test_actual_is_at_the_test_origins():
-    calls, _ = run_step_18_test(test_origins=(49, 60))
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "actual_totals"]
-    assert found == [(("<weekly>", "<weeks>", "<levels>", "<companies>", [37, 40, 44], 5), {}),
-                     (("<weekly>", "<weeks>", "<levels>", "<companies>", [49, 60], 5), {})]
-    assert type(found[1][0][4]) is list
-
-
-def test_step_18_run_grid_test_gets_its_arguments():
-    calls, _ = run_step_18_test()
-    found = [(args, kwargs) for name, args, kwargs in calls if name == "grid_test"]
-    assert len(found) == 1
-    (choice, actual, settings), kwargs = found[0]
-    assert (choice, actual) == ("<choice>", "<test actual>")
-    assert settings.grid.run_test is True
-    on_fit_done = kwargs.pop("on_fit_done")
-    assert callable(on_fit_done)
-    assert kwargs == {"table": "<table>", "block_columns": "<blocks>",
-                      "companies": "<companies>", "week_zero": "<week zero>",
-                      "weekly": "<weekly>", "weeks": "<weeks>", "levels": "<levels>",
-                      "calendar": "<calendar>", "ledger": "<ledger>", "rates": "<rates>",
-                      "new_cash": "<new cash>", "refunds": "<refunds>",
-                      "unidentified": "<unidentified>",
-                      "cache_folder": Path("cache_root") / "hurdle_grid"}
-
-
-def test_step_18_run_grid_test_gets_the_same_settings_and_callback_as_the_grid():
-    calls, _ = run_step_18_test()
-    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
-    assert by_name["grid_test"][0][2] is by_name["grid_predictions"][0][3]
-    assert by_name["grid_test"][1]["on_fit_done"] is by_name["grid_predictions"][1]["on_fit_done"]
-    assert by_name["grid_test"][1]["cache_folder"] == by_name["grid_predictions"][1]["cache_folder"]
-
-
-def test_step_18_run_shows_the_test_with_the_choice_and_settings():
-    calls, _ = run_step_18_test()
-    shown = [(args, kwargs) for name, args, kwargs in calls if name == "show_grid_test"]
-    assert len(shown) == 1
-    (test, choice, settings), kwargs = shown[0]
-    assert kwargs == {} and (test, choice) == ("<test>", "<choice>")
-    by_name = {name: args for name, args, _ in calls}
-    assert settings is by_name["grid_choice"][4]
-
-
-def test_step_18_run_test_progress_counts_from_the_restarted_clock():
-    # The grid's clock starts at 100 s; the test's restarts at 500 s; its one fit of 4 ends at
-    # 560 s: 60 s per fit x 3 left = 180 s = 3 min (from the grid's start it would be 6 min).
-    _, printed = run_step_18_test(ticks=(100.0, 500.0, 560.0),
-                                  test_progress_calls=[(1, 4, "stage 1", 49, 0, 58.0)])
-    assert printed[-1] == "  ... stage 1 setting 0, origin 49: 1 of 4 done (58 s), about 3 min left"
-    assert printed[-2].startswith("        V1 TEST over the test origins 49-60")
-
-
-# show_grid_test, the function alone: compiled from the script, with the two printers it calls
-# replaced by fakes that print what they were given (each is tested on its own above).
-
-def grid_test_printer(printed):
-    from collection_estimation.hurdle import calibrate, evaluate, grid
-    found = [node for node in script_functions() if node.name == "show_grid_test"]
-    assert len(found) == 1
-
-    def fake(name):
-        def show(*args):
-            printed.append((name, args))
-            print(f"<{name}>")
-        return show
-
-    namespace = {"HURDLE": evaluate.HURDLE, "UNCORRECTED": grid.UNCORRECTED,
-                 "candidate_name": calibrate.candidate_name,
-                 "show_evaluation_scores": fake("show_evaluation_scores"),
-                 "show_paired_bootstrap": fake("show_paired_bootstrap")}
-    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_test>", "exec"), namespace)
-    return namespace["show_grid_test"]
-
-
-def hand_test_choice(p_kind="none", m_kind="scale"):
-    from collection_estimation.hurdle.calibrate import MCorrection, PCorrection
-    from collection_estimation.hurdle.settings import TopupSettings
-    topups = TopupSettings(method="mean", window=13, with_level=True, compare=False,
-                           compare_first_origin=0, compare_last_origin=0, compare_windows=(4,))
-    calibration = SimpleNamespace(p_correction=PCorrection(p_kind),
-                                  m_correction=MCorrection(m_kind, 1.036))
-    return SimpleNamespace(stage1=SimpleNamespace(params={"max_iter": 900, "learning_rate": 0.01}),
-                           stage2=SimpleNamespace(params={"loss": "poisson",
-                                                          "learning_rate": 0.05}),
-                           topups=topups, calibration=calibration)
-
-
-def printed_test(capsys, test, choice, settings):
-    printed = []
-    capsys.readouterr()
-    assert grid_test_printer(printed)(test, choice, settings) is None
-    return capsys.readouterr().out.splitlines(), printed
-
-
-def test_show_grid_test_exact_printout(capsys):
-    test = SimpleNamespace(scores="<sc>", bootstrap="<bs>")
-    lines, _ = printed_test(capsys, test, hand_test_choice(),
-                            SimpleNamespace(receivables=SimpleNamespace(horizons=5)))
-    assert lines == [
-        "        frozen on validation: stage 1 {'max_iter': 900, 'learning_rate': 0.01}, "
-        "stage 2 {'loss': 'poisson', 'learning_rate': 0.05}, top-ups mean (window 13, "
-        "with_level True); corrections p none, m scale",
-        "        on the test origins (hurdle = corrected; hurdle uncorrected for information "
-        "only):",
-        "<show_evaluation_scores>",
-        "<show_paired_bootstrap>"]
-
-
-def test_show_grid_test_names_the_corrections_with_candidate_name(capsys):
-    from collection_estimation.hurdle.calibrate import candidate_name
-    choice = hand_test_choice(p_kind="per h", m_kind="by size")
-    lines, _ = printed_test(capsys, SimpleNamespace(scores=1, bootstrap=2), choice,
-                            SimpleNamespace(receivables=SimpleNamespace(horizons=5)))
-    name = candidate_name(choice.calibration.p_correction, choice.calibration.m_correction)
-    assert lines[0].endswith(f"; corrections {name}")
-    assert name == "p per h, m by size"
-
-
-def test_show_grid_test_passes_the_test_scores_horizons_and_bootstrap(capsys):
-    test = SimpleNamespace(scores="<sc>", bootstrap="<bs>", forecast="<f>", uncorrected="<u>")
-    _, printed = printed_test(capsys, test, hand_test_choice(),
-                              SimpleNamespace(receivables=SimpleNamespace(horizons=4)))
-    assert printed == [("show_evaluation_scores", ("<sc>", 4)),
-                       ("show_paired_bootstrap", ("<bs>",))]
-
-
-# show_grid_choice, the function alone: compiled from the script, with the printers it calls
-# replaced by fakes that print what they were given (each is tested on its own above).
-
-def choice_printer(printed):
-    from collection_estimation.hurdle import evaluate
-    found = [node for node in script_functions() if node.name == "show_grid_choice"]
-    assert len(found) == 1
-
-    def fake(name):
-        def show(*args):
-            printed.append((name, args))
-            print(f"<{name}>")
-        return show
-
-    namespace = {"HURDLE": evaluate.HURDLE,
-                 "show_calibration_choice": fake("show_calibration_choice"),
-                 "show_evaluation_scores": fake("show_evaluation_scores"),
-                 "show_paired_bootstrap": fake("show_paired_bootstrap")}
-    exec(compile(ast.Module(body=found, type_ignores=[]), "<show_grid_choice>", "exec"),
-         namespace)
-    return namespace["show_grid_choice"]
-
-
-def choice_candidates():
-    from collection_estimation.hurdle.settings import TopupSettings
-    topups = TopupSettings(method="mean", window=13, with_level=True, compare=False,
-                           compare_first_origin=0, compare_last_origin=0, compare_windows=(4,))
-    return SimpleNamespace(
-        stage1=[SimpleNamespace(params={"max_iter": 300, "learning_rate": 0.05}),
-                SimpleNamespace(params={"max_iter": 900, "learning_rate": 0.05})],
-        stage2=[SimpleNamespace(params={"loss": "poisson", "learning_rate": 0.05}),
-                SimpleNamespace(params={"loss": "gamma", "learning_rate": 0.1})],
-        topups=[topups, SimpleNamespace(method="mean", window=8),
-                SimpleNamespace(method="ridge", with_level=False)])
-
-
-def choice_scores_table(lines=None):
-    """A grid_scores table: current (0, 0, 0) WAPE 0.1, rank 2 by WAPE."""
-    import pandas as pd
-    from collection_estimation.hurdle.grid import GRID_SCORE_COLUMNS
-    lines = lines or [(1, 0, 1, False, 0.098, 0.1, 0.0, 0.2),
-                      (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
-                      (0, 1, 2, False, 0.17, 0.2, 0.0, 0.25)]
-    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
-
-
-def choice_settings(grid_min_gain=0.005, calibration_min_gain=0.01, horizons=5):
-    return SimpleNamespace(grid=SimpleNamespace(min_gain=grid_min_gain),
-                           calibration=SimpleNamespace(min_gain=calibration_min_gain),
-                           receivables=SimpleNamespace(horizons=horizons))
-
-
-def hand_choice(table, row, candidates):
-    winner = table.iloc[row]
-    i, j, k = int(winner["stage1"]), int(winner["stage2"]), int(winner["topups"])
-    return SimpleNamespace(winner=winner, stage1=candidates.stage1[i],
-                           stage2=candidates.stage2[j], topups=candidates.topups[k],
-                           forecast="<forecast>", calibration="<calibration>",
-                           scores="<scores>", bootstrap="<bootstrap>")
-
-
-def printed_choice(capsys, choice, candidates, table, settings):
-    printed = []
-    capsys.readouterr()
-    assert choice_printer(printed)(choice, candidates, table, settings) is None
-    return capsys.readouterr().out.splitlines(), printed
-
-
-CHOICE_TAIL = ["        its calibration (U15.4 on its forecast):",
-               "<show_calibration_choice>",
-               "        on the same origins, uncorrected (hurdle = the combination kept):",
-               "<show_evaluation_scores>",
-               "<show_paired_bootstrap>"]
-
-
-def test_show_grid_choice_exact_printout_when_the_current_settings_are_kept(capsys):
-    candidates, table = choice_candidates(), choice_scores_table()
-    choice = hand_choice(table, 1, candidates)
-    lines, _ = printed_choice(capsys, choice, candidates, table, choice_settings())
-    assert lines == ["        kept the current settings: no combination beats their WAPE "
-                     "0.1000 by more than 0.005 (best 0.0980)"] + CHOICE_TAIL
-
-
-def test_show_grid_choice_kept_and_best_shows_its_own_wape_as_the_best(capsys):
-    candidates = choice_candidates()
-    table = choice_scores_table([(0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
-                                 (1, 0, 1, False, 0.13, 0.1, 0.0, 0.2)])
-    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                              choice_settings(grid_min_gain=0.02))
-    assert lines[0] == ("        kept the current settings: no combination beats their WAPE "
-                        "0.1000 by more than 0.02 (best 0.1000)")
-
-
-def test_show_grid_choice_exact_printout_of_new_settings(capsys):
-    candidates, table = choice_candidates(), choice_scores_table(
-        [(1, 0, 1, False, 0.08, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
-         (0, 1, 2, False, 0.17, 0.2, 0.0, 0.25)])
-    choice = hand_choice(table, 0, candidates)
-    lines, _ = printed_choice(capsys, choice, candidates, table, choice_settings())
-    assert lines == [
-        "        NEW settings: WAPE 0.0800 against 0.1000 (gain 0.0200, more than 0.005):",
-        "          stage 1: {'max_iter': 900, 'learning_rate': 0.05} (was {'max_iter': 300, "
-        "'learning_rate': 0.05})",
-        "          stage 2: {'loss': 'poisson', 'learning_rate': 0.05}",
-        f"          top-ups: {candidates.topups[1]} (was {candidates.topups[0]})",
-    ] + CHOICE_TAIL
-
-
-def test_show_grid_choice_new_settings_mark_only_the_stages_that_changed(capsys):
-    candidates, table = choice_candidates(), choice_scores_table(
-        [(0, 1, 0, False, 0.05, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
-    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                              choice_settings())
-    stage_lines = lines[1:4]
-    assert stage_lines[0] == "          stage 1: {'max_iter': 300, 'learning_rate': 0.05}"
-    assert stage_lines[1].endswith("(was {'loss': 'poisson', 'learning_rate': 0.05})")
-    assert stage_lines[1].startswith("          stage 2: {'loss': 'gamma', ")
-    assert stage_lines[2] == f"          top-ups: {candidates.topups[0]}"
-    assert "(was" not in stage_lines[0] and "(was" not in stage_lines[2]
-
-
-def test_show_grid_choice_the_was_test_compares_values_not_identity(capsys):
-    # A winner whose stage-1 params equal candidate 0's (another dict, same values) is not
-    # marked as changed.
-    candidates, table = choice_candidates(), choice_scores_table(
-        [(1, 1, 2, False, 0.05, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
-    candidates.stage1[1] = SimpleNamespace(params=dict(candidates.stage1[0].params))
-    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                              choice_settings())
-    assert lines[1] == "          stage 1: {'max_iter': 300, 'learning_rate': 0.05}"
-
-
-def test_show_grid_choice_the_gain_is_current_minus_winner_rounded_to_four(capsys):
-    candidates, table = choice_candidates(), choice_scores_table(
-        [(1, 0, 1, False, 0.123456, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.2, 0.12, 0.031, 0.22)])
-    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                              choice_settings(grid_min_gain=0.05))
-    assert lines[0] == ("        NEW settings: WAPE 0.1235 against 0.2000 (gain 0.0765, more "
-                        "than 0.05):")
-
-
-def test_show_grid_choice_finds_the_current_by_its_flag_not_its_position(capsys):
-    candidates = choice_candidates()
-    table = choice_scores_table([(1, 0, 1, False, 0.07, 0.1, 0.0, 0.2),
-                                 (0, 1, 2, False, 0.08, 0.2, 0.0, 0.25),
-                                 (0, 0, 0, True, 0.3, 0.12, 0.031, 0.22)])
-    lines, _ = printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                              choice_settings())
-    assert lines[0].startswith("        NEW settings: WAPE 0.0700 against 0.3000 (gain 0.2300")
-
-
-def test_show_grid_choice_the_current_kept_prints_no_stage_lines(capsys):
-    candidates, table = choice_candidates(), choice_scores_table()
-    lines, _ = printed_choice(capsys, hand_choice(table, 1, candidates), candidates, table,
-                              choice_settings())
-    assert not any("stage 1:" in line or "top-ups:" in line for line in lines)
-
-
-@pytest.mark.parametrize("row", [0, 1])
-def test_show_grid_choice_passes_the_choice_parts_to_the_printers(capsys, row):
-    candidates, table = choice_candidates(), choice_scores_table(
-        [(1, 0, 1, False, 0.08, 0.1, 0.0, 0.2), (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22)])
-    choice = hand_choice(table, row, candidates)
-    choice.calibration, choice.scores, choice.bootstrap = "<cal>", "<sc>", "<bs>"
-    _, printed = printed_choice(capsys, choice, candidates, table,
-                                choice_settings(grid_min_gain=0.005, calibration_min_gain=0.03,
-                                                horizons=4))
-    # The calibration's own min_gain, not the grid's.
-    assert printed == [("show_calibration_choice", ("<cal>", 0.03)),
-                       ("show_evaluation_scores", ("<sc>", 4)),
-                       ("show_paired_bootstrap", ("<bs>",))]
-
-
-def test_show_grid_choice_changes_nothing(capsys):
-    import pandas as pd
-    candidates, table = choice_candidates(), choice_scores_table()
-    before = table.copy()
-    params = [dict(c.params) for c in candidates.stage1 + candidates.stage2]
-    printed_choice(capsys, hand_choice(table, 0, candidates), candidates, table,
-                   choice_settings())
-    pd.testing.assert_frame_equal(table, before)
-    assert [c.params for c in candidates.stage1 + candidates.stage2] == params
-
-
-# show_grid_choice through the real script, with real printers, on a real GridChoice made by
-# grid_choice on test_grid.py's hand-made example (the references are fakes there; the
-# calibration a hand-made CalibrationChoice).
-SHOW_GRID_CHOICE = """
-from types import SimpleNamespace
-import pandas as pd
-import run_hurdle_pipeline as script
-from collection_estimation.hurdle import inputs as prep
-from collection_estimation.hurdle import grid as grid_module
-from collection_estimation.hurdle.calibrate import (CANDIDATE_COLUMNS, CalibrationChoice,
-                                                    MCorrection, PCorrection)
-from tests.hurdle import test_grid as tg
-
-candidates_table = pd.DataFrame(
-    [("p none, m none", "none", "none", 0, 0.17034, 0.11119, -0.05, 0.22221)],
-    columns=CANDIDATE_COLUMNS)
-calibration = CalibrationChoice(p_correction=PCorrection("none"),
-                                m_correction=MCorrection("none"), split_week=21,
-                                judged_origins=[22], candidates=candidates_table,
-                                winner="p none, m none",
-                                bootstrap=pd.DataFrame(columns=["horizon"]))
-predictions, actual = tg.sc_predictions(), tg.sc_actual()
-table = tg.sc_run(predictions=predictions, actual=actual)
-candidates = SimpleNamespace(
-    stage1=[SimpleNamespace(params={"max_iter": 10 * (i + 1)}) for i in range(3)],
-    stage2=[SimpleNamespace(params={"learning_rate": 0.1 * (j + 1)}) for j in range(3)],
-    topups=[f"<topups {k}>" for k in range(2)])
-grid_module.choose_calibration = lambda *args, **kwargs: calibration
-grid_module.deflated_reference = lambda *args, **kwargs: tg.fake_reference(actual)
-grid_module.rule_reference = lambda *args, **kwargs: SimpleNamespace(
-    totals=tg.fake_rule_totals(actual))
-MODE
-choice = tg.ch_run(predictions, scores, actual, settings=settings, candidates=candidates)
-shown = SimpleNamespace(grid=settings.grid, calibration=settings.calibration,
-                        receivables=settings.receivables)
-script.show_grid_choice(choice, candidates, scores, shown)
-print("ok")
-"""
-KEPT_MODE = "scores = table\nsettings = tg.ch_settings(min_gain=10.0)"
-NEW_MODE = "scores = tg.without_current(table)\nsettings = tg.ch_settings(min_gain=0.0)"
-
-
-def real_choice_lines(mode):
-    result = run_code(SHOW_GRID_CHOICE.replace("MODE", mode))
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert lines[-1] == "ok"
-    return lines[:-1]
-
-
-def test_show_grid_choice_real_printers_when_the_current_is_kept():
-    lines = real_choice_lines(KEPT_MODE)
-    assert lines[0].startswith("        kept the current settings: no combination beats their "
-                               "WAPE ")
-    assert lines[0].endswith(")") and "by more than 10.0 (best " in lines[0]
-    assert lines[1] == "        its calibration (U15.4 on its forecast):"
-    assert "        chosen: p none, m none" in lines
-    at = lines.index("        on the same origins, uncorrected (hurdle = the combination kept):")
-    rest = "\n".join(lines[at + 1:])
-    assert "scores (U14.5), consolidated" in rest
-    assert "paired bootstrap (U14.5c)" in rest
-    assert "current settings" not in rest
-    for method in ("hurdle", "deflated", "deflated_nolevel", "deflated_trend", "rule"):
-        assert method in rest, method
-
-
-def test_show_grid_choice_real_printers_with_new_settings():
-    lines = real_choice_lines(NEW_MODE)
-    assert lines[0].startswith("        NEW settings: WAPE ")
-    assert lines[0].endswith("more than 0.0):")
-    assert lines[1].startswith("          stage 1: ")
-    assert lines[2].startswith("          stage 2: ")
-    assert lines[3].startswith("          top-ups: ")
-    at = lines.index("        on the same origins, uncorrected (hurdle = the combination kept):")
-    rest = "\n".join(lines[at + 1:])
-    assert "hurdle vs current settings" in rest
