@@ -411,7 +411,8 @@ def test_step_12_origin_is_read_from_debug_demo_origin():
 def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     # Steps 1-11 are one call now: the guard follows it, its printouts, the unpacking of the
     # inputs into main()'s names, the U18.1 printout of the cleared invoices' days late and
-    # the top-ups (U12.2, U12.3), and nothing else. (U18.1 added its two statements.)
+    # the top-ups (U12.2, U12.3), and nothing else. (U18.1 added its two statements, U18.2
+    # its three: the heading, expected_dues and show_expected_dues.)
     body = main_tree().body
     calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
              and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
@@ -421,9 +422,10 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     assert len(guards) == 1
     between = body[calls[0] + 1:guards[0]]
     assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
-    assert [ast.unparse(node) for node in between[-4:]] == [U18_1_PRINT, U18_1_SHOW,
-                                                            SHOW_TOPUPS, COMPARE_TOPUPS_IF]
-    for node in between[1:-4]:
+    assert [ast.unparse(node) for node in between[-7:]] == [
+        U18_1_PRINT, U18_1_SHOW, U18_2_PRINT, U18_2_DUES, U18_2_SHOW, SHOW_TOPUPS,
+        COMPARE_TOPUPS_IF]
+    for node in between[1:-7]:
         assert isinstance(node, ast.Assign), ast.unparse(node)
         values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
         for value in values:
@@ -5249,9 +5251,9 @@ def test_each_printout_the_script_calls_is_imported_from_a_report_module():
 
 def test_the_script_imports_from_each_report_module_the_printouts_of_its_steps():
     imports = script_imports()
-    # U18.1 added show_cleared_invoice_delays.
+    # U18.1 added show_cleared_invoice_delays, U18.2 show_expected_dues.
     assert imports["collection_estimation.hurdle.reports.preparation"] == [
-        "show_cleared_invoice_delays", "show_preparation"]
+        "show_cleared_invoice_delays", "show_expected_dues", "show_preparation"]
     assert imports["collection_estimation.hurdle.reports.stages"] == [
         "show_amount_reliability", "show_calibration", "show_cash_by_p_group",
         "show_diagnostic_grid", "show_diagnostic_splits", "show_diagnostic_test",
@@ -5299,17 +5301,18 @@ def unpacking_ends():
 
 
 def test_main_calls_show_topups_right_after_the_inputs_are_unpacked():
-    # Right after the U18.1 printout, which follows the unpacking (U18.1 moved it by two).
+    # Right after the U18.1 and U18.2 printouts, which follow the unpacking (U18.1 moved it
+    # by two, U18.2 by three more).
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 3]) == SHOW_TOPUPS
+    assert ast.unparse(body[at + 6]) == SHOW_TOPUPS
     assert len(calls_to(main_tree(), "show_topups")) == 1
 
 
 def test_main_calls_compare_topups_right_after_show_topups_behind_topups_compare():
     body = main_body()
     at = unpacking_ends()
-    block = body[at + 4]
+    block = body[at + 7]
     assert ast.unparse(block) == COMPARE_TOPUPS_IF
     assert block.orelse == []
     assert len(calls_to(main_tree(), "compare_topups")) == 1
@@ -5320,7 +5323,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
     at = unpacking_ends()
     stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    for node in body[at + 3:at + 5]:
+    for node in body[at + 6:at + 8]:
         read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
                 and isinstance(n.ctx, ast.Load)} - {"settings", "show_topups",
                                                      "compare_topups"}
@@ -5330,7 +5333,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
 def test_the_top_ups_come_before_the_demo_origin_guard():
     body = main_body()
     at = unpacking_ends()
-    assert is_demo_origin_guard(body[at + 5])
+    assert is_demo_origin_guard(body[at + 8])
 
 
 def test_show_preparation_no_longer_runs_the_top_ups():
@@ -5431,3 +5434,135 @@ def test_the_script_imports_cleared_invoice_delays_from_receivables_asof():
     assert imports["collection_estimation.hurdle.receivables_asof"] == ["cleared_invoice_delays"]
     assert "show_cleared_invoice_delays" in imports[
         "collection_estimation.hurdle.reports.preparation"]
+
+
+# --- U18.2: main() builds the delay spread right after the U18.1 printout ----------------------
+
+U18_2_PRINT = "print('U18.2: the delay spread of the open invoices')"
+U18_2_DUES = ("dues = expected_dues(table[['key', 'company_code', 'origin_week', 'h']], ledger, "
+              "rates, levels, week_zero, details.holidays, "
+              "horizons=settings.receivables.horizons, "
+              "min_cleared=settings.receivables.min_cleared_for_delay, "
+              "delays_kept=settings.rhythm.delays_kept, "
+              "company_delays_kept=settings.rhythm.company_delays_kept, "
+              "leak_check_weeks=settings.receivables.leak_check_weeks)")
+U18_2_SHOW = ("show_expected_dues(dues, table, settings.evaluation.validation_origins, "
+              "settings.receivables.horizons)")
+U18_2_KEYWORDS = {"horizons": "settings.receivables.horizons",
+                  "min_cleared": "settings.receivables.min_cleared_for_delay",
+                  "delays_kept": "settings.rhythm.delays_kept",
+                  "company_delays_kept": "settings.rhythm.company_delays_kept",
+                  "leak_check_weeks": "settings.receivables.leak_check_weeks"}
+
+
+def expected_dues_call():
+    found = calls_to(main_tree(), "expected_dues")
+    assert len(found) == 1
+    return found[0]
+
+
+def test_main_prints_the_u18_2_heading_right_after_the_u18_1_printout():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 2]) == U18_1_SHOW
+    assert ast.unparse(body[at + 3]) == U18_2_PRINT
+
+
+def test_main_builds_the_expected_dues_right_after_the_u18_2_heading():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 4]) == U18_2_DUES
+
+
+def test_main_shows_the_expected_dues_right_after_building_them():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 5]) == U18_2_SHOW
+    assert ast.unparse(body[at + 6]) == SHOW_TOPUPS
+
+
+def test_expected_dues_gets_the_four_panel_columns_of_the_table():
+    call = expected_dues_call()
+    first = call.args[0]
+    assert isinstance(first, ast.Subscript)
+    assert ast.unparse(first.value) == "table"
+    assert ast.literal_eval(first.slice) == ["key", "company_code", "origin_week", "h"]
+
+
+def test_expected_dues_positional_arguments_in_order():
+    call = expected_dues_call()
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "table[['key', 'company_code', 'origin_week', 'h']]", "ledger", "rates", "levels",
+        "week_zero", "details.holidays"]
+
+
+def test_expected_dues_keyword_arguments_come_from_the_settings():
+    call = expected_dues_call()
+    assert {kw.arg: ast.unparse(kw.value) for kw in call.keywords} == U18_2_KEYWORDS
+
+
+def test_expected_dues_call_matches_the_function_signature():
+    import inspect
+    from collection_estimation.hurdle.features_rhythm import expected_dues
+    call = expected_dues_call()
+    parameters = list(inspect.signature(expected_dues).parameters)
+    assert parameters[:len(call.args)] == ["panel_rows", "ledger", "rates", "levels",
+                                           "week_zero", "holidays"]
+    assert [kw.arg for kw in call.keywords] == parameters[len(call.args):]
+
+
+def test_the_settings_read_by_u18_2_exist_in_the_synthetic_settings():
+    from collection_estimation.hurdle.settings import load_settings
+    settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
+    if not settings_file.exists():
+        pytest.skip("settings/synthetic.toml absent")
+    settings = load_settings(settings_file, SCRIPT.parent)
+    for text in list(U18_2_KEYWORDS.values()) + ["settings.evaluation.validation_origins"]:
+        value = settings
+        for part in text.split(".")[1:]:
+            value = getattr(value, part)
+        assert value is not None, text
+
+
+def test_show_expected_dues_reads_the_dues_and_the_whole_table():
+    found = calls_to(main_tree(), "show_expected_dues")
+    assert len(found) == 1
+    assert [ast.unparse(arg) for arg in found[0].args] == [
+        "dues", "table", "settings.evaluation.validation_origins",
+        "settings.receivables.horizons"]
+    assert found[0].keywords == []
+
+
+def test_dues_is_bound_once_in_main():
+    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name) and n.id == "dues"
+              and isinstance(n.ctx, (ast.Store, ast.Del))]
+    assert len(stores) == 1
+
+
+def test_the_u18_2_calls_are_made_once_in_the_whole_script():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    for name in ("expected_dues", "show_expected_dues"):
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == name]
+        assert len(found) == 1, name
+
+
+def test_the_u18_2_statements_read_main_names_bound_before_them():
+    body = main_body()
+    at = unpacking_ends()
+    stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    stored.add("dues")   # bound by the statement before show_expected_dues
+    for node in body[at + 4:at + 6]:
+        read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                and isinstance(n.ctx, ast.Load)} - {"settings", "expected_dues",
+                                                     "show_expected_dues"}
+        assert read <= stored, read - stored
+    for name in ("table", "ledger", "rates", "levels", "week_zero", "details"):
+        assert name in stored, name
+
+
+def test_the_script_imports_expected_dues_from_features_rhythm():
+    imports = script_imports()
+    assert imports["collection_estimation.hurdle.features_rhythm"] == ["expected_dues"]
+    assert "show_expected_dues" in imports["collection_estimation.hurdle.reports.preparation"]

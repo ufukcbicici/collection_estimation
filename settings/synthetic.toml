@@ -95,6 +95,13 @@ drain_window = 3                # calendar days before a holiday whose payments 
 catch_up_window = 5             # calendar days after a holiday that receive them (both copy
                                 # the synthetic generator's rule; to be chosen on EY data)
 
+[rhythm]
+# The payment-rhythm block (U18, features_rhythm.py): each open invoice spread over the coming
+# weeks by the customer's own past delays (days late of its cleared invoices, as known at t).
+delays_kept = 20                # a customer's most recent cleared invoices used (recent habit)
+company_delays_kept = 200       # its company's, used instead below [receivables]
+                                # min_cleared_for_delay of its own
+
 [stage1]
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
 # weights, early stopping off). The stage-1 diagnostic's choice at origin 40 (its grid on

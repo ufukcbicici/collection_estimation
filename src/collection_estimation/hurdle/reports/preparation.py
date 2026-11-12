@@ -200,6 +200,61 @@ def show_cleared_invoice_delays(delays):
           f"90th percentile {lag.quantile(0.9):.0f}, max {lag.max():.0f}")
 
 
+def show_expected_dues(dues, table, validation_origins, horizons):
+    """A short printout of the delay spread (U18.2), and a preview before any model sees it:
+    at the validation origins, per h, how well three ways of timing the known customers' open
+    invoices match the cash they paid (all deflated, consolidated): the plain due dates
+    (due_in_target_week), the single shifted date and the spread. WAPE over the origins, and
+    the sum against the cash. Not a forecast: new customers and cash without an open invoice
+    are left out of all three."""
+    print(f"        delay spread: {len(dues):,} rows; delays pooled from the company for "
+          f"{dues['delays_pooled'].mean():.0%} of them, none at all for "
+          f"{(dues['delays_used'] == 0).mean():.0%}")
+    # The rows compared: labelled rows at the validation origins. `dues` has the table's rows
+    # in the same order, so the two are put side by side by position.
+    frame = pd.DataFrame({
+        "origin_week": table["origin_week"].to_numpy(),
+        "h": table["h"].to_numpy(),
+        "label_status": table["label_status"].to_numpy(),
+        "actual": table["amount_deflated"].to_numpy(),
+        "due dates": table["due_in_target_week"].to_numpy(),
+        "shifted date": dues["shifted_due_in_target"].to_numpy(),
+        "spread": dues["spread_in_target"].to_numpy(),
+    })
+    at_validation = frame["origin_week"].isin(validation_origins)
+    labelled = frame["label_status"] == "labelled"
+    frame = frame[at_validation & labelled]
+    if frame.empty:
+        print("        preview: no labelled rows at the validation origins")
+        return
+
+    # Per h: the consolidated amounts per origin, then WAPE over the origins and sum / cash.
+    methods = ["due dates", "shifted date", "spread"]
+    print("        preview on the validation origins (known customers' open invoices against "
+          "their cash; WAPE, and sum / cash):")
+    lines = []
+    for h in range(1, horizons + 1):
+        line = {"h": h}
+        at_h = frame[frame["h"] == h]
+        per_origin = at_h.groupby("origin_week")[["actual"] + methods].sum()
+        cash = per_origin["actual"].sum()
+        for name in methods:
+            if per_origin.empty:
+                # E.g. its target weeks are past the data: nothing to compare.
+                line[f"{name} WAPE"] = float("nan")
+                line[f"{name} sum"] = float("nan")
+                continue
+            errors = (per_origin[name] - per_origin["actual"]).abs()
+            line[f"{name} WAPE"] = errors.sum() / cash
+            line[f"{name} sum"] = per_origin[name].sum() / cash
+        lines.append(line)
+    preview = pd.DataFrame(lines).set_index("h")
+    wape_columns = [f"{name} WAPE" for name in methods]
+    sum_columns = [f"{name} sum" for name in methods]
+    preview = preview[wape_columns + sum_columns]
+    print(preview.round(3).to_string())
+
+
 def show_known(known, collections, last_week):
     """A short printout of when keys become known."""
     before = (known["known_week"] < 0).sum()

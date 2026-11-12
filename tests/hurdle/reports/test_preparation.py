@@ -172,6 +172,8 @@ def test_every_step_1_to_11_printout_is_a_function_of_the_module():
         name for name in PREPARATION_PRINTOUTS if name != "print"))
     expected.insert(expected.index("show_receivables_by_week") + 1,
                     "show_cleared_invoice_delays")
+    # U18.2 added show_expected_dues right after it, also called by main() only.
+    expected.insert(expected.index("show_cleared_invoice_delays") + 1, "show_expected_dues")
     assert names == expected
     for name in names:
         assert callable(getattr(preparation, name)), name
@@ -1083,3 +1085,190 @@ def test_cleared_delays_printout_is_not_called_by_show_preparation():
     # U18.1 is main()'s own step, after the inputs are unpacked.
     assert calls_to(show_preparation_tree(), "show_cleared_invoice_delays") == []
     assert calls_to(show_preparation_tree(), "cleared_invoice_delays") == []
+
+
+# U18.2: the printout of the delay spread (`show_expected_dues`), run in a separate process on
+# small hand-built tables. One summary line on `dues`; then, on the labelled rows of `table` at
+# the validation origins, per h: the WAPE over the origins of three timings (due dates =
+# table's due_in_target_week, shifted date and spread = dues' columns) against the cash
+# (amount_deflated), consolidated per (h, origin), and each one's sum / the cash. The tables
+# are matched by position, not by index. Each case's output follows a "== name" marker line.
+EXPECTED_DUES = """
+import inspect
+import pandas as pd
+from collection_estimation.hurdle.reports import preparation as reports
+
+inspect.signature(reports.show_expected_dues).bind("dues", "table", "origins", "horizons")
+
+# origin, h, label_status, cash, due dates, shifted, spread, pooled, delays used
+ROWS = [
+    (33, 1, "labelled", 100.0, 80.0, 90.0, 100.0, False, 5),
+    (33, 1, "labelled", 50.0, 0.0, 10.0, 30.0, True, 3),
+    (34, 1, "labelled", 50.0, 100.0, 60.0, 40.0, False, 0),
+    (33, 2, "labelled", 200.0, 100.0, 150.0, 180.0, False, 5),
+    (34, 2, "labelled", 100.0, 50.0, 100.0, 120.0, False, 5),
+    (34, 2, "unlabelled", 999.0, 999.0, 999.0, 999.0, False, 0),   # not labelled: left out
+    (10, 1, "labelled", 999.0, 999.0, 999.0, 999.0, True, 0),      # not a validation origin
+]
+
+def tables(rows, index=None):
+    table = pd.DataFrame({"key": [f"K{n}" for n in range(len(rows))],
+                          "origin_week": [r[0] for r in rows], "h": [r[1] for r in rows],
+                          "label_status": [r[2] for r in rows],
+                          "amount_deflated": [r[3] for r in rows],
+                          "due_in_target_week": [r[4] for r in rows]}, index=index)
+    dues = pd.DataFrame({"key": table["key"].to_numpy(),
+                         "origin_week": table["origin_week"].to_numpy(),
+                         "h": table["h"].to_numpy(),
+                         "shifted_due_in_target": [r[5] for r in rows],
+                         "spread_in_target": [r[6] for r in rows],
+                         "delays_used": [r[8] for r in rows],
+                         "delays_pooled": [r[7] for r in rows]})
+    return dues, table
+
+print("== small")
+dues, table = tables(ROWS)
+reports.show_expected_dues(dues, table, (33, 34), 2)
+
+print("== shuffled index")
+# table with a shuffled, non-default index: the printout matches rows by position.
+dues, table = tables(ROWS, index=[70, 3, 12, 0, 5, 99, 1])
+reports.show_expected_dues(dues, table, (33, 34), 2)
+
+print("== no validation rows")
+dues, table = tables(ROWS)
+reports.show_expected_dues(dues, table, (50, 51), 2)
+
+print("== only unlabelled")
+dues, table = tables([r[:2] + ("unlabelled",) + r[3:] for r in ROWS])
+reports.show_expected_dues(dues, table, (33, 34), 2)
+
+print("== many")
+dues, table = tables([(33, 1, "labelled", 1.0, 1.0, 1.0, 1.0, n % 4 == 0, n % 2) for n in range(1500)])
+reports.show_expected_dues(dues, table, [33], 1)
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def expected_dues_run():
+    result = run_snippet(EXPECTED_DUES)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    parts = {}
+    for chunk in result.stdout.split("== ")[1:]:
+        name, _, body = chunk.partition("\n")
+        parts[name.strip()] = [line for line in body.splitlines() if line and line != "ok"]
+    return parts
+
+
+def preview_rows(lines):
+    """{h: [the six numbers]} of the preview table's rows."""
+    rows = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 7 and fields[0].isdigit():
+            rows[int(fields[0])] = [float(field) for field in fields[1:]]
+    return rows
+
+
+def test_expected_dues_printout_is_a_function_of_the_module():
+    args = function_tree(PREPARATION, "show_expected_dues").args.args
+    assert [arg.arg for arg in args] == ["dues", "table", "validation_origins", "horizons"]
+
+
+def test_expected_dues_printout_summary_line(expected_dues_run):
+    # 7 rows; pooled 2 of 7 = 29%; no delays (delays_used 0) 3 of 7 = 43%.
+    assert expected_dues_run["small"][0] == (
+        "        delay spread: 7 rows; delays pooled from the company for 29% of them, none "
+        "at all for 43%")
+
+
+def test_expected_dues_printout_preview_heading(expected_dues_run):
+    assert expected_dues_run["small"][1] == (
+        "        preview on the validation origins (known customers' open invoices against "
+        "their cash; WAPE, and sum / cash):")
+
+
+def test_expected_dues_printout_columns_in_order(expected_dues_run):
+    header = expected_dues_run["small"][2].split("  ")
+    names = [part.strip() for part in header if part.strip()]
+    assert names == ["due dates WAPE", "shifted date WAPE", "spread WAPE", "due dates sum",
+                     "shifted date sum", "spread sum"]
+
+
+def test_expected_dues_printout_one_row_per_h(expected_dues_run):
+    assert sorted(preview_rows(expected_dues_run["small"])) == [1, 2]
+
+
+def test_expected_dues_printout_h1_values(expected_dues_run):
+    # Per origin (cash, due, shifted, spread): 33 -> 150, 80, 100, 130; 34 -> 50, 100, 60, 40.
+    # WAPE due (70 + 50) / 200, shifted (50 + 10) / 200, spread (20 + 10) / 200;
+    # sums 180 / 200, 160 / 200, 170 / 200.
+    assert preview_rows(expected_dues_run["small"])[1] == [0.6, 0.3, 0.15, 0.9, 0.8, 0.85]
+
+
+def test_expected_dues_printout_h2_values_rounded_to_three_places(expected_dues_run):
+    # 33 -> 200, 100, 150, 180; 34 -> 100, 50, 100, 120 (the unlabelled 999 row left out).
+    # WAPE due 150 / 300, shifted 50 / 300, spread 40 / 300; sums 150, 250, 300 over 300.
+    assert preview_rows(expected_dues_run["small"])[2] == [0.5, 0.167, 0.133, 0.5, 0.833, 1.0]
+
+
+def test_expected_dues_printout_matches_rows_by_position(expected_dues_run):
+    assert expected_dues_run["shuffled index"] == expected_dues_run["small"]
+
+
+def test_expected_dues_printout_without_validation_rows_is_two_lines(expected_dues_run):
+    assert expected_dues_run["no validation rows"] == [
+        expected_dues_run["small"][0],
+        "        preview: no labelled rows at the validation origins"]
+
+
+def test_expected_dues_printout_with_only_unlabelled_rows_is_two_lines(expected_dues_run):
+    assert expected_dues_run["only unlabelled"][1:] == [
+        "        preview: no labelled rows at the validation origins"]
+    assert len(expected_dues_run["only unlabelled"]) == 2
+
+
+def test_expected_dues_printout_uses_thousands_separators(expected_dues_run):
+    # 1,500 rows; pooled every 4th = 25%; delays_used 0 every 2nd = 50%.
+    assert expected_dues_run["many"][0] == (
+        "        delay spread: 1,500 rows; delays pooled from the company for 25% of them, "
+        "none at all for 50%")
+    assert preview_rows(expected_dues_run["many"])[1] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_expected_dues_printout_is_not_called_by_show_preparation():
+    # U18.2 is main()'s own step, after the inputs are unpacked.
+    assert calls_to(show_preparation_tree(), "show_expected_dues") == []
+    assert calls_to(show_preparation_tree(), "expected_dues") == []
+
+
+def test_expected_dues_printout_reads_the_documented_columns():
+    source = function_source(PREPARATION, "show_expected_dues")
+    for column in ("delays_pooled", "delays_used", "label_status", "due_in_target_week",
+                   "shifted_due_in_target", "spread_in_target", "amount_deflated",
+                   "origin_week"):
+        assert f'"{column}"' in source or f"'{column}'" in source, column
+
+
+MISSING_H = """
+import pandas as pd
+from collection_estimation.hurdle.reports import preparation as reports
+# Labelled rows at the validation origin for h = 1 only, with horizons = 2 (h = 2's rows are
+# not labelled yet, e.g. its target week is past the data).
+table = pd.DataFrame({"origin_week": [33, 33], "h": [1, 2],
+                      "label_status": ["labelled", "unlabelled"],
+                      "amount_deflated": [10.0, 10.0], "due_in_target_week": [5.0, 5.0]})
+dues = pd.DataFrame({"shifted_due_in_target": [10.0, 0.0], "spread_in_target": [10.0, 0.0],
+                     "delays_used": [3, 3], "delays_pooled": [False, False]})
+reports.show_expected_dues(dues, table, [33], 2)
+print("ok")
+"""
+
+
+def test_expected_dues_printout_survives_an_h_without_labelled_rows():
+    # A preview should not crash the pipeline when one h has no labelled validation rows.
+    result = run_snippet(MISSING_H)
+    assert result.returncode == 0, result.stderr[-600:]
+    assert result.stdout.strip().endswith("ok")

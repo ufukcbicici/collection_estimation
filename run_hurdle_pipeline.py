@@ -70,9 +70,11 @@ from collection_estimation.hurdle.calibrate import (  # noqa: E402
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.inputs import prepare_inputs  # noqa: E402
+from collection_estimation.hurdle.features_rhythm import expected_dues  # noqa: E402
 from collection_estimation.hurdle.receivables_asof import cleared_invoice_delays  # noqa: E402
 from collection_estimation.hurdle.reports.preparation import (  # noqa: E402
     show_cleared_invoice_delays,
+    show_expected_dues,
     show_preparation,
 )
 from collection_estimation.hurdle.reports.stages import (  # noqa: E402
@@ -188,6 +190,20 @@ def main():
     # day it was known (the delay spread of U18.2 is built from these, as known at t).
     print("U18.1: days late of every cleared invoice")
     show_cleared_invoice_delays(cleared_invoice_delays(ledger))
+
+    # U18.2: each open invoice spread over the weeks after t by the customer's past delays,
+    # for every panel row; with a preview on the validation origins of how well it times the
+    # known customers' cash, beside the plain due dates and the single shifted date.
+    print("U18.2: the delay spread of the open invoices")
+    dues = expected_dues(table[["key", "company_code", "origin_week", "h"]], ledger, rates,
+                         levels, week_zero, details.holidays,
+                         horizons=settings.receivables.horizons,
+                         min_cleared=settings.receivables.min_cleared_for_delay,
+                         delays_kept=settings.rhythm.delays_kept,
+                         company_delays_kept=settings.rhythm.company_delays_kept,
+                         leak_check_weeks=settings.receivables.leak_check_weeks)
+    show_expected_dues(dues, table, settings.evaluation.validation_origins,
+                       settings.receivables.horizons)
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
     # trailing mean ([topups] window) and by the ridge (with and without the recent level),

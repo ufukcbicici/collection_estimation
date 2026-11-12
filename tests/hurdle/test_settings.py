@@ -163,6 +163,9 @@ VALID = {
     # encodings, in the non-code order; windows 4 and 6 against 3 and 5).
     "calendar": {"holiday_encodings": '["days", "drain"]', "drain_window": "4",
                  "catch_up_window": "6"},
+    # U18.2: the payment-rhythm block. Values differ from synthetic.toml's on purpose (15 and
+    # 150 against 20 and 200), so a test can tell them apart.
+    "rhythm": {"delays_kept": "15", "company_delays_kept": "150"},
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
@@ -365,7 +368,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "calendar", "stage1", "stage2",
+                                       "history", "calendar", "rhythm", "stage1", "stage2",
                                        "diagnostic", "joint_diagnostic", "topups",
                                        "calibration", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
@@ -386,7 +389,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("receivables", "leak_check_weeks"), ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
-    ("calendar", "catch_up_window"),
+    ("calendar", "catch_up_window"), ("rhythm", "delays_kept"), ("rhythm", "company_delays_kept"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -520,7 +523,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("receivables", "overdue_age_days"),
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
-    ("calendar", "catch_up_window"),
+    ("calendar", "catch_up_window"), ("rhythm", "delays_kept"), ("rhythm", "company_delays_kept"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -2257,7 +2260,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
@@ -2765,7 +2768,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_diagnostic_typo_has_the_exact_message(tmp_path, repo):
@@ -3498,7 +3501,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_stage2_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4166,7 +4169,7 @@ def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, r
     assert message == (
         f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_joint_diagnostic_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4668,7 +4671,7 @@ def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_calendar_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4925,7 +4928,7 @@ def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_topups_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -5479,7 +5482,7 @@ def test_a_missing_evaluation_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', "
-        f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', 'stage2', "
+        f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', "
         f"'topups']")
 
 
@@ -6643,7 +6646,7 @@ def test_a_missing_grid_section_is_named(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['grid']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
-        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'stage1', "
+        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'stage1', "
         f"'stage2', 'topups']")
 
 
@@ -7060,3 +7063,151 @@ def test_the_synthetic_toml_grid_tries_both_ridges():
     grid = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).grid
     assert all(type(item) is bool for item in grid.topup_ridge_with_level)
     assert len(set(grid.topup_ridge_with_level)) == len(grid.topup_ridge_with_level)
+
+
+# --- [rhythm] (U18.2) ----------------------------------------------------------------------------
+# A required section: how many past delays the payment-rhythm block (`features_rhythm`) uses.
+# delays_kept (a customer's most recent cleared invoices) and company_delays_kept (its
+# company's, for a customer with too few of its own) are both counts (count_setting).
+
+from collection_estimation.hurdle.settings import RhythmSettings  # noqa: E402
+
+RHYTHM = f"{FILE_NAME} [rhythm]"
+RHYTHM_KEYS = ["company_delays_kept", "delays_kept"]
+
+
+def test_rhythm_settings_fields_are_in_the_documented_order():
+    assert [field.name for field in dataclasses.fields(RhythmSettings)] == [
+        "delays_kept", "company_delays_kept"]
+
+
+def test_the_rhythm_section_is_read(tmp_path, repo):
+    rhythm = load(tmp_path, repo).rhythm
+    assert isinstance(rhythm, RhythmSettings)
+    assert rhythm == RhythmSettings(delays_kept=15, company_delays_kept=150)
+
+
+def test_the_rhythm_values_are_ints(tmp_path, repo):
+    rhythm = load(tmp_path, repo).rhythm
+    assert type(rhythm.delays_kept) is int
+    assert type(rhythm.company_delays_kept) is int
+
+
+def test_rhythm_settings_is_frozen_and_hashable(tmp_path, repo):
+    rhythm = load(tmp_path, repo).rhythm
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rhythm.delays_kept = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rhythm.company_delays_kept = 1
+    assert hash(rhythm) == hash(dataclasses.replace(rhythm))
+
+
+def test_settings_has_a_rhythm_field_right_after_calendar():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("rhythm") == names.index("calendar") + 1
+    assert names.index("rhythm") < names.index("stage1")
+
+
+def test_settings_rhythm_field_is_frozen(tmp_path, repo):
+    settings = load(tmp_path, repo)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        settings.rhythm = None
+
+
+def test_the_rhythm_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("rhythm", "delays_kept"): "3",
+                                      ("rhythm", "company_delays_kept"): "7"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "rhythm":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert a.rhythm != b.rhythm
+    assert b.rhythm == RhythmSettings(delays_kept=3, company_delays_kept=7)
+
+
+def test_a_missing_rhythm_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="rhythm")
+    assert message == (
+        f"{FILE_NAME}: missing ['rhythm']; expected exactly ['calendar', 'calibration', "
+        f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
+        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', "
+        f"'stage1', 'stage2', 'topups']")
+
+
+def test_a_rhythm_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="rhythm", top="rhythm = 5")
+    assert message == f"{RHYTHM} is 5, not a section"
+
+
+def test_an_empty_rhythm_section_names_both_settings(tmp_path, repo):
+    changes = {("rhythm", key): REMOVE for key in VALID["rhythm"]}
+    message = exact_message(tmp_path, repo, changes)
+    assert message == f"{RHYTHM}: missing {RHYTHM_KEYS}; expected exactly {RHYTHM_KEYS}"
+
+
+@pytest.mark.parametrize("key", RHYTHM_KEYS)
+def test_each_missing_rhythm_key_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("rhythm", key): REMOVE})
+    assert message == f"{RHYTHM}: missing [{key!r}]; expected exactly {RHYTHM_KEYS}"
+
+
+@pytest.mark.parametrize("key, value", [("surprise", "1"), ("min_cleared", "3"),
+                                        ("min_cleared_for_delay", "3"), ("horizons", "5")])
+def test_an_unknown_rhythm_key_has_the_exact_message(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("rhythm", key): value})
+    assert message == f"{RHYTHM}: unknown [{key!r}]; expected exactly {RHYTHM_KEYS}"
+
+
+def test_a_rhythm_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "delays_kept"): REMOVE,
+                                             ("rhythm", "delay_kept"): "20"})
+    assert message == (f"{RHYTHM}: missing ['delays_kept']; unknown ['delay_kept']; "
+                       f"expected exactly {RHYTHM_KEYS}")
+
+
+def test_the_rhythm_keys_are_unknown_in_receivables(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("receivables", "delays_kept"): "20"})
+    assert message.startswith(f"{FILE_NAME} [receivables]: unknown ['delays_kept']; ")
+
+
+@pytest.mark.parametrize("key", ["delays_kept", "company_delays_kept"])
+@pytest.mark.parametrize("text, expected", [("1", 1), ("2", 2), ("20", 20), ("200", 200),
+                                            ("100000", 100000)])
+def test_a_rhythm_count_is_accepted(tmp_path, repo, key, text, expected):
+    rhythm = load(tmp_path, repo, changes={("rhythm", key): text}).rhythm
+    assert getattr(rhythm, key) == expected
+    assert type(getattr(rhythm, key)) is int
+
+
+@pytest.mark.parametrize("key", ["delays_kept", "company_delays_kept"])
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("true", "True"),
+                                         ("false", "False"), ("2.5", "2.5"), ("20.0", "20.0"),
+                                         ('"20"', "'20'"), ("[20]", "[20]")])
+def test_a_bad_rhythm_count_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("rhythm", key): text})
+    assert message == f"{RHYTHM}: {key} is {shown}, not a whole number of 1 or more"
+
+
+def test_the_rhythm_counts_do_not_borrow_from_each_other(tmp_path, repo):
+    rhythm = load(tmp_path, repo, changes={("rhythm", "delays_kept"): "300",
+                                           ("rhythm", "company_delays_kept"): "2"}).rhythm
+    assert (rhythm.delays_kept, rhythm.company_delays_kept) == (300, 2)
+
+
+def test_the_delays_kept_is_checked_before_the_company_delays_kept(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "delays_kept"): "0",
+                                             ("rhythm", "company_delays_kept"): "0"})
+    assert message.startswith(f"{RHYTHM}: delays_kept is 0")
+
+
+def test_the_rhythm_is_checked_with_the_calendar_before_it(tmp_path, repo):
+    # Sections are read in file order: a bad [calendar] is reported before a bad [rhythm].
+    message = exact_message(tmp_path, repo, {("calendar", "drain_window"): "0",
+                                             ("rhythm", "delays_kept"): "0"})
+    assert message.startswith(f"{FILE_NAME} [calendar]: drain_window is 0")
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
+def test_the_synthetic_rhythm_settings():
+    rhythm = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).rhythm
+    assert rhythm == RhythmSettings(delays_kept=20, company_delays_kept=200)

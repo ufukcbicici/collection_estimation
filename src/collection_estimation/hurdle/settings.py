@@ -56,6 +56,13 @@ class CalendarSettings:
 
 
 @dataclass(frozen=True)
+class RhythmSettings:
+    """How the payment-rhythm block (U18) is built (see `features_rhythm`)."""
+    delays_kept: int            # a customer's most recent cleared invoices whose delays it uses
+    company_delays_kept: int    # the company's, for a customer with too few of its own
+
+
+@dataclass(frozen=True)
 class Stage1Settings:
     """Stage 1, the "will it pay?" classifier."""
     max_iter: int                     # number of trees
@@ -237,6 +244,7 @@ class Settings:
     receivables: ReceivablesSettings
     history: HistorySettings
     calendar: CalendarSettings
+    rhythm: RhythmSettings
     stage1: Stage1Settings
     stage2: Stage2Settings
     diagnostic: DiagnosticSettings
@@ -260,8 +268,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "calendar", "stage1", "stage2", "diagnostic", "joint_diagnostic",
-                     "topups", "evaluation", "calibration", "grid", "debug"},
+                     "history", "calendar", "rhythm", "stage1", "stage2", "diagnostic",
+                     "joint_diagnostic", "topups", "evaluation", "calibration", "grid", "debug"},
                name)
 
     data = raw["data"]
@@ -278,6 +286,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     calendar = raw["calendar"]
     check_keys(calendar, {"holiday_encodings", "drain_window", "catch_up_window"},
                f"{name} [calendar]")
+    rhythm = raw["rhythm"]
+    check_keys(rhythm, {"delays_kept", "company_delays_kept"}, f"{name} [rhythm]")
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
@@ -369,6 +379,11 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                                         f"{name} [calendar]"),
             drain_window=count_setting(calendar, "drain_window", f"{name} [calendar]"),
             catch_up_window=count_setting(calendar, "catch_up_window", f"{name} [calendar]"),
+        ),
+        rhythm=RhythmSettings(
+            delays_kept=count_setting(rhythm, "delays_kept", f"{name} [rhythm]"),
+            company_delays_kept=count_setting(rhythm, "company_delays_kept",
+                                              f"{name} [rhythm]"),
         ),
         stage1=Stage1Settings(
             max_iter=count_setting(stage1, "max_iter", f"{name} [stage1]"),
