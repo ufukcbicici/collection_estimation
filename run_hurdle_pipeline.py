@@ -23,7 +23,8 @@ Steps (filled in as the units are built; see option_b_implementation_plan.md):
 
 Steps 1-11 are one call, `inputs.prepare_inputs` (shared with the other entry points); their
 printouts follow it (`show_preparation`). To look at one of their tables, put the breakpoint
-in hurdle/inputs.py. Step 18 is one call too, `grid_run.run_grid`, which run_b.py runs alone.
+in hurdle/inputs.py. Step 18 is one call too, `grid_run.run_grid`, which run_hurdle_grid.py
+runs alone.
 Every printout (`show_*`) is in hurdle/reports/, one module per stretch of steps; what stays
 here is main() and the experiments only it runs (the joint diagnostic, the top-up comparison).
 
@@ -472,8 +473,8 @@ def main():
             show_calibration_choice(choice, settings.calibration.min_gain)
 
     # Step 18: the settings grid (U16) over the validation origins, then the v1 test only with
-    # [grid] run_test (hurdle/grid_run.py, which run_b.py runs alone). Candidate 0 is checked
-    # against step 17's forecasts when step 17 made them (rolled).
+    # [grid] run_test (hurdle/grid_run.py, which run_hurdle_grid.py runs alone). Candidate 0 is
+    # checked against step 17's forecasts when step 17 made them (rolled).
     if settings.grid.run:
         run_grid(settings, inputs, rolled=rolled)
 

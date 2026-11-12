@@ -1,7 +1,7 @@
 """Step 18, the settings grid (U16), run from end to end with its printouts.
 
-`run_grid` is what `run_hurdle_pipeline.py` (step 18) and `run_b.py` (the grid alone) both
-call, so the grid is run one way only: the candidates, every candidate's forecast at every
+`run_grid` is what `run_hurdle_pipeline.py` (step 18) and `run_hurdle_grid.py` (the grid alone)
+both call, so the grid is run one way only: the candidates, every candidate's forecast at every
 validation origin (each fit cached on its own, with progress lines), the gates, the scores,
 the combination kept with its calibration and the references, and then, only with [grid]
 run_test, the v1 test of what was kept on the [evaluation] test origins.

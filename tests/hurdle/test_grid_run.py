@@ -1,7 +1,7 @@
 """Tests of `hurdle/grid_run.py`: `run_grid`, step 18 (the settings grid, U16) from end to end.
 
-run_grid is what run_hurdle_pipeline.py (step 18) and run_b.py both call. It is checked on its
-syntax tree (what it calls, in which order, with which arguments), then run with every grid
+run_grid is what run_hurdle_pipeline.py (step 18) and run_hurdle_grid.py both call. It is
+checked on its syntax tree (what it calls, in which order, with which arguments), then run with every grid
 function and printout replaced in grid_run's namespace by a recorder, on a ModelInputs whose
 fields are named placeholders, so that each argument can be traced to the input it came from.
 The grid functions themselves are tested in test_grid.py, the printouts in
@@ -236,7 +236,8 @@ def test_run_grid_has_one_if_the_run_test_check_and_no_loop():
 
 
 def test_run_grid_never_reads_the_grid_run_switch():
-    # [grid] run is main()'s to read (and run_b.py's); run_grid reads run_test only, once.
+    # [grid] run is the pipeline main()'s to read (run_hurdle_grid.py runs the grid without
+    # reading it); run_grid reads run_test only, once.
     source = " ".join(ast.unparse(run_grid_tree()).split())
     assert not re.search(r"settings\.grid\.run\b", source)
     assert source.count("settings.grid.run_test") == 1
