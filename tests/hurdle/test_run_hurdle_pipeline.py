@@ -410,7 +410,8 @@ def test_step_12_origin_is_read_from_debug_demo_origin():
 
 def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     # Steps 1-11 are one call now: the guard follows it, its printouts, the unpacking of the
-    # inputs into main()'s names and the top-ups (U12.2, U12.3), and nothing else.
+    # inputs into main()'s names, the U18.1 printout of the cleared invoices' days late and
+    # the top-ups (U12.2, U12.3), and nothing else. (U18.1 added its two statements.)
     body = main_tree().body
     calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
              and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
@@ -420,8 +421,9 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     assert len(guards) == 1
     between = body[calls[0] + 1:guards[0]]
     assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
-    assert [ast.unparse(node) for node in between[-2:]] == [SHOW_TOPUPS, COMPARE_TOPUPS_IF]
-    for node in between[1:-2]:
+    assert [ast.unparse(node) for node in between[-4:]] == [U18_1_PRINT, U18_1_SHOW,
+                                                            SHOW_TOPUPS, COMPARE_TOPUPS_IF]
+    for node in between[1:-4]:
         assert isinstance(node, ast.Assign), ast.unparse(node)
         values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
         for value in values:
@@ -5247,7 +5249,9 @@ def test_each_printout_the_script_calls_is_imported_from_a_report_module():
 
 def test_the_script_imports_from_each_report_module_the_printouts_of_its_steps():
     imports = script_imports()
-    assert imports["collection_estimation.hurdle.reports.preparation"] == ["show_preparation"]
+    # U18.1 added show_cleared_invoice_delays.
+    assert imports["collection_estimation.hurdle.reports.preparation"] == [
+        "show_cleared_invoice_delays", "show_preparation"]
     assert imports["collection_estimation.hurdle.reports.stages"] == [
         "show_amount_reliability", "show_calibration", "show_cash_by_p_group",
         "show_diagnostic_grid", "show_diagnostic_splits", "show_diagnostic_test",
@@ -5281,6 +5285,10 @@ COMPARE_TOPUPS_IF = ("if settings.topups.compare:\n"
                      "settings.topups, settings.receivables.horizons)")
 
 
+U18_1_PRINT = "print('U18.1: days late of every cleared invoice')"
+U18_1_SHOW = "show_cleared_invoice_delays(cleared_invoice_delays(ledger))"
+
+
 def unpacking_ends():
     """The index in main()'s body of the last statement unpacking the inputs."""
     body = main_body()
@@ -5291,16 +5299,17 @@ def unpacking_ends():
 
 
 def test_main_calls_show_topups_right_after_the_inputs_are_unpacked():
+    # Right after the U18.1 printout, which follows the unpacking (U18.1 moved it by two).
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 1]) == SHOW_TOPUPS
+    assert ast.unparse(body[at + 3]) == SHOW_TOPUPS
     assert len(calls_to(main_tree(), "show_topups")) == 1
 
 
 def test_main_calls_compare_topups_right_after_show_topups_behind_topups_compare():
     body = main_body()
     at = unpacking_ends()
-    block = body[at + 2]
+    block = body[at + 4]
     assert ast.unparse(block) == COMPARE_TOPUPS_IF
     assert block.orelse == []
     assert len(calls_to(main_tree(), "compare_topups")) == 1
@@ -5311,7 +5320,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
     at = unpacking_ends()
     stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    for node in body[at + 1:at + 3]:
+    for node in body[at + 3:at + 5]:
         read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
                 and isinstance(n.ctx, ast.Load)} - {"settings", "show_topups",
                                                      "compare_topups"}
@@ -5321,7 +5330,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
 def test_the_top_ups_come_before_the_demo_origin_guard():
     body = main_body()
     at = unpacking_ends()
-    assert is_demo_origin_guard(body[at + 3])
+    assert is_demo_origin_guard(body[at + 5])
 
 
 def test_show_preparation_no_longer_runs_the_top_ups():
@@ -5378,3 +5387,47 @@ def test_step_15_still_calls_with_params_on_both_stages():
     tree = ast.parse(source)
     defined = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
     assert "with_params" not in defined
+
+
+# --- U18.1: main() prints every cleared invoice's days late right after the unpacking --------
+
+def test_main_prints_the_u18_1_heading_right_after_the_inputs_are_unpacked():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 1]) == U18_1_PRINT
+
+
+def test_main_shows_the_cleared_invoice_delays_of_the_ledger_right_after_the_heading():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 2]) == U18_1_SHOW
+
+
+def test_the_u18_1_calls_are_made_once_in_the_whole_script():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    for name in ("cleared_invoice_delays", "show_cleared_invoice_delays"):
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == name]
+        assert len(found) == 1, name
+    assert len(calls_to(main_tree(), "show_cleared_invoice_delays")) == 1
+
+
+def test_the_u18_1_printout_reads_the_ledger_unpacked_from_the_inputs():
+    body = main_body()
+    at = unpacking_ends()
+    owner = [node for node in body[:at + 1] if isinstance(node, ast.Assign)
+             and any(isinstance(n, ast.Name) and n.id == "ledger" and isinstance(n.ctx, ast.Store)
+                     for t in node.targets for n in ast.walk(t))]
+    assert len(owner) == 1
+    assert "inputs.ledger" in ast.unparse(owner[0].value)
+    # The only binding of `ledger` in main(): not rebound before the call.
+    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name) and n.id == "ledger"
+              and isinstance(n.ctx, (ast.Store, ast.Del))]
+    assert len(stores) == 1
+
+
+def test_the_script_imports_cleared_invoice_delays_from_receivables_asof():
+    imports = script_imports()
+    assert imports["collection_estimation.hurdle.receivables_asof"] == ["cleared_invoice_delays"]
+    assert "show_cleared_invoice_delays" in imports[
+        "collection_estimation.hurdle.reports.preparation"]

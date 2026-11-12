@@ -185,6 +185,21 @@ def show_receivables_by_week(receivables, leak_check_weeks, sample_week, age_edg
     print(aging.loc[aging.index % 8 == 0].round(1).to_string())
 
 
+def show_cleared_invoice_delays(delays):
+    """A short printout of every cleared invoice's days late (U18.1): how many, how late
+    (quartiles), and how long after the money the ledger showed it all (known_on)."""
+    if delays.empty:
+        print("        no cleared invoices with a payment")
+        return
+    late = delays["days_late"]
+    lag = (delays["known_on"] - delays["money_arrived"]).dt.days
+    print(f"        cleared invoices with a payment: {len(delays):,} from "
+          f"{delays['key'].nunique():,} keys; days late: quartiles {late.quantile(0.25):.0f} / "
+          f"{late.median():.0f} / {late.quantile(0.75):.0f}, {(late < 0).mean():.0%} paid early")
+    print(f"        known after the money arrived (clearing lag), days: median {lag.median():.0f}, "
+          f"90th percentile {lag.quantile(0.9):.0f}, max {lag.max():.0f}")
+
+
 def show_known(known, collections, last_week):
     """A short printout of when keys become known."""
     before = (known["known_week"] < 0).sum()

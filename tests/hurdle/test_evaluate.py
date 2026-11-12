@@ -2197,9 +2197,14 @@ def test_an_invoice_cleared_after_t_is_still_open_at_t(running):
 
 
 def test_an_invoice_cleared_on_t_itself_is_not_open():
+    # B2 and its payment PB2 are both moved to T (U18.1: moving only the invoice's clearing
+    # date left PB2 posted after the clearing, which `payment_delays_at` now refuses).
     lines = running_lines()
     for line in lines:
         if line["document_no"] == "B2":
+            line["clearing_date"] = pd.Timestamp(CUT)
+        if line["document_no"] == "PB2":
+            line["posting_date"] = pd.Timestamp(CUT)
             line["clearing_date"] = pd.Timestamp(CUT)
     assert "B2" not in set(run_rule_invoices(rl_ledger(lines))["document_no"])
 

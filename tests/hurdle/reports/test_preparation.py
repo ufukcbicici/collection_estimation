@@ -164,10 +164,15 @@ def test_step_6_switched_on_takes_the_lines_and_days_from_fill_missing_days():
 def test_every_step_1_to_11_printout_is_a_function_of_the_module():
     # They used to be functions of run_hurdle_pipeline.py; show_preparation calls them here.
     from collection_estimation.hurdle.reports import preparation
+    # U18.1 added show_cleared_invoice_delays after show_receivables_by_week: it is called by
+    # main(), not by show_preparation.
     names = [node.name for node in ast.parse(PREPARATION.read_text(encoding="utf-8")).body
              if isinstance(node, ast.FunctionDef)]
-    assert names == ["show_preparation"] + list(dict.fromkeys(
+    expected = ["show_preparation"] + list(dict.fromkeys(
         name for name in PREPARATION_PRINTOUTS if name != "print"))
+    expected.insert(expected.index("show_receivables_by_week") + 1,
+                    "show_cleared_invoice_delays")
+    assert names == expected
     for name in names:
         assert callable(getattr(preparation, name)), name
 
@@ -957,3 +962,124 @@ def test_holiday_positions_printout_lists_a_weeks_holidays_in_date_order(holiday
     _, body = holiday_positions_run["('drain',)"]
     line = next(line for line in body.splitlines() if "week 50 (" in line)
     assert "Tue 19 May, Wed 27 May, Thu 28 May, Fri 29 May" in line, line
+
+
+# U18.1: the printout of every cleared invoice's days late (`show_cleared_invoice_delays`),
+# run in a separate process on a small hand-built table, on what `cleared_invoice_delays`
+# makes of a tiny ledger, on a table of more than a thousand rows (thousands separators) and
+# on an empty table. Each case's output follows a "== name" marker line.
+CLEARED_DELAYS = """
+import inspect
+import pandas as pd
+from collection_estimation.hurdle.reports import preparation as reports
+from collection_estimation.hurdle.receivables_asof import (CLEARED_DELAY_COLUMNS,
+                                                           cleared_invoice_delays)
+
+inspect.signature(reports.show_cleared_invoice_delays).bind("delays")
+
+def table(keys, days_late, lags):
+    money = pd.Timestamp("2026-04-01")
+    rows = []
+    for n, (key, late, lag) in enumerate(zip(keys, days_late, lags)):
+        rows.append({"key": key, "company_code": key[:4], "document_no": f"INV{n}",
+                     "net_due_date": money - pd.Timedelta(days=late), "money_arrived": money,
+                     "days_late": late, "known_on": money + pd.Timedelta(days=lag)})
+    return pd.DataFrame(rows, columns=CLEARED_DELAY_COLUMNS)
+
+print("== small")
+reports.show_cleared_invoice_delays(table(
+    ["TR02-A", "TR02-A", "TR02-B", "TR04-C", "TR04-C"], [-4, -2, 0, 6, 10], [0, 0, 3, 7, 30]))
+
+print("== real")
+ts = pd.Timestamp
+ledger = pd.DataFrame({
+    "key": ["TR02-100"] * 4, "company_code": ["TR02"] * 4,
+    "document_no": ["INV1", "PAY1", "INV2", "PAY2"],
+    "document_role": ["invoice", "payment", "invoice", "payment"],
+    "invoice_reference": [None, None, None, None],
+    "posting_date": [ts("2026-03-01"), ts("2026-03-20"), ts("2026-03-01"), ts("2026-04-12")],
+    "net_due_date": [ts("2026-03-31"), ts("2026-03-20"), ts("2026-04-10"), ts("2026-04-12")],
+    "clearing_date": [ts("2026-04-15"), ts("2026-04-15"), ts("2026-04-12"), ts("2026-04-12")],
+    "clearing_document": ["CLR-1", "CLR-1", "CLR-2", "CLR-2"],
+    "source_row": [2, 3, 4, 5]})
+for column in ["invoice_reference", "clearing_document"]:
+    ledger[column] = ledger[column].astype(object)
+reports.show_cleared_invoice_delays(cleared_invoice_delays(ledger))
+
+print("== many")
+reports.show_cleared_invoice_delays(table(
+    [f"TR02-{n % 1100}" for n in range(1200)], [5] * 1200, [0] * 1200))
+
+print("== empty")
+reports.show_cleared_invoice_delays(table(["TR02-A"], [1], [1]).iloc[0:0])
+
+print("== empty real")
+reports.show_cleared_invoice_delays(cleared_invoice_delays(ledger[ledger["document_role"] == "payment"]))
+print("ok")
+"""
+
+
+@pytest.fixture(scope="module")
+def cleared_delays_run():
+    result = run_snippet(CLEARED_DELAYS)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    parts = {}
+    for chunk in result.stdout.split("== ")[1:]:
+        name, _, body = chunk.partition("\n")
+        parts[name.strip()] = [line for line in body.splitlines() if line and line != "ok"]
+    return parts
+
+
+def test_cleared_delays_printout_is_a_function_of_the_module():
+    assert function_tree(PREPARATION, "show_cleared_invoice_delays").args.args[0].arg == "delays"
+
+
+def test_cleared_delays_printout_is_two_lines(cleared_delays_run):
+    assert len(cleared_delays_run["small"]) == 2
+    assert len(cleared_delays_run["real"]) == 2
+
+
+def test_cleared_delays_printout_counts_quartiles_and_share_early(cleared_delays_run):
+    # Days late -4, -2, 0, 6, 10: quartiles -2 / 0 / 6; 2 of 5 negative = 40%.
+    assert cleared_delays_run["small"][0] == (
+        "        cleared invoices with a payment: 5 from 3 keys; days late: quartiles "
+        "-2 / 0 / 6, 40% paid early")
+
+
+def test_cleared_delays_printout_clearing_lag(cleared_delays_run):
+    # Lags 0, 0, 3, 7, 30: median 3; 90th percentile 7 + 0.6 * 23 = 20.8 -> 21; max 30.
+    assert cleared_delays_run["small"][1] == (
+        "        known after the money arrived (clearing lag), days: median 3, "
+        "90th percentile 21, max 30")
+
+
+def test_cleared_delays_printout_on_the_functions_own_output(cleared_delays_run):
+    # INV1: paid 20 Mar, due 31 Mar (-11), cleared 15 Apr (lag 26); INV2: paid 12 Apr, due
+    # 10 Apr (2), cleared 12 Apr (lag 0). Quartiles of (-11, 2): -7.75 / -4.5 / -1.25.
+    first, second = cleared_delays_run["real"]
+    assert first.startswith("        cleared invoices with a payment: 2 from 1 keys; ")
+    assert "quartiles -8 / -4 / -1, 50% paid early" in first
+    assert "median 13, 90th percentile 23, max 26" in second
+
+
+def test_cleared_delays_printout_uses_thousands_separators(cleared_delays_run):
+    assert cleared_delays_run["many"][0].startswith(
+        "        cleared invoices with a payment: 1,200 from 1,100 keys; ")
+    assert "quartiles 5 / 5 / 5, 0% paid early" in cleared_delays_run["many"][0]
+
+
+def test_cleared_delays_printout_on_an_empty_table_is_one_line(cleared_delays_run):
+    # No quartiles of nothing ("nan"): one line, and nothing else.
+    assert cleared_delays_run["empty"] == ["        no cleared invoices with a payment"]
+
+
+def test_cleared_delays_printout_on_the_functions_empty_output_is_one_line(cleared_delays_run):
+    # A ledger of payments only: cleared_invoice_delays gives no rows.
+    assert cleared_delays_run["empty real"] == ["        no cleared invoices with a payment"]
+
+
+def test_cleared_delays_printout_is_not_called_by_show_preparation():
+    # U18.1 is main()'s own step, after the inputs are unpacked.
+    assert calls_to(show_preparation_tree(), "show_cleared_invoice_delays") == []
+    assert calls_to(show_preparation_tree(), "cleared_invoice_delays") == []

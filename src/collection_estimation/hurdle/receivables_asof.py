@@ -24,6 +24,10 @@ NOTHING_LEFT = 0.005
 # The columns of the table `payment_delays_at` returns, in order.
 DELAY_COLUMNS = ["key", "usual_delay_days", "cleared_invoices"]
 
+# The columns of the table `cleared_invoice_delays` returns, in order (dates as Timestamps).
+CLEARED_DELAY_COLUMNS = ["key", "company_code", "document_no", "net_due_date", "money_arrived",
+                         "days_late", "known_on"]
+
 # Per-key totals must add up to the open invoices' total within this (TRY).
 TIE_OUT_TOLERANCE = 0.01
 
@@ -152,43 +156,76 @@ def open_invoices_at(ledger: pd.DataFrame, cutoff: date) -> pd.DataFrame:
     return table.loc[~nothing_left, OPEN_INVOICE_COLUMNS].reset_index(drop=True)
 
 
-def payment_delays_at(ledger: pd.DataFrame, cutoff: date, min_cleared: int) -> pd.DataFrame:
-    """How late each customer usually pays, judged from invoices cleared by `cutoff`.
+def cleared_invoice_delays(ledger: pd.DataFrame) -> pd.DataFrame:
+    """How late every cleared invoice of `ledger` was paid, and when that became known.
 
-    For every invoice posted and cleared on or before `cutoff`, the money arrived on the
-    latest posting date of the payments in its clearing group (the lines sharing its
-    company and `clearing_document`, which also finds unapplied cash matched later). Days
-    late = that date - the net due date; negative means paid early. The clearing date itself
-    is not used: matching can lag the payment by weeks.
+    For every cleared invoice, the money arrived on the latest posting date of the payments
+    in its clearing group (the lines sharing its company and `clearing_document`, which also
+    finds unapplied cash matched later). Days late = that date - the net due date; negative
+    means paid early. The clearing date itself is not the arrival: matching can lag the
+    payment by weeks. known_on is the day all of it was in the ledger: the latest of the
+    invoice's posting date, its clearing date and the money's arrival. So the rows with
+    known_on <= a cutoff are exactly the invoices posted and cleared by then, with their
+    payments.
 
-    One row per key with at least one such invoice: `usual_delay_days` is the median days
-    late, or NaN if the key has fewer than `min_cleared` cleared invoices; `cleared_invoices`
-    is how many. An invoice cleared without any payment (e.g. by a credit memo) does not
-    count. Raises ValueError if a cleared invoice has no clearing document.
+    One row per cleared invoice with at least one payment, columns `CLEARED_DELAY_COLUMNS`,
+    in the ledger's order. An invoice cleared without any payment (e.g. by a credit memo)
+    has no row. Raises ValueError if an invoice is in the ledger twice, if a cleared invoice
+    has no clearing document (its payments cannot be found), if the lines of a clearing group
+    do not share one clearing date (a clearing is one event), or if a payment of a clearing
+    group was posted after the group's clearing date: the arrival date would then depend on
+    the cutoff, and the rows known at a cutoff would carry a payment from after it.
     """
-    cutoff_day = pd.Timestamp(cutoff)
-    known = ledger[ledger["posting_date"] <= cutoff_day]
-
-    invoices = known[known["document_role"] == "invoice"]
+    invoices = ledger[ledger["document_role"] == "invoice"]
     max_invoice_count = invoices.groupby(["key", "document_no"]).size().max()
     if max_invoice_count > 1:
         raise ValueError("Duplicate entries in the invoices table!")
 
-    cleared = invoices[invoices["clearing_date"] <= cutoff_day]
+    cleared = invoices[invoices["clearing_date"].notna()]
     no_clearing_document = cleared["clearing_document"].isna()
-
     if no_clearing_document.any():
-        raise ValueError(f"{no_clearing_document.sum()} invoices cleared by {cutoff_day.date()} "
-                         f"have no clearing document, so their payments cannot be found "
+        raise ValueError(f"{no_clearing_document.sum()} cleared invoices have no clearing "
+                         f"document, so their payments cannot be found "
                          f"(first rows: {first_rows(cleared, no_clearing_document)})")
 
-    payments = known[(known["document_role"] == "payment") & known["clearing_document"].notna()]
+    # Every line of a clearing group must carry the group's one clearing date (as in SAP):
+    # `ledger_as_known_at` undoes clearings line by line, so a group cleared on two dates
+    # would lose part of itself at a cutoff between them.
+    grouped = ledger[ledger["clearing_document"].notna()]
+    dates_per_group = grouped.groupby(["company_code", "clearing_document"])[
+        "clearing_date"].transform("nunique", dropna=False)
+    several_dates = dates_per_group > 1
+    if several_dates.any():
+        raise ValueError(f"{several_dates.sum()} ledger lines are in a clearing group with more "
+                         f"than one clearing date "
+                         f"(first rows: {first_rows(grouped, several_dates)})")
+
+    payments = ledger[(ledger["document_role"] == "payment") & ledger["clearing_document"].notna()]
     money_arrived = payments.groupby(["company_code", "clearing_document"])["posting_date"].max()
 
     # An inner merge: invoices cleared without any payment have no arrival date and drop out.
     table = cleared.merge(money_arrived.rename("money_arrived").reset_index(),
                           on=["company_code", "clearing_document"], how="inner")
+    paid_after_clearing = table["money_arrived"] > table["clearing_date"]
+    if paid_after_clearing.any():
+        raise ValueError(f"{paid_after_clearing.sum()} cleared invoices have a payment in their "
+                         f"clearing group posted after the clearing date "
+                         f"(first rows: {first_rows(table, paid_after_clearing)})")
     table["days_late"] = (table["money_arrived"] - table["net_due_date"]).dt.days
+    table["known_on"] = table[["posting_date", "clearing_date", "money_arrived"]].max(axis=1)
+    return table[CLEARED_DELAY_COLUMNS]
+
+
+def payment_delays_at(ledger: pd.DataFrame, cutoff: date, min_cleared: int) -> pd.DataFrame:
+    """How late each customer usually pays, judged from invoices cleared by `cutoff`: the
+    invoices of `cleared_invoice_delays` known on or before `cutoff`.
+
+    One row per key with at least one such invoice: `usual_delay_days` is the median days
+    late, or NaN if the key has fewer than `min_cleared` cleared invoices; `cleared_invoices`
+    is how many. Raises ValueError as `cleared_invoice_delays` does.
+    """
+    delays = cleared_invoice_delays(ledger)
+    table = delays[delays["known_on"] <= pd.Timestamp(cutoff)]
 
     per_key = table.groupby("key").agg(
         usual_delay_days=("days_late", "median"),

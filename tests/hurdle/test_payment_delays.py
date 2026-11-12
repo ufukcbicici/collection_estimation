@@ -4,7 +4,9 @@
 invoices posted and cleared by `cutoff`. The money is taken to arrive on the LATEST posting
 date of the payments in the invoice's clearing group (same company code and
 `clearing_document`); days late = that date - the net due date. Per key: the median days late
-(NaN below `min_cleared` cleared invoices) and the count.
+(NaN below `min_cleared` cleared invoices) and the count. Since U18.1 it is built on
+`cleared_invoice_delays`, whose ledger checks cover the whole ledger, not only the lines known
+by the cutoff (see test_cleared_invoice_delays.py).
 
 Ledgers are built by hand with `ledger` and the line builders below. The SLOW tests at the end
 read the synthetic ledger in `data/raw/` once and are skipped when it is absent; the repo's
@@ -173,15 +175,30 @@ def test_an_invoice_posted_after_the_cutoff_does_not_count():
     assert len(table) == 0
 
 
-def test_a_payment_posted_after_the_cutoff_is_not_used():
-    # The group's later payment is posted after the cutoff, so the earlier one is the latest.
-    table = payment_delays_at(ledger([
-        invoice("INV1", "2026-03-01", "2026-03-31", cleared="2026-04-15",
+def test_a_payment_posted_after_the_cutoff_and_after_its_clearing_raises():
+    # Changed in U18.1: a group's payment posted after the clearing date (here 5 May, after
+    # the clearing on 15 Apr) is now refused for the whole ledger, whatever the cutoff,
+    # instead of being silently left out at a cutoff before it.
+    with pytest.raises(ValueError, match="posted after the clearing date"):
+        payment_delays_at(ledger([
+            invoice("INV1", "2026-03-01", "2026-03-31", cleared="2026-04-15",
+                    clearing_document="CLR-1"),
+            payment("PAY1", "2026-04-10", cleared="2026-04-15", clearing_document="CLR-1"),
+            payment("PAY2", "2026-05-05", cleared="2026-04-15", clearing_document="CLR-1"),
+        ]), date(2026, 4, 30), 1)
+
+
+def test_a_payment_posted_after_the_cutoff_keeps_its_invoice_out():
+    # The consistent form: the group clears on 5 May with its last payment. At 30 Apr the
+    # invoice is not cleared yet, so it does not count; at 5 May the latest payment is used.
+    built = ledger([
+        invoice("INV1", "2026-03-01", "2026-03-31", cleared="2026-05-05",
                 clearing_document="CLR-1"),
-        payment("PAY1", "2026-04-10", cleared="2026-04-15", clearing_document="CLR-1"),
-        payment("PAY2", "2026-05-05", cleared="2026-04-15", clearing_document="CLR-1"),
-    ]), date(2026, 4, 30), 1)
-    assert delay_of(table, "TR02-100") == 10.0
+        payment("PAY1", "2026-04-10", cleared="2026-05-05", clearing_document="CLR-1"),
+        payment("PAY2", "2026-05-05", cleared="2026-05-05", clearing_document="CLR-1"),
+    ])
+    assert len(payment_delays_at(built, date(2026, 4, 30), 1)) == 0
+    assert delay_of(payment_delays_at(built, date(2026, 5, 5), 1), "TR02-100") == 35.0
 
 
 def test_a_timestamp_cutoff_gives_the_same_table_as_a_date():
@@ -433,7 +450,9 @@ def test_a_cleared_invoice_with_no_clearing_document_raises():
         ]), CUTOFF, 1)
 
 
-def test_the_error_names_the_count_the_cutoff_and_the_first_source_rows():
+def test_the_error_names_the_count_and_the_first_source_rows():
+    # Changed in U18.1: the check covers the whole ledger, so the message no longer names
+    # a cutoff ("7 invoices cleared by 2026-04-30 ..." became "7 cleared invoices ...").
     lines = [invoice(f"INV{n}", "2026-03-01", "2026-03-31", cleared="2026-04-15",
                      source_row=100 + n) for n in range(7)]
     lines.append(invoice("INVOK", "2026-03-01", "2026-03-31", cleared="2026-04-15",
@@ -441,8 +460,8 @@ def test_the_error_names_the_count_the_cutoff_and_the_first_source_rows():
     with pytest.raises(ValueError) as error:
         payment_delays_at(ledger(lines), CUTOFF, 1)
     message = str(error.value)
-    assert message.startswith("7 invoices")
-    assert "2026-04-30" in message
+    assert message.startswith("7 cleared invoices have no clearing document")
+    assert "2026-04-30" not in message
     assert "[100, 101, 102, 103, 104]" in message
     assert "105" not in message
     assert "50" not in message
@@ -453,11 +472,13 @@ def test_an_open_invoice_with_no_clearing_document_does_not_raise():
     assert len(table) == 0
 
 
-def test_an_invoice_cleared_after_the_cutoff_with_no_clearing_document_does_not_raise():
-    table = payment_delays_at(ledger([
-        invoice("INV1", "2026-03-01", "2026-03-31", cleared="2026-05-15"),
-    ]), CUTOFF, 1)
-    assert len(table) == 0
+def test_an_invoice_cleared_after_the_cutoff_with_no_clearing_document_raises():
+    # Changed in U18.1: the check covers the whole ledger, not only what was cleared by the
+    # cutoff (it used to pass silently at this cutoff).
+    with pytest.raises(ValueError, match="cleared invoices have no clearing document"):
+        payment_delays_at(ledger([
+            invoice("INV1", "2026-03-01", "2026-03-31", cleared="2026-05-15"),
+        ]), CUTOFF, 1)
 
 
 def test_a_payment_with_no_clearing_document_does_not_raise():

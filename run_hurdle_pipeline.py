@@ -70,7 +70,11 @@ from collection_estimation.hurdle.calibrate import (  # noqa: E402
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.inputs import prepare_inputs  # noqa: E402
-from collection_estimation.hurdle.reports.preparation import show_preparation  # noqa: E402
+from collection_estimation.hurdle.receivables_asof import cleared_invoice_delays  # noqa: E402
+from collection_estimation.hurdle.reports.preparation import (  # noqa: E402
+    show_cleared_invoice_delays,
+    show_preparation,
+)
 from collection_estimation.hurdle.reports.stages import (  # noqa: E402
     show_amount_reliability,
     show_calibration,
@@ -179,6 +183,11 @@ def main():
     levels, calendar, table = inputs.levels, inputs.calendar, inputs.table
     block_columns = inputs.block_columns
     new_cash, refunds, unidentified = inputs.new_cash, inputs.refunds, inputs.unidentified
+
+    # U18.1, the first part of the rhythm block: every cleared invoice's days late, with the
+    # day it was known (the delay spread of U18.2 is built from these, as known at t).
+    print("U18.1: days late of every cleared invoice")
+    show_cleared_invoice_delays(cleared_invoice_delays(ledger))
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
     # trailing mean ([topups] window) and by the ridge (with and without the recent level),
