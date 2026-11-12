@@ -54,21 +54,23 @@ def settings_file(argv=None) -> Path:
 
 
 def summary(choice, test) -> str:
-    """One line: the settings kept, their validation scores, the calibration and, if run, the
-    v1 test's consolidated WAPE."""
+    """One line: the settings kept, their validation scores (uncorrected: the corrections are
+    learned on those weeks), the calibration and, if run, the v1 test's consolidated WAPE and
+    bias (corrected, as the test scores the forecast that would be used)."""
     winner = choice.winner
     calibration = choice.calibration
     line = (f"kept: stage 1 {choice.stage1.params}, stage 2 {choice.stage2.params}, top-ups "
             f"{choice.topups.method} (window {choice.topups.window}, with_level "
-            f"{choice.topups.with_level}); validation WAPE {winner['wape']:.4f}, 5-week WAPE "
-            f"{winner['total_wape']:.4f}, bias {winner['bias']:+.4f}; corrections "
+            f"{choice.topups.with_level}); validation (uncorrected) WAPE {winner['wape']:.4f}, "
+            f"5-week WAPE {winner['total_wape']:.4f}, bias {winner['bias']:+.4f}; corrections "
             f"{candidate_name(calibration.p_correction, calibration.m_correction)}")
     if test is None:
         return line + "; v1 test not run"
     scores = test.scores
     pooled = scores[(scores["method"] == HURDLE) & (scores["company_code"] == CONSOLIDATED)
-                    & (scores["horizon"] == POOLED)]
-    return line + f"; v1 test WAPE {pooled['wape'].iloc[0]:.4f}"
+                    & (scores["horizon"] == POOLED)].iloc[0]
+    return line + (f"; v1 test (corrected) WAPE {pooled['wape']:.4f}, "
+                   f"bias {pooled['bias']:+.4f}")
 
 
 def main(argv=None):

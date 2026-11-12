@@ -359,7 +359,7 @@ def test_main_printout_with_the_test_ends_with_its_wape(main):
     found = main(test=test)()
     assert found.printed[3] == "<run_grid output>"
     assert found.printed[4] == found.script.summary(found.choice, test)
-    assert found.printed[4].endswith("; v1 test WAPE 0.2222")
+    assert found.printed[4].endswith("; v1 test (corrected) WAPE 0.2222, bias -0.0333")
     assert found.printed[5].startswith("Done in ")
 
 
@@ -501,24 +501,28 @@ def fake_choice(wape=0.123456, total_wape=0.2, bias=-0.012345, p_kind="one map",
                                     m_correction=MCorrection(m_kind, common=1.1)))
 
 
-def make_score_row(method, company, horizon, wape):
-    return {"method": method, "company_code": company, "horizon": horizon, "wape": wape}
+def make_score_row(method, company, horizon, wape, bias):
+    return {"method": method, "company_code": company, "horizon": horizon, "wape": wape,
+            "bias": bias}
 
 
-def make_test_scores():
-    """Several methods, companies and horizons; only one row is hurdle / ALL / pooled."""
+def make_test_scores(target_bias=-0.03333):
+    """Several methods, companies and horizons; only one row is hurdle / ALL / pooled, with
+    WAPE 0.22222 and bias `target_bias`. Every other row has a distinct WAPE and a distinct
+    bias of the opposite sign to the default target's."""
     rows = []
     wape = 0.5
     for method in ("deflated", "hurdle uncorrected", HURDLE, "rule"):
         for company in ("TR02", CONSOLIDATED, "TR04"):
             for horizon in ("1", "2", POOLED, "total"):
                 wape += 0.001
-                rows.append(make_score_row(method, company, horizon, wape))
+                rows.append(make_score_row(method, company, horizon, wape, wape - 0.4))
     table = pd.DataFrame(rows)
     target = ((table["method"] == HURDLE) & (table["company_code"] == CONSOLIDATED)
               & (table["horizon"] == POOLED))
     assert target.sum() == 1
     table.loc[target, "wape"] = 0.22222
+    table.loc[target, "bias"] = target_bias
     return table
 
 
@@ -526,8 +530,8 @@ def test_summary_without_the_test(script):
     line = script.summary(fake_choice(), None)
     assert line == (
         "kept: stage 1 {'max_iter': 300, 'learning_rate': 0.05}, stage 2 {'loss': 'poisson', "
-        "'learning_rate': 0.1}, top-ups mean (window 13, with_level False); validation WAPE "
-        "0.1235, 5-week WAPE 0.2000, bias -0.0123; corrections p one map, m scale; "
+        "'learning_rate': 0.1}, top-ups mean (window 13, with_level False); validation "
+        "(uncorrected) WAPE 0.1235, 5-week WAPE 0.2000, bias -0.0123; corrections p one map, m scale; "
         "v1 test not run")
 
 
@@ -538,21 +542,52 @@ def test_summary_is_one_line(script):
 
 def test_summary_with_the_test_picks_the_hurdle_consolidated_pooled_row(script):
     line = script.summary(fake_choice(), SimpleNamespace(scores=make_test_scores()))
-    assert line.endswith("; corrections p one map, m scale; v1 test WAPE 0.2222")
+    assert line.endswith("; corrections p one map, m scale; v1 test (corrected) WAPE 0.2222, bias -0.0333")
     assert line.startswith(script.summary(fake_choice(), None)[:-len("; v1 test not run")])
 
 
 def test_summary_with_the_test_ignores_row_order(script):
     scores = make_test_scores().iloc[::-1].reset_index(drop=True)
     line = script.summary(fake_choice(), SimpleNamespace(scores=scores))
-    assert line.endswith("; v1 test WAPE 0.2222")
+    assert line.endswith("; v1 test (corrected) WAPE 0.2222, bias -0.0333")
 
 
 def test_summary_with_the_test_reads_the_scores_index_free(script):
     scores = make_test_scores()
     scores.index = range(1000, 1000 + len(scores))
     assert script.summary(fake_choice(), SimpleNamespace(scores=scores)).endswith(
-        "v1 test WAPE 0.2222")
+        "; v1 test (corrected) WAPE 0.2222, bias -0.0333")
+
+
+@pytest.mark.parametrize("target_bias, text", [
+    (-0.03333, "bias -0.0333"), (0.04444, "bias +0.0444"), (0.0, "bias +0.0000"),
+    (-1.25, "bias -1.2500")])
+def test_summary_test_bias_is_the_same_rows_bias_signed(script, target_bias, text):
+    # Every other row carries a different bias (wape - 0.4: 0.101 ... 0.148, all positive and
+    # none equal to the target's), so a wrong row would show up in the number or the sign.
+    scores = make_test_scores(target_bias=target_bias)
+    others = scores[~((scores["method"] == HURDLE) & (scores["company_code"] == CONSOLIDATED)
+                      & (scores["horizon"] == POOLED))]
+    assert (others["bias"] > 0).all() and not (others["bias"] == target_bias).any()
+    for frame in (scores, scores.iloc[::-1]):
+        line = script.summary(fake_choice(), SimpleNamespace(scores=frame))
+        assert line.endswith(f"; v1 test (corrected) WAPE 0.2222, {text}"), line
+
+
+def test_summary_test_bias_is_not_the_validation_bias(script):
+    # The validation bias (winner row) and the test bias (scores row) are separate numbers.
+    line = script.summary(fake_choice(bias=0.0777), SimpleNamespace(
+        scores=make_test_scores(target_bias=-0.0111)))
+    assert "5-week WAPE 0.2000, bias +0.0777; corrections" in line
+    assert line.endswith("v1 test (corrected) WAPE 0.2222, bias -0.0111")
+    assert line.count("bias ") == 2
+
+
+def test_summary_says_uncorrected_once_and_corrected_once(script):
+    line = script.summary(fake_choice(), SimpleNamespace(scores=make_test_scores()))
+    assert line.count("(uncorrected)") == 1 and line.count("(corrected)") == 1
+    assert line.index("validation (uncorrected) WAPE") < line.index("v1 test (corrected) WAPE")
+    assert "(corrected)" not in script.summary(fake_choice(), None)
 
 
 def test_summary_with_the_test_not_the_uncorrected_hurdle(script):
@@ -572,7 +607,7 @@ def test_summary_bias_is_signed_to_four_places(script, bias, text):
 
 def test_summary_wapes_to_four_places(script):
     line = script.summary(fake_choice(wape=0.18765, total_wape=0.1), None)
-    assert "validation WAPE 0.1877, 5-week WAPE 0.1000," in line
+    assert "validation (uncorrected) WAPE 0.1877, 5-week WAPE 0.1000," in line
 
 
 def test_summary_nan_five_week_wape_is_printed_as_nan(script):
@@ -680,10 +715,11 @@ def test_end_to_end_summary_line_matches_the_returned_choice(end_to_end, script)
     assert len(pooled) == 1
     expected = (f"kept: stage 1 {choice.stage1.params}, stage 2 {choice.stage2.params}, "
                 f"top-ups {choice.topups.method} (window {choice.topups.window}, with_level "
-                f"{choice.topups.with_level}); validation WAPE {winner['wape']:.4f}, 5-week "
-                f"WAPE {winner['total_wape']:.4f}, bias {winner['bias']:+.4f}; corrections "
+                f"{choice.topups.with_level}); validation (uncorrected) WAPE {winner['wape']:.4f}, "
+                f"5-week WAPE {winner['total_wape']:.4f}, bias {winner['bias']:+.4f}; corrections "
                 f"{candidate_name(choice.calibration.p_correction, choice.calibration.m_correction)}"
-                f"; v1 test WAPE {pooled['wape'].iloc[0]:.4f}")
+                f"; v1 test (corrected) WAPE {pooled['wape'].iloc[0]:.4f}, "
+                f"bias {pooled['bias'].iloc[0]:+.4f}")
     assert lines[-2] == expected
 
 
