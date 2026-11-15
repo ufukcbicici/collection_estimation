@@ -70,11 +70,15 @@ from collection_estimation.hurdle.calibrate import (  # noqa: E402
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.inputs import prepare_inputs  # noqa: E402
-from collection_estimation.hurdle.features_rhythm import expected_dues  # noqa: E402
+from collection_estimation.hurdle.features_rhythm import (  # noqa: E402
+    expected_dues,
+    payment_habits,
+)
 from collection_estimation.hurdle.receivables_asof import cleared_invoice_delays  # noqa: E402
 from collection_estimation.hurdle.reports.preparation import (  # noqa: E402
     show_cleared_invoice_delays,
     show_expected_dues,
+    show_payment_habits,
     show_preparation,
 )
 from collection_estimation.hurdle.reports.stages import (  # noqa: E402
@@ -204,6 +208,20 @@ def main():
                          leak_check_weeks=settings.receivables.leak_check_weeks)
     show_expected_dues(dues, table, settings.evaluation.validation_origins,
                        settings.receivables.horizons)
+
+    # U18.3: each customer's payment habits (when in the month it pays, how regularly, and how
+    # much of that falls in the target week), from its past payment days as known at t; with
+    # a preview of the paid rate by how much of the habit falls in the target week.
+    print("U18.3: the payment habits")
+    habits = payment_habits(table[["key", "origin_week", "h"]], details.collections, ledger,
+                            week_zero, details.holidays, min(details.daily_files),
+                            use_ledger_before_first_file=(
+                                settings.history.use_ledger_before_first_file),
+                            horizons=settings.receivables.horizons,
+                            payment_days_kept=settings.rhythm.payment_days_kept,
+                            min_payment_days=settings.rhythm.min_payment_days,
+                            leak_check_weeks=settings.receivables.leak_check_weeks)
+    show_payment_habits(habits, table, settings.evaluation.validation_origins)
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
     # trailing mean ([topups] window) and by the ridge (with and without the recent level),

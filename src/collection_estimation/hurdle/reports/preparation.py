@@ -255,6 +255,64 @@ def show_expected_dues(dues, table, validation_origins, horizons):
     print(preview.round(3).to_string())
 
 
+# The groups `show_payment_habits` splits a share into, in the order they are printed.
+SHARE_GROUPS = ["no habit", "0", "above 0, below 0.5", "0.5 or more"]
+
+
+def share_groups(shares):
+    """Each share's group of SHARE_GROUPS: NaN is "no habit"."""
+    groups = pd.Series("0.5 or more", index=shares.index, dtype=object)
+    groups[shares < 0.5] = "above 0, below 0.5"
+    groups[shares == 0] = "0"
+    groups[shares.isna()] = "no habit"
+    return groups
+
+
+def show_payment_habits(habits, table, validation_origins):
+    """A short printout of the payment habits (U18.3), and a preview before any model sees
+    them: at the validation origins, the labelled rows split by how much of the customer's
+    habit falls in the target week (next_payment_share_in_target, then
+    month_habit_in_target), with each group's paid rate and mean deflated amount. If the paid
+    rate barely changes from group to group, the feature tells the model little."""
+    has_habit = habits["median_gap_days"].notna()
+    with_habit = habits[has_habit]
+    print(f"        payment habits: {len(habits):,} rows; a habit for {has_habit.mean():.0%} of "
+          f"them (median gap {with_habit['median_gap_days'].median():.0f} days, month-end "
+          f"share {with_habit['month_end_share'].mean():.0%} on average)")
+    # The rows compared: labelled rows at the validation origins. `habits` has the table's
+    # rows in the same order, so the two are put side by side by position.
+    frame = pd.DataFrame({
+        "origin_week": table["origin_week"].to_numpy(),
+        "label_status": table["label_status"].to_numpy(),
+        "paid": table["paid"].to_numpy(),
+        "actual": table["amount_deflated"].to_numpy(),
+        "next_payment_share_in_target": habits["next_payment_share_in_target"].to_numpy(),
+        "month_habit_in_target": habits["month_habit_in_target"].to_numpy(),
+    })
+    at_validation = frame["origin_week"].isin(validation_origins)
+    labelled = frame["label_status"] == "labelled"
+    frame = frame[at_validation & labelled].copy()
+    if frame.empty:
+        print("        preview: no labelled rows at the validation origins")
+        return
+    frame["paid"] = frame["paid"].astype(float)
+
+    for column in ["next_payment_share_in_target", "month_habit_in_target"]:
+        print(f"        preview on the validation origins, by {column}:")
+        frame["group"] = share_groups(frame[column])
+        lines = []
+        for group in SHARE_GROUPS:
+            rows = frame[frame["group"] == group]
+            lines.append({
+                column: group,
+                "rows": len(rows),
+                "paid rate": rows["paid"].mean() if len(rows) else float("nan"),
+                "mean amount": rows["actual"].mean() if len(rows) else float("nan"),
+            })
+        preview = pd.DataFrame(lines).set_index(column)
+        print(preview.round(3).to_string())
+
+
 def show_known(known, collections, last_week):
     """A short printout of when keys become known."""
     before = (known["known_week"] < 0).sum()

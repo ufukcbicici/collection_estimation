@@ -174,6 +174,9 @@ def test_every_step_1_to_11_printout_is_a_function_of_the_module():
                     "show_cleared_invoice_delays")
     # U18.2 added show_expected_dues right after it, also called by main() only.
     expected.insert(expected.index("show_cleared_invoice_delays") + 1, "show_expected_dues")
+    # U18.3 added share_groups and show_payment_habits right after it, also for main() only.
+    at = expected.index("show_expected_dues") + 1
+    expected[at:at] = ["share_groups", "show_payment_habits"]
     assert names == expected
     for name in names:
         assert callable(getattr(preparation, name)), name
@@ -1272,3 +1275,274 @@ def test_expected_dues_printout_survives_an_h_without_labelled_rows():
     result = run_snippet(MISSING_H)
     assert result.returncode == 0, result.stderr[-600:]
     assert result.stdout.strip().endswith("ok")
+
+
+# U18.3: the printout of the payment habits (`show_payment_habits`) and its groups
+# (`share_groups`), run in a separate process on small hand-built tables. One summary line on
+# `habits`; then, on the labelled rows of `table` at the validation origins, per share column
+# (next_payment_share_in_target, then month_habit_in_target), one row per SHARE_GROUPS group
+# with its row count, paid rate and mean amount_deflated. Rows are matched by position.
+PAYMENT_HABITS = """
+import inspect
+import pandas as pd
+from collection_estimation.hurdle.reports import preparation as reports
+
+inspect.signature(reports.show_payment_habits).bind("habits", "table", "origins")
+NAN = float("nan")
+
+print("== groups")
+shares = pd.Series([NAN, 0.0, 0.3, 0.5, 1.0, 0.4999, 1e-9, 2.0, -0.1],
+                   index=[10, 11, 12, 13, 14, 15, 16, 17, 18])
+groups = reports.share_groups(shares)
+print(repr(list(groups)))
+print(repr(list(groups.index)))
+print(groups.dtype)
+print(repr(list(shares.index)), shares.isna().sum())
+print(repr(reports.SHARE_GROUPS))
+print(len(reports.share_groups(pd.Series([], dtype="float64"))))
+
+# origin, label_status, paid, amount, next share, month habit, median gap, month-end share
+ROWS = [
+    (33, "labelled", True, 100.0, NAN, 0.0, NAN, NAN),
+    (33, "labelled", False, 0.0, 0.0, 0.3, 28.0, 1.0),
+    (33, "labelled", True, 50.0, 0.3, 0.5, 30.0, 0.5),
+    (34, "labelled", True, 30.0, 0.5, 1.0, 31.0, 0.0),
+    (34, "labelled", False, 0.0, 1.0, NAN, 14.0, 0.5),
+    (34, "unlabelled", True, 999.0, 0.3, 0.3, 20.0, 1.0),   # not labelled: left out
+    (10, "labelled", True, 999.0, 0.0, 0.0, 40.0, 0.0),     # not a validation origin
+]
+
+def tables(rows, index=None, habit_index=None):
+    table = pd.DataFrame({"key": [f"K{n}" for n in range(len(rows))],
+                          "origin_week": [r[0] for r in rows],
+                          "label_status": [r[1] for r in rows],
+                          "paid": [r[2] for r in rows],
+                          "amount_deflated": [r[3] for r in rows]}, index=index)
+    habits = pd.DataFrame({"key": table["key"].to_numpy(),
+                           "origin_week": table["origin_week"].to_numpy(),
+                           "next_payment_share_in_target": [r[4] for r in rows],
+                           "month_habit_in_target": [r[5] for r in rows],
+                           "median_gap_days": [r[6] for r in rows],
+                           "month_end_share": [r[7] for r in rows]}, index=habit_index)
+    return habits, table
+
+print("== small")
+habits, table = tables(ROWS)
+reports.show_payment_habits(habits, table, (33, 34))
+
+print("== shuffled index")
+habits, table = tables(ROWS, index=[70, 3, 12, 0, 5, 99, 1], habit_index=[6, 5, 4, 3, 2, 1, 0])
+reports.show_payment_habits(habits, table, (33, 34))
+
+print("== no validation rows")
+habits, table = tables(ROWS)
+reports.show_payment_habits(habits, table, (50, 51))
+
+print("== only unlabelled")
+habits, table = tables([r[:1] + ("unlabelled",) + r[2:] for r in ROWS])
+reports.show_payment_habits(habits, table, (33, 34))
+
+print("== one group")
+habits, table = tables([(33, "labelled", n % 2 == 0, float(n), 1.0, 1.0, 7.0, 1.0)
+                        for n in range(4)])
+reports.show_payment_habits(habits, table, [33])
+
+print("== many")
+habits, table = tables([(33, "labelled", True, 1.0, 0.5, 0.5, 7.0, 1.0) for n in range(1500)])
+reports.show_payment_habits(habits, table, [33])
+print("ok")
+"""
+
+GROUP_LABELS = ["above 0, below 0.5", "0.5 or more", "no habit", "0"]   # longest first
+
+
+@pytest.fixture(scope="module")
+def payment_habits_run():
+    result = run_snippet(PAYMENT_HABITS)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+    parts = {}
+    for chunk in result.stdout.split("== ")[1:]:
+        name, _, body = chunk.partition("\n")
+        parts[name.strip()] = [line for line in body.splitlines() if line and line != "ok"]
+    return parts
+
+
+def habit_previews(lines):
+    """{column: {group: [rows, paid rate, mean amount]}} of the two preview tables."""
+    previews = {}
+    current = None
+    for line in lines:
+        if line.startswith("        preview on the validation origins, by "):
+            current = line.rsplit(" ", 1)[-1].rstrip(":")
+            previews[current] = {}
+            continue
+        if current is None:
+            continue
+        for label in GROUP_LABELS:
+            if line.startswith(label + " "):
+                values = line[len(label):].split()
+                previews[current][label] = [float(value) for value in values]
+                break
+    return previews
+
+
+def same(a, b):
+    """Lists of floats equal, NaN equal to NaN."""
+    return len(a) == len(b) and all((x != x and y != y) or x == y for x, y in zip(a, b))
+
+
+def test_share_groups_constant_in_print_order(payment_habits_run):
+    assert payment_habits_run["groups"][4] == (
+        "['no habit', '0', 'above 0, below 0.5', '0.5 or more']")
+
+
+def test_share_groups_nan_zero_below_half_and_half_or_more(payment_habits_run):
+    # NaN, 0, 0.3, 0.5, 1, 0.4999, 1e-9, 2.0 (above 1: still "0.5 or more"), -0.1.
+    assert payment_habits_run["groups"][0] == (
+        "['no habit', '0', 'above 0, below 0.5', '0.5 or more', '0.5 or more', "
+        "'above 0, below 0.5', 'above 0, below 0.5', '0.5 or more', 'above 0, below 0.5']")
+
+
+def test_share_groups_keeps_the_index_and_does_not_change_its_input(payment_habits_run):
+    lines = payment_habits_run["groups"]
+    assert lines[1] == "[10, 11, 12, 13, 14, 15, 16, 17, 18]"
+    assert lines[2] == "object"
+    assert lines[3] == "[10, 11, 12, 13, 14, 15, 16, 17, 18] 1"
+
+
+def test_share_groups_of_an_empty_series_is_empty(payment_habits_run):
+    assert payment_habits_run["groups"][5] == "0"
+
+
+def test_payment_habits_printout_is_a_function_of_the_module():
+    args = function_tree(PREPARATION, "show_payment_habits").args.args
+    assert [arg.arg for arg in args] == ["habits", "table", "validation_origins"]
+    args = function_tree(PREPARATION, "share_groups").args.args
+    assert [arg.arg for arg in args] == ["shares"]
+
+
+def test_payment_habits_printout_summary_line(payment_habits_run):
+    # 7 rows, a habit (median gap not NaN) for 6 = 86%; median of 28, 30, 31, 14, 20, 40 = 29;
+    # mean month-end share of 1, 0.5, 0, 0.5, 1, 0 = 50%. Over every row, not only validation.
+    assert payment_habits_run["small"][0] == (
+        "        payment habits: 7 rows; a habit for 86% of them (median gap 29 days, "
+        "month-end share 50% on average)")
+
+
+def test_payment_habits_printout_headings_in_order(payment_habits_run):
+    headings = [line for line in payment_habits_run["small"] if "preview" in line]
+    assert headings == [
+        "        preview on the validation origins, by next_payment_share_in_target:",
+        "        preview on the validation origins, by month_habit_in_target:"]
+
+
+def test_payment_habits_printout_columns(payment_habits_run):
+    header = payment_habits_run["small"][2]
+    names = [part.strip() for part in header.split("  ") if part.strip()]
+    assert names == ["rows", "paid rate", "mean amount"]
+
+
+def test_payment_habits_printout_groups_in_order(payment_habits_run):
+    lines = payment_habits_run["small"]
+    for heading in ("next_payment_share_in_target", "month_habit_in_target"):
+        at = next(i for i, line in enumerate(lines) if line.endswith(f"by {heading}:"))
+        # heading, the column header, the index-name line, then the four groups.
+        groups = [line for line in lines[at + 1: at + 7]
+                  if any(line.startswith(label + " ") for label in GROUP_LABELS)]
+        found = [next(label for label in GROUP_LABELS if line.startswith(label + " "))
+                 for line in groups]
+        assert found == ["no habit", "0", "above 0, below 0.5", "0.5 or more"], heading
+
+
+def test_payment_habits_printout_by_next_payment_share(payment_habits_run):
+    # The 5 labelled rows at 33 and 34 (the unlabelled row and origin 10 left out).
+    preview = habit_previews(payment_habits_run["small"])["next_payment_share_in_target"]
+    assert preview == {"no habit": [1, 1.0, 100.0], "0": [1, 0.0, 0.0],
+                       "above 0, below 0.5": [1, 1.0, 50.0], "0.5 or more": [2, 0.5, 15.0]}
+
+
+def test_payment_habits_printout_by_month_habit(payment_habits_run):
+    preview = habit_previews(payment_habits_run["small"])["month_habit_in_target"]
+    assert preview == {"no habit": [1, 0.0, 0.0], "0": [1, 1.0, 100.0],
+                       "above 0, below 0.5": [1, 0.0, 0.0], "0.5 or more": [2, 1.0, 40.0]}
+
+
+def test_payment_habits_printout_counts_only_labelled_validation_rows(payment_habits_run):
+    for preview in habit_previews(payment_habits_run["small"]).values():
+        assert sum(values[0] for values in preview.values()) == 5
+
+
+def test_payment_habits_printout_matches_rows_by_position(payment_habits_run):
+    assert payment_habits_run["shuffled index"] == payment_habits_run["small"]
+
+
+def test_payment_habits_printout_without_validation_rows_is_two_lines(payment_habits_run):
+    assert payment_habits_run["no validation rows"] == [
+        payment_habits_run["small"][0],
+        "        preview: no labelled rows at the validation origins"]
+
+
+def test_payment_habits_printout_with_only_unlabelled_rows_is_two_lines(payment_habits_run):
+    assert payment_habits_run["only unlabelled"] == [
+        payment_habits_run["small"][0],
+        "        preview: no labelled rows at the validation origins"]
+
+
+def test_payment_habits_printout_prints_empty_groups_with_nan(payment_habits_run):
+    # Every share is 1: three groups have no rows, and are still printed, with a NaN rate.
+    nan = float("nan")
+    for column, preview in habit_previews(payment_habits_run["one group"]).items():
+        assert list(preview) == ["no habit", "0", "above 0, below 0.5", "0.5 or more"], column
+        for label in ("no habit", "0", "above 0, below 0.5"):
+            assert same(preview[label], [0, nan, nan]), (column, label)
+        # paid on n = 0 and 2 of 0..3; amounts 0, 1, 2, 3.
+        assert preview["0.5 or more"] == [4, 0.5, 1.5], column
+
+
+def test_payment_habits_printout_uses_thousands_separators(payment_habits_run):
+    assert payment_habits_run["many"][0] == (
+        "        payment habits: 1,500 rows; a habit for 100% of them (median gap 7 days, "
+        "month-end share 100% on average)")
+    preview = habit_previews(payment_habits_run["many"])["next_payment_share_in_target"]
+    assert preview["0.5 or more"] == [1500, 1.0, 1.0]
+
+
+def test_payment_habits_printout_is_not_called_by_show_preparation():
+    # U18.3 is main()'s own step, after the inputs are unpacked.
+    assert calls_to(show_preparation_tree(), "show_payment_habits") == []
+    assert calls_to(show_preparation_tree(), "payment_habits") == []
+
+
+def test_payment_habits_printout_reads_the_documented_columns():
+    source = function_source(PREPARATION, "show_payment_habits")
+    for column in ("median_gap_days", "month_end_share", "origin_week", "label_status",
+                   "paid", "amount_deflated", "next_payment_share_in_target",
+                   "month_habit_in_target"):
+        assert f'"{column}"' in source or f"'{column}'" in source, column
+
+
+NO_HABIT_AT_ALL = """
+import pandas as pd
+from collection_estimation.hurdle.reports import preparation as reports
+NAN = float("nan")
+# No row has a habit (e.g. min_payment_days above every customer's history).
+table = pd.DataFrame({"origin_week": [33, 33], "label_status": ["labelled", "labelled"],
+                      "paid": [True, False], "amount_deflated": [10.0, 0.0]})
+habits = pd.DataFrame({"next_payment_share_in_target": [NAN, NAN],
+                       "month_habit_in_target": [NAN, NAN], "median_gap_days": [NAN, NAN],
+                       "month_end_share": [NAN, NAN]})
+reports.show_payment_habits(habits, table, [33])
+print("ok")
+"""
+
+
+def test_payment_habits_printout_survives_no_habit_at_all():
+    # A preview should not crash the pipeline when no customer has a habit.
+    result = run_snippet(NO_HABIT_AT_ALL)
+    assert result.returncode == 0, result.stderr[-600:]
+    assert result.stdout.strip().endswith("ok")
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("        payment habits: 2 rows; a habit for 0% of them")
+    previews = habit_previews(lines)
+    assert previews["next_payment_share_in_target"]["no habit"] == [2, 0.5, 5.0]

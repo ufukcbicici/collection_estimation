@@ -101,6 +101,10 @@ catch_up_window = 5             # calendar days after a holiday that receive the
 delays_kept = 20                # a customer's most recent cleared invoices used (recent habit)
 company_delays_kept = 200       # its company's, used instead below [receivables]
                                 # min_cleared_for_delay of its own
+# The payment habits (U18.3): when in the month and week a customer pays, and how regularly,
+# from its own past payment days (daily files, and the ledger before them), as known at t.
+payment_days_kept = 24          # a customer's most recent payment days used (recent habit)
+min_payment_days = 3            # below this many, no habit features (NaN; 2 or more)
 
 [stage1]
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class

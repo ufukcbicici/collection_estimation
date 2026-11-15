@@ -165,7 +165,9 @@ VALID = {
                  "catch_up_window": "6"},
     # U18.2: the payment-rhythm block. Values differ from synthetic.toml's on purpose (15 and
     # 150 against 20 and 200), so a test can tell them apart.
-    "rhythm": {"delays_kept": "15", "company_delays_kept": "150"},
+    # U18.3: payment_days_kept and min_payment_days are the same as synthetic.toml's (24, 3).
+    "rhythm": {"delays_kept": "15", "company_delays_kept": "150", "payment_days_kept": "24",
+               "min_payment_days": "3"},
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
@@ -390,6 +392,7 @@ def test_settings_is_frozen(tmp_path, repo, attribute):
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
     ("calendar", "catch_up_window"), ("rhythm", "delays_kept"), ("rhythm", "company_delays_kept"),
+    ("rhythm", "payment_days_kept"), ("rhythm", "min_payment_days"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -524,6 +527,7 @@ def test_a_section_given_as_a_list_of_tables_raises(tmp_path, repo):
     ("history", "windows"), ("history", "use_ledger_before_first_file"),
     ("calendar", "holiday_encodings"), ("calendar", "drain_window"),
     ("calendar", "catch_up_window"), ("rhythm", "delays_kept"), ("rhythm", "company_delays_kept"),
+    ("rhythm", "payment_days_kept"), ("rhythm", "min_payment_days"),
     ("stage1", "max_iter"), ("stage1", "learning_rate"), ("stage1", "max_leaf_nodes"),
     ("stage1", "min_samples_leaf"), ("stage1", "random_seed"), ("stage1", "feature_blocks"),
     ("stage1", "company_as_feature"), ("stage1", "baseline_c"),
@@ -7073,18 +7077,19 @@ def test_the_synthetic_toml_grid_tries_both_ridges():
 from collection_estimation.hurdle.settings import RhythmSettings  # noqa: E402
 
 RHYTHM = f"{FILE_NAME} [rhythm]"
-RHYTHM_KEYS = ["company_delays_kept", "delays_kept"]
+RHYTHM_KEYS = ["company_delays_kept", "delays_kept", "min_payment_days", "payment_days_kept"]
 
 
 def test_rhythm_settings_fields_are_in_the_documented_order():
     assert [field.name for field in dataclasses.fields(RhythmSettings)] == [
-        "delays_kept", "company_delays_kept"]
+        "delays_kept", "company_delays_kept", "payment_days_kept", "min_payment_days"]
 
 
 def test_the_rhythm_section_is_read(tmp_path, repo):
     rhythm = load(tmp_path, repo).rhythm
     assert isinstance(rhythm, RhythmSettings)
-    assert rhythm == RhythmSettings(delays_kept=15, company_delays_kept=150)
+    assert rhythm == RhythmSettings(delays_kept=15, company_delays_kept=150,
+                                    payment_days_kept=24, min_payment_days=3)
 
 
 def test_the_rhythm_values_are_ints(tmp_path, repo):
@@ -7122,7 +7127,8 @@ def test_the_rhythm_does_not_change_the_other_sections(tmp_path, repo):
         if field.name != "rhythm":
             assert getattr(a, field.name) == getattr(b, field.name), field.name
     assert a.rhythm != b.rhythm
-    assert b.rhythm == RhythmSettings(delays_kept=3, company_delays_kept=7)
+    assert b.rhythm == RhythmSettings(delays_kept=3, company_delays_kept=7,
+                                    payment_days_kept=24, min_payment_days=3)
 
 
 def test_a_missing_rhythm_section_raises_the_exact_message(tmp_path, repo):
@@ -7139,7 +7145,7 @@ def test_a_rhythm_section_given_as_a_plain_value_raises(tmp_path, repo):
     assert message == f"{RHYTHM} is 5, not a section"
 
 
-def test_an_empty_rhythm_section_names_both_settings(tmp_path, repo):
+def test_an_empty_rhythm_section_names_every_setting(tmp_path, repo):
     changes = {("rhythm", key): REMOVE for key in VALID["rhythm"]}
     message = exact_message(tmp_path, repo, changes)
     assert message == f"{RHYTHM}: missing {RHYTHM_KEYS}; expected exactly {RHYTHM_KEYS}"
@@ -7210,4 +7216,146 @@ def test_the_rhythm_is_checked_with_the_calendar_before_it(tmp_path, repo):
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
 def test_the_synthetic_rhythm_settings():
     rhythm = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).rhythm
-    assert rhythm == RhythmSettings(delays_kept=20, company_delays_kept=200)
+    assert rhythm == RhythmSettings(delays_kept=20, company_delays_kept=200,
+                                    payment_days_kept=24, min_payment_days=3)
+
+
+# --- [rhythm]: the payment habits (U18.3) -----------------------------------------------------
+# payment_days_kept (a customer's most recent payment days used) is a count; min_payment_days
+# is a count that must also be 2 or more (a gap needs two payment days). VALID holds 24 and 3,
+# as settings/synthetic.toml does.
+
+def test_the_habit_settings_are_read(tmp_path, repo):
+    rhythm = load(tmp_path, repo).rhythm
+    assert (rhythm.payment_days_kept, rhythm.min_payment_days) == (24, 3)
+    assert type(rhythm.payment_days_kept) is int
+    assert type(rhythm.min_payment_days) is int
+
+
+def test_the_habit_settings_are_frozen(tmp_path, repo):
+    rhythm = load(tmp_path, repo).rhythm
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rhythm.payment_days_kept = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rhythm.min_payment_days = 2
+
+
+@pytest.mark.parametrize("key", ["payment_days_kept", "min_payment_days"])
+def test_a_missing_habit_setting_has_the_exact_message(tmp_path, repo, key):
+    message = exact_message(tmp_path, repo, {("rhythm", key): REMOVE})
+    assert message == f"{RHYTHM}: missing [{key!r}]; expected exactly {RHYTHM_KEYS}"
+
+
+def test_both_habit_settings_missing_are_named_together(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): REMOVE,
+                                             ("rhythm", "min_payment_days"): REMOVE})
+    assert message == (f"{RHYTHM}: missing ['min_payment_days', 'payment_days_kept']; "
+                       f"expected exactly {RHYTHM_KEYS}")
+
+
+def test_a_habit_setting_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "min_payment_days"): REMOVE,
+                                             ("rhythm", "min_payment_day"): "3"})
+    assert message == (f"{RHYTHM}: missing ['min_payment_days']; unknown ['min_payment_day']; "
+                       f"expected exactly {RHYTHM_KEYS}")
+
+
+def test_the_habit_keys_are_unknown_in_receivables(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("receivables", "payment_days_kept"): "24"})
+    assert message.startswith(f"{FILE_NAME} [receivables]: unknown ['payment_days_kept']; ")
+
+
+@pytest.mark.parametrize("key", ["payment_days_kept", "min_payment_days"])
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("-3", "-3"),
+                                         ("true", "True"), ("false", "False"),
+                                         ("2.5", "2.5"), ("3.0", "3.0"), ('"3"', "'3'"),
+                                         ("[3]", "[3]")])
+def test_a_bad_habit_count_has_the_exact_message(tmp_path, repo, key, text, shown):
+    message = exact_message(tmp_path, repo, {("rhythm", key): text})
+    assert message == f"{RHYTHM}: {key} is {shown}, not a whole number of 1 or more"
+
+
+# min_payment_days is 3 in VALID, so payment_days_kept must be 3 or more (the cross-check).
+@pytest.mark.parametrize("text, expected", [("3", 3), ("4", 4), ("24", 24), ("100000", 100000)])
+def test_a_payment_days_kept_count_is_accepted(tmp_path, repo, text, expected):
+    rhythm = load(tmp_path, repo, changes={("rhythm", "payment_days_kept"): text}).rhythm
+    assert rhythm.payment_days_kept == expected
+    assert type(rhythm.payment_days_kept) is int
+
+
+@pytest.mark.parametrize("text", ["1", "2"])
+def test_a_payment_days_kept_below_the_valid_minimum_of_3_fails_the_cross_check(tmp_path, repo,
+                                                                                text):
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): text})
+    assert message == (f"{RHYTHM}: min_payment_days is 3, above payment_days_kept {text}, so "
+                       f"no customer would have a habit")
+
+
+def test_a_min_payment_days_of_1_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "min_payment_days"): "1"})
+    assert message == f"{RHYTHM}: min_payment_days is 1; it must be 2 or more"
+
+
+def test_a_min_payment_days_of_1_names_the_section_and_the_key(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[rhythm]", "min_payment_days",
+                  changes={("rhythm", "min_payment_days"): "1"})
+
+
+@pytest.mark.parametrize("text, expected", [("2", 2), ("3", 3), ("50", 50)])
+def test_a_min_payment_days_of_2_or_more_is_accepted(tmp_path, repo, text, expected):
+    # payment_days_kept is 24 in VALID: 50 needs a larger one (the cross-check).
+    rhythm = load(tmp_path, repo, changes={("rhythm", "min_payment_days"): text,
+                                           ("rhythm", "payment_days_kept"): "50"}).rhythm
+    assert rhythm.min_payment_days == expected
+    assert type(rhythm.min_payment_days) is int
+
+
+def test_min_payment_days_above_payment_days_kept_has_the_exact_message(tmp_path, repo):
+    # No customer ever uses more than payment_days_kept days: none would have a habit.
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): "2",
+                                             ("rhythm", "min_payment_days"): "5"})
+    assert message == (f"{RHYTHM}: min_payment_days is 5, above payment_days_kept 2, so no "
+                       f"customer would have a habit")
+
+
+def test_min_payment_days_one_above_payment_days_kept_raises(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): "3",
+                                             ("rhythm", "min_payment_days"): "4"})
+    assert message == (f"{RHYTHM}: min_payment_days is 4, above payment_days_kept 3, so no "
+                       f"customer would have a habit")
+
+
+@pytest.mark.parametrize("value", ["2", "3", "24"])
+def test_min_payment_days_equal_to_payment_days_kept_loads(tmp_path, repo, value):
+    rhythm = load(tmp_path, repo, changes={("rhythm", "payment_days_kept"): value,
+                                           ("rhythm", "min_payment_days"): value}).rhythm
+    assert rhythm.payment_days_kept == rhythm.min_payment_days == int(value)
+
+
+def test_min_payment_days_3_and_payment_days_kept_24_load(tmp_path, repo):
+    rhythm = load(tmp_path, repo, changes={("rhythm", "payment_days_kept"): "24",
+                                           ("rhythm", "min_payment_days"): "3"}).rhythm
+    assert (rhythm.payment_days_kept, rhythm.min_payment_days) == (24, 3)
+
+
+def test_a_bad_payment_days_kept_is_reported_before_the_cross_check(tmp_path, repo):
+    # payment_days_kept 0 is not a count: that message, not the cross-check's.
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): "0"})
+    assert message == f"{RHYTHM}: payment_days_kept is 0, not a whole number of 1 or more"
+
+
+def test_a_min_payment_days_of_1_is_reported_before_the_cross_check(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): "1",
+                                             ("rhythm", "min_payment_days"): "1"})
+    assert message == f"{RHYTHM}: min_payment_days is 1; it must be 2 or more"
+
+
+def test_the_habit_settings_do_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("rhythm", "payment_days_kept"): "10",
+                                      ("rhythm", "min_payment_days"): "2"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "rhythm":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert b.rhythm == RhythmSettings(delays_kept=15, company_delays_kept=150,
+                                      payment_days_kept=10, min_payment_days=2)

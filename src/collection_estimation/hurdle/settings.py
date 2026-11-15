@@ -60,6 +60,8 @@ class RhythmSettings:
     """How the payment-rhythm block (U18) is built (see `features_rhythm`)."""
     delays_kept: int            # a customer's most recent cleared invoices whose delays it uses
     company_delays_kept: int    # the company's, for a customer with too few of its own
+    payment_days_kept: int      # a customer's most recent payment days its habits are built on
+    min_payment_days: int       # below this many (2 or more), it has no habit features (NaN)
 
 
 @dataclass(frozen=True)
@@ -287,7 +289,19 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     check_keys(calendar, {"holiday_encodings", "drain_window", "catch_up_window"},
                f"{name} [calendar]")
     rhythm = raw["rhythm"]
-    check_keys(rhythm, {"delays_kept", "company_delays_kept"}, f"{name} [rhythm]")
+    check_keys(rhythm, {"delays_kept", "company_delays_kept", "payment_days_kept",
+                        "min_payment_days"}, f"{name} [rhythm]")
+    min_payment_days = count_setting(rhythm, "min_payment_days", f"{name} [rhythm]")
+    if min_payment_days < 2:
+        # The habits need a gap between payment days, so at least two of them.
+        raise ValueError(f"{name} [rhythm]: min_payment_days is {min_payment_days}; it must be "
+                         f"2 or more")
+    payment_days_kept = count_setting(rhythm, "payment_days_kept", f"{name} [rhythm]")
+    if min_payment_days > payment_days_kept:
+        # A customer never uses more than payment_days_kept days, so none would have a habit.
+        raise ValueError(f"{name} [rhythm]: min_payment_days is {min_payment_days}, above "
+                         f"payment_days_kept {payment_days_kept}, so no customer would have "
+                         f"a habit")
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
@@ -384,6 +398,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
             delays_kept=count_setting(rhythm, "delays_kept", f"{name} [rhythm]"),
             company_delays_kept=count_setting(rhythm, "company_delays_kept",
                                               f"{name} [rhythm]"),
+            payment_days_kept=payment_days_kept,
+            min_payment_days=min_payment_days,
         ),
         stage1=Stage1Settings(
             max_iter=count_setting(stage1, "max_iter", f"{name} [stage1]"),
