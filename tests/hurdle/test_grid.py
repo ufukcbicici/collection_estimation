@@ -52,7 +52,9 @@ GRID = GridSettings(run=True, run_test=False,
                     topup_windows=(8, 13),
                     # No ridge by default, so the worked counts stay small; the ridge tests set
                     # it themselves.
-                    topup_ridge_with_level=(), min_gain=0.005)
+                    topup_ridge_with_level=(), min_gain=0.005,
+                    # U18.5: no extra block, so the pre-U18.5 tests keep their counts.
+                    extra_blocks=())
 
 STAGE1_KEYS = ["max_iter", "learning_rate", "max_leaf_nodes"]
 STAGE2_KEYS = ["loss", "max_iter", "learning_rate", "max_leaf_nodes", "scale", "balance_floor"]
@@ -62,6 +64,13 @@ def make(stage1=STAGE1, stage2=STAGE2, topups=TOPUPS, **grid_changes):
     """A stand-in for `Settings` with the four sections grid_candidates reads."""
     return SimpleNamespace(stage1=stage1, stage2=stage2, topups=topups,
                            grid=dataclasses.replace(GRID, **grid_changes))
+
+
+def named(candidate, name="none"):
+    """`candidate` with params ending in "extra_blocks": `name`, as grid_candidates lists a
+    stage_grid candidate since U18.5."""
+    return Candidate(params={**candidate.params, "extra_blocks": name},
+                     settings=candidate.settings, class_weight=candidate.class_weight)
 
 
 def stage1_triples(candidates):
@@ -108,13 +117,15 @@ def test_stage1_slot_0_is_the_current_stage1():
     first = grid_candidates(make()).stage1[0]
     assert first.settings == STAGE1
     assert first.class_weight == "none"
-    assert first.params == {"max_iter": 300, "learning_rate": 0.05, "max_leaf_nodes": 31}
-    assert list(first.params) == STAGE1_KEYS
+    # U18.5: the params end with the subset of extra blocks, "none" for candidate 0.
+    assert first.params == {"max_iter": 300, "learning_rate": 0.05, "max_leaf_nodes": 31,
+                            "extra_blocks": "none"}
+    assert list(first.params) == STAGE1_KEYS + ["extra_blocks"]
 
 
 def test_stage1_params_keys_are_the_same_as_stage1_grids():
     # The printout lists params in key order: the current one must read like the others.
-    grid_keys = list(stage1_grid(STAGE1, GRID)[0].params)
+    grid_keys = list(stage1_grid(STAGE1, GRID)[0].params) + ["extra_blocks"]
     for candidate in grid_candidates(make()).stage1:
         assert list(candidate.params) == grid_keys
 
@@ -138,7 +149,7 @@ def test_stage1_current_not_in_the_grid_is_still_first():
 def test_stage1_rest_is_stage1_grid_in_its_order_without_the_current():
     settings = make(stage1_max_iter=(900, 300, 100), stage1_learning_rate=(0.2, 0.05),
                     stage1_max_leaf_nodes=(63, 31, 15))
-    expected = [c for c in stage1_grid(STAGE1, settings.grid) if c.settings != STAGE1]
+    expected = [named(c) for c in stage1_grid(STAGE1, settings.grid) if c.settings != STAGE1]
     found = grid_candidates(settings).stage1
     assert found[1:] == expected
     assert len(found) == 3 * 2 * 3
@@ -191,7 +202,8 @@ def test_stage1_params_match_the_settings_they_carry():
     for candidate in grid_candidates(make(stage1_max_iter=(100, 900))).stage1:
         assert candidate.params == {"max_iter": candidate.settings.max_iter,
                                     "learning_rate": candidate.settings.learning_rate,
-                                    "max_leaf_nodes": candidate.settings.max_leaf_nodes}
+                                    "max_leaf_nodes": candidate.settings.max_leaf_nodes,
+                                    "extra_blocks": "none"}
 
 
 @pytest.mark.parametrize("company_as_feature", [True, False])
@@ -218,12 +230,12 @@ def test_stage2_slot_0_is_the_current_stage2():
     assert first.class_weight == "none"
     assert first.params == {"loss": "poisson", "max_iter": 300, "learning_rate": 0.05,
                             "max_leaf_nodes": 31, "scale": "open balance",
-                            "balance_floor": "own mean"}
-    assert list(first.params) == STAGE2_KEYS
+                            "balance_floor": "own mean", "extra_blocks": "none"}
+    assert list(first.params) == STAGE2_KEYS + ["extra_blocks"]
 
 
 def test_stage2_params_keys_are_the_same_as_stage2_grids():
-    grid_keys = list(stage2_grid(STAGE2, GRID)[0].params)
+    grid_keys = list(stage2_grid(STAGE2, GRID)[0].params) + ["extra_blocks"]
     for candidate in grid_candidates(make()).stage2:
         assert list(candidate.params) == grid_keys
 
@@ -268,7 +280,7 @@ def test_stage2_rest_is_stage2_grid_in_its_order_without_the_current():
                     stage2_learning_rate=(0.1, 0.05), stage2_max_leaf_nodes=(63, 31),
                     stage2_scale=("open balance", "none"),
                     stage2_balance_floor=("own mean", "median"))
-    expected = [c for c in stage2_grid(STAGE2, settings.grid) if c.settings != STAGE2]
+    expected = [named(c) for c in stage2_grid(STAGE2, settings.grid) if c.settings != STAGE2]
     found = grid_candidates(settings).stage2
     assert found[1:] == expected
     # 16 (loss, iter, rate, leaves) points x (2 floors under open balance + 1 under none),
@@ -350,17 +362,24 @@ def test_stage2_params_match_the_settings_they_carry():
         assert candidate.params == {"loss": s.loss, "max_iter": s.max_iter,
                                     "learning_rate": s.learning_rate,
                                     "max_leaf_nodes": s.max_leaf_nodes, "scale": s.scale,
-                                    "balance_floor": floor}
+                                    "balance_floor": floor, "extra_blocks": "none"}
 
 
-@pytest.mark.parametrize("blocks", [("history",), ("calendar", "receivables"),
-                                    ("history", "calendar", "receivables")])
-def test_feature_blocks_of_each_stage_are_kept_in_every_candidate(blocks):
-    stage1 = dataclasses.replace(STAGE1, feature_blocks=blocks)
-    stage2 = dataclasses.replace(STAGE2, feature_blocks=blocks[::-1])
+# U18.5: the stage blocks are given in FEATURE_BLOCKS order, as load_settings returns them
+# (`feature_blocks_setting`); before U18.5 stage 2 got them reversed here. grid_candidates now
+# writes every candidate's blocks in FEATURE_BLOCKS order (`with_extra_blocks`), so a reversed
+# tuple comes back reordered: see test_grid_extra_blocks.py.
+@pytest.mark.parametrize("blocks1, blocks2", [
+    (("history",), ("calendar",)),
+    (("calendar", "receivables"), ("history", "receivables")),
+    (("history", "calendar", "receivables"), ("history", "calendar")),
+])
+def test_feature_blocks_of_each_stage_are_kept_in_every_candidate(blocks1, blocks2):
+    stage1 = dataclasses.replace(STAGE1, feature_blocks=blocks1)
+    stage2 = dataclasses.replace(STAGE2, feature_blocks=blocks2)
     found = grid_candidates(make(stage1=stage1, stage2=stage2))
-    assert all(c.settings.feature_blocks == blocks for c in found.stage1)
-    assert all(c.settings.feature_blocks == blocks[::-1] for c in found.stage2)
+    assert all(c.settings.feature_blocks == blocks1 for c in found.stage1)
+    assert all(c.settings.feature_blocks == blocks2 for c in found.stage2)
 
 
 def test_stage2_candidates_are_stage2_settings_and_stage1_candidates_stage1_settings():
@@ -538,9 +557,11 @@ def test_a_loaded_settings_gives_its_current_sections_first(tmp_path):
     assert found.stage1[0].settings == settings.stage1
     assert found.stage2[0].settings == settings.stage2
     assert found.topups[0] is settings.topups
-    assert found.stage1[1:] == [c for c in stage1_grid(settings.stage1, settings.grid)
+    # test_settings' VALID tries no extra block (U18.5): one subset, "none".
+    assert settings.grid.extra_blocks == ()
+    assert found.stage1[1:] == [named(c) for c in stage1_grid(settings.stage1, settings.grid)
                                 if c.settings != settings.stage1]
-    assert found.stage2[1:] == [c for c in stage2_grid(settings.stage2, settings.grid)
+    assert found.stage2[1:] == [named(c) for c in stage2_grid(settings.stage2, settings.grid)
                                 if c.settings != settings.stage2]
     means = [dataclasses.replace(settings.topups, method="mean", window=w)
              for w in settings.grid.topup_windows]
@@ -605,19 +626,22 @@ def g_settings(horizons=5, company_as_feature=True, reference_window=G_WINDOW,
 
 def g_candidates(settings=None, n1=2, n2=2, topups=None):
     """Candidate 0 of each stage is the current [stage1] / [stage2]; the others change
-    max_iter (stage 1) or learning_rate (stage 2). Top-ups: the current, then a 4-week mean."""
+    max_iter (stage 1) or learning_rate (stage 2). Top-ups: the current, then a 4-week mean.
+    Every params ends with "extra_blocks": "none" (U18.5: grid_scores pairs by it)."""
     settings = settings or g_settings()
     s1, s2 = settings.stage1, settings.stage2
-    stage1 = [Candidate(params={"max_iter": s1.max_iter}, settings=s1, class_weight="none")]
+    none = {"extra_blocks": "none"}
+    stage1 = [Candidate(params={"max_iter": s1.max_iter, **none}, settings=s1,
+                        class_weight="none")]
     for i in range(1, n1):
         changed = dataclasses.replace(s1, max_iter=s1.max_iter + 3 * i)
-        stage1.append(Candidate(params={"max_iter": changed.max_iter}, settings=changed,
-                                class_weight="none"))
-    stage2 = [Candidate(params={"learning_rate": s2.learning_rate}, settings=s2,
+        stage1.append(Candidate(params={"max_iter": changed.max_iter, **none},
+                                settings=changed, class_weight="none"))
+    stage2 = [Candidate(params={"learning_rate": s2.learning_rate, **none}, settings=s2,
                         class_weight="none")]
     for j in range(1, n2):
         changed = dataclasses.replace(s2, learning_rate=0.1 + 0.1 * j)
-        stage2.append(Candidate(params={"learning_rate": changed.learning_rate},
+        stage2.append(Candidate(params={"learning_rate": changed.learning_rate, **none},
                                 settings=changed, class_weight="none"))
     if topups is None:
         topups = [settings.topups, dataclasses.replace(settings.topups, window=4)]
@@ -1893,7 +1917,10 @@ def test_with_params_is_defined_here_not_in_the_pipeline_script():
     source = (Path(__file__).resolve().parents[2] / "run_hurdle_pipeline.py").read_text(
         encoding="utf-8")
     assert "def with_params(" not in source
-    assert "    with_params,\n" in source
+    # Imported from grid, either inside a parenthesised import list or on its own line (the
+    # script's imports were regrouped after U16.4; this test predates U18.5's diff).
+    assert ("    with_params,\n" in source
+            or "from collection_estimation.hurdle.grid import with_params" in source)
 
 
 def test_with_params_keeps_each_rows_params_when_the_table_is_reordered():
@@ -2627,9 +2654,15 @@ def sc_predictions(n1=3, n2=3, n3=2, seed=11, origins=SC_ORIGINS, index_offset=9
 
 
 def sc_candidates(n1=3, n2=3, n3=2):
-    return GridCandidates(stage1=[f"<s1 {i}>" for i in range(n1)],
-                          stage2=[f"<s2 {j}>" for j in range(n2)],
-                          topups=[f"<t {k}>" for k in range(n3)])
+    """Stand-in candidates: settings are labels; params only "extra_blocks": "none" (U18.5:
+    grid_scores pairs the stages by it and copies it into its table)."""
+    none = {"extra_blocks": "none"}
+    return GridCandidates(
+        stage1=[Candidate(params=none, settings=f"<s1 {i}>", class_weight="none")
+                for i in range(n1)],
+        stage2=[Candidate(params=none, settings=f"<s2 {j}>", class_weight="none")
+                for j in range(n2)],
+        topups=[f"<t {k}>" for k in range(n3)])
 
 
 def sc_gate(number_column, eligible):
@@ -2713,8 +2746,9 @@ def sc_result():
 # --- the constants and the small helpers --------------------------------------------------
 
 def test_grid_score_columns_are_the_documented_list():
-    assert GRID_SCORE_COLUMNS == ["stage1", "stage2", "topups", "current", "wape", "total_wape",
-                                  "bias", "company_wape"]
+    # U18.5 adds "extra_blocks" (the subset's name) after "topups".
+    assert GRID_SCORE_COLUMNS == ["stage1", "stage2", "topups", "extra_blocks", "current",
+                                  "wape", "total_wape", "bias", "company_wape"]
 
 
 def test_combination_name_exact_format():
@@ -3229,8 +3263,9 @@ def gated_scores(predictions):
                             "fallback": False}
                            for origin in GATE_ORIGINS for h in range(1, 6)],
                           columns=TOPUP_COLUMNS)
-    candidates = GridCandidates(stage1=gate_candidates().stage1,
-                                stage2=gate_candidates().stage2, topups=["<t>"])
+    candidates = GridCandidates(stage1=[named(c) for c in gate_candidates().stage1],
+                                stage2=[named(c) for c in gate_candidates().stage2],
+                                topups=["<t>"])
     lines = [("TR02|K", "TR02", "K", week, 1e7, 0.0) for week in range(0, 50)]
     actual = actual_totals(make_weekly(lines), make_weeks(49), f_levels(), ["TR02"],
                            list(GATE_ORIGINS), 5)
@@ -3714,7 +3749,7 @@ def test_combination_forecast_a_company_missing_from_the_list_raises():
 
 def choice_table(lines):
     """A grid_scores-like table from (stage1, stage2, topups, current, wape)."""
-    frame = pd.DataFrame([(i, j, k, current, wape, 0.1, 0.0, 0.2)
+    frame = pd.DataFrame([(i, j, k, "none", current, wape, 0.1, 0.0, 0.2)
                           for i, j, k, current, wape in lines], columns=GRID_SCORE_COLUMNS)
     frame["current"] = frame["current"].astype(bool)
     return frame
@@ -4034,8 +4069,8 @@ def test_grid_choice_new_winner_gives_its_candidates(ch_case):
     assert not bool(choice.winner["current"])
     pd.testing.assert_series_equal(choice.winner, expected)
     i, j, k = winner_numbers(choice)
-    assert (choice.stage1, choice.stage2, choice.topups) == (f"<s1 {i}>", f"<s2 {j}>",
-                                                             f"<t {k}>")
+    assert (choice.stage1.settings, choice.stage2.settings, choice.topups) == (
+        f"<s1 {i}>", f"<s2 {j}>", f"<t {k}>")
 
 
 def test_grid_choice_forecast_is_the_winners_combination_forecast(ch_case):

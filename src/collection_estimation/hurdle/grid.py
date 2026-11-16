@@ -14,13 +14,21 @@ beat them by [grid] min_gain WAPE to replace them (U16.6). Every candidate keeps
 settings only through company_as_feature, so each stage-1 and each stage-2 setting can be
 fitted once per origin and paired afterwards (U16.1).
 
+U18.5, the feature-block subsets: [grid] extra_blocks (e.g. ["dues", "habits"]) are tried on
+top of each stage's own feature_blocks, every subset of them (none, dues, habits, both), and
+each stage list above is made once per subset (`block_subsets`). A combination uses the same
+subset in both stages; its params name it ("extra_blocks"). Candidate 0 stays the current
+settings with no extra block, so a block is kept only if it beats them by min_gain.
+
 U16.3, `grid_predictions`: every candidate's forecast at every origin, nothing scored yet.
 Each stage-1 and each stage-2 candidate is fitted at each origin on the rows known there and
 predicts the rows at it (its p or m); each top-up candidate is forecast at all origins at
 once. Beside them, per row, what happened and the two references the gates (U16.4) need.
 Every fit is cached on its own (`cache.load_with_cache`), keyed by its stage, origin and
 setting: a grid with one more candidate fits only that one, and a run stopped after hours
-keeps every fit it finished.
+keeps every fit it finished. The table is hashed without the columns of the extra blocks a
+fit does not use, so a change to how a block is built ([rhythm]) refits only the fits that
+use it.
 
 U16.4, `grid_gates`: which stage-1 and stage-2 candidates make sense on their own, judged on
 the labelled rows of every validation origin pooled (`diagnostic_joint.stage1_gates` and
@@ -68,6 +76,7 @@ from .evaluate import (HORIZON_TOTAL, HURDLE, MODEL_CODE, POOLED, STACK_COLUMNS,
 from .forecast import (CONSOLIDATED, CUSTOMER_COLUMNS, Forecast, forecast_totals,
                        stage1_predictions, stage2_predictions)
 from .prices import projected_levels
+from .settings import FEATURE_BLOCKS
 from .stage2 import amount_references
 from .topups import topup_forecasts
 from .training_table import rows_at_origin, rows_known_at
@@ -78,11 +87,16 @@ from .training_table import rows_at_origin, rows_known_at
 ROW_COLUMNS = CUSTOMER_COLUMNS[:6] + ["label_status", "paid", "amount_deflated", "base_rate",
                                       "training_mean"]
 
-# The columns of `grid_scores`' table, in order: the candidate numbers, whether it is the
-# current settings, then the scores of the consolidated totals (WAPE over every (origin, h),
-# WAPE of each origin's total over its h weeks, bias) and the mean of the companies' WAPE.
-GRID_SCORE_COLUMNS = ["stage1", "stage2", "topups", "current", "wape", "total_wape", "bias",
-                      "company_wape"]
+# The columns of `grid_scores`' table, in order: the candidate numbers, the extra feature
+# blocks they use (U18.5), whether it is the current settings, then the scores of the
+# consolidated totals (WAPE over every (origin, h), WAPE of each origin's total over its h
+# weeks, bias) and the mean of the companies' WAPE.
+GRID_SCORE_COLUMNS = ["stage1", "stage2", "topups", "extra_blocks", "current", "wape",
+                      "total_wape", "bias", "company_wape"]
+
+# The feature blocks every fit's cache name hashes, used or not: stage 2 reads the open balance
+# (receivables) and the history means for its scale, whatever its feature_blocks.
+ALWAYS_HASHED_BLOCKS = ("history", "calendar", "receivables")
 
 
 @dataclass(frozen=True)
@@ -93,32 +107,75 @@ class GridCandidates:
     topups: list                # each a copy of [topups] (`TopupSettings`)
 
 
+def block_subsets(extra_blocks: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """Every subset of `extra_blocks`, smallest first; within a size, in the order of
+    `extra_blocks`. E.g. ("dues", "habits") -> (), ("dues",), ("habits",), ("dues", "habits")."""
+    subsets = []
+    for size in range(len(extra_blocks) + 1):
+        subsets.extend(itertools.combinations(extra_blocks, size))
+    return subsets
+
+
+def subset_name(subset: tuple[str, ...]) -> str:
+    """The name of a subset of extra blocks in the params and tables: "none" or
+    "dues + habits"."""
+    return " + ".join(subset) if subset else "none"
+
+
+def with_extra_blocks(stage_settings, subset: tuple[str, ...]):
+    """A copy of one stage's settings with the blocks of `subset` added to its feature_blocks,
+    in the order of FEATURE_BLOCKS (as [stage1] and [stage2] are read)."""
+    blocks = [block for block in FEATURE_BLOCKS
+              if block in stage_settings.feature_blocks or block in subset]
+    return dataclasses.replace(stage_settings, feature_blocks=tuple(blocks))
+
+
 def grid_candidates(settings) -> GridCandidates:
     """The settings to try (see the module docstring), from `settings` (a `Settings`).
 
-    `stage1_grid` and `stage2_grid` read the [grid] values, which have the names of the
-    [joint_diagnostic] ones. A combination equal to the current settings is not listed twice.
+    For each subset of [grid] extra_blocks (`block_subsets`), the current [stage1] with those
+    blocks added, then every combination of the [grid] stage-1 values with them; stage 2 the
+    same way. `stage1_grid` and `stage2_grid` read the [grid] values, which have the names of
+    the [joint_diagnostic] ones. A combination equal to the current settings is not listed
+    twice. Every stage candidate's params end with "extra_blocks" (`subset_name`).
+
     A top-up candidate is a copy of [topups] with the method and its own setting replaced (the
-    mean's window, the ridge's with_level); the setting the method does not read is kept.
+    mean's window, the ridge's with_level); the setting the method does not read is kept. The
+    top-ups do not depend on the feature blocks, so they are listed once.
     """
     stage1, stage2, topups = settings.stage1, settings.stage2, settings.topups
     grid = settings.grid
 
-    current_stage1 = Candidate(
-        params={"max_iter": stage1.max_iter, "learning_rate": stage1.learning_rate,
-                "max_leaf_nodes": stage1.max_leaf_nodes},
-        settings=stage1, class_weight="none")
-    floor = stage2.balance_floor if stage2.scale == "open balance" else "-"
-    current_stage2 = Candidate(
-        params={"loss": stage2.loss, "max_iter": stage2.max_iter,
-                "learning_rate": stage2.learning_rate, "max_leaf_nodes": stage2.max_leaf_nodes,
-                "scale": stage2.scale, "balance_floor": floor},
-        settings=stage2, class_weight="none")
+    stage1_candidates, stage2_candidates = [], []
+    for subset in block_subsets(grid.extra_blocks):
+        name = subset_name(subset)
 
-    stage1_candidates = [current_stage1] + [
-        candidate for candidate in stage1_grid(stage1, grid) if candidate.settings != stage1]
-    stage2_candidates = [current_stage2] + [
-        candidate for candidate in stage2_grid(stage2, grid) if candidate.settings != stage2]
+        # Stage 1: the current settings with this subset, then the grid's others.
+        current1 = with_extra_blocks(stage1, subset)
+        stage1_candidates.append(Candidate(
+            params={"max_iter": stage1.max_iter, "learning_rate": stage1.learning_rate,
+                    "max_leaf_nodes": stage1.max_leaf_nodes, "extra_blocks": name},
+            settings=current1, class_weight="none"))
+        for candidate in stage1_grid(current1, grid):
+            if candidate.settings != current1:
+                stage1_candidates.append(Candidate(
+                    params={**candidate.params, "extra_blocks": name},
+                    settings=candidate.settings, class_weight=candidate.class_weight))
+
+        # Stage 2 the same way.
+        current2 = with_extra_blocks(stage2, subset)
+        floor = stage2.balance_floor if stage2.scale == "open balance" else "-"
+        stage2_candidates.append(Candidate(
+            params={"loss": stage2.loss, "max_iter": stage2.max_iter,
+                    "learning_rate": stage2.learning_rate,
+                    "max_leaf_nodes": stage2.max_leaf_nodes, "scale": stage2.scale,
+                    "balance_floor": floor, "extra_blocks": name},
+            settings=current2, class_weight="none"))
+        for candidate in stage2_grid(current2, grid):
+            if candidate.settings != current2:
+                stage2_candidates.append(Candidate(
+                    params={**candidate.params, "extra_blocks": name},
+                    settings=candidate.settings, class_weight=candidate.class_weight))
 
     topup_candidates = [topups]
     for window in grid.topup_windows:
@@ -132,6 +189,23 @@ def grid_candidates(settings) -> GridCandidates:
 
     return GridCandidates(stage1=stage1_candidates, stage2=stage2_candidates,
                           topups=topup_candidates)
+
+
+def same_extra_blocks(stage1_candidate: Candidate, stage2_candidate: Candidate) -> bool:
+    """True if a stage-1 and a stage-2 candidate use the same subset of extra blocks: only
+    such a pair is a combination (one subset for both stages)."""
+    return stage1_candidate.params["extra_blocks"] == stage2_candidate.params["extra_blocks"]
+
+
+def combination_count(candidates: GridCandidates) -> int:
+    """How many combinations the candidates make: each stage-1 and stage-2 pair with the same
+    extra blocks, times every top-up."""
+    pairs = 0
+    for first in candidates.stage1:
+        for second in candidates.stage2:
+            if same_extra_blocks(first, second):
+                pairs += 1
+    return pairs * len(candidates.topups)
 
 
 @dataclass(frozen=True)
@@ -149,6 +223,16 @@ def setting_hash(setting) -> str:
     """A short hash of one stage's settings (a dataclass), for the name of its cache files."""
     text = json.dumps(asdict(setting), sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def hashed_table(table: pd.DataFrame, block_columns: dict[str, list[str]],
+                 blocks: tuple[str, ...]) -> pd.DataFrame:
+    """The part of `table` a fit with feature blocks `blocks` is hashed on: all of it but the
+    columns of the blocks it does not use, other than the ALWAYS_HASHED_BLOCKS."""
+    unused = [column for block, columns in block_columns.items()
+              if block not in blocks and block not in ALWAYS_HASHED_BLOCKS
+              for column in columns]
+    return table.drop(columns=unused)
 
 
 def cached_fit(stage: str, origin: int, setting, inputs: list, cache_folder: Path,
@@ -191,11 +275,21 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
                               horizons, topup.method, topup.window, topup.with_level)
               for topup in candidates.topups]
 
-    # What every fit is made from besides its own setting and origin; the table's hash takes
-    # seconds, so it is made once.
+    # What every fit is made from besides its own setting and origin, per set of feature
+    # blocks: the table without the extra blocks the fit does not use, and the columns of the
+    # blocks hashed. A table's hash takes seconds, so each is made once.
     here = Path(__file__).parent
-    inputs = [asdict(settings.receivables), block_columns, sorted(companies),
-              table_fingerprint(table), source_fingerprint(*(here / name for name in MODEL_CODE))]
+    code = source_fingerprint(*(here / name for name in MODEL_CODE))
+    inputs_of = {}
+    for candidate in candidates.stage1 + candidates.stage2:
+        blocks = candidate.settings.feature_blocks
+        if blocks in inputs_of:
+            continue
+        hashed = hashed_table(table, block_columns, blocks)
+        hashed_columns = {block: columns for block, columns in block_columns.items()
+                          if block in blocks or block in ALWAYS_HASHED_BLOCKS}
+        inputs_of[blocks] = [asdict(settings.receivables), hashed_columns, sorted(companies),
+                             table_fingerprint(hashed), code]
     company_as_feature = settings.stage1.company_as_feature
     diagnostic = settings.diagnostic
 
@@ -223,6 +317,7 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
         p_at = {}
         for number, candidate in enumerate(candidates.stage1):
             started = time.perf_counter()
+            inputs = inputs_of[candidate.settings.feature_blocks]
             p_at[number] = cached_fit(
                 "stage1", origin, candidate.settings, inputs, cache_folder,
                 lambda setting=candidate.settings: stage1_predictions(
@@ -236,6 +331,7 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
         m_at = {}
         for number, candidate in enumerate(candidates.stage2):
             started = time.perf_counter()
+            inputs = inputs_of[candidate.settings.feature_blocks]
             m_at[number] = cached_fit(
                 "stage2", origin, candidate.settings, inputs + [company_as_feature],
                 cache_folder,
@@ -413,7 +509,11 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
     projected = projected_at(origins, horizons, week_zero)
     stage1 = scored_numbers(gates.stage1, "stage1")
     stage2 = scored_numbers(gates.stage2, "stage2")
-    combinations = list(itertools.product(stage1, stage2, range(len(candidates.topups))))
+    combinations = []
+    for i, j, k in itertools.product(stage1, stage2, range(len(candidates.topups))):
+        # One subset of the extra blocks for both stages (U18.5).
+        if same_extra_blocks(candidates.stage1[i], candidates.stage2[j]):
+            combinations.append((i, j, k))
 
     # 1. Each combination's totals at each origin, as `forecast` makes them.
     keys = ["company_code", "origin_week", "h", "target_week"]
@@ -436,7 +536,9 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
         mine = scores[scores["method"] == combination_name(i, j, k)]
         consolidated = mine[mine["company_code"] == CONSOLIDATED].set_index("horizon")
         by_company = mine[(mine["company_code"] != CONSOLIDATED) & (mine["horizon"] == POOLED)]
-        lines.append({"stage1": i, "stage2": j, "topups": k, "current": (i, j, k) == (0, 0, 0),
+        lines.append({"stage1": i, "stage2": j, "topups": k,
+                      "extra_blocks": candidates.stage1[i].params["extra_blocks"],
+                      "current": (i, j, k) == (0, 0, 0),
                       "wape": consolidated.loc[POOLED, "wape"],
                       "total_wape": consolidated["wape"].get(HORIZON_TOTAL, float("nan")),
                       "bias": consolidated.loc[POOLED, "bias"],

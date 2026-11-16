@@ -4,7 +4,7 @@ gates, the scores, the combination kept and the v1 test.
 from ..calibrate import candidate_name
 from ..evaluate import HURDLE, POOLED, STACK_COLUMNS, evaluation_scores
 from ..forecast import CONSOLIDATED
-from ..grid import UNCORRECTED
+from ..grid import UNCORRECTED, combination_count
 from .evaluation import show_calibration_choice, show_evaluation_scores, show_paired_bootstrap
 
 
@@ -23,7 +23,7 @@ def show_grid_candidates(candidates, origins):
         else:
             method = f"ridge {'with' if topups.with_level else 'without'} the level"
         print(f"          {i}: {method}{'   <- current' if i == 0 else ''}")
-    pairs = len(candidates.stage1) * len(candidates.stage2) * len(candidates.topups)
+    pairs = combination_count(candidates)   # same extra blocks in both stages
     fits = origins * (len(candidates.stage1) + len(candidates.stage2))
     print(f"        {pairs} combinations to score; per origin {len(candidates.stage1)} stage-1 "
           f"and {len(candidates.stage2)} stage-2 fits; {origins} origins: {fits} fits (those "
@@ -81,7 +81,7 @@ def show_grid_scores(table, candidates, rolled, actual, horizons):
     """Step 18's scores (U16.5): how many combinations were scored, the 10 best by WAPE, the
     current combination and its rank, and whether it scores exactly as step 17's model
     (`rolled`, scored here on `actual`; None if step 17 did not forecast with the model)."""
-    every = len(candidates.stage1) * len(candidates.stage2) * len(candidates.topups)
+    every = combination_count(candidates)   # same extra blocks in both stages
     print(f"        {len(table)} of {every} combinations scored (stage-1 and stage-2 "
           f"candidates eligible or current, every top-up); the 10 best by WAPE:")
     print(table.head(10).round(4).to_string(index=False))

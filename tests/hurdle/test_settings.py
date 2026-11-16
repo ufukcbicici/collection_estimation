@@ -238,7 +238,10 @@ VALID = {
              "stage1_log_loss_tolerance": "0.3", "stage1_slope_band": "[0.6, 1.6]",
              "stage2_skill_tolerance": "0.04", "stage2_ratio_band": "[0.85, 1.15]",
              "topup_windows": "[13, 4]", "topup_ridge_with_level": "[false, true]",
-             "min_gain": "0.01"},
+             "min_gain": "0.01",
+             # U18.5: no extra block here (synthetic.toml tries ["dues", "habits"]); the
+             # extra_blocks tests set it themselves.
+             "extra_blocks": "[]"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -6461,7 +6464,7 @@ GRID_SECTION_KEYS = sorted([
     "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
     "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
     "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows", "topup_ridge_with_level",
-    "min_gain"])
+    "min_gain", "extra_blocks"])
 GRID_STAGE_KEYS = ["stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
                    "stage2_loss", "stage2_max_iter", "stage2_learning_rate",
                    "stage2_max_leaf_nodes", "stage2_scale", "stage2_balance_floor"]
@@ -6472,7 +6475,7 @@ GRID_READ = GridSettings(
     stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "mean"),
     stage1_log_loss_tolerance=0.3, stage1_slope_band=(0.6, 1.6), stage2_skill_tolerance=0.04,
     stage2_ratio_band=(0.85, 1.15), topup_windows=(4, 13), topup_ridge_with_level=(False, True),
-    min_gain=0.01)
+    min_gain=0.01, extra_blocks=())
 
 
 def grid_error(tmp_path, repo, changes):
@@ -6489,7 +6492,7 @@ def grid_table(**changes):
              "stage1_log_loss_tolerance": 0.1, "stage1_slope_band": [0.8, 1.25],
              "stage2_skill_tolerance": 0.05, "stage2_ratio_band": [0.9, 1.1],
              "topup_windows": [8, 13], "topup_ridge_with_level": [True, False],
-             "min_gain": 0.005}
+             "min_gain": 0.005, "extra_blocks": []}
     table.update(changes)
     return table
 
@@ -6515,7 +6518,7 @@ def test_grid_settings_fields_are_in_the_documented_order():
         "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance",
         "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
         "topup_ridge_with_level",
-        "min_gain"]
+        "min_gain", "extra_blocks"]
 
 
 def test_grid_settings_has_every_stage_grid_and_gate_name_of_the_joint_diagnostic():
@@ -6940,7 +6943,7 @@ def test_read_grid_by_hand():
         stage1_log_loss_tolerance=0.1, stage1_slope_band=(0.8, 1.25),
         stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1), topup_windows=(8, 13),
         topup_ridge_with_level=(True, False),
-        min_gain=0.005)
+        min_gain=0.005, extra_blocks=())
 
 
 def test_read_grid_uses_where_in_its_messages():
@@ -7108,7 +7111,8 @@ def test_bool_list_setting_does_not_change_its_input():
 
 
 def test_read_grid_reads_topup_ridge_with_level_and_names_where():
-    assert read_grid(grid_table(topup_ridge_with_level=[]), "here").topup_ridge_with_level == ()
+    grid = read_grid(grid_table(topup_ridge_with_level=[]), "here")
+    assert grid.topup_ridge_with_level == ()
     assert read_grid_error(topup_ridge_with_level=[True, True]) == (
         "here: topup_ridge_with_level lists a value more than once: [True, True]")
 
@@ -7410,3 +7414,245 @@ def test_the_habit_settings_do_not_change_the_other_sections(tmp_path, repo):
             assert getattr(a, field.name) == getattr(b, field.name), field.name
     assert b.rhythm == RhythmSettings(delays_kept=15, company_delays_kept=150,
                                       payment_days_kept=10, min_payment_days=2)
+
+
+# =============================================================================================
+# U18.5: [grid] extra_blocks, read by `extra_blocks_setting` (through `read_grid`): a list (may
+# be empty) of FEATURE_BLOCKS names, each once; returned in the order of FEATURE_BLOCKS. A
+# block a stage already uses is refused by `load_settings` at its very end, once `Settings` is
+# built, so every section's own error comes first. VALID's stages use history, calendar,
+# receivables, so "dues" and "habits" are free; VALID itself tries none ([]).
+# =============================================================================================
+
+from collection_estimation.hurdle.settings import extra_blocks_setting  # noqa: E402
+
+FEATURE_BLOCK_LIST = "['history', 'calendar', 'receivables', 'dues', 'habits']"
+
+
+def test_extra_blocks_is_the_last_grid_field_and_a_required_key():
+    names = [f.name for f in dataclasses.fields(GridSettings)]
+    assert names[-1] == "extra_blocks"
+    assert "extra_blocks" in GRID_SECTION_KEYS
+
+
+def test_valid_tries_no_extra_block(tmp_path, repo):
+    grid = load(tmp_path, repo).grid
+    assert grid.extra_blocks == ()
+    assert type(grid.extra_blocks) is tuple
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("[]", ()),
+    ('["dues"]', ("dues",)),
+    ('["habits"]', ("habits",)),
+    ('["dues", "habits"]', ("dues", "habits")),
+    ('["habits", "dues"]', ("dues", "habits")),
+], ids=["empty", "dues", "habits", "both", "both-reversed"])
+def test_extra_blocks_good_values_in_feature_blocks_order(tmp_path, repo, text, expected):
+    grid = load(tmp_path, repo, changes={("grid", "extra_blocks"): text}).grid
+    assert grid.extra_blocks == expected
+    assert type(grid.extra_blocks) is tuple
+    assert all(type(block) is str for block in grid.extra_blocks)
+
+
+def test_extra_blocks_may_hold_a_base_block_neither_stage_uses(tmp_path, repo):
+    # Stage 1 drops receivables and stage 2 never had it: the grid may try it on top.
+    grid = load(tmp_path, repo, changes={
+        ("stage1", "feature_blocks"): '["history", "calendar"]',
+        ("grid", "extra_blocks"): '["habits", "receivables"]'}).grid
+    assert grid.extra_blocks == ("receivables", "habits")
+
+
+def test_a_missing_extra_blocks_has_the_exact_message(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"extra_blocks": REMOVE})
+    assert message == (f"{GRID_SECTION}: missing ['extra_blocks']; expected exactly "
+                       f"{GRID_SECTION_KEYS}")
+
+
+@pytest.mark.parametrize("text, shown", [('"dues"', "'dues'"), ("1", "1"), ("true", "True"),
+                                         ("{ a = 1 }", "{'a': 1}")],
+                         ids=["text", "int", "bool", "table"])
+def test_an_extra_blocks_that_is_not_a_list_has_the_exact_message(tmp_path, repo, text, shown):
+    assert grid_error(tmp_path, repo, {"extra_blocks": text}) == (
+        f"{GRID_SECTION}: extra_blocks is {shown}, not a list of feature blocks")
+
+
+@pytest.mark.parametrize("text, shown", [
+    ('["rhythm"]', "['rhythm']"),
+    ('["dues", "Habits"]', "['Habits']"),
+    ('["due", "habit"]', "['due', 'habit']"),
+    ("[1]", "[1]"),
+    ('["dues", ""]', "['']"),
+], ids=["rhythm", "capital", "two-unknown", "int", "empty-text"])
+def test_an_unknown_extra_block_has_the_exact_message(tmp_path, repo, text, shown):
+    assert grid_error(tmp_path, repo, {"extra_blocks": text}) == (
+        f"{GRID_SECTION}: extra_blocks holds {shown}; the feature blocks are "
+        f"{FEATURE_BLOCK_LIST}")
+
+
+@pytest.mark.parametrize("text, shown", [
+    ('["dues", "dues"]', "['dues', 'dues']"),
+    ('["habits", "dues", "habits"]', "['habits', 'dues', 'habits']"),
+])
+def test_a_repeated_extra_block_has_the_exact_message(tmp_path, repo, text, shown):
+    assert grid_error(tmp_path, repo, {"extra_blocks": text}) == (
+        f"{GRID_SECTION}: extra_blocks lists a feature block more than once: {shown}")
+
+
+@pytest.mark.parametrize("text, shown", [
+    ('["history"]', "['history']"),          # in both stages
+    ('["receivables"]', "['receivables']"),  # in stage 1 only
+    # Listed in the order of the read extra_blocks (FEATURE_BLOCKS order), not as written.
+    ('["dues", "calendar", "history"]', "['history', 'calendar']"),
+], ids=["both-stages", "stage1-only", "two-of-three"])
+def test_an_extra_block_a_stage_already_uses_has_the_exact_message(tmp_path, repo, text, shown):
+    assert grid_error(tmp_path, repo, {"extra_blocks": text}) == (
+        f"{GRID_SECTION}: extra_blocks holds {shown}, already in [stage1] or [stage2] "
+        f"feature_blocks")
+
+
+def test_an_extra_block_used_by_stage2_only_is_refused(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {
+        ("stage2", "feature_blocks"): '["history", "habits"]',
+        ("grid", "extra_blocks"): '["dues", "habits"]'})
+    assert message == (f"{GRID_SECTION}: extra_blocks holds ['habits'], already in [stage1] or "
+                       f"[stage2] feature_blocks")
+
+
+def test_an_extra_block_used_by_stage1_only_is_refused(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {
+        ("stage1", "feature_blocks"): '["history", "dues"]',
+        ("grid", "extra_blocks"): '["dues"]'})
+    assert message == (f"{GRID_SECTION}: extra_blocks holds ['dues'], already in [stage1] or "
+                       f"[stage2] feature_blocks")
+
+
+def test_the_used_check_reads_both_stages_after_a_change(tmp_path, repo):
+    # Stage 1 takes dues, stage 2 takes habits: the grid may then try neither of the two...
+    changes = {("stage1", "feature_blocks"): '["history", "dues"]',
+               ("stage2", "feature_blocks"): '["history", "habits"]'}
+    assert load(tmp_path, repo, changes={**changes, ("grid", "extra_blocks"): "[]"}
+                ).grid.extra_blocks == ()
+    # ... but still a base block neither uses.
+    assert load(tmp_path, repo, changes={**changes, ("grid", "extra_blocks"): '["calendar"]'}
+                ).grid.extra_blocks == ("calendar",)
+
+
+def test_extra_blocks_checks_in_order_list_unknown_repeat_used(tmp_path, repo):
+    # Unknown before repeated; repeated before used.
+    assert grid_error(tmp_path, repo, {"extra_blocks": '["dues", "dues", "x"]'}) == (
+        f"{GRID_SECTION}: extra_blocks holds ['x']; the feature blocks are {FEATURE_BLOCK_LIST}")
+    assert grid_error(tmp_path, repo, {"extra_blocks": '["history", "history"]'}) == (
+        f"{GRID_SECTION}: extra_blocks lists a feature block more than once: "
+        f"['history', 'history']")
+
+
+def test_a_bad_extra_blocks_is_refused_with_the_grid_switched_off(tmp_path, repo):
+    message = grid_error(tmp_path, repo, {"run": "false", "run_test": "false",
+                                          "extra_blocks": '["history"]'})
+    assert message.startswith(f"{GRID_SECTION}: extra_blocks holds ['history']")
+
+
+def test_a_bad_stage_feature_blocks_is_still_reported_as_that_stage(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): '["rhythm"]'})
+    assert message == (f"{FILE_NAME} [stage2]: feature_blocks holds ['rhythm']; the feature "
+                       f"blocks are {FEATURE_BLOCK_LIST}")
+
+
+# The overlap check runs after Settings is built: any section's error wins over it, whether
+# the section comes before [grid] in the file or after it.
+OVERLAP = {("grid", "extra_blocks"): '["history"]'}
+
+
+@pytest.mark.parametrize("changes, start", [
+    ({("debug", "sample_week"): '"x"'}, f"{FILE_NAME} [debug]: sample_week"),
+    ({("data", "ledger_as_of"): '"x"'}, f"{FILE_NAME} [data]: ledger_as_of"),
+    ({("stage1", "max_iter"): "0"}, f"{FILE_NAME} [stage1]: max_iter"),
+    ({("stage2", "feature_blocks"): "[]"}, f"{FILE_NAME} [stage2]: feature_blocks"),
+    ({("grid", "min_gain"): "0"}, f"{GRID_SECTION}: min_gain"),
+], ids=["debug-after-grid", "data-before-grid", "stage1", "stage2-blocks", "grid-itself"])
+def test_any_section_error_wins_over_the_overlap_error(tmp_path, repo, changes, start):
+    message = exact_message(tmp_path, repo, {**OVERLAP, **changes})
+    assert message.startswith(start), message
+    assert "already in [stage1] or [stage2]" not in message
+
+
+def test_the_overlap_error_comes_once_every_section_is_fixed(tmp_path, repo):
+    message = exact_message(tmp_path, repo, OVERLAP)
+    assert message == (f"{GRID_SECTION}: extra_blocks holds ['history'], already in [stage1] or "
+                       f"[stage2] feature_blocks")
+
+
+def test_the_stage1_settings_errors_still_come_in_field_order_with_an_overlap(tmp_path, repo):
+    # max_iter first, then feature_blocks, and the overlap only once [stage1] is whole.
+    changes = {**OVERLAP, ("stage1", "max_iter"): "0", ("stage1", "feature_blocks"): "[]"}
+    assert exact_message(tmp_path, repo, changes).startswith(f"{FILE_NAME} [stage1]: max_iter")
+    changes[("stage1", "max_iter")] = "300"
+    assert exact_message(tmp_path, repo, changes).startswith(
+        f"{FILE_NAME} [stage1]: feature_blocks")
+    changes[("stage1", "feature_blocks")] = '["history"]'
+    assert "already in [stage1] or [stage2]" in exact_message(tmp_path, repo, changes)
+
+
+def test_extra_blocks_do_not_change_the_other_sections_or_grid_fields(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("grid", "extra_blocks"): '["dues", "habits"]'})
+    for field in dataclasses.fields(Settings):
+        if field.name != "grid":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert dataclasses.replace(a.grid, extra_blocks=("dues", "habits")) == b.grid
+
+
+# --- extra_blocks_setting and read_grid on their own -----------------------------------------
+
+def test_extra_blocks_setting_direct_calls():
+    assert extra_blocks_setting({"k": []}, "k", "here") == ()
+    assert extra_blocks_setting({"k": ["habits", "dues"]}, "k", "here") == ("dues", "habits")
+    for value, message in (
+            (("dues",), "here: k is ('dues',), not a list of feature blocks"),
+            (None, "here: k is None, not a list of feature blocks"),
+            (["x"], f"here: k holds ['x']; the feature blocks are {FEATURE_BLOCK_LIST}"),
+            (["dues", "dues"], "here: k lists a feature block more than once: "
+                               "['dues', 'dues']")):
+        with pytest.raises(ValueError) as error:
+            extra_blocks_setting({"k": value}, "k", "here")
+        assert str(error.value) == message, value
+
+
+def test_extra_blocks_setting_accepts_every_block_it_does_not_know_the_stages():
+    # The overlap with the stages is load_settings' check, not this one's.
+    found = extra_blocks_setting({"k": list(FEATURE_BLOCKS)[::-1]}, "k", "here")
+    assert found == FEATURE_BLOCKS
+
+
+def test_extra_blocks_setting_does_not_change_its_table():
+    table = {"k": ["habits", "dues"]}
+    extra_blocks_setting(table, "k", "here")
+    assert table == {"k": ["habits", "dues"]}
+
+
+def test_extra_blocks_setting_without_the_key_raises_key_error():
+    with pytest.raises(KeyError):
+        extra_blocks_setting({}, "k", "here")
+
+
+def test_read_grid_reads_extra_blocks_without_the_overlap_check():
+    table = grid_table(extra_blocks=["dues", "history"])
+    assert read_grid(table, "here").extra_blocks == ("history", "dues")
+    assert read_grid_error(extra_blocks=["dues", "dues"]) == (
+        "here: extra_blocks lists a feature block more than once: ['dues', 'dues']")
+
+
+def test_read_grid_checks_the_grids_before_extra_blocks():
+    assert read_grid_error(stage2_loss=["squared_error"], extra_blocks="x") == (
+        "here stage2_loss item: stage2_loss is 'squared_error', not one of ['poisson', 'gamma']")
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
+def test_the_synthetic_toml_tries_dues_and_habits_on_top():
+    # Only extra_blocks is pinned; the grids themselves are the owner's to change.
+    settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
+    assert settings.grid.extra_blocks == ("dues", "habits")
+    for block in settings.grid.extra_blocks:
+        assert block not in settings.stage1.feature_blocks
+        assert block not in settings.stage2.feature_blocks

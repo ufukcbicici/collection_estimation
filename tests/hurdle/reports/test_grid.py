@@ -220,21 +220,24 @@ def test_show_grid_candidates_exact_printout_of_the_worked_example(capsys):
     from collection_estimation.hurdle.grid import grid_candidates
     from tests.hurdle.test_grid import make
     lines = printed_grid(capsys, grid_candidates(make()), 3)
+    # U18.5: every params ends with "extra_blocks" (here always "none": the example tries no
+    # extra block), so every candidate line ends with it.
     assert lines == [
         "        stage 1: 4 settings",
-        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
-        "          1: max_iter 300, learning_rate 0.01, max_leaf_nodes 31",
-        "          2: max_iter 900, learning_rate 0.01, max_leaf_nodes 31",
-        "          3: max_iter 900, learning_rate 0.05, max_leaf_nodes 31",
+        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31, extra_blocks none"
+        "   <- current",
+        "          1: max_iter 300, learning_rate 0.01, max_leaf_nodes 31, extra_blocks none",
+        "          2: max_iter 900, learning_rate 0.01, max_leaf_nodes 31, extra_blocks none",
+        "          3: max_iter 900, learning_rate 0.05, max_leaf_nodes 31, extra_blocks none",
         "        stage 2: 4 settings",
         "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean   <- current",
+        "scale open balance, balance_floor own mean, extra_blocks none   <- current",
         "          1: loss poisson, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
+        "scale open balance, balance_floor own mean, extra_blocks none",
         "          2: loss gamma, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
+        "scale open balance, balance_floor own mean, extra_blocks none",
         "          3: loss gamma, max_iter 300, learning_rate 0.1, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
+        "scale open balance, balance_floor own mean, extra_blocks none",
         "        top-ups: 2 settings",
         "          0: mean of 13 weeks   <- current",
         "          1: mean of 8 weeks",
@@ -256,12 +259,13 @@ def test_show_grid_candidates_shows_a_ridge_and_a_scale_none_floor_as_a_dash(cap
     lines = printed_grid(capsys, candidates, 1)
     assert lines == [
         "        stage 1: 1 settings",
-        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31   <- current",
+        "          0: max_iter 300, learning_rate 0.05, max_leaf_nodes 31, extra_blocks none"
+        "   <- current",
         "        stage 2: 2 settings",
         "          0: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale none, balance_floor -   <- current",
+        "scale none, balance_floor -, extra_blocks none   <- current",
         "          1: loss poisson, max_iter 300, learning_rate 0.05, max_leaf_nodes 31, "
-        "scale open balance, balance_floor own mean",
+        "scale open balance, balance_floor own mean, extra_blocks none",
         "        top-ups: 2 settings",
         "          0: ridge with the level   <- current",
         "          1: mean of 13 weeks",
@@ -292,8 +296,9 @@ def test_show_grid_candidates_top_up_lines_with_both_ridges(capsys):
 @pytest.mark.parametrize("with_level, text", [(True, "ridge with the level"),
                                               (False, "ridge without the level")])
 def test_show_grid_candidates_a_current_ridge_line(capsys, with_level, text):
+    none = {"k": 0, "extra_blocks": "none"}   # U18.5: the count pairs by extra_blocks
     candidates = SimpleNamespace(
-        stage1=[SimpleNamespace(params={"k": 0})], stage2=[SimpleNamespace(params={"k": 0})],
+        stage1=[SimpleNamespace(params=none)], stage2=[SimpleNamespace(params=none)],
         topups=[SimpleNamespace(method="ridge", window=8, with_level=with_level),
                 SimpleNamespace(method="ridge", window=8, with_level=not with_level)])
     lines = printed_grid(capsys, candidates, 1)
@@ -304,8 +309,10 @@ def test_show_grid_candidates_a_current_ridge_line(capsys, with_level, text):
 
 
 def fake_candidates(n1, n2, n3):
-    """GridCandidates-like lists of the given sizes (only what the printout reads)."""
-    stage = [SimpleNamespace(params={"k": i}) for i in range(max(n1, n2))]
+    """GridCandidates-like lists of the given sizes (only what the printout reads). Every
+    params names one subset, "none" (U18.5), so every stage pair is a combination."""
+    stage = [SimpleNamespace(params={"k": i, "extra_blocks": "none"})
+             for i in range(max(n1, n2))]
     topups = [SimpleNamespace(method="mean", window=i + 1) for i in range(n3)]
     return SimpleNamespace(stage1=stage[:n1], stage2=stage[:n2], topups=topups)
 
@@ -341,7 +348,8 @@ def test_show_grid_candidates_no_longer_shows_a_time(capsys):
 def test_show_grid_candidates_marks_only_slot_0_in_each_list(capsys):
     lines = printed_grid(capsys, fake_candidates(3, 2, 4), 1)
     marked = [line for line in lines if line.endswith("   <- current")]
-    assert marked == ["          0: k 0   <- current", "          0: k 0   <- current",
+    assert marked == ["          0: k 0, extra_blocks none   <- current",
+                      "          0: k 0, extra_blocks none   <- current",
                       "          0: mean of 1 weeks   <- current"]
 
 
@@ -597,7 +605,9 @@ def test_show_grid_scores_is_a_module_level_function_with_five_parameters():
     assert found[0].args.kwonlyargs == [] and found[0].args.kwarg is None
 
 
-SHOW_SCORES_GLOBALS = {"CONSOLIDATED", "HURDLE", "POOLED", "STACK_COLUMNS", "evaluation_scores"}
+# U18.5: combination_count (grid.py) counts the combinations.
+SHOW_SCORES_GLOBALS = {"CONSOLIDATED", "HURDLE", "POOLED", "STACK_COLUMNS", "evaluation_scores",
+                       "combination_count"}
 
 
 def test_show_grid_scores_reads_only_names_the_module_imports():
@@ -635,11 +645,19 @@ def grid_score_table(lines=None):
     lines = lines or [(1, 0, 1, False, 0.150004, 0.101234, -0.020001, 0.200049),
                       (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
                       (0, 1, 1, False, 0.170001, float("nan"), 0.0, 0.25)]
-    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+    return pd.DataFrame(with_subset(lines), columns=GRID_SCORE_COLUMNS)
+
+
+def with_subset(lines, name="none"):
+    """Lines written as before U18.5 (stage1, stage2, topups, current, scores...) with the
+    extra_blocks column put in after topups."""
+    return [line[:3] + (name,) + line[3:] for line in lines]
 
 
 def score_candidates(n1=2, n2=3, n3=2):
-    return SimpleNamespace(stage1=["s1"] * n1, stage2=["s2"] * n2, topups=["t"] * n3)
+    # Only params["extra_blocks"] is read (combination_count): one subset, every pair counts.
+    stage = SimpleNamespace(params={"extra_blocks": "none"})
+    return SimpleNamespace(stage1=[stage] * n1, stage2=[stage] * n2, topups=["t"] * n3)
 
 
 def score_actual():
@@ -803,7 +821,7 @@ def test_show_grid_scores_on_grid_scores_own_output(capsys):
     lines = printed_scores(capsys, table, sc_candidates(), None, horizons=5)
     assert lines[0] == ("        18 of 18 combinations scored (stage-1 and stage-2 candidates "
                         "eligible or current, every top-up); the 10 best by WAPE:")
-    assert lines[1].split()[:4] == ["stage1", "stage2", "topups", "current"]
+    assert lines[1].split()[:5] == ["stage1", "stage2", "topups", "extra_blocks", "current"]
     rank = int(table.index[table["current"]][0]) + 1
     current = table[table["current"]].iloc[0]
     assert lines[-2] == (f"        current settings: rank {rank} of 18, WAPE "
@@ -993,7 +1011,7 @@ def choice_scores_table(lines=None):
     lines = lines or [(1, 0, 1, False, 0.098, 0.1, 0.0, 0.2),
                       (0, 0, 0, True, 0.1, 0.12, 0.031, 0.22),
                       (0, 1, 2, False, 0.17, 0.2, 0.0, 0.25)]
-    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+    return pd.DataFrame(with_subset(lines), columns=GRID_SCORE_COLUMNS)
 
 
 def choice_settings(grid_min_gain=0.005, calibration_min_gain=0.01, horizons=5):

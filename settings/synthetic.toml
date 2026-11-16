@@ -271,6 +271,10 @@ topup_ridge_with_level = [true, false]   # the ridges of the top-ups to try (the
                                          # model): with and without the recent level; [] = none
 min_gain = 0.005                 # a pair replaces the current settings only if its WAPE is
                                  # at least this much lower
+# U18.5: feature blocks tried on top of [stage1] and [stage2] feature_blocks, every subset of
+# them (with ["dues", "habits"]: none, dues, habits, both), the same subset in both stages.
+# Each subset fits every stage setting again, so the fits grow as 2^N. [] = none tried.
+extra_blocks = ["dues", "habits"]
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

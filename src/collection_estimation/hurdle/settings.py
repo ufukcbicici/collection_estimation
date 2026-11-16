@@ -207,6 +207,8 @@ class GridSettings:
                                               # without the recent level; empty = no ridge
     min_gain: float                           # how much WAPE a pair must beat the current
                                               # settings by to replace them
+    extra_blocks: tuple[str, ...]             # feature blocks tried on top of the stages' own
+                                              # (every subset); empty = none tried
 
 
 @dataclass(frozen=True)
@@ -342,7 +344,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                       "stage2_learning_rate", "stage2_max_leaf_nodes", "stage2_scale",
                       "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
                       "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
-                      "topup_ridge_with_level", "min_gain"}, f"{name} [grid]")
+                      "topup_ridge_with_level", "min_gain", "extra_blocks"}, f"{name} [grid]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -355,7 +357,7 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
 
     windows = window_list_setting(history, "windows", f"{name} [history]")
 
-    return Settings(
+    settings = Settings(
         settings_file=settings_file.resolve(),
         data=DataSettings(
             corpus_folder=path_setting(data, "corpus_folder", repo_root, f"{name} [data]"),
@@ -476,6 +478,16 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         ),
     )
 
+    # [grid] extra_blocks may not repeat a block a stage already uses: "with it" and "without
+    # it" would be the same model. Checked once every section is read, so that the errors
+    # above come in the order of the file.
+    used = [block for block in settings.grid.extra_blocks
+            if block in settings.stage1.feature_blocks or block in settings.stage2.feature_blocks]
+    if used:
+        raise ValueError(f"{name} [grid]: extra_blocks holds {used}, already in [stage1] or "
+                         f"[stage2] feature_blocks")
+    return settings
+
 
 def read_joint_diagnostic(table: dict, repo_root: Path, where: str) -> JointDiagnosticSettings:
     """The [joint_diagnostic] section, checked."""
@@ -511,7 +523,8 @@ def read_grid(table: dict, where: str) -> GridSettings:
     """The [grid] section, checked. Refused, as settings known to fail: a stage-2 loss outside
     GRID_STAGE2_LOSSES and a learning rate of GRID_LEARNING_RATE_LIMIT or more. Refused too:
     run_test without run, since the test needs the grid's choice and would be skipped without
-    a word."""
+    a word. (An extra block a stage already uses is refused by `load_settings`, which knows
+    the stages.)"""
     def one_of(choices):
         return lambda item_table, key, item_where: choice_setting(item_table, key, item_where,
                                                                   choices)
@@ -545,7 +558,23 @@ def read_grid(table: dict, where: str) -> GridSettings:
         topup_windows=window_list_setting(table, "topup_windows", where),
         topup_ridge_with_level=bool_list_setting(table, "topup_ridge_with_level", where),
         min_gain=positive_number_setting(table, "min_gain", where),
+        extra_blocks=extra_blocks_setting(table, "extra_blocks", where),
     )
+
+
+def extra_blocks_setting(table: dict, key: str, where: str) -> tuple[str, ...]:
+    """A list of feature blocks, each once, from FEATURE_BLOCKS; may be empty. Returned in the
+    order of FEATURE_BLOCKS."""
+    value = table[key]
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} is {value!r}, not a list of feature blocks")
+    unknown = [item for item in value if item not in FEATURE_BLOCKS]
+    if unknown:
+        raise ValueError(f"{where}: {key} holds {unknown}; the feature blocks are "
+                         f"{list(FEATURE_BLOCKS)}")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{where}: {key} lists a feature block more than once: {value}")
+    return tuple(block for block in FEATURE_BLOCKS if block in value)
 
 
 def read_topups(table: dict, diagnostic_origin: int, where: str) -> TopupSettings:
