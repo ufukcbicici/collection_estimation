@@ -33,6 +33,11 @@ BLOCK_COLUMNS = {
     "calendar": ["business_days", "has_month_end"],
     "receivables": ["open_invoices", "due_in_target_week"],
 }
+# With the two rhythm blocks of U18.4 (dues, habits), in FEATURE_BLOCKS order.
+BLOCK_COLUMNS_ALL = dict(BLOCK_COLUMNS,
+                         dues=["spread_in_target", "delays_used"],
+                         habits=["payment_days_used", "month_start_share"])
+BASE_BLOCKS = ("history", "calendar", "receivables")
 COMPANIES = ["TR02", "TR04", "TR05", "TR06", "TR91"]
 
 
@@ -70,14 +75,41 @@ def test_feature_columns_with_no_blocks_is_only_h():
 
 
 def test_feature_columns_h_comes_first_always():
-    for blocks in (("calendar",), ("receivables", "calendar"), FEATURE_BLOCKS):
-        assert feature_columns(BLOCK_COLUMNS, blocks)[0] == "h"
+    for blocks in (("calendar",), ("receivables", "calendar"), BASE_BLOCKS, FEATURE_BLOCKS,
+                   ("habits", "dues")):
+        assert feature_columns(BLOCK_COLUMNS_ALL, blocks)[0] == "h"
 
 
 def test_feature_columns_an_empty_block_adds_nothing():
-    columns = dict(BLOCK_COLUMNS, calendar=[])
+    columns = dict(BLOCK_COLUMNS_ALL, calendar=[], habits=[])
     assert feature_columns(columns, FEATURE_BLOCKS) == [
-        "h", "customer_age_weeks", "mean_receipts_4", "open_invoices", "due_in_target_week"]
+        "h", "customer_age_weeks", "mean_receipts_4", "open_invoices", "due_in_target_week",
+        "spread_in_target", "delays_used"]
+
+
+def test_feature_columns_all_five_blocks_in_feature_blocks_order():
+    assert feature_columns(BLOCK_COLUMNS_ALL, FEATURE_BLOCKS) == [
+        "h", "customer_age_weeks", "mean_receipts_4", "business_days", "has_month_end",
+        "open_invoices", "due_in_target_week", "spread_in_target", "delays_used",
+        "payment_days_used", "month_start_share"]
+
+
+def test_feature_columns_base_blocks_take_no_rhythm_column():
+    # U18.4: block_columns now carries dues and habits, but the [stage1]/[stage2] setting of
+    # the three base blocks must give exactly the columns it gave before.
+    assert (feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS)
+            == feature_columns(BLOCK_COLUMNS, BASE_BLOCKS))
+    leaked = set(feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS)) & set(
+        BLOCK_COLUMNS_ALL["dues"] + BLOCK_COLUMNS_ALL["habits"])
+    assert leaked == set()
+
+
+@pytest.mark.parametrize("rhythm", [("dues",), ("habits",), ("dues", "habits")])
+def test_feature_columns_base_plus_a_rhythm_subset_adds_only_that_subset(rhythm):
+    columns = feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS + rhythm)
+    base = feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS)
+    assert columns[:len(base)] == base
+    assert columns[len(base):] == [c for block in rhythm for c in BLOCK_COLUMNS_ALL[block]]
 
 
 def test_feature_columns_returns_a_new_list():
@@ -475,9 +507,13 @@ def chain():
         return build_chain(*base_data(), file_days())
 
 
+def chain_block_columns(chain):
+    return block_feature_columns(chain["history"], chain["calendar"], chain["owed"],
+                                 chain["dues"], chain["habits"])
+
+
 def chain_columns(chain, blocks=FEATURE_BLOCKS):
-    return feature_columns(block_feature_columns(chain["history"], chain["calendar"],
-                                                 chain["owed"]), blocks)
+    return feature_columns(chain_block_columns(chain), blocks)
 
 
 def test_chain_feature_columns_hold_no_identity_week_or_label(chain):
@@ -493,7 +529,21 @@ def test_chain_feature_columns_are_h_then_the_blocks(chain):
     history = [c for c in chain["history"].columns if c not in ("key", "origin_week")]
     calendar = [c for c in chain["calendar"].columns if c != "week"]
     owed = [c for c in chain["owed"].columns if c not in ("key", "origin_week", "h")]
-    assert columns == ["h"] + history + calendar + owed
+    dues = [c for c in chain["dues"].columns if c not in ("key", "origin_week", "h")]
+    habits = [c for c in chain["habits"].columns if c not in ("key", "origin_week", "h")]
+    assert columns == ["h"] + history + calendar + owed + dues + habits
+
+
+def test_chain_base_blocks_hold_no_dues_or_habits_column(chain):
+    rhythm = set(chain["dues"].columns) | set(chain["habits"].columns)
+    rhythm -= {"key", "origin_week", "h"}
+    assert rhythm
+    assert not set(chain_columns(chain, BASE_BLOCKS)) & rhythm
+    # The three base blocks' columns as before U18.4, rebuilt by hand.
+    before = (["h"] + [c for c in chain["history"].columns if c not in ("key", "origin_week")]
+              + [c for c in chain["calendar"].columns if c != "week"]
+              + [c for c in chain["owed"].columns if c not in ("key", "origin_week", "h")])
+    assert chain_columns(chain, BASE_BLOCKS) == before
 
 
 def test_chain_stage1_features_on_the_training_rows(chain):
@@ -521,7 +571,8 @@ def test_chain_stage1_features_on_the_forecast_rows(chain):
     assert x.dtypes.to_dict() == train.dtypes.to_dict()
 
 
-@pytest.mark.parametrize("blocks", [("calendar",), ("history", "receivables")])
+@pytest.mark.parametrize("blocks", [("calendar",), ("history", "receivables"), ("dues",),
+                                    ("habits",), ("receivables", "habits")])
 def test_chain_a_subset_of_blocks_gives_only_those_columns(chain, blocks):
     from tests.hurdle.test_training_table import T
     columns = chain_columns(chain, blocks)
@@ -1082,9 +1133,11 @@ def test_both_fits_raise_the_check_labels_messages(fit, case):
 # is_amount_column
 
 def test_amount_columns_is_the_documented_set():
+    # The six receivables amounts, plus (U18.4) the four deflated amounts of the dues block.
     assert AMOUNT_COLUMNS == {"last_payment_amount", "due_before_target_week",
                               "due_in_target_week", "due_after_target_week", "unapplied_cash",
-                              "open_balance"}
+                              "open_balance", "spread_in_target", "spread_before_target",
+                              "overdue_beyond_habit", "shifted_due_in_target"}
 
 
 @pytest.mark.parametrize("column", [
@@ -1131,10 +1184,10 @@ def test_amount_pattern_must_match_the_whole_name():
 
 
 def test_is_amount_column_on_the_chain_columns(chain):
-    # Every feature column the real chain makes, classified: amounts are TRY, the rest are
-    # counts, days, weeks or flags.
+    # Every feature column the real chain's three base blocks make, classified: amounts are
+    # TRY, the rest are counts, days, weeks or flags. (The rhythm blocks: see below.)
     from tests.hurdle.test_training_table import AGE_EDGES, WINDOWS
-    columns = chain_columns(chain)
+    columns = chain_columns(chain, BASE_BLOCKS)
     amounts = [column for column in columns if is_amount_column(column)]
     expected = ({"last_payment_amount", f"median_payment_{max(WINDOWS)}",
                  "due_before_target_week", "due_in_target_week", "due_after_target_week",
@@ -1153,6 +1206,28 @@ def test_is_amount_column_agrees_with_what_the_receivables_block_deflates(chain)
     assert receivables, "the chain has no receivables columns"
     for column in receivables:
         assert is_amount_column(column) == (column not in NON_AMOUNT_COLUMNS), column
+
+
+# The delay-spread block (dues, U18.2) deflates four of its columns by the price level of
+# week t, as the receivables block does: spread_in_target, spread_before_target,
+# overdue_beyond_habit and shifted_due_in_target are TRY of week 0. The baseline log-scales
+# only what is_amount_column names, so these should be named too. (The habits block holds no
+# amount: "None is an amount, so nothing is deflated".)
+DUES_AMOUNTS = ["spread_in_target", "spread_before_target", "overdue_beyond_habit",
+                "shifted_due_in_target"]
+
+
+@pytest.mark.parametrize("column", DUES_AMOUNTS)
+def test_is_amount_column_true_for_the_deflated_dues_amounts(column):
+    assert is_amount_column(column) is True
+
+
+@pytest.mark.parametrize("column", ["spread_share_in_target", "delay_iqr_days", "delays_used",
+                                    "delays_pooled", "payment_days_used", "month_start_share",
+                                    "median_gap_days", "payment_due_ratio",
+                                    "next_payment_share_in_target"])
+def test_is_amount_column_false_for_the_rhythm_shares_counts_and_days(column):
+    assert is_amount_column(column) is False
 
 
 # signed_log1p
@@ -1610,6 +1685,118 @@ def test_baseline_converges_on_the_chain(chain):
     p = predict_paid(model, forecast)
     assert p.notna().all() and p.between(0, 1).all()
     pd.testing.assert_index_equal(p.index, forecast.index)
+
+
+# U18.4: stage 1 on the five blocks, the rhythm blocks with their NaN (habits below [rhythm]
+# min_payment_days, a spread share with nothing open, no delays).
+
+def test_chain_rhythm_columns_hold_nan_on_the_training_rows(chain):
+    from tests.hurdle.test_training_table import T
+    rows = rows_known_at(chain["table"], T)
+    x = stage1_features(rows, chain_columns(chain), COMPANIES, True)
+    habits = chain_block_columns(chain)["habits"]
+    assert x[habits].isna().any().any(), "no NaN in the habits: the case is not exercised"
+
+
+@pytest.mark.parametrize("blocks", [FEATURE_BLOCKS, BASE_BLOCKS + ("dues",),
+                                    BASE_BLOCKS + ("habits",)],
+                         ids=["all-five", "base+dues", "base+habits"])
+def test_hgb_fits_and_predicts_on_the_chain_with_the_rhythm_blocks(chain, blocks):
+    from tests.hurdle.test_training_table import T
+    columns = chain_columns(chain, blocks)
+    rows = rows_known_at(chain["table"], T)
+    x = stage1_features(rows, columns, COMPANIES, True)
+    model = fit_stage1(x, rows["paid"], stage1_settings(min_samples_leaf=2))
+    forecast = stage1_features(rows_at_origin(chain["table"], T), columns, COMPANIES, True)
+    p = predict_paid(model, forecast)
+    assert p.notna().all() and p.between(0, 1).all()
+    pd.testing.assert_index_equal(p.index, forecast.index)
+    assert list(model.feature_names_in_) == columns + ["company_code"]
+
+
+@pytest.mark.parametrize("blocks", [FEATURE_BLOCKS, BASE_BLOCKS + ("habits",)],
+                         ids=["all-five", "base+habits"])
+def test_baseline_fits_and_predicts_on_the_chain_with_the_rhythm_blocks(chain, blocks):
+    from tests.hurdle.test_training_table import T
+    columns = chain_columns(chain, blocks)
+    rows = rows_known_at(chain["table"], T)
+    x = stage1_features(rows, columns, COMPANIES, True)
+    model = fit_stage1_baseline(x, rows["paid"], stage1_settings())
+    forecast = stage1_features(rows_at_origin(chain["table"], T), columns, COMPANIES, True)
+    p = predict_paid(model, forecast)
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+def rhythm_xy(n=600, seed=5):
+    """A small synthetic frame as stage1_features gives it with all five blocks: the habit
+    columns NaN for a third of the rows (below min_payment_days), the delay IQR NaN for a
+    fifth, the spread share NaN where nothing is open. Paid follows the habit share where it
+    is known, so the NaN rows carry no signal."""
+    rng = np.random.default_rng(seed)
+    few_days = rng.random(n) < 1 / 3
+    share = rng.random(n)
+    x = pd.DataFrame({
+        "h": rng.integers(1, 6, size=n).astype("float64"),
+        "mean_receipts_4": rng.lognormal(8, 1, size=n),
+        "has_month_end": rng.integers(0, 2, size=n).astype("float64"),
+        "open_balance": rng.lognormal(9, 1, size=n),
+        "spread_in_target": rng.lognormal(7, 1, size=n),
+        "spread_share_in_target": np.where(rng.random(n) < 0.1, np.nan, rng.random(n)),
+        "delay_iqr_days": np.where(rng.random(n) < 0.2, np.nan, rng.gamma(2, 5, size=n)),
+        "delays_used": rng.integers(0, 6, size=n).astype("float64"),
+        "delays_pooled": rng.integers(0, 2, size=n).astype("float64"),
+        "payment_days_used": np.where(few_days, 1.0, rng.integers(2, 11, size=n)),
+        "month_start_share": np.where(few_days, np.nan, rng.random(n)),
+        "next_payment_share_in_target": np.where(few_days, np.nan, share),
+    })
+    x["company_code"] = pd.Categorical(rng.choice(["TR02", "TR04"], size=n),
+                                       categories=["TR02", "TR04", "TR05"])
+    paid = np.where(few_days, rng.random(n) < 0.3, share > 0.5)
+    x.index = pd.RangeIndex(7000, 7000 + n)
+    return x, pd.Series(paid, index=x.index, name="paid")
+
+
+def test_hgb_fits_on_rhythm_columns_with_nan_and_learns_the_known_habit():
+    x, paid = rhythm_xy()
+    model = fit_stage1(x, paid, stage1_settings(max_iter=30))
+    p = predict_paid(model, x)
+    assert p.notna().all() and p.between(0, 1).all()
+    known = x["next_payment_share_in_target"].notna()
+    assert roc_auc_score(paid[known], p[known]) > 0.9
+
+
+def test_hgb_predicts_on_rows_whose_habits_are_all_nan():
+    x, paid = rhythm_xy()
+    model = fit_stage1(x, paid, stage1_settings())
+    unseen = x.iloc[:5].copy()
+    unseen[["month_start_share", "next_payment_share_in_target", "delay_iqr_days",
+            "spread_share_in_target"]] = np.nan
+    p = predict_paid(model, unseen)
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+def test_baseline_fits_on_rhythm_columns_with_nan_and_adds_missing_indicators():
+    x, paid = rhythm_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    p = predict_paid(model, x)
+    assert p.notna().all() and p.between(0, 1).all()
+    others = parts_of(model)["others"]
+    for column in ("month_start_share", "next_payment_share_in_target", "delay_iqr_days",
+                   "payment_days_used", "delays_pooled"):
+        assert column in others, column
+    imputer = model.named_steps["prepare"].named_transformers_["others"][0]
+    flagged = [others[i] for i in imputer.indicator_.features_]
+    assert set(flagged) == {"spread_share_in_target", "delay_iqr_days", "month_start_share",
+                            "next_payment_share_in_target"}
+
+
+def test_baseline_predicts_on_rows_whose_habits_are_all_nan():
+    x, paid = rhythm_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    unseen = x.iloc[:5].copy()
+    unseen[["month_start_share", "next_payment_share_in_target"]] = np.nan
+    p = predict_paid(model, unseen)
+    assert p.notna().all() and p.between(0, 1).all()
 
 
 def test_baseline_is_deterministic():

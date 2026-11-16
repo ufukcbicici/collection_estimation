@@ -49,8 +49,13 @@ history = table[["key", "origin_week", "mean_receipts_4"]].drop_duplicates(["key
 calendar = (table[["target_week", "has_month_end"]].drop_duplicates("target_week")
             .rename(columns={"target_week": "week"}))
 owed = table[["key", "origin_week", "h", "open_invoices"]]
-columns = feature_columns(prep.block_feature_columns(history, calendar, owed),
-                                 ("history", "calendar", "receivables"))
+# The two rhythm blocks (U18.4), per panel row; B has no habits (NaN). Not selected here: the
+# three base blocks must give the same four columns as before.
+dues = table[["key", "origin_week", "h"]].assign(spread_in_target=table["origin_week"] * 10.0)
+habits = table[["key", "origin_week", "h"]].assign(
+    month_start_share=[0.5 if a else nan for a in is_a])
+block_columns = prep.block_feature_columns(history, calendar, owed, dues, habits)
+columns = feature_columns(block_columns, ("history", "calendar", "receivables"))
 assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices"], columns
 origin = ORIGIN
 train_rows = rows_known_at(table, origin)
@@ -313,6 +318,47 @@ def test_step_12_real_fit_predict_and_scores_on_the_tiny_table(company):
     assert [line.split()[0] for line in lines[start - 3:start]] == ["stage", "baseline", "base"]
     # Only h=1 is labelled at origin 2 (h=2 targets week 4, after the last week 3).
     assert [line.split()[0] for line in lines[start + 3:-1]] == ["1"]
+    assert lines[-1] == "ok"
+
+
+# U18.4: the same tiny table with the two rhythm blocks joined and selected (all five blocks):
+# the habit column is NaN for TR04-B, and both stage-1 models still fit, predict and print.
+STAGE1_RHYTHM_FIT = STAGE1.replace('print("ok")', """
+from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings
+table = table.merge(dues, on=["key", "origin_week", "h"]).merge(
+    habits, on=["key", "origin_week", "h"])
+columns = feature_columns(block_columns, FEATURE_BLOCKS)
+assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices",
+                   "spread_in_target", "month_start_share"], columns
+train_rows = rows_known_at(table, origin)
+forecast_rows = rows_at_origin(table, origin)
+train_x = stage1_features(train_rows, columns, companies, COMPANY_AS_FEATURE)
+assert train_x["month_start_share"].isna().any()
+settings = Stage1Settings(max_iter=5, learning_rate=0.1, max_leaf_nodes=3, min_samples_leaf=1,
+                          random_seed=1, feature_blocks=FEATURE_BLOCKS,
+                          company_as_feature=COMPANY_AS_FEATURE, baseline_c=1.0)
+forecast_x = stage1_features(forecast_rows, columns, companies, COMPANY_AS_FEATURE)
+predictions = {}
+for name, fit in (("stage 1 (HGB)", fit_stage1),
+                  ("baseline (LR)", fit_stage1_baseline)):
+    model = fit(train_x, train_rows["paid"], settings)
+    predictions[name] = predict_paid(model, forecast_x)
+    assert predictions[name].notna().all() and predictions[name].between(0, 1).all()
+reports.show_stage1_scores(forecast_rows, predictions, train_rows,
+                          {"stage 1 (HGB)": 0.5, "baseline (LR)": 0.25})
+print("ok")
+""")
+
+
+@pytest.mark.parametrize("company", [True, False])
+def test_step_12_fit_predict_and_scores_with_the_rhythm_blocks_holding_nan(company):
+    code = STAGE1_RHYTHM_FIT.replace("COMPANY_AS_FEATURE", str(company)).replace("ORIGIN", "2")
+    result = run_snippet(code)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert [line for line in lines if line.startswith("        fitted in")] == [
+        "        fitted in stage 1 (HGB) 0.5 s, baseline (LR) 0.2 s; scored on 2 forecast "
+        "rows (50.0% paid)"]
     assert lines[-1] == "ok"
 
 
@@ -790,8 +836,9 @@ if SCALE == "open balance":
     # training amount, 100), so every E is lifted to 100 and s = 1.
     train_rows = train_rows.assign(open_balance=50.0)
     forecast_rows = forecast_rows.assign(open_balance=50.0)
-stage2_columns = feature_columns(prep.block_feature_columns(history, calendar, owed),
-                                        settings_stage2.feature_blocks)
+stage2_columns = feature_columns(prep.block_feature_columns(history, calendar, owed, dues,
+                                                           habits),
+                                settings_stage2.feature_blocks)
 assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
 paid_rows = train_rows[train_rows["paid"].astype(bool)]
 paid_x = stage1_features(paid_rows, stage2_columns, companies, COMPANY_AS_FEATURE)

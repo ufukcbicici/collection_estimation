@@ -335,7 +335,8 @@ assert source.index("companies, week_zero = inputs.companies, inputs.week_zero")
 assert "block_feature_columns(" not in source
 inspect.signature(script.show_stage1_rows).bind("origin", "train", "forecast", "train_x")
 inspect.signature(script.feature_columns).bind({}, ())
-inspect.signature(prep.block_feature_columns).bind("history", "calendar", "owed")
+inspect.signature(prep.block_feature_columns).bind("history", "calendar", "owed", "dues",
+                                                   "habits")
 inspect.signature(script.rows_known_at).bind("table", 40)
 inspect.signature(script.rows_at_origin).bind("table", 40)
 inspect.signature(script.stage1_features).bind("rows", [], [], True)
@@ -412,8 +413,9 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     # Steps 1-11 are one call now: the guard follows it, its printouts, the unpacking of the
     # inputs into main()'s names, the U18.1 printout of the cleared invoices' days late and
     # the top-ups (U12.2, U12.3), and nothing else. (U18.1 added its two statements, U18.2
-    # its three: the heading, expected_dues and show_expected_dues; U18.3 its three: the
-    # heading, payment_habits and show_payment_habits.)
+    # and U18.3 two each: a heading and a printout. Since U18.4 the blocks themselves are
+    # built in prepare_inputs, step 11b, so main() no longer calls expected_dues or
+    # payment_habits.)
     body = main_tree().body
     calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
              and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
@@ -423,10 +425,10 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     assert len(guards) == 1
     between = body[calls[0] + 1:guards[0]]
     assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
-    assert [ast.unparse(node) for node in between[-10:]] == [
-        U18_1_PRINT, U18_1_SHOW, U18_2_PRINT, U18_2_DUES, U18_2_SHOW, U18_3_PRINT,
-        U18_3_HABITS, U18_3_SHOW, SHOW_TOPUPS, COMPARE_TOPUPS_IF]
-    for node in between[1:-10]:
+    assert [ast.unparse(node) for node in between[-8:]] == [
+        U18_1_PRINT, U18_1_SHOW, U18_2_PRINT, U18_2_SHOW, U18_3_PRINT, U18_3_SHOW,
+        SHOW_TOPUPS, COMPARE_TOPUPS_IF]
+    for node in between[1:-8]:
         assert isinstance(node, ast.Assign), ast.unparse(node)
         values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
         for value in values:
@@ -4402,7 +4404,8 @@ def test_step_17_block_columns_are_made_once_and_used_by_both():
     assert len(made) == 1 and any(node is made[0] for node in tree.body)
     assert ast.unparse(made[0].value) == "inputs.block_columns"
     assert len(calls_to(prepare_tree(), "block_feature_columns")) == 1
-    assert "block_columns=block_feature_columns(history, calendar, owed)" in prepare_source()
+    assert ("block_columns=block_feature_columns(history, calendar, owed, dues, habits)"
+            in prepare_source())
     for name in ("rolling_forecasts", "rolling_fingerprint"):
         assert keywords_of(calls_to(branch, name)[0])["block_columns"] == "block_columns", name
 
@@ -5305,17 +5308,17 @@ def unpacking_ends():
 
 def test_main_calls_show_topups_right_after_the_inputs_are_unpacked():
     # Right after the U18.1, U18.2 and U18.3 printouts, which follow the unpacking (U18.1 moved it
-    # by two, U18.2 by three more, U18.3 by three more).
+    # by two, U18.2 by two more, U18.3 by two more; U18.4 moved the two builds out of main()).
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 9]) == SHOW_TOPUPS
+    assert ast.unparse(body[at + 7]) == SHOW_TOPUPS
     assert len(calls_to(main_tree(), "show_topups")) == 1
 
 
 def test_main_calls_compare_topups_right_after_show_topups_behind_topups_compare():
     body = main_body()
     at = unpacking_ends()
-    block = body[at + 10]
+    block = body[at + 8]
     assert ast.unparse(block) == COMPARE_TOPUPS_IF
     assert block.orelse == []
     assert len(calls_to(main_tree(), "compare_topups")) == 1
@@ -5326,7 +5329,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
     at = unpacking_ends()
     stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    for node in body[at + 9:at + 11]:
+    for node in body[at + 7:at + 9]:
         read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
                 and isinstance(n.ctx, ast.Load)} - {"settings", "show_topups",
                                                      "compare_topups"}
@@ -5336,7 +5339,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
 def test_the_top_ups_come_before_the_demo_origin_guard():
     body = main_body()
     at = unpacking_ends()
-    assert is_demo_origin_guard(body[at + 11])
+    assert is_demo_origin_guard(body[at + 9])
 
 
 def test_show_preparation_no_longer_runs_the_top_ups():
@@ -5439,29 +5442,17 @@ def test_the_script_imports_cleared_invoice_delays_from_receivables_asof():
         "collection_estimation.hurdle.reports.preparation"]
 
 
-# --- U18.2: main() builds the delay spread right after the U18.1 printout ----------------------
+# --- U18.2 / U18.3 printouts, U18.4: the blocks come from prepare_inputs (details) ---------
+# Since U18.4 the delay spread (dues) and the payment habits (habits) are built in
+# prepare_inputs (step 11b, tested in test_inputs_source.py); main() only prints them, from
+# details.dues and details.habits.
 
 U18_2_PRINT = "print('U18.2: the delay spread of the open invoices')"
-U18_2_DUES = ("dues = expected_dues(table[['key', 'company_code', 'origin_week', 'h']], ledger, "
-              "rates, levels, week_zero, details.holidays, "
-              "horizons=settings.receivables.horizons, "
-              "min_cleared=settings.receivables.min_cleared_for_delay, "
-              "delays_kept=settings.rhythm.delays_kept, "
-              "company_delays_kept=settings.rhythm.company_delays_kept, "
-              "leak_check_weeks=settings.receivables.leak_check_weeks)")
-U18_2_SHOW = ("show_expected_dues(dues, table, settings.evaluation.validation_origins, "
+U18_2_SHOW = ("show_expected_dues(details.dues, table, settings.evaluation.validation_origins, "
               "settings.receivables.horizons)")
-U18_2_KEYWORDS = {"horizons": "settings.receivables.horizons",
-                  "min_cleared": "settings.receivables.min_cleared_for_delay",
-                  "delays_kept": "settings.rhythm.delays_kept",
-                  "company_delays_kept": "settings.rhythm.company_delays_kept",
-                  "leak_check_weeks": "settings.receivables.leak_check_weeks"}
-
-
-def expected_dues_call():
-    found = calls_to(main_tree(), "expected_dues")
-    assert len(found) == 1
-    return found[0]
+U18_3_PRINT = "print('U18.3: the payment habits')"
+U18_3_SHOW = ("show_payment_habits(details.habits, table, "
+              "settings.evaluation.validation_origins)")
 
 
 def test_main_prints_the_u18_2_heading_right_after_the_u18_1_printout():
@@ -5471,258 +5462,140 @@ def test_main_prints_the_u18_2_heading_right_after_the_u18_1_printout():
     assert ast.unparse(body[at + 3]) == U18_2_PRINT
 
 
-def test_main_builds_the_expected_dues_right_after_the_u18_2_heading():
+def test_main_shows_the_expected_dues_of_the_details_right_after_the_u18_2_heading():
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 4]) == U18_2_DUES
-
-
-def test_main_shows_the_expected_dues_right_after_building_them():
-    body = main_body()
-    at = unpacking_ends()
-    assert ast.unparse(body[at + 5]) == U18_2_SHOW
-    assert ast.unparse(body[at + 6]) == U18_3_PRINT   # U18.3 follows; then the top-ups
-
-
-def test_expected_dues_gets_the_four_panel_columns_of_the_table():
-    call = expected_dues_call()
-    first = call.args[0]
-    assert isinstance(first, ast.Subscript)
-    assert ast.unparse(first.value) == "table"
-    assert ast.literal_eval(first.slice) == ["key", "company_code", "origin_week", "h"]
-
-
-def test_expected_dues_positional_arguments_in_order():
-    call = expected_dues_call()
-    assert [ast.unparse(arg) for arg in call.args] == [
-        "table[['key', 'company_code', 'origin_week', 'h']]", "ledger", "rates", "levels",
-        "week_zero", "details.holidays"]
-
-
-def test_expected_dues_keyword_arguments_come_from_the_settings():
-    call = expected_dues_call()
-    assert {kw.arg: ast.unparse(kw.value) for kw in call.keywords} == U18_2_KEYWORDS
-
-
-def test_expected_dues_call_matches_the_function_signature():
-    import inspect
-    from collection_estimation.hurdle.features_rhythm import expected_dues
-    call = expected_dues_call()
-    parameters = list(inspect.signature(expected_dues).parameters)
-    assert parameters[:len(call.args)] == ["panel_rows", "ledger", "rates", "levels",
-                                           "week_zero", "holidays"]
-    assert [kw.arg for kw in call.keywords] == parameters[len(call.args):]
-
-
-def test_the_settings_read_by_u18_2_exist_in_the_synthetic_settings():
-    from collection_estimation.hurdle.settings import load_settings
-    settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
-    if not settings_file.exists():
-        pytest.skip("settings/synthetic.toml absent")
-    settings = load_settings(settings_file, SCRIPT.parent)
-    for text in list(U18_2_KEYWORDS.values()) + ["settings.evaluation.validation_origins"]:
-        value = settings
-        for part in text.split(".")[1:]:
-            value = getattr(value, part)
-        assert value is not None, text
-
-
-def test_show_expected_dues_reads_the_dues_and_the_whole_table():
-    found = calls_to(main_tree(), "show_expected_dues")
-    assert len(found) == 1
-    assert [ast.unparse(arg) for arg in found[0].args] == [
-        "dues", "table", "settings.evaluation.validation_origins",
-        "settings.receivables.horizons"]
-    assert found[0].keywords == []
-
-
-def test_dues_is_bound_once_in_main():
-    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name) and n.id == "dues"
-              and isinstance(n.ctx, (ast.Store, ast.Del))]
-    assert len(stores) == 1
-
-
-def test_the_u18_2_calls_are_made_once_in_the_whole_script():
-    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    for name in ("expected_dues", "show_expected_dues"):
-        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                 and isinstance(node.func, ast.Name) and node.func.id == name]
-        assert len(found) == 1, name
-
-
-def test_the_u18_2_statements_read_main_names_bound_before_them():
-    body = main_body()
-    at = unpacking_ends()
-    stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
-              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    stored.add("dues")   # bound by the statement before show_expected_dues
-    for node in body[at + 4:at + 6]:
-        read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
-                and isinstance(n.ctx, ast.Load)} - {"settings", "expected_dues",
-                                                     "show_expected_dues"}
-        assert read <= stored, read - stored
-    for name in ("table", "ledger", "rates", "levels", "week_zero", "details"):
-        assert name in stored, name
-
-
-def test_the_script_imports_expected_dues_from_features_rhythm():
-    imports = script_imports()
-    assert imports["collection_estimation.hurdle.features_rhythm"] == ["expected_dues",
-                                                                        "payment_habits"]
-    assert "show_expected_dues" in imports["collection_estimation.hurdle.reports.preparation"]
-
-
-# --- U18.3: main() builds the payment habits right after the U18.2 printout ------------------
-
-U18_3_PRINT = "print('U18.3: the payment habits')"
-U18_3_HABITS = ("habits = payment_habits(table[['key', 'origin_week', 'h']], "
-                "details.collections, ledger, week_zero, details.holidays, "
-                "min(details.daily_files), "
-                "use_ledger_before_first_file=settings.history.use_ledger_before_first_file, "
-                "horizons=settings.receivables.horizons, "
-                "payment_days_kept=settings.rhythm.payment_days_kept, "
-                "min_payment_days=settings.rhythm.min_payment_days, "
-                "leak_check_weeks=settings.receivables.leak_check_weeks)")
-U18_3_SHOW = "show_payment_habits(habits, table, settings.evaluation.validation_origins)"
-U18_3_KEYWORDS = {"use_ledger_before_first_file":
-                  "settings.history.use_ledger_before_first_file",
-                  "horizons": "settings.receivables.horizons",
-                  "payment_days_kept": "settings.rhythm.payment_days_kept",
-                  "min_payment_days": "settings.rhythm.min_payment_days",
-                  "leak_check_weeks": "settings.receivables.leak_check_weeks"}
-
-
-def payment_habits_call():
-    found = calls_to(main_tree(), "payment_habits")
-    assert len(found) == 1
-    return found[0]
+    assert ast.unparse(body[at + 4]) == U18_2_SHOW
 
 
 def test_main_prints_the_u18_3_heading_right_after_the_u18_2_printout():
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 5]) == U18_2_SHOW
-    assert ast.unparse(body[at + 6]) == U18_3_PRINT
+    assert ast.unparse(body[at + 5]) == U18_3_PRINT
 
 
-def test_main_builds_the_payment_habits_right_after_the_u18_3_heading():
+def test_main_shows_the_payment_habits_of_the_details_right_after_the_heading():
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 7]) == U18_3_HABITS
+    assert ast.unparse(body[at + 6]) == U18_3_SHOW
+    assert ast.unparse(body[at + 7]) == SHOW_TOPUPS
 
 
-def test_main_shows_the_payment_habits_right_after_building_them_and_before_the_top_ups():
-    body = main_body()
-    at = unpacking_ends()
-    assert ast.unparse(body[at + 8]) == U18_3_SHOW
-    assert ast.unparse(body[at + 9]) == SHOW_TOPUPS
-
-
-def test_the_u18_3_block_comes_after_u18_2_and_before_show_topups_in_the_source():
+def test_the_u18_printouts_come_in_order_before_show_topups_in_the_source():
     source = SCRIPT.read_text(encoding="utf-8")
-    assert (source.index("show_expected_dues(dues, table,")
-            < source.index("print(\"U18.3: the payment habits\")")
-            < source.index("habits = payment_habits(")
-            < source.index("show_payment_habits(habits, table,")
+    assert (source.index('print("U18.1: days late of every cleared invoice")')
+            < source.index('print("U18.2: the delay spread of the open invoices")')
+            < source.index("show_expected_dues(details.dues, table,")
+            < source.index('print("U18.3: the payment habits")')
+            < source.index("show_payment_habits(details.habits, table,")
             < source.index("show_topups(new_cash, refunds,"))
 
 
-def test_payment_habits_gets_the_three_panel_columns_of_the_table():
-    first = payment_habits_call().args[0]
-    assert isinstance(first, ast.Subscript)
-    assert ast.unparse(first.value) == "table"
-    assert ast.literal_eval(first.slice) == ["key", "origin_week", "h"]
+@pytest.mark.parametrize("name", ["expected_dues", "payment_habits"])
+def test_main_no_longer_builds_the_rhythm_blocks(name):
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == name]
+    assert found == [], name
+    assert name not in SCRIPT.read_text(encoding="utf-8").replace(f"show_{name}", "")
 
 
-def test_payment_habits_positional_arguments_in_order():
-    assert [ast.unparse(arg) for arg in payment_habits_call().args] == [
-        "table[['key', 'origin_week', 'h']]", "details.collections", "ledger", "week_zero",
-        "details.holidays", "min(details.daily_files)"]
+@pytest.mark.parametrize("name", ["dues", "habits"])
+def test_main_binds_no_dues_or_habits_name_of_its_own(name):
+    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name) and n.id == name]
+    assert stores == [], name
 
 
-def test_payment_habits_keyword_arguments_come_from_the_settings():
-    call = payment_habits_call()
-    assert {kw.arg: ast.unparse(kw.value) for kw in call.keywords} == U18_3_KEYWORDS
-    assert [kw.arg for kw in call.keywords] == list(U18_3_KEYWORDS)
+def test_the_script_no_longer_imports_features_rhythm():
+    imports = script_imports()
+    assert "collection_estimation.hurdle.features_rhythm" not in imports
+    assert not [module for module in imports if module.endswith("features_rhythm")]
 
 
-def test_payment_habits_call_matches_the_function_signature():
-    import inspect
-    from collection_estimation.hurdle.features_rhythm import payment_habits
-    call = payment_habits_call()
-    parameters = list(inspect.signature(payment_habits).parameters)
-    assert parameters[:len(call.args)] == ["panel_rows", "collections", "ledger", "week_zero",
-                                           "holidays", "first_file_day"]
-    assert [kw.arg for kw in call.keywords] == parameters[len(call.args):]
+def test_the_script_imports_both_printouts_from_the_preparation_reports():
+    names = script_imports()["collection_estimation.hurdle.reports.preparation"]
+    assert "show_expected_dues" in names and "show_payment_habits" in names
 
 
-def test_the_settings_read_by_u18_3_exist_in_the_synthetic_settings():
-    from collection_estimation.hurdle.settings import load_settings
-    settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
-    if not settings_file.exists():
-        pytest.skip("settings/synthetic.toml absent")
-    settings = load_settings(settings_file, SCRIPT.parent)
-    for text in list(U18_3_KEYWORDS.values()) + ["settings.evaluation.validation_origins"]:
-        value = settings
-        for part in text.split(".")[1:]:
-            value = getattr(value, part)
-        assert value is not None, text
-
-
-def test_the_details_read_by_u18_3_are_fields_of_the_preparation_details():
-    import dataclasses
-    from collection_estimation.hurdle.inputs import PreparationDetails
-    fields = {field.name for field in dataclasses.fields(PreparationDetails)}
-    assert {"collections", "holidays", "daily_files"} <= fields
-
-
-def test_show_payment_habits_reads_the_habits_and_the_whole_table():
-    found = calls_to(main_tree(), "show_payment_habits")
+def test_show_expected_dues_reads_details_dues_and_the_whole_table():
+    found = calls_to(main_tree(), "show_expected_dues")
     assert len(found) == 1
     assert [ast.unparse(arg) for arg in found[0].args] == [
-        "habits", "table", "settings.evaluation.validation_origins"]
+        "details.dues", "table", "settings.evaluation.validation_origins",
+        "settings.receivables.horizons"]
     assert found[0].keywords == []
 
 
-def test_habits_is_bound_once_in_main():
-    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name) and n.id == "habits"
-              and isinstance(n.ctx, (ast.Store, ast.Del))]
-    assert len(stores) == 1
+def test_show_payment_habits_reads_details_habits_and_the_whole_table():
+    found = calls_to(main_tree(), "show_payment_habits")
+    assert len(found) == 1
+    assert [ast.unparse(arg) for arg in found[0].args] == [
+        "details.habits", "table", "settings.evaluation.validation_origins"]
+    assert found[0].keywords == []
 
 
-def test_the_u18_3_calls_are_made_once_in_the_whole_script():
+def test_the_u18_printouts_are_called_once_in_the_whole_script():
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    for name in ("payment_habits", "show_payment_habits"):
+    for name in ("show_expected_dues", "show_payment_habits"):
         found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == name]
         assert len(found) == 1, name
 
 
-def test_the_u18_3_statements_read_main_names_bound_before_them():
+def test_the_printouts_match_their_signatures():
+    import inspect
+
+    from collection_estimation.hurdle.reports.preparation import (
+        show_expected_dues,
+        show_payment_habits,
+    )
+    for name, function in (("show_expected_dues", show_expected_dues),
+                           ("show_payment_habits", show_payment_habits)):
+        call = calls_to(main_tree(), name)[0]
+        inspect.signature(function).bind(*[ast.unparse(a) for a in call.args])
+
+
+def test_the_details_read_by_the_printouts_are_fields_of_the_preparation_details():
+    import dataclasses
+
+    from collection_estimation.hurdle.inputs import PreparationDetails
+    fields = [field.name for field in dataclasses.fields(PreparationDetails)]
+    assert "dues" in fields and "habits" in fields
+
+
+def test_the_u18_printouts_read_main_names_bound_before_them():
     body = main_body()
     at = unpacking_ends()
     stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    stored.add("habits")   # bound by the statement before show_payment_habits
-    for node in body[at + 7:at + 9]:
+    for node in body[at + 4:at + 7:2]:
         read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
-                and isinstance(n.ctx, ast.Load)} - {"settings", "payment_habits",
-                                                     "show_payment_habits", "min"}
+                and isinstance(n.ctx, ast.Load)} - {"settings", "show_expected_dues",
+                                                     "show_payment_habits"}
         assert read <= stored, read - stored
-    for name in ("table", "ledger", "week_zero", "details"):
-        assert name in stored, name
+    assert {"table", "details"} <= stored
 
 
-def test_the_script_imports_payment_habits_and_its_printout():
-    imports = script_imports()
-    assert "payment_habits" in imports["collection_estimation.hurdle.features_rhythm"]
-    assert "show_payment_habits" in imports["collection_estimation.hurdle.reports.preparation"]
+def test_the_settings_read_by_the_u18_printouts_exist_in_the_synthetic_settings():
+    from collection_estimation.hurdle.settings import load_settings
+    settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
+    if not settings_file.exists():
+        pytest.skip("settings/synthetic.toml absent")
+    settings = load_settings(settings_file, SCRIPT.parent)
+    assert settings.evaluation.validation_origins is not None
+    assert settings.receivables.horizons is not None
+    # The [rhythm] settings prepare_inputs reads for the two blocks.
+    for name in ("delays_kept", "company_delays_kept", "payment_days_kept",
+                 "min_payment_days"):
+        assert getattr(settings.rhythm, name) is not None, name
 
 
-def test_payment_habits_gets_the_history_ledger_switch_first_among_the_keywords():
-    # The same [history] switch as the history features, so both blocks agree.
-    call = payment_habits_call()
-    first = call.keywords[0]
-    assert first.arg == "use_ledger_before_first_file"
-    assert ast.unparse(first.value) == "settings.history.use_ledger_before_first_file"
-    assert ast.unparse(call.args[-1]) == "min(details.daily_files)"
+def test_the_synthetic_stages_keep_the_three_base_blocks():
+    # U18.4 makes "dues" and "habits" selectable; settings/synthetic.toml does not select them.
+    from collection_estimation.hurdle.settings import load_settings
+    settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
+    if not settings_file.exists():
+        pytest.skip("settings/synthetic.toml absent")
+    settings = load_settings(settings_file, SCRIPT.parent)
+    for stage in (settings.stage1, settings.stage2):
+        assert "dues" not in stage.feature_blocks and "habits" not in stage.feature_blocks

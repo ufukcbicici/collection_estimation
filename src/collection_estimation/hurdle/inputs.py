@@ -8,7 +8,8 @@ in one place only.
 
 Every check that stops a run stays in it and fails where it did: the ledger's tie to the
 daily files (step 5), the weekly table's tie to the payment lines (step 7), the receivables'
-leak check (step 8) and the side tables' tie-out, panel + A + G = gross receipts (step 9).
+leak check (step 8), the side tables' tie-out, panel + A + G = gross receipts (step 9), and
+the rhythm features' leak checks (step 11b).
 
 It prints nothing of its own. With `with_details=True` it also returns the tables made on
 the way (`PreparationDetails`), so the pipeline can print each step as before; without, they
@@ -28,6 +29,7 @@ from .features_history import (
     weekly_matrix,
 )
 from .features_receivables import receivables_features
+from .features_rhythm import expected_dues, payment_habits
 from .fill_from_ledger import fill_missing_days
 from .holidays import HolidayTable, load_holidays
 from .keys import add_keys
@@ -89,6 +91,8 @@ class PreparationDetails:
     history: pd.DataFrame               # step 11: the history features
     positions: pd.DataFrame             # step 11: the holiday positions alone
     owed: pd.DataFrame                  # step 11: the receivables features
+    dues: pd.DataFrame                  # step 11b: the delay-spread features (U18.2)
+    habits: pd.DataFrame                # step 11b: the payment-habit features (U18.3)
 
 
 def prepare_inputs(settings, *, with_details: bool = False
@@ -188,15 +192,37 @@ def prepare_inputs(settings, *, with_details: bool = False
     calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")
     owed = receivables_features(panel, receivables, levels, horizons,
                                 settings.receivables.overdue_age_days)
+
+    # Step 11b: the rhythm features, from [rhythm], as known at t. The delay spread (block
+    # "dues"): each open invoice spread over the weeks after t by the customer's past delays.
+    # The payment habits (block "habits"): when in the month and week the customer pays, and
+    # how regularly, from its past payment days. Each rebuilds its [receivables]
+    # leak_check_weeks from what was known then.
+    dues = expected_dues(panel[["key", "company_code", "origin_week", "h"]], ledger, rates,
+                         levels, week_zero, holidays, horizons=horizons,
+                         min_cleared=settings.receivables.min_cleared_for_delay,
+                         delays_kept=settings.rhythm.delays_kept,
+                         company_delays_kept=settings.rhythm.company_delays_kept,
+                         leak_check_weeks=settings.receivables.leak_check_weeks)
+    habits = payment_habits(panel[["key", "origin_week", "h"]], collections, ledger, week_zero,
+                            holidays, min(daily_files),
+                            use_ledger_before_first_file=(
+                                settings.history.use_ledger_before_first_file),
+                            horizons=horizons,
+                            payment_days_kept=settings.rhythm.payment_days_kept,
+                            min_payment_days=settings.rhythm.min_payment_days,
+                            leak_check_weeks=settings.receivables.leak_check_weeks)
+
     # The label in TRY of week 0, like the features; then one row per panel row with every
     # feature block.
     panel = add_deflated_label(panel, levels)
-    table = join_features(panel, history, calendar, owed)
+    table = join_features(panel, history, calendar, owed, dues, habits)
 
     inputs = ModelInputs(
         companies=companies, week_zero=week_zero, last_week=last_week, weeks=weeks,
         weekly=weekly, ledger=ledger, rates=rates, levels=levels, calendar=calendar,
-        table=table, block_columns=block_feature_columns(history, calendar, owed),
+        table=table,
+        block_columns=block_feature_columns(history, calendar, owed, dues, habits),
         new_cash=new_cash, refunds=refunds, unidentified=unidentified)
     if not with_details:
         return inputs, None
@@ -206,5 +232,5 @@ def prepare_inputs(settings, *, with_details: bool = False
         receivables=receivables, known=known_all, identified_weekly=identified_weekly,
         panel=panel, checked=checked, first_price_week=first_price_week,
         history_start=history_start, early_receipts=early_receipts, matrix=matrix,
-        history=history, positions=positions, owed=owed)
+        history=history, positions=positions, owed=owed, dues=dues, habits=habits)
     return inputs, details

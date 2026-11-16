@@ -7,7 +7,13 @@ test_ledger_starting_late.py.
 """
 import ast
 
-from tests.hurdle.code_checks import HURDLE, calls_to, function_source, function_tree
+from tests.hurdle.code_checks import (
+    HURDLE,
+    calls_to,
+    function_source,
+    function_tree,
+    keywords_of,
+)
 
 INPUTS_MODULE = HURDLE / "inputs.py"
 
@@ -21,7 +27,7 @@ STEPS_1_TO_11 = ("list_daily_files", "load_collections", "add_keys", "load_ledge
                  "published_levels", "ledger_receipts_before", "first_history_week",
                  "weekly_matrix", "history_features", "calendar_features",
                  "holiday_position_features", "receivables_features", "add_deflated_label",
-                 "join_features", "block_feature_columns")
+                 "expected_dues", "payment_habits", "join_features", "block_feature_columns")
 
 
 def prepare_tree():
@@ -156,3 +162,118 @@ def test_step_11_early_receipts_are_cut_at_the_history_start_and_the_matrix_star
             < source.index("matrix = weekly_matrix("))
     # The price levels the matrix divides by are built (step 10) before the matrix (step 11).
     assert source.index("levels = published_levels(") < source.index("matrix = weekly_matrix(")
+
+
+# --- step 11b (U18.4): the rhythm blocks, dues and habits ----------------------------------
+# Built from the panel with the [rhythm] / [receivables] / [history] settings, after the
+# receivables features and before the join, and passed to join_features and
+# block_feature_columns as their last two arguments.
+
+def only_call(name):
+    calls = calls_to(prepare_tree(), name)
+    assert len(calls) == 1, (name, len(calls))
+    return calls[0]
+
+
+def test_step_11b_inputs_module_imports_both_from_features_rhythm():
+    module = ast.parse(INPUTS_MODULE.read_text(encoding="utf-8"))
+    found = [node for node in module.body if isinstance(node, ast.ImportFrom)
+             and node.module == "features_rhythm" and node.level == 1]
+    assert len(found) == 1
+    assert sorted(alias.name for alias in found[0].names) == ["expected_dues", "payment_habits"]
+
+
+def test_step_11b_expected_dues_positional_arguments():
+    call = only_call("expected_dues")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "panel[['key', 'company_code', 'origin_week', 'h']]", "ledger", "rates", "levels",
+        "week_zero", "holidays"]
+
+
+def test_step_11b_expected_dues_keywords_come_from_the_settings():
+    assert keywords_of(only_call("expected_dues")) == {
+        "horizons": "horizons",
+        "min_cleared": "settings.receivables.min_cleared_for_delay",
+        "delays_kept": "settings.rhythm.delays_kept",
+        "company_delays_kept": "settings.rhythm.company_delays_kept",
+        "leak_check_weeks": "settings.receivables.leak_check_weeks",
+    }
+
+
+def test_step_11b_payment_habits_positional_arguments():
+    call = only_call("payment_habits")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "panel[['key', 'origin_week', 'h']]", "collections", "ledger", "week_zero",
+        "holidays", "min(daily_files)"]
+
+
+def test_step_11b_payment_habits_keywords_come_from_the_settings():
+    assert keywords_of(only_call("payment_habits")) == {
+        "use_ledger_before_first_file": "settings.history.use_ledger_before_first_file",
+        "horizons": "horizons",
+        "payment_days_kept": "settings.rhythm.payment_days_kept",
+        "min_payment_days": "settings.rhythm.min_payment_days",
+        "leak_check_weeks": "settings.receivables.leak_check_weeks",
+    }
+
+
+def test_step_11b_calls_match_the_function_signatures():
+    import inspect
+
+    from collection_estimation.hurdle.features_rhythm import expected_dues, payment_habits
+    for name, function in (("expected_dues", expected_dues),
+                           ("payment_habits", payment_habits)):
+        call = only_call(name)
+        inspect.signature(function).bind(*[ast.unparse(a) for a in call.args],
+                                         **keywords_of(call))
+
+
+def test_step_11b_results_are_bound_to_dues_and_habits_once():
+    for name, function in (("dues", "expected_dues"), ("habits", "payment_habits")):
+        found = assignments_to(prepare_tree(), name)
+        assert len(found) == 1, name
+        value = found[0].value
+        assert isinstance(value, ast.Call) and ast.unparse(value.func) == function, name
+
+
+def test_step_11b_is_built_after_the_receivables_and_before_the_join():
+    source = prepare_source()
+    order = [source.index("owed = receivables_features("),
+             source.index("dues = expected_dues("),
+             source.index("habits = payment_habits("),
+             source.index("panel = add_deflated_label(panel, levels)"),
+             source.index("table = join_features(")]
+    assert order == sorted(order), order
+    # Both use the panel before its deflated label is added (the panel's key columns only),
+    # and the collections after the fill and the week index.
+    assert source.index("collections = add_week_index(") < source.index(
+        "habits = payment_habits(")
+
+
+def test_step_11b_join_features_gets_the_two_blocks_last():
+    call = only_call("join_features")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "panel", "history", "calendar", "owed", "dues", "habits"]
+    assert call.keywords == []
+
+
+def test_step_11b_block_feature_columns_gets_the_two_blocks_last():
+    call = only_call("block_feature_columns")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "history", "calendar", "owed", "dues", "habits"]
+    assert call.keywords == []
+
+
+def test_step_11b_details_keep_the_two_blocks():
+    found = [node for node in calls_to(prepare_tree(), "PreparationDetails")]
+    assert len(found) == 1
+    keywords = keywords_of(found[0])
+    assert keywords["dues"] == "dues"
+    assert keywords["habits"] == "habits"
+
+
+def test_step_11b_model_inputs_block_columns_come_from_block_feature_columns():
+    found = calls_to(prepare_tree(), "ModelInputs")
+    assert len(found) == 1
+    assert keywords_of(found[0])["block_columns"] == (
+        "block_feature_columns(history, calendar, owed, dues, habits)")

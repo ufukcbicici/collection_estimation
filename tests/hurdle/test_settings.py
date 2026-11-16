@@ -2447,8 +2447,56 @@ def test_seed_setting_does_not_change_week_setting_wording():
 # --- [stage1] feature_blocks (feature_blocks_setting) ---------------------------------------
 
 def test_feature_blocks_constant():
-    assert FEATURE_BLOCKS == ("history", "calendar", "receivables")
+    # U18.4: the two rhythm blocks, "dues" (U18.2) and "habits" (U18.3), come after the three
+    # base blocks.
+    assert FEATURE_BLOCKS == ("history", "calendar", "receivables", "dues", "habits")
     assert type(FEATURE_BLOCKS) is tuple
+
+
+BASE_BLOCKS = ("history", "calendar", "receivables")
+
+
+@pytest.mark.parametrize("rhythm", [(), ("dues",), ("habits",), ("dues", "habits")],
+                         ids=["base", "base+dues", "base+habits", "base+dues+habits"])
+@pytest.mark.parametrize("stage", ["stage1", "stage2"])
+def test_feature_blocks_take_the_base_blocks_with_any_rhythm_subset(tmp_path, repo, stage,
+                                                                    rhythm):
+    # The rhythm blocks listed first and in reverse: the result is still FEATURE_BLOCKS order.
+    listed = list(reversed(rhythm)) + list(reversed(BASE_BLOCKS))
+    text = "[" + ", ".join(f'"{block}"' for block in listed) + "]"
+    value = getattr(load(tmp_path, repo, changes={(stage, "feature_blocks"): text}),
+                    stage).feature_blocks
+    assert value == BASE_BLOCKS + rhythm
+    assert type(value) is tuple
+
+
+@pytest.mark.parametrize("good, expected", [
+    ('["habits", "dues"]', ("dues", "habits")),
+    ('["habits"]', ("habits",)),
+    ('["dues"]', ("dues",)),
+    ('["habits", "history"]', ("history", "habits")),
+    ('["dues", "calendar"]', ("calendar", "dues")),
+    ('["habits", "receivables", "dues", "history", "calendar"]',
+     ("history", "calendar", "receivables", "dues", "habits")),
+], ids=["rhythm-only-reversed", "habits-only", "dues-only", "habits-history",
+        "dues-calendar", "all-five-shuffled"])
+def test_feature_blocks_rhythm_blocks_alone_or_mixed(tmp_path, repo, good, expected):
+    value = load(tmp_path, repo,
+                 changes={("stage1", "feature_blocks"): good}).stage1.feature_blocks
+    assert value == expected
+
+
+def test_feature_blocks_setting_direct_calls_with_the_rhythm_blocks():
+    assert feature_blocks_setting({"b": ["habits", "receivables", "dues"]}, "b", "here") == (
+        "receivables", "dues", "habits")
+    with pytest.raises(ValueError) as error:
+        feature_blocks_setting({"b": ["dues", "habits", "dues"]}, "b", "here")
+    assert str(error.value) == ("here: b lists a feature block more than once: "
+                                "['dues', 'habits', 'dues']")
+    with pytest.raises(ValueError) as error:
+        feature_blocks_setting({"b": ["Dues", "habit"]}, "b", "here")
+    assert str(error.value) == ("here: b holds ['Dues', 'habit']; the feature blocks are "
+                                "['history', 'calendar', 'receivables', 'dues', 'habits']")
 
 
 @pytest.mark.parametrize("good, expected", [
@@ -2492,7 +2540,7 @@ def test_feature_blocks_not_a_non_empty_list_has_the_exact_message(tmp_path, rep
 def test_feature_blocks_with_an_unknown_block_has_the_exact_message(tmp_path, repo, bad, shown):
     message = exact_message(tmp_path, repo, {("stage1", "feature_blocks"): bad})
     assert message == (f"{STAGE1}: feature_blocks holds {shown}; the feature blocks are "
-                       f"['history', 'calendar', 'receivables']")
+                       f"['history', 'calendar', 'receivables', 'dues', 'habits']")
 
 
 @pytest.mark.parametrize("bad, shown", [
@@ -3058,8 +3106,11 @@ def test_grid_setting_with_the_key_absent_raises_key_error():
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_diagnostic_settings():
+    # `run` is left out on purpose: it is the owner's switch to flip locally. It is set to
+    # True on both sides before the comparison, so every other value stays pinned.
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
-    assert settings.diagnostic == DiagnosticSettings(
+    assert type(settings.diagnostic.run) is bool
+    assert dataclasses.replace(settings.diagnostic, run=True) == DiagnosticSettings(
         run=True, origin=40, hgb_max_iter=(100, 300, 600, 900),
         hgb_learning_rate=(0.01, 0.05, 0.1, 0.15, 0.2, 0.5), hgb_max_leaf_nodes=(15, 31, 63),
         lr_c=(0.01, 0.1, 1.0, 10.0), class_weights=("none",),
@@ -3702,7 +3753,7 @@ def test_stage2_feature_blocks_empty_has_the_exact_message(tmp_path, repo):
 def test_stage2_feature_blocks_unknown_has_the_exact_message(tmp_path, repo):
     message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): '["weather"]'})
     assert message == (f"{STAGE2}: feature_blocks holds ['weather']; the feature blocks are "
-                       f"['history', 'calendar', 'receivables']")
+                       f"['history', 'calendar', 'receivables', 'dues', 'habits']")
 
 
 def test_stage2_feature_blocks_twice_has_the_exact_message(tmp_path, repo):
@@ -4435,9 +4486,9 @@ def test_read_joint_diagnostic_does_not_change_its_table(tmp_path):
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_joint_diagnostic_settings():
     # The grids are left out on purpose: they are the owner's to widen or narrow while tuning
-    # (U11.5b). Everything else is pinned, including the four gate settings.
+    # (U11.5b). So is `run`: it is the owner's switch to flip locally. Everything else is
+    # pinned, including the four gate settings.
     joint = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).joint_diagnostic
-    assert joint.run is True
     assert (joint.stage1_log_loss_tolerance, joint.stage1_slope_band) == (0.10, (0.8, 1.25))
     assert (joint.stage2_skill_tolerance, joint.stage2_ratio_band) == (0.05, (0.9, 1.1))
     assert joint.selection_metric == "wape"

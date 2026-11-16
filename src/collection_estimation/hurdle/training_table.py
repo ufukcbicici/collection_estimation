@@ -1,7 +1,8 @@
 """The training table: the panel's rows with their labels and every feature block.
 
 Each block comes at its own level: history per (key, origin week), the calendar per week,
-the receivables per panel row (key, origin week, h). Here they are joined onto the panel,
+the receivables, the delay spread (dues) and the payment habits per panel row (key, origin
+week, h). Here they are joined onto the panel,
 one row per panel row, in the panel's order. Choosing which rows to train on and which
 columns go into the model happens later.
 """
@@ -9,20 +10,24 @@ import pandas as pd
 
 
 def join_features(panel: pd.DataFrame, history: pd.DataFrame, calendar: pd.DataFrame,
-                  owed: pd.DataFrame) -> pd.DataFrame:
+                  owed: pd.DataFrame, dues: pd.DataFrame, habits: pd.DataFrame) -> pd.DataFrame:
     """The panel (from `add_deflated_label`) with the history features (`history_features`)
     joined on key and origin week, the calendar features (`calendar_features`) on the target
-    week, and the receivables features (`receivables_features`) on key, origin week and h.
+    week, and the receivables (`receivables_features`), delay-spread (`expected_dues`) and
+    payment-habit (`payment_habits`) features on key, origin week and h.
 
     One row per panel row, in the panel's order, with a fresh index. Raises ValueError if a
     feature column has the same name as another column, if a block repeats a join key (a
     panel row would be repeated), or if a panel row finds no row in a block (a missing
-    feature must not become a silent NaN).
+    feature must not become a silent NaN). A NaN inside a block's row is kept: e.g. no habit
+    below [rhythm] min_payment_days.
     """
     blocks = [
         ("history", history, ["key", "origin_week"]),
         ("calendar", calendar.rename(columns={"week": "target_week"}), ["target_week"]),
         ("receivables", owed, ["key", "origin_week", "h"]),
+        ("dues", dues, ["key", "origin_week", "h"]),
+        ("habits", habits, ["key", "origin_week", "h"]),
     ]
     check_no_shared_columns(panel, blocks)
 
@@ -60,8 +65,8 @@ def check_no_shared_columns(panel: pd.DataFrame, blocks: list) -> None:
             seen[column] = f"the {name} features"
 
 
-def block_feature_columns(history: pd.DataFrame, calendar: pd.DataFrame,
-                          owed: pd.DataFrame) -> dict[str, list[str]]:
+def block_feature_columns(history: pd.DataFrame, calendar: pd.DataFrame, owed: pd.DataFrame,
+                          dues: pd.DataFrame, habits: pd.DataFrame) -> dict[str, list[str]]:
     """{block name: its feature columns}: every column of each block but its join keys."""
     return {
         "history": [column for column in history.columns
@@ -69,6 +74,10 @@ def block_feature_columns(history: pd.DataFrame, calendar: pd.DataFrame,
         "calendar": [column for column in calendar.columns if column != "week"],
         "receivables": [column for column in owed.columns
                         if column not in ("key", "origin_week", "h")],
+        "dues": [column for column in dues.columns
+                 if column not in ("key", "origin_week", "h")],
+        "habits": [column for column in habits.columns
+                   if column not in ("key", "origin_week", "h")],
     }
 
 

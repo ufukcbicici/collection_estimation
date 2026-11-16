@@ -70,10 +70,6 @@ from collection_estimation.hurdle.calibrate import (  # noqa: E402
 )
 from collection_estimation.hurdle.cache import load_with_cache  # noqa: E402
 from collection_estimation.hurdle.inputs import prepare_inputs  # noqa: E402
-from collection_estimation.hurdle.features_rhythm import (  # noqa: E402
-    expected_dues,
-    payment_habits,
-)
 from collection_estimation.hurdle.receivables_asof import cleared_invoice_delays  # noqa: E402
 from collection_estimation.hurdle.reports.preparation import (  # noqa: E402
     show_cleared_invoice_delays,
@@ -195,33 +191,19 @@ def main():
     print("U18.1: days late of every cleared invoice")
     show_cleared_invoice_delays(cleared_invoice_delays(ledger))
 
-    # U18.2: each open invoice spread over the weeks after t by the customer's past delays,
-    # for every panel row; with a preview on the validation origins of how well it times the
-    # known customers' cash, beside the plain due dates and the single shifted date.
+    # U18.2: each open invoice spread over the weeks after t by the customer's past delays
+    # (block "dues", built in step 11b); with a preview on the validation origins of how well
+    # it times the known customers' cash, beside the plain due dates and the single shifted
+    # date.
     print("U18.2: the delay spread of the open invoices")
-    dues = expected_dues(table[["key", "company_code", "origin_week", "h"]], ledger, rates,
-                         levels, week_zero, details.holidays,
-                         horizons=settings.receivables.horizons,
-                         min_cleared=settings.receivables.min_cleared_for_delay,
-                         delays_kept=settings.rhythm.delays_kept,
-                         company_delays_kept=settings.rhythm.company_delays_kept,
-                         leak_check_weeks=settings.receivables.leak_check_weeks)
-    show_expected_dues(dues, table, settings.evaluation.validation_origins,
+    show_expected_dues(details.dues, table, settings.evaluation.validation_origins,
                        settings.receivables.horizons)
 
-    # U18.3: each customer's payment habits (when in the month it pays, how regularly, and how
-    # much of that falls in the target week), from its past payment days as known at t; with
-    # a preview of the paid rate by how much of the habit falls in the target week.
+    # U18.3: each customer's payment habits (block "habits", built in step 11b): when in the
+    # month it pays, how regularly, and how much of that falls in the target week; with a
+    # preview of the paid rate by how much of the habit falls in the target week.
     print("U18.3: the payment habits")
-    habits = payment_habits(table[["key", "origin_week", "h"]], details.collections, ledger,
-                            week_zero, details.holidays, min(details.daily_files),
-                            use_ledger_before_first_file=(
-                                settings.history.use_ledger_before_first_file),
-                            horizons=settings.receivables.horizons,
-                            payment_days_kept=settings.rhythm.payment_days_kept,
-                            min_payment_days=settings.rhythm.min_payment_days,
-                            leak_check_weeks=settings.receivables.leak_check_weeks)
-    show_payment_habits(habits, table, settings.evaluation.validation_origins)
+    show_payment_habits(details.habits, table, settings.evaluation.validation_origins)
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
     # trailing mean ([topups] window) and by the ridge (with and without the recent level),

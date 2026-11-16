@@ -26,7 +26,7 @@ from collection_estimation.hurdle.forecast import (
     forecast_totals, stage1_predictions, stage2_predictions)
 from collection_estimation.hurdle.prices import projected_levels
 from collection_estimation.hurdle.topups import TOPUP_COLUMNS
-from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings, Stage2Settings
+from collection_estimation.hurdle.settings import Stage1Settings, Stage2Settings
 from collection_estimation.hurdle.stage1 import (
     feature_columns, fit_stage1, predict_paid, stage1_features)
 from collection_estimation.hurdle.stage2 import exposure, fit_stage2, predict_amount
@@ -41,18 +41,21 @@ BLOCK_COLUMNS = {
     "calendar": ["business_days"],
     "receivables": ["open_balance", "due_in_target_week"],
 }
+# Every block of this file's tables: the three base blocks. (Since U18.4 FEATURE_BLOCKS also
+# names the rhythm blocks "dues" and "habits", which these tables do not have.)
+TABLE_BLOCKS = tuple(BLOCK_COLUMNS)
 ORIGIN = 20          # the default origin of the tests
 LAST_LABELLED = 23   # target weeks after this are "future" (not yet known when built)
 HORIZONS = 5
 
 
-def stage1_settings(blocks=FEATURE_BLOCKS, company_as_feature=True, max_iter=10, seed=3):
+def stage1_settings(blocks=TABLE_BLOCKS, company_as_feature=True, max_iter=10, seed=3):
     return Stage1Settings(max_iter=max_iter, learning_rate=0.1, max_leaf_nodes=7,
                           min_samples_leaf=5, random_seed=seed, feature_blocks=blocks,
                           company_as_feature=company_as_feature, baseline_c=1.0)
 
 
-def stage2_settings(blocks=FEATURE_BLOCKS, loss="poisson", scale="none",
+def stage2_settings(blocks=TABLE_BLOCKS, loss="poisson", scale="none",
                     balance_floor="median", max_iter=10, seed=3):
     return Stage2Settings(loss=loss, max_iter=max_iter, learning_rate=0.1, max_leaf_nodes=7,
                           min_samples_leaf=5, random_seed=seed, feature_blocks=blocks,
@@ -351,7 +354,7 @@ def test_stage2_company_follows_the_stage1_setting(table, monkeypatch):
 
 def test_stage2_with_a_block_stage1_lacks_runs_and_differs(table, result):
     settings = make_settings(stage1_settings(blocks=("history",)),
-                             stage2_settings(blocks=FEATURE_BLOCKS))
+                             stage2_settings(blocks=TABLE_BLOCKS))
     got = run(table, ORIGIN, settings)
     p, m, model1, model2 = by_hand(table, ORIGIN, settings)
     assert list(model1.feature_names_in_) == ["h", "mean_receipts_4", "paying_weeks_4",
@@ -382,7 +385,7 @@ def test_open_balance_scale_m_is_s_times_the_exposure(table):
     _, _, _, model2 = by_hand(table, ORIGIN, settings)
     at = rows_at_origin(table, ORIGIN)
     train = rows_known_at(table, ORIGIN)
-    x2 = stage1_features(at, feature_columns(BLOCK_COLUMNS, FEATURE_BLOCKS), COMPANIES, True)
+    x2 = stage1_features(at, feature_columns(BLOCK_COLUMNS, TABLE_BLOCKS), COMPANIES, True)
     e = exposure(train, at, settings.stage2)
     assert (e != 1.0).any()
     np.testing.assert_array_equal(got["m"].to_numpy(), model2.predict(x2) * e.to_numpy())
@@ -2584,7 +2587,7 @@ def test_stage2_alone_m_is_s_times_the_forecast_rows_exposure(table):
     s2 = stage2_settings(scale="open balance")
     m = stage2_predictions(train, at, s2, BLOCK_COLUMNS, COMPANIES, True)
     _, _, _, model2 = by_hand(table, ORIGIN, make_settings(stage2=s2))
-    x2 = stage1_features(at, feature_columns(BLOCK_COLUMNS, FEATURE_BLOCKS), COMPANIES, True)
+    x2 = stage1_features(at, feature_columns(BLOCK_COLUMNS, TABLE_BLOCKS), COMPANIES, True)
     e = exposure(train, at, s2)
     assert (e != 1.0).any()
     np.testing.assert_array_equal(m.to_numpy(), model2.predict(x2) * e.to_numpy())

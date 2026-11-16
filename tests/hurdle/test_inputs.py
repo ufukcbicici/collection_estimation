@@ -31,6 +31,12 @@ from collection_estimation.hurdle.features_history import (
     weekly_matrix,
 )
 from collection_estimation.hurdle.features_receivables import receivables_features
+from collection_estimation.hurdle.features_rhythm import (
+    EXPECTED_DUE_COLUMNS,
+    HABIT_COLUMNS,
+    expected_dues,
+    payment_habits,
+)
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days
 from collection_estimation.hurdle.holidays import load_holidays
 from collection_estimation.hurdle.inputs import ModelInputs, PreparationDetails, prepare_inputs
@@ -56,6 +62,7 @@ from collection_estimation.hurdle.settings import (
     DataSettings,
     HistorySettings,
     ReceivablesSettings,
+    RhythmSettings,
 )
 from collection_estimation.hurdle.side_tables import (
     check_side_tables,
@@ -93,7 +100,10 @@ MODEL_FIELDS = ["companies", "week_zero", "last_week", "weeks", "weekly", "ledge
 DETAIL_FIELDS = ["daily_files", "collections_keyed", "tie", "filled_days", "collections",
                  "holidays", "receivables", "known", "identified_weekly", "panel", "checked",
                  "first_price_week", "history_start", "early_receipts", "matrix", "history",
-                 "positions", "owed"]
+                 "positions", "owed", "dues", "habits"]
+RHYTHM = dict(delays_kept=5, company_delays_kept=20, payment_days_kept=10, min_payment_days=3)
+BASE_BLOCKS = ("history", "calendar", "receivables")
+JOIN_KEYS = ["key", "origin_week", "h"]
 
 
 def business_days():
@@ -177,7 +187,7 @@ def build_corpus(root, *, late_ledger=False, broken_tie=False, stray_company=Fal
 
 
 def make_settings(corpus, ledger_file, holidays_file, cache, *, fill=True, history=True,
-                  unidentified=(PLACEHOLDER,)):
+                  unidentified=(PLACEHOLDER,), rhythm=None):
     """Only the sections `prepare_inputs` reads, as the real settings dataclasses."""
     return SimpleNamespace(
         data=DataSettings(corpus_folder=corpus, ledger_file=ledger_file,
@@ -191,6 +201,7 @@ def make_settings(corpus, ledger_file, holidays_file, cache, *, fill=True, histo
         history=HistorySettings(windows=(2, 4), use_ledger_before_first_file=history),
         calendar=CalendarSettings(holiday_encodings=("drain",), drain_window=3,
                                   catch_up_window=5),
+        rhythm=RhythmSettings(**{**RHYTHM, **(rhythm or {})}),
     )
 
 
@@ -289,11 +300,22 @@ def direct_chain(settings):
                                           c.catch_up_window)
     calendar = calendar.merge(positions, on="week", how="left", validate="one_to_one")
     owed = receivables_features(panel, receivables, levels, r.horizons, r.overdue_age_days)
-    table = join_features(add_deflated_label(panel, levels), history, calendar, owed)
+    rhythm = settings.rhythm
+    dues = expected_dues(panel[["key", "company_code", "origin_week", "h"]], ledger, rates,
+                         levels, week_zero, holidays, r.horizons, r.min_cleared_for_delay,
+                         rhythm.delays_kept, rhythm.company_delays_kept, r.leak_check_weeks)
+    habits = payment_habits(panel[JOIN_KEYS], collections, ledger, week_zero, holidays, first,
+                            settings.history.use_ledger_before_first_file, r.horizons,
+                            rhythm.payment_days_kept, rhythm.min_payment_days,
+                            r.leak_check_weeks)
+    table = join_features(add_deflated_label(panel, levels), history, calendar, owed, dues,
+                          habits)
     return dict(companies=companies, week_zero=week_zero, last_week=last_week, weeks=weeks,
                 weekly=weekly, ledger=ledger, rates=rates, levels=levels, calendar=calendar,
-                table=table, block_columns=block_feature_columns(history, calendar, owed),
-                new_cash=new_cash, refunds=refunds, unidentified=unidentified)
+                table=table,
+                block_columns=block_feature_columns(history, calendar, owed, dues, habits),
+                new_cash=new_cash, refunds=refunds, unidentified=unidentified,
+                dues=dues, habits=habits)
 
 
 @pytest.fixture(scope="module")
@@ -420,11 +442,177 @@ def test_calendar_holds_the_holiday_position_columns(prepared):
     assert "drain_days" in inputs.calendar.columns
 
 
-def test_block_columns_has_the_three_blocks(prepared):
+def test_block_columns_has_the_five_blocks_in_feature_blocks_order(prepared):
+    from collection_estimation.hurdle.settings import FEATURE_BLOCKS
     inputs, _ = prepared()
-    assert set(inputs.block_columns) == {"history", "calendar", "receivables"}
+    assert tuple(inputs.block_columns) == FEATURE_BLOCKS
     for columns in inputs.block_columns.values():
         assert set(columns) <= set(inputs.table.columns)
+
+
+# --- U18.4: the rhythm blocks (step 11b) ---------------------------------------------------
+
+def test_block_columns_dues_and_habits_are_the_documented_columns(prepared):
+    inputs, _ = prepared()
+    assert inputs.block_columns["dues"] == EXPECTED_DUE_COLUMNS
+    assert inputs.block_columns["habits"] == HABIT_COLUMNS
+
+
+def test_details_dues_and_habits_have_one_row_per_panel_row_in_its_order(prepared):
+    _, details = prepared()
+    for block in (details.dues, details.habits):
+        pd.testing.assert_frame_equal(block[JOIN_KEYS],
+                                      details.panel[JOIN_KEYS].reset_index(drop=True))
+
+
+@pytest.mark.parametrize("name", ["dues", "habits"])
+def test_table_rhythm_columns_equal_the_details_blocks(prepared, name):
+    inputs, details = prepared()
+    block = getattr(details, name)
+    columns = inputs.block_columns[name]
+    pd.testing.assert_frame_equal(inputs.table[JOIN_KEYS + columns].reset_index(drop=True),
+                                  block[JOIN_KEYS + columns])
+
+
+@pytest.mark.parametrize("fill,history", [(True, True), (False, True), (True, False),
+                                          (False, False)])
+@pytest.mark.parametrize("name", ["dues", "habits"])
+def test_details_rhythm_blocks_equal_the_direct_calls(direct, prepared, fill, history, name):
+    _, details = prepared(fill=fill, history=history)
+    pd.testing.assert_frame_equal(getattr(details, name),
+                                  direct(fill=fill, history=history)[name])
+
+
+def test_base_blocks_feature_columns_take_no_rhythm_column(prepared):
+    from collection_estimation.hurdle.stage1 import feature_columns
+    inputs, _ = prepared()
+    base = feature_columns(inputs.block_columns, BASE_BLOCKS)
+    rhythm = set(inputs.block_columns["dues"]) | set(inputs.block_columns["habits"])
+    assert not set(base) & rhythm
+    expected = ["h"] + [c for block in BASE_BLOCKS for c in inputs.block_columns[block]]
+    assert base == expected
+
+
+def test_habits_hold_nan_below_min_payment_days_and_the_table_keeps_them(prepared):
+    inputs, details = prepared()
+    few = details.habits["payment_days_used"] < RHYTHM["min_payment_days"]
+    assert few.any(), "no row below min_payment_days in the tiny corpus"
+    others = [c for c in HABIT_COLUMNS if c != "payment_days_used"]
+    assert details.habits.loc[few, others].isna().all().all()
+    assert len(inputs.table) == len(details.panel)
+
+
+def test_a_min_payment_days_above_every_customer_makes_every_habit_nan(corpus):
+    inputs, details = prepare_inputs(settings_for(corpus, rhythm={"min_payment_days": 1000}),
+                                     with_details=True)
+    others = [c for c in HABIT_COLUMNS if c != "payment_days_used"]
+    assert details.habits[others].isna().all().all()
+    assert inputs.table[others].isna().all().all()
+    assert details.habits["payment_days_used"].notna().all()
+
+
+def test_payment_days_kept_caps_payment_days_used(corpus):
+    _, details = prepare_inputs(settings_for(corpus, rhythm={"payment_days_kept": 2,
+                                                             "min_payment_days": 2}),
+                                with_details=True)
+    assert details.habits["payment_days_used"].max() == 2
+
+
+def test_a_min_payment_days_below_two_is_refused_by_payment_habits(corpus):
+    with pytest.raises(ValueError, match="min_payment_days is 1; it must be 2 or more"):
+        prepare_inputs(settings_for(corpus, rhythm={"min_payment_days": 1}))
+
+
+def spy_on(monkeypatch, name):
+    """Record each call of inputs.<name> (args, kwargs) and still run the real function."""
+    calls = []
+    real = getattr(inputs_module, name)
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        result = real(*args, **kwargs)
+        calls[-1] = (args, kwargs, result)
+        return result
+    monkeypatch.setattr(inputs_module, name, spy)
+    return calls
+
+
+@pytest.fixture
+def spied(corpus, monkeypatch):
+    """prepare_inputs on settings with unusual [rhythm] values, with expected_dues,
+    payment_habits, join_features and block_feature_columns spied on."""
+    rhythm = {"delays_kept": 7, "company_delays_kept": 13, "payment_days_kept": 9,
+              "min_payment_days": 4}
+    calls = {name: spy_on(monkeypatch, name) for name in
+             ("expected_dues", "payment_habits", "join_features", "block_feature_columns")}
+    settings = settings_for(corpus, rhythm=rhythm, history=False)
+    inputs, details = prepare_inputs(settings, with_details=True)
+    return SimpleNamespace(calls=calls, settings=settings, inputs=inputs, details=details)
+
+
+def test_expected_dues_is_called_once_with_the_settings(spied):
+    assert len(spied.calls["expected_dues"]) == 1
+    args, kwargs, result = spied.calls["expected_dues"][0]
+    s = spied.settings
+    assert kwargs == {"horizons": s.receivables.horizons,
+                      "min_cleared": s.receivables.min_cleared_for_delay,
+                      "delays_kept": 7, "company_delays_kept": 13,
+                      "leak_check_weeks": s.receivables.leak_check_weeks}
+    panel_rows, ledger, rates, levels, week_zero, holidays = args
+    assert list(panel_rows.columns) == ["key", "company_code", "origin_week", "h"]
+    assert len(panel_rows) == len(spied.details.panel)
+    pd.testing.assert_frame_equal(ledger, spied.inputs.ledger)
+    pd.testing.assert_frame_equal(rates, spied.inputs.rates)
+    pd.testing.assert_series_equal(levels, spied.inputs.levels)
+    assert week_zero == spied.inputs.week_zero
+    assert holidays == spied.details.holidays
+    assert result is spied.details.dues
+
+
+def test_payment_habits_is_called_once_with_the_settings(spied):
+    assert len(spied.calls["payment_habits"]) == 1
+    args, kwargs, result = spied.calls["payment_habits"][0]
+    s = spied.settings
+    assert kwargs == {"use_ledger_before_first_file": False,
+                      "horizons": s.receivables.horizons, "payment_days_kept": 9,
+                      "min_payment_days": 4,
+                      "leak_check_weeks": s.receivables.leak_check_weeks}
+    panel_rows, collections, ledger, week_zero, holidays, first_file_day = args
+    assert list(panel_rows.columns) == JOIN_KEYS
+    assert len(panel_rows) == len(spied.details.panel)
+    pd.testing.assert_frame_equal(collections, spied.details.collections)
+    pd.testing.assert_frame_equal(ledger, spied.inputs.ledger)
+    assert week_zero == spied.inputs.week_zero
+    assert holidays == spied.details.holidays
+    assert first_file_day == min(spied.details.daily_files)
+    assert result is spied.details.habits
+
+
+def test_the_history_switch_reaches_payment_habits(corpus, monkeypatch):
+    calls = spy_on(monkeypatch, "payment_habits")
+    prepare_inputs(settings_for(corpus, history=True))
+    assert calls[0][1]["use_ledger_before_first_file"] is True
+
+
+def test_join_features_and_block_feature_columns_get_the_rhythm_blocks(spied):
+    (join_args, join_kwargs, table), = spied.calls["join_features"]
+    (block_args, block_kwargs, columns), = spied.calls["block_feature_columns"]
+    assert join_kwargs == {} and block_kwargs == {}
+    assert len(join_args) == 6 and len(block_args) == 5
+    assert join_args[4] is spied.details.dues and join_args[5] is spied.details.habits
+    assert block_args[3] is spied.details.dues and block_args[4] is spied.details.habits
+    assert all(a is b for a, b in zip(join_args[1:4], block_args[:3]))
+    assert table is spied.inputs.table
+    assert columns is spied.inputs.block_columns
+
+
+def test_the_rhythm_settings_reach_the_features(corpus, prepared):
+    _, default = prepared()
+    _, changed = prepare_inputs(settings_for(corpus, rhythm={"min_payment_days": 2,
+                                                             "payment_days_kept": 2}),
+                                with_details=True)
+    assert not default.habits.equals(changed.habits)
+    pd.testing.assert_frame_equal(default.dues, changed.dues)    # dues do not read these
 
 
 def test_block_columns_calendar_includes_the_holiday_positions(prepared):
@@ -675,3 +863,23 @@ def test_module_exposes_prepare_inputs_and_the_dataclasses():
     assert inputs_module.prepare_inputs is prepare_inputs
     assert dataclasses.is_dataclass(inputs_module.ModelInputs)
     assert dataclasses.is_dataclass(inputs_module.PreparationDetails)
+
+
+# --- the pipeline's printouts on the details' rhythm blocks (U18.4) ------------------------
+
+def test_show_expected_dues_runs_on_details_dues(prepared, capsys):
+    from collection_estimation.hurdle.reports.preparation import show_expected_dues
+    inputs, details = prepared()
+    show_expected_dues(details.dues, inputs.table, (2, 3), 2)
+    printed = capsys.readouterr().out
+    assert printed.strip(), "nothing printed"
+    assert f"{len(details.dues):,}" in printed
+
+
+def test_show_payment_habits_runs_on_details_habits(prepared, capsys):
+    from collection_estimation.hurdle.reports.preparation import show_payment_habits
+    inputs, details = prepared()
+    show_payment_habits(details.habits, inputs.table, (2, 3))
+    printed = capsys.readouterr().out
+    assert printed.strip(), "nothing printed"
+    assert f"{len(details.habits):,}" in printed

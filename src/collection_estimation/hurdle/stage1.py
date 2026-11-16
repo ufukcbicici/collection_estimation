@@ -118,7 +118,10 @@ def predict_paid(model, x: pd.DataFrame) -> pd.Series:
 
 # The amount columns (TRY of week 0), found by name: they are log-scaled for the baseline.
 AMOUNT_COLUMNS = {"last_payment_amount", "due_before_target_week", "due_in_target_week",
-                  "due_after_target_week", "unapplied_cash", "open_balance"}
+                  "due_after_target_week", "unapplied_cash", "open_balance",
+                  # the delay spread ("dues", U18.2)
+                  "spread_in_target", "spread_before_target", "overdue_beyond_habit",
+                  "shifted_due_in_target"}
 AMOUNT_PATTERN = re.compile(r"mean_receipts_\d+|median_payment_\d+|overdue_up_to_\d+"
                             r"|overdue_\d+_to_\d+|overdue_over_\d+")
 

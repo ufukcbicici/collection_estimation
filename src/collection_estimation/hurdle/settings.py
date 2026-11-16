@@ -72,7 +72,7 @@ class Stage1Settings:
     max_leaf_nodes: int               # leaves per tree (2 or more)
     min_samples_leaf: int             # rows per leaf, at least
     random_seed: int                  # makes a fit repeatable (0 or more)
-    feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
+    feature_blocks: tuple[str, ...]   # which feature blocks go in (FEATURE_BLOCKS)
     company_as_feature: bool          # the company code (an EY entity) as a categorical feature
     baseline_c: float                 # the logistic baseline's C: smaller = stronger regularisation
 
@@ -87,7 +87,7 @@ class Stage2Settings:
     max_leaf_nodes: int               # leaves per tree (2 or more)
     min_samples_leaf: int             # rows per leaf, at least
     random_seed: int                  # makes a fit repeatable (0 or more)
-    feature_blocks: tuple[str, ...]   # which feature blocks go in: history, calendar, receivables
+    feature_blocks: tuple[str, ...]   # which feature blocks go in (FEATURE_BLOCKS)
     scale: str                        # one of STAGE2_SCALES: what m = s x E is measured against
     balance_floor: str                # one of BALANCE_FLOORS: E's floor under "open balance"
     own_mean_window: int              # history window of the "own mean" floor
@@ -892,8 +892,9 @@ def day_edges_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
     return tuple(value)
 
 
-# The feature blocks a model can use, in the order their columns are taken.
-FEATURE_BLOCKS = ("history", "calendar", "receivables")
+# The feature blocks a model can use, in the order their columns are taken. "dues" (the delay
+# spread, U18.2) and "habits" (the payment habits, U18.3) are both built from [rhythm].
+FEATURE_BLOCKS = ("history", "calendar", "receivables", "dues", "habits")
 
 
 # The holiday encodings the calendar block can get (`features_calendar.HOLIDAY_ENCODINGS`).
