@@ -249,19 +249,21 @@ min_gain = 0.005                 # the pairs of corrections at most this much WA
 # The settings grid (U16, pipeline step 18): stage 1, stage 2 and the top-ups chosen together
 # over the [evaluation] validation origins. Each stage-1 and each stage-2 setting is fitted
 # once per origin and paired afterwards. The current [stage1], [stage2] and [topups] are
-# always tried, and stay unless a pair beats them by min_gain WAPE. This grid is the small
-# local one; the full grid runs on the compute machine.
+# always tried, and stay unless a pair beats them by min_gain WAPE. This is the full grid
+# (17 November 2026): with extra_blocks, 144 stage-1 and 292 stage-2 fits per origin, 5,232
+# fits over 12 origins and 42,048 combinations; about 1.5 days of fits with workers = 3 on a
+# 12-thread machine, plus about 3.3 h of scoring.
 run = true
-run_test = false                 # the v1 test on the [evaluation] test origins: only when asked
-stage1_max_iter = [300, 900]     # stage 1's grid (one fit takes about a minute)
-stage1_learning_rate = [0.01, 0.05]   # learning rates below 0.5 only
-stage1_max_leaf_nodes = [63]
+run_test = true                  # the v1 test on the [evaluation] test origins: a report only
+stage1_max_iter = [300, 900, 1500]   # stage 1's grid (one fit 40-160 s at origin 44)
+stage1_learning_rate = [0.01, 0.03, 0.05, 0.1]   # learning rates below 0.5 only
+stage1_max_leaf_nodes = [31, 63, 127]
 stage2_loss = ["poisson", "gamma"]    # not "squared_error": it can predict below 0
-stage2_max_iter = [300]
-stage2_learning_rate = [0.05, 0.1]
-stage2_max_leaf_nodes = [31]
-stage2_scale = ["open balance"]
-stage2_balance_floor = ["own mean"]   # tried under "open balance" only
+stage2_max_iter = [300, 900]
+stage2_learning_rate = [0.03, 0.1]
+stage2_max_leaf_nodes = [15, 31, 63]
+stage2_scale = ["none", "open balance"]
+stage2_balance_floor = ["median", "own mean"]   # tried under "open balance" only
 stage1_log_loss_tolerance = 0.10      # the eligibility gates, as in [joint_diagnostic]
 stage1_slope_band = [0.8, 1.25]
 stage2_skill_tolerance = 0.05
