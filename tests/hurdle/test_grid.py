@@ -54,7 +54,10 @@ GRID = GridSettings(run=True, run_test=False,
                     # it themselves.
                     topup_ridge_with_level=(), min_gain=0.005,
                     # U18.5: no extra block, so the pre-U18.5 tests keep their counts.
-                    extra_blocks=())
+                    extra_blocks=(),
+                    # [grid] workers: one fit at a time, in this process (the parallel path is
+                    # tested in test_grid_workers.py).
+                    workers=1)
 
 STAGE1_KEYS = ["max_iter", "learning_rate", "max_leaf_nodes"]
 STAGE2_KEYS = ["loss", "max_iter", "learning_rate", "max_leaf_nodes", "scale", "balance_floor"]
@@ -614,13 +617,15 @@ G_WINDOW = 4            # the table's history columns are for a 4-week window
 
 
 def g_settings(horizons=5, company_as_feature=True, reference_window=G_WINDOW,
-               amount_reference_window=G_WINDOW, reference_prior_weeks=1.0):
-    """f_settings plus the [diagnostic] reference windows grid_predictions reads."""
+               amount_reference_window=G_WINDOW, reference_prior_weeks=1.0, workers=1):
+    """f_settings plus the [diagnostic] reference windows and the [grid] workers
+    grid_predictions reads (1: one fit at a time, in this process)."""
     settings = f_settings(horizons=horizons,
                           stage1=stage1_settings(company_as_feature=company_as_feature))
     settings.diagnostic = SimpleNamespace(reference_window=reference_window,
                                           amount_reference_window=amount_reference_window,
                                           reference_prior_weeks=reference_prior_weeks)
+    settings.grid = SimpleNamespace(workers=workers)
     return settings
 
 
@@ -4307,7 +4312,7 @@ def fit_settings(min_gain=0.005):
     base = g_settings()
     return ChoiceSettings(
         receivables=base.receivables, topups=base.topups, stage1=base.stage1, stage2=base.stage2,
-        grid=SimpleNamespace(min_gain=min_gain),
+        grid=SimpleNamespace(min_gain=min_gain, workers=1),
         evaluation=SimpleNamespace(bootstrap_samples=40, bootstrap_seed=5,
                                    rule_doubtful_days=90),
         calibration=SimpleNamespace(company_shrink_rows=50, min_gain=0.005),

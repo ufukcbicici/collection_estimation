@@ -20,7 +20,8 @@ scikit-learn==1.9.0
 scipy==1.17.1
 matplotlib==3.11.0
 openpyxl==3.1.5          # reading the corpus workbooks
-joblib==1.5.3            # persisting fitted models
+joblib==1.5.3            # persisting fitted models; the grid's parallel fits
+threadpoolctl==3.5.0     # the threads of each parallel fit (comes with scikit-learn)
 pytest==9.0.3
 lightgbm==4.7.0          # Tweedie objective for the hurdle competitor; pip-installed
                          # 2026-10-05 (conda env, so add it with pip after the create above)

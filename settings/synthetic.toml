@@ -275,6 +275,11 @@ min_gain = 0.005                 # a pair replaces the current settings only if 
 # them (with ["dues", "habits"]: none, dues, habits, both), the same subset in both stages.
 # Each subset fits every stage setting again, so the fits grow as 2^N. [] = none tried.
 extra_blocks = ["dues", "habits"]
+# How many fits run at once, each in its own process with its share of the threads (12 // 3 =
+# 4 here). Measured on this machine (origin 44, 6 + 6 fits): 3 workers fit stage 1 1.42x and
+# stage 2 1.78x faster than one at a time, about 1.2 GB each; 6 workers were slower. 1 = one
+# at a time with every thread.
+workers = 3
 
 [debug]
 one_day = 2025-06-02            # the day whose payment lines step 2 prints

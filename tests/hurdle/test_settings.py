@@ -241,7 +241,9 @@ VALID = {
              "min_gain": "0.01",
              # U18.5: no extra block here (synthetic.toml tries ["dues", "habits"]); the
              # extra_blocks tests set it themselves.
-             "extra_blocks": "[]"},
+             "extra_blocks": "[]",
+             # [grid] workers: 2 (synthetic.toml has 3), so a test can tell which file was read.
+             "workers": "2"},
     "debug":{"one_day": "2025-06-02", "sample_week": "30", "demo_origin": "40"},
 }
 ALL_SECTIONS = list(VALID)
@@ -6464,7 +6466,7 @@ GRID_SECTION_KEYS = sorted([
     "stage2_loss", "stage2_max_iter", "stage2_learning_rate", "stage2_max_leaf_nodes",
     "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
     "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows", "topup_ridge_with_level",
-    "min_gain", "extra_blocks"])
+    "min_gain", "extra_blocks", "workers"])
 GRID_STAGE_KEYS = ["stage1_max_iter", "stage1_learning_rate", "stage1_max_leaf_nodes",
                    "stage2_loss", "stage2_max_iter", "stage2_learning_rate",
                    "stage2_max_leaf_nodes", "stage2_scale", "stage2_balance_floor"]
@@ -6475,7 +6477,7 @@ GRID_READ = GridSettings(
     stage2_scale=("none", "open balance"), stage2_balance_floor=("median", "mean"),
     stage1_log_loss_tolerance=0.3, stage1_slope_band=(0.6, 1.6), stage2_skill_tolerance=0.04,
     stage2_ratio_band=(0.85, 1.15), topup_windows=(4, 13), topup_ridge_with_level=(False, True),
-    min_gain=0.01, extra_blocks=())
+    min_gain=0.01, extra_blocks=(), workers=2)
 
 
 def grid_error(tmp_path, repo, changes):
@@ -6492,7 +6494,7 @@ def grid_table(**changes):
              "stage1_log_loss_tolerance": 0.1, "stage1_slope_band": [0.8, 1.25],
              "stage2_skill_tolerance": 0.05, "stage2_ratio_band": [0.9, 1.1],
              "topup_windows": [8, 13], "topup_ridge_with_level": [True, False],
-             "min_gain": 0.005, "extra_blocks": []}
+             "min_gain": 0.005, "extra_blocks": [], "workers": 1}
     table.update(changes)
     return table
 
@@ -6518,7 +6520,7 @@ def test_grid_settings_fields_are_in_the_documented_order():
         "stage2_scale", "stage2_balance_floor", "stage1_log_loss_tolerance",
         "stage1_slope_band", "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
         "topup_ridge_with_level",
-        "min_gain", "extra_blocks"]
+        "min_gain", "extra_blocks", "workers"]
 
 
 def test_grid_settings_has_every_stage_grid_and_gate_name_of_the_joint_diagnostic():
@@ -6943,7 +6945,7 @@ def test_read_grid_by_hand():
         stage1_log_loss_tolerance=0.1, stage1_slope_band=(0.8, 1.25),
         stage2_skill_tolerance=0.05, stage2_ratio_band=(0.9, 1.1), topup_windows=(8, 13),
         topup_ridge_with_level=(True, False),
-        min_gain=0.005, extra_blocks=())
+        min_gain=0.005, extra_blocks=(), workers=1)
 
 
 def test_read_grid_uses_where_in_its_messages():
@@ -7429,9 +7431,10 @@ from collection_estimation.hurdle.settings import extra_blocks_setting  # noqa: 
 FEATURE_BLOCK_LIST = "['history', 'calendar', 'receivables', 'dues', 'habits']"
 
 
-def test_extra_blocks_is_the_last_grid_field_and_a_required_key():
+def test_extra_blocks_is_the_last_grid_field_before_workers_and_a_required_key():
+    # [grid] workers came after U18.5 and is the last field; extra_blocks is just before it.
     names = [f.name for f in dataclasses.fields(GridSettings)]
-    assert names[-1] == "extra_blocks"
+    assert names[-2:] == ["extra_blocks", "workers"]
     assert "extra_blocks" in GRID_SECTION_KEYS
 
 

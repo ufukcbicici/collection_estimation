@@ -209,6 +209,7 @@ class GridSettings:
                                               # settings by to replace them
     extra_blocks: tuple[str, ...]             # feature blocks tried on top of the stages' own
                                               # (every subset); empty = none tried
+    workers: int                              # fits run at once (processes); 1 = one at a time
 
 
 @dataclass(frozen=True)
@@ -344,7 +345,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                       "stage2_learning_rate", "stage2_max_leaf_nodes", "stage2_scale",
                       "stage2_balance_floor", "stage1_log_loss_tolerance", "stage1_slope_band",
                       "stage2_skill_tolerance", "stage2_ratio_band", "topup_windows",
-                      "topup_ridge_with_level", "min_gain", "extra_blocks"}, f"{name} [grid]")
+                      "topup_ridge_with_level", "min_gain", "extra_blocks", "workers"},
+               f"{name} [grid]")
     debug = raw["debug"]
     check_keys(debug, {"one_day", "sample_week", "demo_origin"}, f"{name} [debug]")
     collections_layout = raw["collections_layout"]
@@ -559,6 +561,7 @@ def read_grid(table: dict, where: str) -> GridSettings:
         topup_ridge_with_level=bool_list_setting(table, "topup_ridge_with_level", where),
         min_gain=positive_number_setting(table, "min_gain", where),
         extra_blocks=extra_blocks_setting(table, "extra_blocks", where),
+        workers=count_setting(table, "workers", where),
     )
 
 

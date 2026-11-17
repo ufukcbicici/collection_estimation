@@ -28,7 +28,8 @@ Every fit is cached on its own (`cache.load_with_cache`), keyed by its stage, or
 setting: a grid with one more candidate fits only that one, and a run stopped after hours
 keeps every fit it finished. The table is hashed without the columns of the extra blocks a
 fit does not use, so a change to how a block is built ([rhythm]) refits only the fits that
-use it.
+use it. With [grid] workers above 1, the fits of an origin run that many at a time, each in
+its own process with its share of the threads (`fit_on_worker`); the predictions are the same.
 
 U16.4, `grid_gates`: which stage-1 and stage-2 candidates make sense on their own, judged on
 the labelled rows of every validation origin pooled (`diagnostic_joint.stage1_gates` and
@@ -59,6 +60,7 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -66,6 +68,8 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 
 from .cache import load_with_cache, source_fingerprint, table_fingerprint
 from .diagnostic import Candidate, reference_probabilities
@@ -251,6 +255,38 @@ def cached_fit(stage: str, origin: int, setting, inputs: list, cache_folder: Pat
     return load_with_cache(name, fingerprint, fit, cache_folder)
 
 
+def fit_on_worker(stage: str, number: int, setting, origin: int, train_rows: pd.DataFrame,
+                  forecast_rows: pd.DataFrame, block_columns: dict[str, list[str]],
+                  companies: list[str], company_as_feature: bool, inputs: list,
+                  cache_folder: Path, threads: int | None):
+    """One fit of `grid_predictions`: stage `stage` ("stage1" or "stage2") with `setting` at
+    `origin`, read from or saved to `cache_folder` (`cached_fit`, `inputs` as there; stage 2
+    also hashes `company_as_feature`). With at most `threads` threads (None: no limit).
+
+    Run in a worker process when [grid] workers is above 1, so it gets only plain data and
+    builds the fit itself here (a function made in the caller cannot be sent to another
+    process). Returns (stage, number, the prediction, the seconds it took), `number` being
+    the candidate's, so the caller knows which fit came back.
+
+    Raises ValueError if `stage` is neither, before anything is read or fitted.
+    """
+    if stage not in ("stage1", "stage2"):
+        raise ValueError(f"stage is {stage!r}, not 'stage1' or 'stage2'")
+    started = time.perf_counter()
+    with threadpool_limits(threads):
+        if stage == "stage1":
+            prediction = cached_fit(
+                "stage1", origin, setting, inputs, cache_folder,
+                lambda: stage1_predictions(train_rows, forecast_rows, setting, block_columns,
+                                           companies))
+        else:   # "stage2"
+            prediction = cached_fit(
+                "stage2", origin, setting, inputs + [company_as_feature], cache_folder,
+                lambda: stage2_predictions(train_rows, forecast_rows, setting, block_columns,
+                                           companies, company_as_feature))
+    return stage, number, prediction, time.perf_counter() - started
+
+
 def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCandidates,
                      settings, *, block_columns: dict[str, list[str]], companies: list[str],
                      new_cash: pd.DataFrame, refunds: pd.DataFrame, unidentified: pd.DataFrame,
@@ -269,8 +305,14 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
     with a p that is not a number or an m below 0 is refused by the gates (U16.4), so one
     broken candidate does not stop the grid.
 
+    With [grid] workers above 1, the fits of each origin (stage 1's first, the long ones,
+    then stage 2's) run that many at a time in worker processes, each with the machine's
+    threads shared out (`fit_on_worker`); the p and m columns are still in the order of the
+    candidates. With 1, one after another here, with every thread.
+
     `on_fit_done(done, total, stage, origin, candidate, seconds)`, if given, is called after
-    each fit, read from the cache or not (e.g. to print progress).
+    each fit, read from the cache or not (e.g. to print progress); with several workers, in
+    the order the fits finish.
 
     Raises ValueError as `check_forecast_origins`, the top-ups, the references and the fits
     do, and if an origin has no rows.
@@ -298,6 +340,10 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
                              table_fingerprint(hashed), code]
     company_as_feature = settings.stage1.company_as_feature
     diagnostic = settings.diagnostic
+    # With several workers, each fit gets its share of the threads; alone, all of them.
+    workers = settings.grid.workers
+    # (os.cpu_count() is None when the machine cannot tell: then 1 thread each.)
+    threads = None if workers == 1 else max(1, (os.cpu_count() or 1) // workers)
 
     rows, p_parts, m_parts = [], [], []
     total = len(origins) * (len(candidates.stage1) + len(candidates.stage2))
@@ -319,38 +365,45 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
         rows.append(forecast_rows[ROW_COLUMNS[:9]].assign(base_rate=base_rate,
                                                           training_mean=training_mean))
 
-        # Stage 1: each candidate fitted once at this origin (or read back).
-        p_at = {}
-        for number, candidate in enumerate(candidates.stage1):
-            started = time.perf_counter()
-            inputs = inputs_of[candidate.settings.feature_blocks]
-            p_at[number] = cached_fit(
-                "stage1", origin, candidate.settings, inputs, cache_folder,
-                lambda setting=candidate.settings: stage1_predictions(
-                    train_rows, forecast_rows, setting, block_columns, companies))
+        # Every candidate fitted once at this origin (or read back): stage 1's first, the
+        # long ones, so that stage 2's short fits fill the gaps at the end.
+        fits = ([("stage1", number, candidate.settings)
+                 for number, candidate in enumerate(candidates.stage1)]
+                + [("stage2", number, candidate.settings)
+                   for number, candidate in enumerate(candidates.stage2)])
+
+        def arguments(stage, number, setting):
+            return (stage, number, setting, origin, train_rows, forecast_rows, block_columns,
+                    companies, company_as_feature, inputs_of[setting.feature_blocks],
+                    cache_folder, threads)
+
+        if workers == 1:
+            # Here, one after another.
+            results = (fit_on_worker(*arguments(*fit)) for fit in fits)
+        else:
+            # In the worker processes, each result as soon as it is done; the loop below
+            # runs here, in this process.
+            results = Parallel(n_jobs=workers, backend="loky",
+                               return_as="generator_unordered")(
+                delayed(fit_on_worker)(*arguments(*fit)) for fit in fits)
+        p_at, m_at = {}, {}
+        for stage, number, prediction, seconds in results:
+            if stage == "stage1":
+                p_at[number] = prediction
+            else:
+                m_at[number] = prediction
             done += 1
             if on_fit_done is not None:
-                on_fit_done(done, total, "stage 1", origin, number,
-                            time.perf_counter() - started)
+                on_fit_done(done, total, "stage 1" if stage == "stage1" else "stage 2",
+                            origin, number, seconds)
 
-        # Stage 2 the same way. company_as_feature is the one stage-1 setting it reads.
-        m_at = {}
-        for number, candidate in enumerate(candidates.stage2):
-            started = time.perf_counter()
-            inputs = inputs_of[candidate.settings.feature_blocks]
-            m_at[number] = cached_fit(
-                "stage2", origin, candidate.settings, inputs + [company_as_feature],
-                cache_folder,
-                lambda setting=candidate.settings: stage2_predictions(
-                    train_rows, forecast_rows, setting, block_columns, companies,
-                    company_as_feature))
-            done += 1
-            if on_fit_done is not None:
-                on_fit_done(done, total, "stage 2", origin, number,
-                            time.perf_counter() - started)
-
-        p_parts.append(pd.DataFrame(p_at, index=forecast_rows.index))
-        m_parts.append(pd.DataFrame(m_at, index=forecast_rows.index))
+        # In the order of the candidates, whatever order the fits finished in.
+        p_parts.append(pd.DataFrame({number: p_at[number]
+                                     for number in range(len(candidates.stage1))},
+                                    index=forecast_rows.index))
+        m_parts.append(pd.DataFrame({number: m_at[number]
+                                     for number in range(len(candidates.stage2))},
+                                    index=forecast_rows.index))
 
     return GridPredictions(rows=pd.concat(rows), p=pd.concat(p_parts), m=pd.concat(m_parts),
                            topups=topups)
