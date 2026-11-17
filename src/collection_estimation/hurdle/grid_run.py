@@ -2,7 +2,8 @@
 
 `run_grid` is what `run_hurdle_pipeline.py` (step 18) and `run_hurdle_grid.py` (the grid alone)
 both call, so the grid is run one way only: the candidates, every candidate's forecast at every
-validation origin (each fit cached on its own, with progress lines), the gates, the scores,
+validation origin (each fit cached on its own, with progress lines), the gates, the scores
+(with a progress line per batch),
 the combination kept with its calibration and the references, and then, only with [grid]
 run_test, the v1 test of what was kept on the [evaluation] test origins.
 """
@@ -66,8 +67,16 @@ def run_grid(settings, inputs: ModelInputs, *, rolled=None) -> tuple[GridChoice,
     show_grid_gates("stage 2", gates.stage2, "deviance skill", ascending=False)
     actual = actual_totals(inputs.weekly, inputs.weeks, inputs.levels, inputs.companies,
                            origins, horizons)
+    scoring_started = time.perf_counter()
+
+    def score_progress(done, total):
+        so_far = time.perf_counter() - scoring_started
+        print(f"  ... scored {done} of {total} combinations ({so_far / 60:.0f} min so far, "
+              f"about {so_far / done * (total - done) / 60:.0f} min left)")
+
     table = grid_scores(predictions, candidates, gates, actual, settings,
-                        companies=inputs.companies, week_zero=inputs.week_zero)
+                        companies=inputs.companies, week_zero=inputs.week_zero,
+                        on_batch_done=score_progress)
     show_grid_scores(table, candidates, rolled, actual, horizons)
 
     # U16.6: the combination kept, its calibration, and on the same origins how it compares

@@ -42,7 +42,8 @@ current settings), a scored stage-2 candidate (the same) and a top-up candidate,
 every origin as `forecast.forecast` does (p x m added up per company and h, plus the top-ups,
 times the price level projected at the origin; nominal TRY) and scored against the cash that
 came by `evaluate.evaluation_scores`, as step 17 scores the model. Nothing is chosen here
-(U16.6), and p and m are not calibrated.
+(U16.6), and p and m are not calibrated. The combinations are forecast and scored in
+batches of SCORE_BATCH, so the forecasts of a whole grid are never held at once.
 
 U16.6, `grid_choice`: the combination kept (the current settings unless beaten by more than
 [grid] min_gain WAPE), its calibration, and, on the same validation origins, how it compares
@@ -93,6 +94,11 @@ ROW_COLUMNS = CUSTOMER_COLUMNS[:6] + ["label_status", "paid", "amount_deflated",
 # weeks, bias) and the mean of the companies' WAPE.
 GRID_SCORE_COLUMNS = ["stage1", "stage2", "topups", "extra_blocks", "current", "wape",
                       "total_wape", "bias", "company_wape"]
+
+# How many combinations `grid_scores` forecasts and scores at a time. A combination's score
+# reads its own rows only, so the batch size changes the memory used (about 32 MB of
+# forecasts per batch), not the scores.
+SCORE_BATCH = 500
 
 # The feature blocks every fit's cache name hashes, used or not: stage 2 reads the open balance
 # (receivables) and the history means for its scale, whatever its feature_blocks.
@@ -473,8 +479,9 @@ def combination_forecast(predictions: GridPredictions, stage1: int, stage2: int,
 
 
 def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates: GridGates,
-                actual: pd.DataFrame, settings, *, companies: list[str],
-                week_zero) -> pd.DataFrame:
+                actual: pd.DataFrame, settings, *, companies: list[str], week_zero,
+                batch_size: int = SCORE_BATCH,
+                on_batch_done: Callable[[int, int], None] | None = None) -> pd.DataFrame:
     """The scores of every combination (see the module docstring): one row per combination,
     `GRID_SCORE_COLUMNS`, sorted by WAPE (on a tie, in the order of the candidates, so the
     current settings first). `actual` is `evaluate.actual_totals` at the origins of
@@ -484,9 +491,15 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
     company_wape is the mean over the companies that have cash at the grid's origins: a
     company with none has no WAPE (a share of nothing) and is left out of the mean.
 
+    The combinations are forecast and scored `batch_size` at a time, each one whole within
+    its batch; the scores do not depend on it. `on_batch_done(done, total)`, if given, is
+    called after each batch with the combinations scored so far and in all (e.g. to print
+    progress).
+
     Raises ValueError if `gates` or `predictions` do not have one entry per candidate, if
     `actual` is not for the origins of `predictions` (scored on fewer origins, the grid would
-    be judged on other weeks than asked), if there is no consolidated cash to score on, and
+    be judged on other weeks than asked), if `batch_size` is below 1, if there is no
+    consolidated cash to score on, and
     as `forecast_totals` (e.g. a NaN p x m of the current settings) and `evaluation_scores`
     do.
     """
@@ -500,6 +513,8 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
                                  candidates.topups)):
         if found != len(listed):
             raise ValueError(f"there are {found} {what} for {len(listed)} candidates")
+    if batch_size < 1:
+        raise ValueError(f"batch_size is {batch_size}; at least 1 combination is needed")
     horizons = settings.receivables.horizons
     origins = sorted(set(predictions.rows["origin_week"]))
     actual_origins = sorted(set(actual["origin_week"]))
@@ -515,34 +530,44 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
         if same_extra_blocks(candidates.stage1[i], candidates.stage2[j]):
             combinations.append((i, j, k))
 
-    # 1. Each combination's totals at each origin, as `forecast` makes them.
     keys = ["company_code", "origin_week", "h", "target_week"]
-    parts = []
-    for i, j, k in combinations:
-        totals = combination_forecast(predictions, i, j, k, projected=projected,
-                                      companies=companies, horizons=horizons).totals
-        part = totals[keys + ["total"]].rename(columns={"total": "forecast"})
-        part.insert(0, "method", combination_name(i, j, k))
-        parts.append(part)
-    forecasts = pd.concat(parts, ignore_index=True)
-    forecasts["company_code"] = forecasts["company_code"].astype(object)
-
-    # 2. Every combination scored as step 17 scores the model.
-    scores = evaluation_scores(forecasts[STACK_COLUMNS], actual, horizons)
-    if scores[(scores["company_code"] == CONSOLIDATED) & (scores["horizon"] == POOLED)].empty:
-        raise ValueError("there is no consolidated cash at the grid's origins to score on")
     lines = []
-    for i, j, k in combinations:
-        mine = scores[scores["method"] == combination_name(i, j, k)]
-        consolidated = mine[mine["company_code"] == CONSOLIDATED].set_index("horizon")
-        by_company = mine[(mine["company_code"] != CONSOLIDATED) & (mine["horizon"] == POOLED)]
-        lines.append({"stage1": i, "stage2": j, "topups": k,
-                      "extra_blocks": candidates.stage1[i].params["extra_blocks"],
-                      "current": (i, j, k) == (0, 0, 0),
-                      "wape": consolidated.loc[POOLED, "wape"],
-                      "total_wape": consolidated["wape"].get(HORIZON_TOTAL, float("nan")),
-                      "bias": consolidated.loc[POOLED, "bias"],
-                      "company_wape": by_company["wape"].mean()})
+    for start in range(0, len(combinations), batch_size):
+        batch = combinations[start:start + batch_size]
+
+        # 1. Each combination's totals at each origin, as `forecast` makes them: all of a
+        # combination's rows in its own batch.
+        parts = []
+        for i, j, k in batch:
+            totals = combination_forecast(predictions, i, j, k, projected=projected,
+                                          companies=companies, horizons=horizons).totals
+            part = totals[keys + ["total"]].rename(columns={"total": "forecast"})
+            part.insert(0, "method", combination_name(i, j, k))
+            parts.append(part)
+        forecasts = pd.concat(parts, ignore_index=True)
+        forecasts["company_code"] = forecasts["company_code"].astype(object)
+
+        # 2. The batch scored as step 17 scores the model.
+        scores = evaluation_scores(forecasts[STACK_COLUMNS], actual, horizons)
+        if scores[(scores["company_code"] == CONSOLIDATED)
+                  & (scores["horizon"] == POOLED)].empty:
+            raise ValueError("there is no consolidated cash at the grid's origins to score on")
+
+        # 3. One line per combination; the batch's forecasts and scores are then dropped.
+        for i, j, k in batch:
+            mine = scores[scores["method"] == combination_name(i, j, k)]
+            consolidated = mine[mine["company_code"] == CONSOLIDATED].set_index("horizon")
+            by_company = mine[(mine["company_code"] != CONSOLIDATED)
+                              & (mine["horizon"] == POOLED)]
+            lines.append({"stage1": i, "stage2": j, "topups": k,
+                          "extra_blocks": candidates.stage1[i].params["extra_blocks"],
+                          "current": (i, j, k) == (0, 0, 0),
+                          "wape": consolidated.loc[POOLED, "wape"],
+                          "total_wape": consolidated["wape"].get(HORIZON_TOTAL, float("nan")),
+                          "bias": consolidated.loc[POOLED, "bias"],
+                          "company_wape": by_company["wape"].mean()})
+        if on_batch_done is not None:
+            on_batch_done(len(lines), len(combinations))
     table = pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
     # "stable" keeps the candidates' order on a tie.
     return table.sort_values("wape", kind="stable").reset_index(drop=True)

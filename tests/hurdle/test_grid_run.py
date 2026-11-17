@@ -32,7 +32,8 @@ SCRIPT = REPO_ROOT / "run_hurdle_pipeline.py"
 # each fit cached under hurdle_grid, with a progress callback), then show_grid_predictions,
 # which checks candidate 0 against step 17's rolled forecasts (or says it cannot, without
 # them). U16.4: grid_gates, and show_grid_gates once per stage. U16.5: the actual cash at the
-# grid's origins, every combination scored (grid_scores) and show_grid_scores. U16.6:
+# grid's origins, every combination scored (grid_scores, in batches, with a progress callback
+# timed from its own clock, scoring_started) and show_grid_scores. U16.6:
 # grid_choice and show_grid_choice. U16.7: without [grid] run_test, a line saying the v1 test
 # is not run and (choice, None); with it, the v1 test on the test origins and (choice, test).
 FIT_PROGRESS = (
@@ -48,8 +49,16 @@ GRID_CALL = (
     "on_fit_done=fit_progress)")
 ACTUAL = ("actual = actual_totals(inputs.weekly, inputs.weeks, inputs.levels, inputs.companies, "
           "origins, horizons)")
+SCORE_CLOCK = "scoring_started = time.perf_counter()"
+# The scores' progress: one line per batch of combinations, timed from scoring_started.
+SCORE_PROGRESS = (
+    "def score_progress(done, total):\n"
+    "    so_far = time.perf_counter() - scoring_started\n"
+    "    print(f'  ... scored {done} of {total} combinations ({so_far / 60:.0f} min so far, "
+    "about {so_far / done * (total - done) / 60:.0f} min left)')")
 SCORES = ("table = grid_scores(predictions, candidates, gates, actual, settings, "
-          "companies=inputs.companies, week_zero=inputs.week_zero)")
+          "companies=inputs.companies, week_zero=inputs.week_zero, "
+          "on_batch_done=score_progress)")
 SHOW_SCORES = "show_grid_scores(table, candidates, rolled, actual, horizons)"
 CHOICE = ("choice = grid_choice(predictions, candidates, table, actual, settings, "
           "companies=inputs.companies, week_zero=inputs.week_zero, weekly=inputs.weekly, "
@@ -93,6 +102,8 @@ STATEMENTS = [
     "show_grid_gates('stage 1', gates.stage1, 'log loss', ascending=True)",
     "show_grid_gates('stage 2', gates.stage2, 'deviance skill', ascending=False)",
     ACTUAL,
+    SCORE_CLOCK,
+    SCORE_PROGRESS,
     SCORES,
     SHOW_SCORES,
     CHOICE,
@@ -196,7 +207,7 @@ def test_grid_run_names_are_the_modules_functions_with_the_signatures_it_uses():
                                                      ascending=True)
     inspect.signature(grid_run.grid_scores).bind("predictions", "candidates", "gates",
                                                  "actual", "settings", companies=[],
-                                                 week_zero=None)
+                                                 week_zero=None, on_batch_done=None)
     inspect.signature(grid_run.show_grid_scores).bind("table", "candidates", None, "actual", 5)
     inspect.signature(grid_run.grid_choice).bind(
         "predictions", "candidates", "table", "actual", "settings", companies=[],
@@ -297,6 +308,46 @@ def test_run_grid_fit_progress_is_defined_after_the_clock_and_before_the_grid():
     assert progress.args.defaults == [] and progress.args.vararg is None
     assert statements().index("started = time.perf_counter()") < defs[0]
     assert defs[0] < statements().index(GRID_CALL)
+
+
+def test_run_grid_score_progress_is_defined_after_its_clock_and_before_the_scores():
+    nodes = body()
+    defs = [i for i, node in enumerate(nodes)
+            if isinstance(node, ast.FunctionDef) and node.name == "score_progress"]
+    assert len(defs) == 1
+    progress = nodes[defs[0]]
+    assert [a.arg for a in progress.args.args] == ["done", "total"]
+    assert progress.args.defaults == [] and progress.args.vararg is None
+    assert progress.args.kwonlyargs == [] and progress.args.kwarg is None
+    found = statements()
+    # The scoring clock starts after the gates and the actual cash, so it times the scores only.
+    assert found.index(ACTUAL) < found.index(SCORE_CLOCK) < defs[0] < found.index(SCORES)
+    assert found.index(SCORES) < not_run_at()
+
+
+def test_run_grid_scoring_started_is_set_once_and_read_in_score_progress_only():
+    tree = run_grid_tree()
+    stores = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+              and node.id == "scoring_started" and isinstance(node.ctx, ast.Store)]
+    assert len(stores) == 1
+    progress = [node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "score_progress"][0]
+    loads = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+             and node.id == "scoring_started" and isinstance(node.ctx, ast.Load)]
+    inside = {id(node) for node in ast.walk(progress)}
+    assert len(loads) == 1 and id(loads[0]) in inside
+    # And score_progress never reads the fits' clock.
+    assert "started" not in {node.id for node in ast.walk(progress)
+                             if isinstance(node, ast.Name)}
+
+
+def test_run_grid_grid_scores_gets_score_progress_and_the_default_batch_size():
+    call = calls_to(run_grid_tree(), "grid_scores")[0]
+    assert [ast.unparse(a) for a in call.args] == ["predictions", "candidates", "gates",
+                                                   "actual", "settings"]
+    assert keywords_of(call) == {"companies": "inputs.companies",
+                                 "week_zero": "inputs.week_zero",
+                                 "on_batch_done": "score_progress"}
 
 
 def test_run_grid_the_test_restarts_the_clock_after_the_banner_and_before_the_fits():
@@ -456,8 +507,12 @@ class Run:
     """run_grid with recorders for every function it calls, in grid_run's namespace."""
 
     def __init__(self, monkeypatch, capsys, *, run_test=False, validation_origins=(37, 40, 44),
-                 test_origins=None, ticks=(100.0,), progress_calls=(), test_progress_calls=(),
-                 horizons=5, cache_root=Path("cache_root")):
+                 test_origins=None, ticks=(100.0, 200.0), progress_calls=(),
+                 test_progress_calls=(), score_calls=(), horizons=5,
+                 cache_root=Path("cache_root")):
+        # ticks: one clock read for the fits' start, one for the scores' start, one per
+        # score_calls item (score_progress), then, with the test, one for its restart and one
+        # per test fit. score_calls: the (done, total) the fake grid_scores reports per batch.
         self.calls = []
         self.monkeypatch, self.capsys = monkeypatch, capsys
         clock = iter(ticks)
@@ -481,6 +536,12 @@ class Run:
                 kwargs["on_fit_done"](*item)
             return "<test>"
 
+        def fake_scores(*args, **kwargs):
+            self.calls.append(("grid_scores", args, kwargs))
+            for item in score_calls:
+                kwargs["on_batch_done"](*item)
+            return "<grid table>"
+
         fakes = {
             "grid_candidates": recorder("grid_candidates", "<candidates>"),
             "show_grid_candidates": recorder("show_grid_candidates", None),
@@ -490,7 +551,7 @@ class Run:
                                                                  stage2="<gates 2>")),
             "show_grid_gates": recorder("show_grid_gates", None),
             "actual_totals": recorder("actual_totals", lambda: next(actual)),
-            "grid_scores": recorder("grid_scores", "<grid table>"),
+            "grid_scores": fake_scores,
             "show_grid_scores": recorder("show_grid_scores", None),
             "grid_choice": recorder("grid_choice", "<choice>"),
             "show_grid_choice": recorder("show_grid_choice", None),
@@ -544,7 +605,8 @@ def test_run_grid_calls_in_order_without_the_test(run):
 
 
 def test_run_grid_calls_in_order_with_the_test(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))(rolled="<rolled>")
+    found = run(run_test=True, test_origins=(49, 60),
+                ticks=(100.0, 300.0, 500.0))(rolled="<rolled>")
     assert found.names() == ["grid_candidates", "show_grid_candidates", "grid_predictions",
                              "show_grid_predictions", "grid_gates", "show_grid_gates",
                              "show_grid_gates", "actual_totals", "grid_scores",
@@ -559,7 +621,7 @@ def test_run_grid_without_the_test_returns_the_choice_and_none(run):
 
 
 def test_run_grid_with_the_test_returns_the_choice_and_the_test(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0))()
     assert found.returned == ("<choice>", "<test>")
     assert type(found.returned) is tuple
 
@@ -619,7 +681,7 @@ def test_run_grid_grid_predictions_gets_the_inputs_fields_and_the_cache_folder(r
 
 
 def test_run_grid_cache_folder_follows_the_settings(run, tmp_path):
-    found = run(run_test=True, test_origins=(49,), ticks=(1.0, 2.0), cache_root=tmp_path)()
+    found = run(run_test=True, test_origins=(49,), ticks=(1.0, 1.5, 2.0), cache_root=tmp_path)()
     assert found.only("grid_predictions")[1]["cache_folder"] == tmp_path / "hurdle_grid"
     assert found.only("grid_test")[1]["cache_folder"] == tmp_path / "hurdle_grid"
     assert not (tmp_path / "hurdle_grid").exists()   # made by the grid's fits, not here
@@ -646,7 +708,58 @@ def test_run_grid_grid_scores_gets_the_gates_the_actual_and_the_inputs_fields(ru
     assert (predictions, candidates) == ("<predictions>", "<candidates>")
     assert (gates.stage1, gates.stage2) == ("<gates 1>", "<gates 2>")
     assert actual == "<grid actual>" and settings is found.settings
+    on_batch_done = kwargs.pop("on_batch_done")
+    assert callable(on_batch_done)
+    # No batch_size: the grid's default (SCORE_BATCH) is used.
     assert kwargs == {"companies": "<companies>", "week_zero": "<week zero>"}
+
+
+def test_run_grid_score_progress_is_not_the_fit_progress(run):
+    found = run(run_test=True, test_origins=(49,), ticks=(1.0, 1.5, 2.0))()
+    on_batch_done = found.only("grid_scores")[1]["on_batch_done"]
+    assert on_batch_done is not found.only("grid_predictions")[1]["on_fit_done"]
+    assert on_batch_done is not found.only("grid_test")[1]["on_fit_done"]
+    assert list(inspect.signature(on_batch_done).parameters) == ["done", "total"]
+
+
+def test_run_grid_score_progress_prints_one_line_per_batch(run):
+    # The scores' clock starts at 600 s; the batches end at 720 s, 840 s and 900 s.
+    found = run(ticks=(100.0, 600.0, 720.0, 840.0, 900.0),
+                score_calls=[(500, 1200), (1000, 1200), (1200, 1200)])()
+    assert found.printed[1:] == [
+        # 120 s so far = 2 min; 120 / 500 x 700 = 168 s = 2.8 min -> 3 min.
+        "  ... scored 500 of 1200 combinations (2 min so far, about 3 min left)",
+        # 240 s = 4 min; 240 / 1000 x 200 = 48 s = 0.8 min -> 1 min.
+        "  ... scored 1000 of 1200 combinations (4 min so far, about 1 min left)",
+        # 300 s = 5 min; nothing left.
+        "  ... scored 1200 of 1200 combinations (5 min so far, about 0 min left)",
+        TEST_NOT_RUN_LINE,
+    ]
+
+
+def test_run_grid_score_progress_counts_from_the_scores_clock_not_the_fits(run):
+    # The fits' clock starts at 0 s, the scores' at 3600 s; one batch of 2 ends at 3720 s:
+    # 2 min so far and 2 min left (from the fits' start it would be 62 and 62).
+    found = run(ticks=(0.0, 3600.0, 3720.0), score_calls=[(1, 2)])()
+    assert found.printed[1] == "  ... scored 1 of 2 combinations (2 min so far, about 2 min left)"
+
+
+def test_run_grid_score_progress_lines_come_before_the_test_banner(run):
+    found = run(run_test=True, test_origins=(49, 60), ticks=(0.0, 0.0, 60.0, 120.0, 500.0),
+                score_calls=[(1, 2), (2, 2)])()
+    assert found.printed == [
+        "Step 18: settings grid (U16) over the validation origins 37-44 (3 origins)",
+        "  ... scored 1 of 2 combinations (1 min so far, about 1 min left)",
+        "  ... scored 2 of 2 combinations (2 min so far, about 0 min left)",
+        "        V1 TEST over the test origins 49-60 (2 origins): a report, not a choice; "
+        "do not change the settings because of it"]
+
+
+def test_run_grid_single_batch_progress_line(run):
+    # One batch holding the whole grid: done == total at once; 30 s rounds to 0 min (banker's
+    # rounding of 0.5 min to 0).
+    found = run(ticks=(0.0, 10.0, 40.0), score_calls=[(7, 7)])()
+    assert found.printed[1] == "  ... scored 7 of 7 combinations (0 min so far, about 0 min left)"
 
 
 @pytest.mark.parametrize("horizons", [5, 3])
@@ -686,7 +799,7 @@ def test_run_grid_without_the_test_never_reads_the_test_origins(run):
     (tuple(range(49, 61)), "49-60 (12 origins)")])
 def test_run_grid_with_the_test_prints_the_v1_banner_and_not_the_not_run_line(run, origins,
                                                                               text):
-    found = run(run_test=True, test_origins=origins, ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=origins, ticks=(100.0, 300.0, 500.0))()
     assert found.printed == [
         "Step 18: settings grid (U16) over the validation origins 37-44 (3 origins)",
         f"        V1 TEST over the test origins {text}: a report, not a choice; do not change "
@@ -694,7 +807,7 @@ def test_run_grid_with_the_test_prints_the_v1_banner_and_not_the_not_run_line(ru
 
 
 def test_run_grid_the_test_actual_is_at_the_test_origins_from_the_settings(run):
-    found = run(run_test=True, test_origins=(60, 49), ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=(60, 49), ticks=(100.0, 300.0, 500.0))()
     assert found.all("actual_totals") == [
         (("<weekly>", "<weeks>", "<levels>", "<companies>", [37, 40, 44], 5), {}),
         (("<weekly>", "<weeks>", "<levels>", "<companies>", [60, 49], 5), {})]
@@ -702,7 +815,7 @@ def test_run_grid_the_test_actual_is_at_the_test_origins_from_the_settings(run):
 
 
 def test_run_grid_grid_test_gets_the_choice_the_test_actual_and_the_inputs_fields(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0))()
     (choice, actual, settings), kwargs = found.only("grid_test")
     assert (choice, actual) == ("<choice>", "<test actual>") and settings is found.settings
     on_fit_done = kwargs.pop("on_fit_done")
@@ -711,7 +824,7 @@ def test_run_grid_grid_test_gets_the_choice_the_test_actual_and_the_inputs_field
 
 
 def test_run_grid_grid_test_gets_the_same_settings_callback_and_cache_as_the_grid(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0))()
     grid_args, grid_kwargs = found.only("grid_predictions")
     test_args, test_kwargs = found.only("grid_test")
     assert test_args[2] is grid_args[3]
@@ -720,7 +833,7 @@ def test_run_grid_grid_test_gets_the_same_settings_callback_and_cache_as_the_gri
 
 
 def test_run_grid_shows_the_test_with_the_choice_and_settings(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))()
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0))()
     assert found.only("show_grid_test") == (("<test>", "<choice>", found.settings), {})
 
 
@@ -728,7 +841,7 @@ def test_run_grid_passes_on_the_inputs_objects_themselves(run):
     # Not copies: each grid function gets the very object the inputs hold.
     tables = {name: object() for name in INPUT_KEYWORDS}
     inputs = ModelInputs(last_week=64, **tables)
-    found = run(run_test=True, test_origins=(49,), ticks=(1.0, 2.0))(inputs=inputs)
+    found = run(run_test=True, test_origins=(49,), ticks=(1.0, 1.5, 2.0))(inputs=inputs)
     _, kwargs = found.only("grid_test")
     for name, table in tables.items():
         assert kwargs[name] is table, name
@@ -746,14 +859,15 @@ def test_run_grid_reads_the_inputs_fields_it_passes_on_and_never_last_week(run):
             read.append(name)
             return getattr(INPUTS, name)
 
-    run(run_test=True, test_origins=(49,), ticks=(1.0, 2.0))(inputs=Watched())
+    run(run_test=True, test_origins=(49,), ticks=(1.0, 1.5, 2.0))(inputs=Watched())
     assert set(read) == set(INPUT_KEYWORDS)
     assert "last_week" not in read
 
 
 def test_run_grid_progress_lines(run):
-    # The clock: 100 s at the start; the fits end at 160 s and 400 s (one tick per call).
-    found = run(ticks=(100.0, 160.0, 400.0),
+    # The clock: 100 s at the start; the fits end at 160 s and 400 s (one tick per call);
+    # the scores' clock starts at 450 s (no batch reported).
+    found = run(ticks=(100.0, 160.0, 400.0, 450.0),
                 progress_calls=[(1, 8, "stage 1", 37, 0, 59.6), (2, 8, "stage 2", 37, 3, 0.4)])()
     assert found.printed[1:] == [
         # 60 s per fit so far x 7 left = 420 s = 7 min.
@@ -765,27 +879,52 @@ def test_run_grid_progress_lines(run):
 
 
 def test_run_grid_last_progress_line_has_nothing_left(run):
-    found = run(ticks=(0.0, 3000.0), progress_calls=[(4, 4, "stage 2", 44, 1, 12.0)])()
+    found = run(ticks=(0.0, 3000.0, 3100.0), progress_calls=[(4, 4, "stage 2", 44, 1, 12.0)])()
     assert found.printed[-2:] == [
         "  ... stage 2 setting 1, origin 44: 4 of 4 done (12 s), about 0 min left",
         TEST_NOT_RUN_LINE]
 
 
 def test_run_grid_test_progress_counts_from_the_restarted_clock(run):
-    # The grid's clock starts at 100 s; the test's restarts at 500 s; its one fit of 4 ends at
-    # 560 s: 60 s per fit x 3 left = 180 s = 3 min (from the grid's start it would be 6 min).
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0, 560.0),
+    # The grid's clock starts at 100 s (the scores' at 300 s); the test's restarts at 500 s;
+    # its one fit of 4 ends at 560 s: 60 s per fit x 3 left = 180 s = 3 min (from the grid's
+    # start it would be 6 min, from the scores' start 2 min).
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0, 560.0),
                 test_progress_calls=[(1, 4, "stage 1", 49, 0, 58.0)])()
     assert found.printed[-1] == ("  ... stage 1 setting 0, origin 49: 1 of 4 done (58 s), "
                                  "about 3 min left")
     assert found.printed[-2].startswith("        V1 TEST over the test origins 49-60")
 
 
-def test_run_grid_reads_the_clock_once_without_the_test_and_twice_with_it(run):
-    # Fewer ticks than reads would raise StopIteration: one read each for the grid's start
-    # and the test's restart, none for the printouts.
-    run(ticks=(1.0,))()
-    run(run_test=True, test_origins=(49,), ticks=(1.0, 2.0))()
+def test_run_grid_reads_the_clock_twice_without_the_test_and_three_times_with_it(run):
+    # Fewer ticks than reads would raise StopIteration: one read each for the grid's start,
+    # the scores' start and the test's restart; none for the printouts (the fakes report no
+    # fit and no batch here).
+    run(ticks=(1.0, 1.5))()
+    run(run_test=True, test_origins=(49,), ticks=(1.0, 1.5, 2.0))()
+
+
+@pytest.mark.parametrize("ticks", [(1.0,), ()])
+def test_run_grid_without_the_scores_clock_read_runs_out_of_ticks(run, ticks):
+    # The scores' clock is a read of its own: one tick less than needed is not enough.
+    with pytest.raises(StopIteration):
+        run(ticks=ticks)()
+
+
+def test_run_grid_reads_the_clock_no_more_than_once_per_batch(run):
+    # Two starts plus one read per batch: exactly enough ticks run without StopIteration,
+    # and the clock is never read again after the last batch (one tick less would fail).
+    batches = [(2, 6), (4, 6), (6, 6)]
+    run(ticks=(0.0, 10.0, 20.0, 30.0, 40.0), score_calls=batches)()
+    with pytest.raises(StopIteration):
+        run(ticks=(0.0, 10.0, 20.0, 30.0), score_calls=batches)()
+
+
+def test_run_grid_reads_the_clock_once_per_batch_and_per_test_fit_with_the_test(run):
+    # The fits' start, the scores' start, 2 batches, the test's restart, 2 test fits: 7 reads.
+    run(run_test=True, test_origins=(49,), ticks=(0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0),
+        score_calls=[(1, 2), (2, 2)], test_progress_calls=[(1, 2, "stage 1", 49, 0, 1.0),
+                                                           (2, 2, "stage 2", 49, 0, 1.0)])()
 
 
 def test_run_grid_a_failing_grid_function_stops_it_before_the_choice(run, monkeypatch):
@@ -801,7 +940,7 @@ def test_run_grid_a_failing_grid_function_stops_it_before_the_choice(run, monkey
 
 
 def test_run_grid_changes_nothing_in_the_settings(run):
-    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 500.0))
+    found = run(run_test=True, test_origins=(49, 60), ticks=(100.0, 300.0, 500.0))
     before = repr(found.settings)
     found()
     assert repr(found.settings) == before
@@ -906,6 +1045,20 @@ def test_run_grid_end_to_end_prints_the_steps_in_order(e2e):
     assert TEST_NOT_RUN_LINE not in lines
     gates = [i for i, line in enumerate(lines) if line.startswith("        stage 1 gates:")]
     assert len(gates) == 1 and gates[0] < lines.index(banner)
+
+
+def test_run_grid_end_to_end_prints_one_score_progress_line_for_the_one_batch(e2e):
+    # The tiny grid has far fewer combinations than SCORE_BATCH: one batch, one line, all done.
+    pattern = re.compile(r"  \.\.\. scored (\d+) of (\d+) combinations "
+                         r"\(\d+ min so far, about 0 min left\)")
+    found = [(i, pattern.fullmatch(line)) for i, line in enumerate(e2e.printed)]
+    found = [(i, match) for i, match in found if match]
+    assert len(found) == 1, e2e.printed
+    at, match = found[0]
+    assert match.group(1) == match.group(2) and int(match.group(1)) > 0
+    gates = [i for i, line in enumerate(e2e.printed) if line.startswith("        stage 2 gates:")]
+    banner = [i for i, line in enumerate(e2e.printed) if "V1 TEST over the test origins" in line]
+    assert gates and banner and gates[0] < at < banner[0]
 
 
 def test_run_grid_end_to_end_the_choice_is_grid_choices_on_the_same_inputs(e2e):
