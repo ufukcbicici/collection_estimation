@@ -1,14 +1,20 @@
 """Tests of `run_hurdle_grid.py` (the settings grid alone, e.g. on the compute machine).
 
 The script is loaded in this process from its file, under its own module name, with
-sys.stdout swapped for a stub while it loads (the script reconfigures sys.stdout at import,
-which should not touch pytest's capture) and sys.path restored afterwards (it puts src/ on
+sys.stdout and sys.stderr swapped for stubs while it loads (the script reconfigures both at
+import, which should not touch pytest's capture) and sys.path restored afterwards (it puts src/ on
 it). Its functions are then called with `prepare_inputs`, `run_grid` and `load_settings`
 replaced in the script's namespace. Running it as a script (exit codes) is done in a separate
 Python process, as in test_run_hurdle_pipeline.py.
 
 The end-to-end run reuses test_grid_run.py's tiny grid: real run_grid, real fits (cached in a
 tmp folder), test_grid.py's two candidates per stage.
+
+main() writes a log file. No test may write into the repo's outputs/: every call of main()
+passes a tmp `log_folder`, and an autouse fixture also points main's default log folder at a
+tmp folder (main's default is bound when the script loads, so patching LOG_FOLDER alone would
+not move it). The subprocess runs go through `LAUNCHER`, which calls main() with a tmp
+log folder. The log itself is tested in test_run_hurdle_grid_log.py.
 """
 import dataclasses
 import importlib.util
@@ -47,23 +53,34 @@ class _StdoutStub:
 
 
 def load_script():
-    saved_path, saved_stdout = list(sys.path), sys.stdout
-    stub = _StdoutStub()
-    sys.stdout = stub
+    # Both streams are stubbed: the script reconfigures stdout and stderr at import, and
+    # neither should touch pytest's capture.
+    saved_path, saved_stdout, saved_stderr = list(sys.path), sys.stdout, sys.stderr
+    stub, err_stub = _StdoutStub(), _StdoutStub()
+    sys.stdout, sys.stderr = stub, err_stub
     try:
         spec = importlib.util.spec_from_file_location("run_hurdle_grid_under_test", SCRIPT)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:
-        sys.stdout = saved_stdout
+        sys.stdout, sys.stderr = saved_stdout, saved_stderr
         sys.path[:] = saved_path
-    module._stub = stub
+    module._stub, module._err_stub = stub, err_stub
     return module
 
 
 @pytest.fixture(scope="module")
 def script():
     return load_script()
+
+
+@pytest.fixture(autouse=True)
+def _no_log_into_the_repo(script, tmp_path_factory, monkeypatch):
+    """A guard: should a test call main() without a log folder, its log lands in tmp."""
+    defaults = script.main.__defaults__
+    assert len(defaults) == 2 and defaults[1] == REPO_ROOT / "outputs" / "logs"
+    monkeypatch.setattr(script.main, "__defaults__",
+                        (defaults[0], tmp_path_factory.mktemp("default_logs")))
 
 
 # --- the module -----------------------------------------------------------------------------
@@ -80,6 +97,24 @@ def test_repo_root_and_default_settings_file(script):
 
 def test_loading_the_script_reconfigures_stdout_to_utf8_with_replace(script):
     assert script._stub.reconfigured == [{"encoding": "utf-8", "errors": "replace"}]
+
+
+def test_loading_the_script_reconfigures_stderr_to_utf8_with_replace(script):
+    # An error message may carry a Turkish name too.
+    assert script._err_stub.reconfigured == [{"encoding": "utf-8", "errors": "replace"}]
+
+
+def test_both_reconfigures_are_module_level_side_by_side():
+    import ast
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in tree.body
+             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+             and ast.unparse(node.value.func).endswith(".reconfigure")]
+    assert [ast.unparse(node) for node in found] == [
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
+        "sys.stderr.reconfigure(encoding='utf-8', errors='replace')"]
+    assert found[1].lineno == found[0].lineno + 1
+    assert tree.body.index(found[1]) == tree.body.index(found[0]) + 1
 
 
 def test_the_script_uses_the_package_functions_themselves(script):
@@ -104,10 +139,55 @@ def test_the_script_never_reads_the_grid_run_switch():
     assert "grid" not in names
 
 
-def test_the_script_has_no_try_except():
+def _script_tries():
+    """The script's top-level functions by name, and every try in the file."""
     import ast
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    assert not [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    tries = [node for node in ast.walk(tree)
+             if isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try)))]
+    return functions, tries
+
+
+def _try_in(function, tries):
+    import ast
+    inside = [node for node in tries if node in list(ast.walk(function))]
+    assert len(inside) == 1, len(inside)
+    return inside[0]
+
+
+def test_the_script_has_two_trys_one_in_main_one_in_new_log():
+    # Only main's log wrapper and new_log's name search may catch; no other try anywhere.
+    functions, tries = _script_tries()
+    assert len(tries) == 2
+    assert {_try_in(functions["main"], tries), _try_in(functions["new_log"], tries)} == set(tries)
+
+
+def test_mains_try_only_logs_and_reraises():
+    # One `except BaseException` that writes the traceback to the log and ends in a bare
+    # `raise` (nothing is swallowed), a finally, no else.
+    import ast
+    functions, tries = _script_tries()
+    found = _try_in(functions["main"], tries)
+    (handler,) = found.handlers
+    assert ast.unparse(handler.type) == "BaseException" and handler.name is None
+    assert isinstance(handler.body[-1], ast.Raise) and handler.body[-1].exc is None
+    assert not [node for node in ast.walk(handler) if isinstance(node, (ast.Return, ast.Break,
+                                                                        ast.Continue))]
+    assert "log.write(traceback.format_exc())" in [ast.unparse(s) for s in handler.body]
+    assert found.finalbody and not found.orelse
+
+
+def test_new_logs_try_catches_only_file_exists_and_moves_on():
+    # FileExistsError only; its handler neither raises nor returns (it tries the next name).
+    import ast
+    functions, tries = _script_tries()
+    found = _try_in(functions["new_log"], tries)
+    (handler,) = found.handlers
+    assert ast.unparse(handler.type) == "FileExistsError" and handler.name is None
+    assert not [node for node in ast.walk(handler)
+                if isinstance(node, (ast.Raise, ast.Return, ast.Break))]
+    assert not found.finalbody and not found.orelse
 
 
 # --- 1. settings_file: flag, then env, then default ----------------------------------------
@@ -236,9 +316,9 @@ def test_settings_file_refuses_a_flag_without_a_value(script):
 class Main:
     """main() with load_settings, prepare_inputs, run_grid and the clock replaced."""
 
-    def __init__(self, script, monkeypatch, capsys, *, grid_run_switch=False, test=None,
-                 ticks=(10.0, 52.4, 160.0), rows=1234, columns=17):
-        self.script, self.capsys = script, capsys
+    def __init__(self, script, monkeypatch, capsys, log_folder, *, grid_run_switch=False,
+                 test=None, ticks=(10.0, 52.4, 160.0), rows=1234, columns=17):
+        self.script, self.capsys, self.log_folder = script, capsys, log_folder
         self.calls = []
         self.settings = SimpleNamespace(
             settings_file=Path("/settings/tiny.toml"),
@@ -270,9 +350,14 @@ class Main:
 
     def __call__(self, argv=("--settings", "tiny.toml")):
         self.capsys.readouterr()
-        self.returned = self.script.main(list(argv))
+        self.returned = self.script.main(list(argv), log_folder=self.log_folder)
         self.printed = self.capsys.readouterr().out.splitlines()
+        (self.log_file,) = self.log_folder.iterdir()
         return self
+
+    @property
+    def log_line(self):
+        return f"Log: {self.log_file}"
 
     def only(self, name):
         found = [(a, k) for n, a, k in self.calls if n == name]
@@ -281,9 +366,9 @@ class Main:
 
 
 @pytest.fixture
-def main(script, monkeypatch, capsys):
+def main(script, monkeypatch, capsys, tmp_path):
     def make(**options):
-        return Main(script, monkeypatch, capsys, **options)
+        return Main(script, monkeypatch, capsys, tmp_path / "logs", **options)
     return make
 
 
@@ -344,6 +429,7 @@ def test_main_runs_the_grid_even_without_a_grid_run_attribute(main):
 def test_main_printout_order_without_the_test(main):
     found = main()()
     assert found.printed == [
+        found.log_line,
         f"Settings: {Path('/settings/tiny.toml')}",
         f"Corpus folder: {Path('/corpus/v2')}",
         "Steps 1-11: inputs ready in 42 s (training table 1,234 rows x 17 columns)",
@@ -351,16 +437,37 @@ def test_main_printout_order_without_the_test(main):
         found.script.summary(found.choice, None),
         "Done in 2.5 min",
     ]
-    assert found.printed[4].endswith("; v1 test not run")
+    assert found.printed[5].endswith("; v1 test not run")
 
 
 def test_main_printout_with_the_test_ends_with_its_wape(main):
     test = SimpleNamespace(scores=make_test_scores())
     found = main(test=test)()
-    assert found.printed[3] == "<run_grid output>"
-    assert found.printed[4] == found.script.summary(found.choice, test)
-    assert found.printed[4].endswith("; v1 test (corrected) WAPE 0.2222, bias -0.0333")
-    assert found.printed[5].startswith("Done in ")
+    assert found.printed[0] == found.log_line
+    assert found.printed[4] == "<run_grid output>"
+    assert found.printed[5] == found.script.summary(found.choice, test)
+    assert found.printed[5].endswith("; v1 test (corrected) WAPE 0.2222, bias -0.0333")
+    assert found.printed[6].startswith("Done in ")
+    assert len(found.printed) == 7
+
+
+def test_run_alone_prints_the_old_body_without_a_log_line(main, script, capsys, tmp_path):
+    # run() is main's old body: the same printout, no "Log:" line, and no log file.
+    found = main()
+    capsys.readouterr()
+    assert script.run(["--settings", "tiny.toml"]) is None
+    printed = capsys.readouterr().out.splitlines()
+    assert printed == [
+        f"Settings: {Path('/settings/tiny.toml')}",
+        f"Corpus folder: {Path('/corpus/v2')}",
+        "Steps 1-11: inputs ready in 42 s (training table 1,234 rows x 17 columns)",
+        "<run_grid output>",
+        script.summary(found.choice, None),
+        "Done in 2.5 min",
+    ]
+    assert [name for name, _, _ in found.calls] == ["load_settings", "prepare_inputs",
+                                                    "run_grid"]
+    assert not (tmp_path / "logs").exists()
 
 
 @pytest.mark.parametrize("ticks, ready, done", [
@@ -370,7 +477,8 @@ def test_main_printout_with_the_test_ends_with_its_wape(main):
 ])
 def test_main_times_from_one_start(main, ticks, ready, done):
     found = main(ticks=ticks)()
-    assert ready in found.printed[2]
+    assert found.printed[0] == found.log_line
+    assert ready in found.printed[3]
     assert found.printed[-1] == done
 
 
@@ -381,12 +489,14 @@ def test_main_reads_the_clock_three_times(main):
 
 def test_main_training_table_size_uses_thousands_separators(main):
     found = main(rows=1_234_567, columns=3)()
-    assert found.printed[2].endswith("(training table 1,234,567 rows x 3 columns)")
+    assert found.printed[3].startswith("Steps 1-11: inputs ready")
+    assert found.printed[3].endswith("(training table 1,234,567 rows x 3 columns)")
 
 
 def test_main_with_an_empty_training_table(main):
     found = main(rows=0, columns=0)()
-    assert found.printed[2].endswith("(training table 0 rows x 0 columns)")
+    assert found.printed[3].startswith("Steps 1-11: inputs ready")
+    assert found.printed[3].endswith("(training table 0 rows x 0 columns)")
 
 
 # --- 4. failures propagate -------------------------------------------------------------------
@@ -405,7 +515,7 @@ def test_main_a_failing_prepare_inputs_propagates_before_the_grid(main, script, 
 
 
 def test_main_a_failing_run_grid_propagates_without_summary(main, script, monkeypatch,
-                                                            capsys):
+                                                            capsys, tmp_path):
     found = main()
 
     def broken(*args, **kwargs):
@@ -414,13 +524,13 @@ def test_main_a_failing_run_grid_propagates_without_summary(main, script, monkey
     monkeypatch.setattr(script, "run_grid", broken)
     capsys.readouterr()
     with pytest.raises(ValueError, match="gates failed"):
-        script.main(["--settings", "tiny.toml"])
+        script.main(["--settings", "tiny.toml"], log_folder=tmp_path / "logs")
     printed = capsys.readouterr().out
     assert "kept:" not in printed and "Done in" not in printed
     assert "Steps 1-11: inputs ready" in printed
 
 
-def test_main_a_failing_load_settings_propagates(script, monkeypatch):
+def test_main_a_failing_load_settings_propagates(script, monkeypatch, tmp_path):
     def broken(*args, **kwargs):
         raise ValueError("tiny.toml [grid]: unknown setting")
 
@@ -428,38 +538,59 @@ def test_main_a_failing_load_settings_propagates(script, monkeypatch):
     called = []
     monkeypatch.setattr(script, "prepare_inputs", lambda *a, **k: called.append(a))
     with pytest.raises(ValueError, match="unknown setting"):
-        script.main(["--settings", "tiny.toml"])
+        script.main(["--settings", "tiny.toml"], log_folder=tmp_path / "logs")
     assert called == []
 
 
 def test_main_with_a_missing_file_raises_file_not_found(script, tmp_path):
     with pytest.raises(FileNotFoundError):
-        script.main(["--settings", str(tmp_path / "missing.toml")])
+        script.main(["--settings", str(tmp_path / "missing.toml")],
+                    log_folder=tmp_path / "logs")
 
 
-def run_script(*args, env_settings=None, cwd=REPO_ROOT):
+# Runs the script's file as a script would (its module-level code, then main()), except that
+# main() gets a tmp log folder (argv[1]); the rest of argv is the script's own.
+LAUNCHER = """\
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("run_hurdle_grid", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.main(sys.argv[3:], log_folder=Path(sys.argv[2]))
+"""
+
+
+def run_script(*args, log_folder, env_settings=None, cwd=REPO_ROOT):
     import os
     env = {k: v for k, v in os.environ.items() if k != SETTINGS_ENV}
     if env_settings is not None:
         env[SETTINGS_ENV] = env_settings
     env["PYTHONIOENCODING"] = "utf-8"
-    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, env=env,
-                          capture_output=True, text=True, encoding="utf-8", timeout=300)
+    return subprocess.run([sys.executable, "-c", LAUNCHER, str(SCRIPT), str(log_folder),
+                           *args], cwd=cwd, env=env, capture_output=True, text=True,
+                          encoding="utf-8", timeout=300)
 
 
 def test_the_script_with_a_missing_settings_file_exits_non_zero(tmp_path):
-    result = run_script("--settings", str(tmp_path / "missing.toml"))
+    result = run_script("--settings", str(tmp_path / "missing.toml"),
+                        log_folder=tmp_path / "logs")
     assert result.returncode != 0
     assert "FileNotFoundError" in result.stderr
     assert "Settings:" not in result.stdout
+    (log,) = (tmp_path / "logs").iterdir()
+    assert result.stdout.splitlines() == [f"Log: {log}"]
+    assert log.read_text(encoding="utf-8").rstrip().splitlines()[-1].startswith(
+        "FileNotFoundError")
 
 
 def test_the_script_with_a_settings_file_that_fails_its_check_exits_non_zero(tmp_path):
     bad = tmp_path / "bad.toml"
     bad.write_text("[data]\ncorpus_folder = 'x'\n", encoding="utf-8")
-    result = run_script(env_settings=str(bad))      # the env var route, no flag
+    result = run_script(env_settings=str(bad), log_folder=tmp_path / "logs")   # env var route
     assert result.returncode != 0
     assert "ValueError" in result.stderr and "bad.toml" in result.stderr
+    (log,) = (tmp_path / "logs").iterdir()
+    assert "ValueError" in log.read_text(encoding="utf-8")
 
 
 def test_the_script_from_another_directory_reads_a_relative_path_from_the_repo_root(tmp_path):
@@ -469,8 +600,9 @@ def test_the_script_from_another_directory_reads_a_relative_path_from_the_repo_r
     name = "no_such_settings_file_for_this_test.toml"
     assert not (REPO_ROOT / name).exists()
     (tmp_path / name).write_text("[data]\ncorpus_folder = 'x'\n", encoding="utf-8")
-    for args, env_settings in ((("--settings", name), None), ((), name)):
-        result = run_script(*args, env_settings=env_settings, cwd=tmp_path)
+    for i, (args, env_settings) in enumerate(((("--settings", name), None), ((), name))):
+        result = run_script(*args, env_settings=env_settings, cwd=tmp_path,
+                            log_folder=tmp_path / f"logs{i}")
         assert result.returncode != 0
         assert "FileNotFoundError" in result.stderr, result.stderr
         assert "ValueError" not in result.stderr
@@ -685,9 +817,12 @@ def end_to_end(script, tmp_path_factory):
         patch.setattr(script, "load_settings", load_settings)
         patch.setattr(script, "prepare_inputs", prepare_inputs)
         patch.setattr(script, "run_grid", run_grid)
-        script.main(["--settings", "tiny.toml"])
+        log_folder = tmp_path_factory.mktemp("run_hurdle_grid_logs")
+        script.main(["--settings", "tiny.toml"], log_folder=log_folder)
+    (log_file,) = log_folder.iterdir()
     return SimpleNamespace(settings=settings, inputs=inputs, seen=seen,
-                           printed=printed.getvalue().splitlines(), cache_root=cache_root)
+                           printed=printed.getvalue().splitlines(), cache_root=cache_root,
+                           log_file=log_file)
 
 
 def test_end_to_end_returns_a_choice_and_a_test(end_to_end):
@@ -725,13 +860,14 @@ def test_end_to_end_summary_line_matches_the_returned_choice(end_to_end, script)
 
 def test_end_to_end_printout_order(end_to_end):
     lines = end_to_end.printed
-    assert lines[0] == "Settings: tiny.toml"
-    assert lines[1] == "Corpus folder: tiny_corpus"
+    assert lines[0] == f"Log: {end_to_end.log_file}"
+    assert lines[1] == "Settings: tiny.toml"
+    assert lines[2] == "Corpus folder: tiny_corpus"
     assert re.fullmatch(r"Steps 1-11: inputs ready in \d+ s \(training table [\d,]+ rows x "
-                        r"\d+ columns\)", lines[2]), lines[2]
+                        r"\d+ columns\)", lines[3]), lines[3]
     rows, columns = end_to_end.inputs.table.shape
-    assert lines[2].endswith(f"(training table {rows:,} rows x {columns} columns)")
-    assert lines[3].startswith("Step 18: settings grid (U16) over the validation origins")
+    assert lines[3].endswith(f"(training table {rows:,} rows x {columns} columns)")
+    assert lines[4].startswith("Step 18: settings grid (U16) over the validation origins")
     assert any(line.startswith("        V1 TEST over the test origins") for line in lines)
     assert lines[-2].startswith("kept: ")
     assert re.fullmatch(r"Done in \d+\.\d min", lines[-1]), lines[-1]
@@ -740,6 +876,10 @@ def test_end_to_end_printout_order(end_to_end):
 def test_end_to_end_without_rolled_says_candidate_0_is_not_checked(end_to_end):
     assert ("        candidate 0 against step 17: not checked (step 17 did not forecast "
             "with the model)") in end_to_end.printed
+
+
+def test_end_to_end_log_holds_exactly_what_was_printed(end_to_end):
+    assert end_to_end.log_file.read_text(encoding="utf-8").splitlines() == end_to_end.printed
 
 
 def test_end_to_end_caches_its_fits_under_hurdle_grid(end_to_end):
