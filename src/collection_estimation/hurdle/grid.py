@@ -255,6 +255,44 @@ def cached_fit(stage: str, origin: int, setting, inputs: list, cache_folder: Pat
     return load_with_cache(name, fingerprint, fit, cache_folder)
 
 
+def available_cpus(cgroup_folder: Path = Path("/sys/fs/cgroup")) -> int:
+    """How many CPUs this process may use, at least 1: the machine's (`os.cpu_count`, or those
+    this process is pinned to, where the system says), but no more than a CPU limit set on it.
+
+    In a container (e.g. a Kubernetes pod with a CPU limit of 12000m), `os.cpu_count` counts
+    every core of the machine, not the limit; giving each worker its share of those would run
+    far more threads than the pod may use, and the pod would be held back. The limit is read
+    from `cgroup_folder` (Linux): cgroup v2's cpu.max ("1200000 100000" = 12 CPUs, "max ..." =
+    none), else cgroup v1's cpu/cpu.cfs_quota_us over cpu/cpu.cfs_period_us (-1 = none). A
+    fraction of a CPU is rounded down. Where neither file is there (e.g. Windows), or a file
+    cannot be read, does not hold numbers or gives a period of 0 or less, no limit.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count() or 1
+
+    limit = None
+    v2 = cgroup_folder / "cpu.max"
+    v1_quota = cgroup_folder / "cpu" / "cpu.cfs_quota_us"
+    v1_period = cgroup_folder / "cpu" / "cpu.cfs_period_us"
+    try:
+        if v2.is_file():
+            quota, period = v2.read_text().split()[:2]
+            if quota != "max" and int(period) > 0:
+                limit = int(quota) // int(period)
+        elif v1_quota.is_file() and v1_period.is_file():
+            quota, period = int(v1_quota.read_text()), int(v1_period.read_text())
+            if quota > 0 and period > 0:
+                limit = quota // period
+    except (OSError, ValueError):
+        # A file that cannot be read or does not hold numbers: no limit known.
+        limit = None
+    if limit is not None:
+        cpus = min(cpus, limit)
+    return max(1, cpus)
+
+
 def fit_on_worker(stage: str, number: int, setting, origin: int, train_rows: pd.DataFrame,
                   forecast_rows: pd.DataFrame, block_columns: dict[str, list[str]],
                   companies: list[str], company_as_feature: bool, inputs: list,
@@ -306,8 +344,8 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
     broken candidate does not stop the grid.
 
     With [grid] workers above 1, the fits of each origin (stage 1's first, the long ones,
-    then stage 2's) run that many at a time in worker processes, each with the machine's
-    threads shared out (`fit_on_worker`); the p and m columns are still in the order of the
+    then stage 2's) run that many at a time in worker processes, each with the CPUs this
+    process may use shared out (`available_cpus`, `fit_on_worker`); the p and m columns are still in the order of the
     candidates. With 1, one after another here, with every thread.
 
     `on_fit_done(done, total, stage, origin, candidate, seconds)`, if given, is called after
@@ -342,8 +380,7 @@ def grid_predictions(table: pd.DataFrame, origins: list[int], candidates: GridCa
     diagnostic = settings.diagnostic
     # With several workers, each fit gets its share of the threads; alone, all of them.
     workers = settings.grid.workers
-    # (os.cpu_count() is None when the machine cannot tell: then 1 thread each.)
-    threads = None if workers == 1 else max(1, (os.cpu_count() or 1) // workers)
+    threads = None if workers == 1 else max(1, available_cpus() // workers)
 
     rows, p_parts, m_parts = [], [], []
     total = len(origins) * (len(candidates.stage1) + len(candidates.stage2))

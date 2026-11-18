@@ -9,6 +9,7 @@ on test_forecast.py's small table and compare against one worker.
 """
 import contextlib
 import dataclasses
+import inspect
 import json
 import shutil
 from dataclasses import asdict
@@ -25,6 +26,7 @@ from collection_estimation.hurdle.diagnostic import Candidate
 from collection_estimation.hurdle.forecast import stage1_predictions, stage2_predictions
 from collection_estimation.hurdle.grid import (
     GridCandidates,
+    available_cpus,
     cached_fit,
     fit_on_worker,
     grid_predictions,
@@ -421,6 +423,214 @@ def test_fit_on_worker_really_limits_the_threads_during_the_fit(w_rows, tmp_path
 
 
 # =============================================================================================
+# available_cpus: the machine's CPUs, capped by a cgroup CPU limit (tmp_path cgroup folders)
+# =============================================================================================
+
+def machine(monkeypatch, cpus, affinity=None):
+    """Fix the machine's count: os.cpu_count() -> `cpus`; with `affinity` (a count) also
+    os.sched_getaffinity, else remove it (as on Windows)."""
+    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: cpus)
+    if affinity is None:
+        monkeypatch.delattr(grid_module.os, "sched_getaffinity", raising=False)
+    else:
+        monkeypatch.setattr(grid_module.os, "sched_getaffinity",
+                            lambda pid: set(range(affinity)), raising=False)
+
+
+def cgroup_v2(folder, text):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "cpu.max").write_text(text, encoding="utf-8")
+    return folder
+
+
+def cgroup_v1(folder, quota=None, period=None):
+    folder = Path(folder)
+    (folder / "cpu").mkdir(parents=True, exist_ok=True)
+    if quota is not None:
+        (folder / "cpu" / "cpu.cfs_quota_us").write_text(quota, encoding="utf-8")
+    if period is not None:
+        (folder / "cpu" / "cpu.cfs_period_us").write_text(period, encoding="utf-8")
+    return folder
+
+
+def test_available_cpus_default_folder_is_sys_fs_cgroup():
+    default = inspect.signature(available_cpus).parameters["cgroup_folder"].default
+    assert default == Path("/sys/fs/cgroup")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("1200000 100000", 12), ("600000 100000", 6), ("150000 100000", 1),
+    ("50000 100000", 1), ("100000 100000", 1), ("6400000 100000", 32),
+    ("max 100000", 32),
+], ids=["12", "6", "1.5-down", "0.5-at-least-1", "1", "above-machine", "max"])
+def test_available_cpus_v2_limit(tmp_path, monkeypatch, text, expected):
+    machine(monkeypatch, 32)
+    found = available_cpus(cgroup_v2(tmp_path, text))
+    assert found == expected and type(found) is int
+
+
+@pytest.mark.parametrize("text", ["1200000 100000\n", "  1200000   100000  \n",
+                                  "1200000\t100000", "1200000 100000 extra fields\n"],
+                         ids=["newline", "spaces", "tab", "extra-fields"])
+def test_available_cpus_v2_tolerates_whitespace_and_extra_fields(tmp_path, monkeypatch, text):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v2(tmp_path, text)) == 12
+
+
+@pytest.mark.parametrize("text", ["garbage", "twelve 100000", "1200000", "max", "", "\n",
+                                  "1.5e6 100000", "1200000 abc"],
+                         ids=["garbage", "word-quota", "one-field", "max-alone", "empty",
+                              "newline-only", "float-quota", "word-period"])
+def test_available_cpus_v2_unreadable_is_no_limit(tmp_path, monkeypatch, text):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v2(tmp_path, text)) == 32
+
+
+@pytest.mark.parametrize("quota, period, expected", [
+    ("1200000", "100000", 12), ("1200000\n", "100000\n", 12), ("150000", "100000", 1),
+    ("50000", "100000", 1), ("6400000", "100000", 32), ("-1", "100000", 32),
+    ("-1\n", "100000\n", 32), ("0", "100000", 32),
+], ids=["12", "newlines", "1.5-down", "0.5-at-least-1", "above-machine", "minus-1",
+        "minus-1-newline", "zero"])
+def test_available_cpus_v1_limit(tmp_path, monkeypatch, quota, period, expected):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, quota, period)) == expected
+
+
+@pytest.mark.parametrize("text", ["1200000 0", "1200000 -5", "1200000 0\n", "max 0",
+                                  "max -5", "max abc"],
+                         ids=["zero", "negative", "zero-newline", "max-zero", "max-negative",
+                              "max-word"])
+def test_available_cpus_v2_a_period_of_zero_or_less_is_no_limit(tmp_path, monkeypatch, text):
+    # No ZeroDivisionError: a period that is not above 0 says nothing about a limit.
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v2(tmp_path, text)) == 32
+
+
+@pytest.mark.parametrize("quota, period", [("1200000", "0"), ("1200000", "-1"),
+                                           ("1200000\n", "0\n"), ("-1", "0"), ("-1", "-1"),
+                                           ("0", "0")],
+                         ids=["zero", "minus-1", "zero-newline", "no-quota-zero",
+                              "no-quota-minus-1", "both-zero"])
+def test_available_cpus_v1_a_period_of_zero_or_less_is_no_limit(tmp_path, monkeypatch, quota,
+                                                               period):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, quota, period)) == 32
+
+
+def test_available_cpus_v1_no_quota_with_a_word_period_is_no_limit(tmp_path, monkeypatch):
+    # Both files are read as numbers first: a word period with quota -1 is still no limit.
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, "-1", "abc")) == 32
+
+
+def test_available_cpus_a_zero_period_v2_still_wins_over_a_v1_limit(tmp_path, monkeypatch):
+    # cpu.max is there (period 0, so no limit): v1's 2 CPUs are not read.
+    machine(monkeypatch, 32)
+    cgroup_v1(tmp_path, "200000", "100000")
+    assert available_cpus(cgroup_v2(tmp_path, "1200000 0")) == 32
+
+
+def test_available_cpus_a_zero_period_does_not_stop_the_grid(w_table, tmp_path, monkeypatch,
+                                                             reversed_parallel):
+    # Through grid_predictions with 2 workers: 32 // 2 = 16 threads each, no error.
+    real = grid_module.available_cpus
+    cgroup = cgroup_v2(tmp_path / "cgroup", "1200000 0")
+    monkeypatch.setattr(grid_module, "available_cpus", lambda: real(cgroup))
+    machine(monkeypatch, 32)
+    calls = []
+    fake_fit_on_worker(monkeypatch, calls)
+    w_run(w_table, tmp_path / "cache", workers=2)
+    assert len(calls) == 8 and {c["threads"] for c in calls} == {16}
+
+
+def test_available_cpus_v1_without_a_period_file_is_no_limit(tmp_path, monkeypatch):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, quota="1200000")) == 32
+
+
+def test_available_cpus_v1_without_a_quota_file_is_no_limit(tmp_path, monkeypatch):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, period="100000")) == 32
+
+
+@pytest.mark.parametrize("quota, period", [("abc", "100000"), ("1200000", "abc"), ("", "")],
+                         ids=["word-quota", "word-period", "empty"])
+def test_available_cpus_v1_unreadable_is_no_limit(tmp_path, monkeypatch, quota, period):
+    machine(monkeypatch, 32)
+    assert available_cpus(cgroup_v1(tmp_path, quota, period)) == 32
+
+
+@pytest.mark.parametrize("v2, expected", [("600000 100000", 6), ("max 100000", 32),
+                                          ("garbage", 32)], ids=["6", "max", "garbage"])
+def test_available_cpus_v2_wins_over_v1(tmp_path, monkeypatch, v2, expected):
+    # v1 says 2 CPUs; whenever cpu.max is there, v1 is not read, even when cpu.max says
+    # "max" or cannot be read.
+    machine(monkeypatch, 32)
+    cgroup_v1(tmp_path, "200000", "100000")
+    assert available_cpus(cgroup_v2(tmp_path, v2)) == expected
+
+
+def test_available_cpus_an_empty_folder_is_no_limit(tmp_path, monkeypatch):
+    machine(monkeypatch, 32)
+    assert available_cpus(tmp_path) == 32
+
+
+def test_available_cpus_a_missing_folder_is_no_limit(tmp_path, monkeypatch):
+    machine(monkeypatch, 32)
+    assert available_cpus(tmp_path / "not" / "there") == 32
+
+
+def test_available_cpus_a_folder_named_cpu_max_is_not_read_as_v2(tmp_path, monkeypatch):
+    # cpu.max a folder (not a file): v2 is not there, so v1 is read.
+    machine(monkeypatch, 32)
+    (tmp_path / "cpu.max").mkdir()
+    assert available_cpus(cgroup_v1(tmp_path, "400000", "100000")) == 4
+
+
+def test_available_cpus_uses_sched_getaffinity_where_there(tmp_path, monkeypatch):
+    # Pinned to 6 of the machine's 32: 6, and the cgroup limit still caps it.
+    machine(monkeypatch, 32, affinity=6)
+    assert available_cpus(tmp_path / "none") == 6
+    assert available_cpus(cgroup_v2(tmp_path / "a", "1200000 100000")) == 6
+    assert available_cpus(cgroup_v2(tmp_path / "b", "400000 100000")) == 4
+
+
+def test_available_cpus_sched_getaffinity_is_asked_for_this_process(tmp_path, monkeypatch):
+    asked = []
+    monkeypatch.setattr(grid_module.os, "sched_getaffinity",
+                        lambda pid: asked.append(pid) or {0, 1, 2}, raising=False)
+    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: 99)
+    assert available_cpus(tmp_path) == 3
+    assert asked == [0]
+
+
+def test_available_cpus_without_sched_getaffinity_uses_cpu_count(tmp_path, monkeypatch):
+    machine(monkeypatch, 20)
+    assert available_cpus(tmp_path / "none") == 20
+    assert available_cpus(cgroup_v2(tmp_path / "a", "800000 100000")) == 8
+
+
+@pytest.mark.parametrize("v2", [None, "1200000 100000", "max 100000"],
+                         ids=["no-cgroup", "limit-12", "max"])
+def test_available_cpus_cpu_count_none_counts_as_one(tmp_path, monkeypatch, v2):
+    machine(monkeypatch, None)
+    folder = tmp_path if v2 is None else cgroup_v2(tmp_path, v2)
+    assert available_cpus(folder) == 1
+
+
+def test_available_cpus_is_at_least_one_even_with_an_empty_affinity(tmp_path, monkeypatch):
+    machine(monkeypatch, 8, affinity=0)
+    assert available_cpus(tmp_path) == 1
+
+
+def test_available_cpus_on_this_machine_is_a_positive_int():
+    found = available_cpus()
+    assert type(found) is int and found >= 1
+
+
+# =============================================================================================
 # grid_predictions: workers == 1, and workers > 1 with an in-process stand-in for Parallel
 # =============================================================================================
 
@@ -485,8 +695,18 @@ def test_one_worker_does_not_ask_for_the_cpu_count(w_table, tmp_path, monkeypatc
     calls = []
     fake_fit_on_worker(monkeypatch, calls)
     monkeypatch.setattr(grid_module.os, "cpu_count", lambda: None)
+    monkeypatch.setattr(grid_module, "available_cpus",
+                        lambda *args: pytest.fail("available_cpus with one worker"))
     w_run(w_table, tmp_path, workers=1)
     assert {c["threads"] for c in calls} == {None}
+
+
+def test_one_worker_never_calls_available_cpus(w_table, tmp_path, monkeypatch, no_parallel):
+    asked = []
+    monkeypatch.setattr(grid_module, "available_cpus", lambda *args: asked.append(args) or 8)
+    fake_fit_on_worker(monkeypatch, [])
+    w_run(w_table, tmp_path, workers=1)
+    assert asked == []
 
 
 def test_one_worker_calls_the_fits_stage1_then_stage2_per_origin(w_table, tmp_path, monkeypatch,
@@ -511,25 +731,45 @@ def test_one_worker_calls_the_fits_stage1_then_stage2_per_origin(w_table, tmp_pa
 
 @pytest.mark.parametrize("cpus, workers, threads", [(12, 3, 4), (13, 2, 6), (12, 5, 2),
                                                     (2, 3, 1), (1, 2, 1), (4, 4, 1)])
-def test_several_workers_get_cpu_count_over_workers_threads_at_least_one(
+def test_several_workers_get_available_cpus_over_workers_threads_at_least_one(
         w_table, tmp_path, monkeypatch, reversed_parallel, cpus, workers, threads):
-    calls = []
+    calls, asked = [], []
     fake_fit_on_worker(monkeypatch, calls)
-    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: cpus)
+    monkeypatch.setattr(grid_module, "available_cpus", lambda *args: asked.append(args) or cpus)
+    # The machine's count is not what grid_predictions reads any more.
+    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: 999)
     w_run(w_table, tmp_path, workers=workers)
     assert len(calls) == 8 and {c["threads"] for c in calls} == {threads}
+    assert asked and all(args == () for args in asked)     # the default cgroup folder
 
 
 @pytest.mark.parametrize("workers", [2, 3])
 def test_several_workers_with_an_unknown_cpu_count_get_one_thread_each_and_run(
         w_table, tmp_path, monkeypatch, reversed_parallel, workers):
-    # os.cpu_count() is None when the machine cannot tell: 1 thread per fit, no TypeError.
+    # The real available_cpus on a machine that cannot tell its count (no sched_getaffinity,
+    # os.cpu_count() None) and no cgroup limit: 1 thread per fit, no TypeError.
+    real = grid_module.available_cpus
+    monkeypatch.setattr(grid_module, "available_cpus", lambda: real(tmp_path / "no_cgroup"))
+    monkeypatch.delattr(grid_module.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: None)
     calls = []
     fake_fit_on_worker(monkeypatch, calls)
-    monkeypatch.setattr(grid_module.os, "cpu_count", lambda: None)
     result = w_run(w_table, tmp_path, workers=workers)
     assert len(calls) == 8 and {c["threads"] for c in calls} == {1}
     assert list(result.p.columns) == [0, 1] and list(result.m.columns) == [0, 1]
+
+
+def test_several_workers_read_the_pod_limit_not_the_machine(w_table, tmp_path, monkeypatch,
+                                                            reversed_parallel):
+    # A 64-core node, a pod limited to 12 CPUs (cgroup v2), 3 workers: 4 threads each.
+    real = grid_module.available_cpus
+    cgroup = cgroup_v2(tmp_path / "cgroup", "1200000 100000")
+    monkeypatch.setattr(grid_module, "available_cpus", lambda: real(cgroup))
+    machine(monkeypatch, 64)
+    calls = []
+    fake_fit_on_worker(monkeypatch, calls)
+    w_run(w_table, tmp_path / "cache", workers=3)
+    assert {c["threads"] for c in calls} == {4}
 
 
 def test_several_workers_make_one_loky_unordered_parallel_per_origin(
