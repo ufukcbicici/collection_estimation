@@ -686,8 +686,17 @@ def printed_scores(capsys, table, candidates, rolled, actual=None, horizons=2):
     return capsys.readouterr().out.splitlines()
 
 
-SCORES_HEAD = ("        3 of 12 combinations scored (stage-1 and stage-2 candidates eligible "
-               "or current, every top-up); the 10 best by WAPE:")
+def scores_head(scored, every):
+    """The first line of show_grid_scores (since shortlisted_numbers)."""
+    return (f"        {scored} of {every} combinations scored: per subset of the extra blocks "
+            f"the best eligible stage 1 by log loss and stage 2 by deviance skill, the current "
+            f"settings, every top-up")
+
+
+SCORES_HEAD = scores_head(3, 12)
+# grid_score_table(): one subset, stage 1 {1, 0}, stage 2 {0, 1}.
+SUBSET_LINE = "          none: stage 1 [0, 1], stage 2 [0, 1]"
+BEST_LINE = "        the 10 best by WAPE:"
 CURRENT_LINE = ("        current settings: rank 2 of 3, WAPE 0.1000, 5-week WAPE 0.1200, bias "
                 "+0.0310, company WAPE 0.2200")
 NOT_CHECKED = ("        current against step 17: not checked (step 17 did not forecast with "
@@ -701,13 +710,14 @@ def table_text(table, rows=10):
 def test_show_grid_scores_exact_printout_when_rolled_is_none(capsys):
     table = grid_score_table()
     lines = printed_scores(capsys, table, score_candidates(), None)
-    assert lines == [SCORES_HEAD] + table_text(table) + [CURRENT_LINE, NOT_CHECKED]
+    assert lines == [SCORES_HEAD, SUBSET_LINE, BEST_LINE] + table_text(table) + [
+        CURRENT_LINE, NOT_CHECKED]
 
 
 def test_show_grid_scores_exact_printout_when_the_current_equals_step_17(capsys):
     table = grid_score_table()
     lines = printed_scores(capsys, table, score_candidates(), score_rolled())
-    assert lines == [SCORES_HEAD] + table_text(table) + [
+    assert lines == [SCORES_HEAD, SUBSET_LINE, BEST_LINE] + table_text(table) + [
         CURRENT_LINE,
         "        current WAPE the same as step 17's model: yes (step 17 0.100000, grid "
         "0.100000)"]
@@ -748,8 +758,7 @@ def test_show_grid_scores_reads_only_the_total_of_step_17(capsys):
 
 def test_show_grid_scores_counts_every_combination_of_the_candidates(capsys):
     lines = printed_scores(capsys, grid_score_table(), score_candidates(4, 5, 3), None)
-    assert lines[0] == ("        3 of 60 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
+    assert lines[0] == scores_head(3, 60)
 
 
 def many_lines(n, current_at):
@@ -761,10 +770,14 @@ def many_lines(n, current_at):
 def test_show_grid_scores_shows_the_10_best_only(capsys):
     table = grid_score_table(many_lines(14, current_at=12))
     lines = printed_scores(capsys, table, score_candidates(5, 3, 1), None)
-    assert lines[1:12] == table_text(table)
+    # After the head, the one subset line and "the 10 best" line.
+    assert lines[1] == ("          none: stage 1 [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14], "
+                        "stage 2 [0]")
+    assert lines[2] == BEST_LINE
+    assert lines[3:14] == table_text(table)
     assert len(table_text(table)) == 11            # the header and 10 rows
-    assert lines[12].startswith("        current settings: rank 13 of 14, WAPE 0.2200")
-    assert len(lines) == 14
+    assert lines[14].startswith("        current settings: rank 13 of 14, WAPE 0.2200")
+    assert len(lines) == 16
 
 
 def test_show_grid_scores_rank_1_when_the_current_is_best(capsys):
@@ -776,8 +789,8 @@ def test_show_grid_scores_rank_1_when_the_current_is_best(capsys):
 def test_show_grid_scores_a_lone_current_combination(capsys):
     table = grid_score_table([(0, 0, 0, True, 0.25, 0.3, -0.05, 0.4)])
     lines = printed_scores(capsys, table, score_candidates(1, 1, 1), None)
-    assert lines[0] == ("        1 of 1 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
+    assert lines[:3] == [scores_head(1, 1), "          none: stage 1 [0], stage 2 [0]",
+                         BEST_LINE]
     assert lines[-2] == ("        current settings: rank 1 of 1, WAPE 0.2500, 5-week WAPE "
                          "0.3000, bias -0.0500, company WAPE 0.4000")
 
@@ -791,7 +804,7 @@ def test_show_grid_scores_a_missing_5_week_wape_prints_nan(capsys):
 
 def test_show_grid_scores_rounds_the_table_to_four_decimals(capsys):
     lines = printed_scores(capsys, grid_score_table(), score_candidates(), None)
-    body = "\n".join(lines[1:5])
+    body = "\n".join(lines[3:7])
     assert "0.15" in body and "0.150004" not in body and "0.101234" not in body
 
 
@@ -815,19 +828,87 @@ def test_show_grid_scores_changes_nothing(capsys):
 
 
 def test_show_grid_scores_on_grid_scores_own_output(capsys):
-    # test_grid.py's hand-made example: 3 x 3 x 2 combinations, all scored.
+    # test_grid.py's hand-made example: 3 x 3 x 2 combinations, all eligible; since
+    # shortlisted_numbers 8 of them scored (stage 1 {0, 1}, stage 2 {0, 2}, both top-ups).
     from tests.hurdle.test_grid import sc_candidates, sc_run
     table = sc_run()
     lines = printed_scores(capsys, table, sc_candidates(), None, horizons=5)
-    assert lines[0] == ("        18 of 18 combinations scored (stage-1 and stage-2 candidates "
-                        "eligible or current, every top-up); the 10 best by WAPE:")
-    assert lines[1].split()[:5] == ["stage1", "stage2", "topups", "extra_blocks", "current"]
+    assert lines[0] == scores_head(8, 18)
+    assert lines[1] == "          none: stage 1 [0, 1], stage 2 [0, 2]"
+    assert lines[2] == BEST_LINE
+    assert lines[3].split()[:5] == ["stage1", "stage2", "topups", "extra_blocks", "current"]
     rank = int(table.index[table["current"]][0]) + 1
     current = table[table["current"]].iloc[0]
-    assert lines[-2] == (f"        current settings: rank {rank} of 18, WAPE "
+    assert lines[-2] == (f"        current settings: rank {rank} of 8, WAPE "
                          f"{current['wape']:.4f}, 5-week WAPE {current['total_wape']:.4f}, bias "
                          f"{current['bias']:+.4f}, company WAPE {current['company_wape']:.4f}")
     assert lines[-1] == NOT_CHECKED
+
+
+def subset_score_table():
+    """A grid_scores table over three subsets, sorted by WAPE: "dues" comes first, then
+    "none", then "habits"."""
+    import pandas as pd
+    from collection_estimation.hurdle.grid import GRID_SCORE_COLUMNS
+    lines = [(4, 3, 1, "dues", False, 0.08, 0.1, 0.0, 0.2),
+             (1, 0, 0, "none", False, 0.09, 0.1, 0.0, 0.2),
+             (0, 0, 0, "none", True, 0.10, 0.1, 0.0, 0.2),
+             (4, 3, 0, "dues", False, 0.11, 0.1, 0.0, 0.2),
+             (0, 2, 1, "none", False, 0.12, 0.1, 0.0, 0.2),
+             (6, 5, 0, "habits", False, 0.13, 0.1, 0.0, 0.2)]
+    return pd.DataFrame(lines, columns=GRID_SCORE_COLUMNS)
+
+
+def subset_candidates():
+    # 7 stage-1 and 6 stage-2 candidates: none {0, 1, 2} / {0, 1, 2}, dues {3, 4} / {3, 4},
+    # habits {5, 6} / {5}; 2 top-ups. Same-subset pairs: 9 + 4 + 2 = 15, times 2 = 30.
+    stage1 = [SimpleNamespace(params={"extra_blocks": n})
+              for n in ["none"] * 3 + ["dues"] * 2 + ["habits"] * 2]
+    stage2 = [SimpleNamespace(params={"extra_blocks": n})
+              for n in ["none"] * 3 + ["dues"] * 2 + ["habits"]]
+    return SimpleNamespace(stage1=stage1, stage2=stage2, topups=["t"] * 2)
+
+
+def test_show_grid_scores_one_line_per_subset_in_the_order_of_the_table(capsys):
+    table = subset_score_table()
+    lines = printed_scores(capsys, table, subset_candidates(), None)
+    assert lines[:5] == [scores_head(6, 30),
+                         "          dues: stage 1 [4], stage 2 [3]",
+                         "          none: stage 1 [0, 1], stage 2 [0, 2]",
+                         "          habits: stage 1 [6], stage 2 [5]",
+                         BEST_LINE]
+    assert lines[5:12] == table_text(table)
+    assert lines[12].startswith("        current settings: rank 3 of 6, WAPE 0.1000")
+    assert lines[13] == NOT_CHECKED
+    assert len(lines) == 14
+
+
+def test_show_grid_scores_subset_lines_list_each_number_once_sorted(capsys):
+    # Candidate 4 of stage 1 appears with both top-ups, and the rows are not in number order.
+    lines = printed_scores(capsys, subset_score_table(), subset_candidates(), None)
+    dues = [line for line in lines if line.startswith("          dues:")]
+    assert dues == ["          dues: stage 1 [4], stage 2 [3]"]
+
+
+def test_show_grid_scores_subset_lines_on_grid_scores_own_output_with_subsets(capsys):
+    # test_grid_extra_blocks.py's worked example: shortlists stage 1 {0, 1, 2, 3} and stage 2
+    # {0, 2, 3}; pairs (0, 0), (1, 0) in none, (2, 2) in dues, (3, 3) in habits.
+    from tests.hurdle.test_grid import sc_predictions, sc_run
+    from tests.hurdle.test_grid_extra_blocks import NAMES1, NAMES2, labelled, labelled_gates
+    candidates = labelled(NAMES1, NAMES2)
+    table = sc_run(predictions=sc_predictions(n1=4, n2=4, n3=2), candidates=candidates,
+                   gates=labelled_gates(NAMES1, NAMES2))
+    lines = printed_scores(capsys, table, candidates, None, horizons=5)
+    # combination_count: none 2 x 1, dues 1 x 2, habits 1 x 1 pairs, times 2 top-ups = 10.
+    assert lines[0] == scores_head(8, 10)
+    subsets = lines[1:4]
+    assert sorted(subsets) == sorted(["          none: stage 1 [0, 1], stage 2 [0]",
+                                      "          dues: stage 1 [2], stage 2 [2]",
+                                      "          habits: stage 1 [3], stage 2 [3]"])
+    # In the order each subset first appears in the WAPE-sorted table.
+    first = list(dict.fromkeys(table["extra_blocks"]))
+    assert [line.split(":")[0].strip() for line in subsets] == first
+    assert lines[4] == BEST_LINE
 
 
 def test_show_grid_choice_is_a_module_level_function_with_four_parameters():

@@ -38,8 +38,10 @@ candidate of the grid, whichever it is. Top-ups have no gate: they are judged in
 only (U16.5). The current settings are scored even if they fail a gate (U16.6): they are what
 is kept unless beaten.
 
-U16.5, `grid_scores`: every combination of a scored stage-1 candidate (eligible, or the
-current settings), a scored stage-2 candidate (the same) and a top-up candidate, forecast at
+U16.5, `grid_scores`: every combination of a shortlisted stage-1 candidate, a shortlisted
+stage-2 candidate and a top-up candidate (`shortlisted_numbers`: per subset of the extra
+blocks, the eligible stage-1 candidate with the lowest log loss and the eligible stage-2
+candidate with the highest deviance skill, and the current settings always), forecast at
 every origin as `forecast.forecast` does (p x m added up per company and h, plus the top-ups,
 times the price level projected at the origin; nominal TRY) and scored against the cash that
 came by `evaluate.evaluation_scores`, as step 17 scores the model. Nothing is chosen here
@@ -535,6 +537,28 @@ def scored_numbers(gates: pd.DataFrame, number_column: str) -> list[int]:
     return sorted(int(number) for number in gates.loc[scored, number_column])
 
 
+def shortlisted_numbers(gates: pd.DataFrame, scored: list[int], number_column: str,
+                        measure: str, lowest: bool) -> list[int]:
+    """The candidates of one stage that go on to the WAPE choice: of the `scored` ones
+    (`scored_numbers`), per subset of the extra blocks the eligible one best on the stage's
+    own `measure` (the lowest if `lowest`, else the highest; on a tie the lower number), and
+    the current settings (number 0) if scored.
+
+    So each stage is chosen on how well it does its own job (stage 1 its log loss, stage 2 its
+    deviance skill), and WAPE only chooses among the subsets and the top-ups: among thousands
+    of combinations, WAPE could pick a weaker stage whose errors happen to cancel on the
+    validation weeks.
+    """
+    rows = gates[gates[number_column].isin(scored)]
+    shortlist = {0} if 0 in scored else set()
+    eligible = rows[rows["eligible"]].sort_values(number_column)
+    for _, subset in eligible.groupby("extra_blocks", sort=False):
+        # "stable" keeps the lower number first on a tie.
+        best = subset.sort_values(measure, ascending=lowest, kind="stable").iloc[0]
+        shortlist.add(int(best[number_column]))
+    return sorted(shortlist)
+
+
 def combination_name(stage1: int, stage2: int, topups: int) -> str:
     """The name of a combination of candidates in the stacked forecasts."""
     return f"stage1 {stage1}, stage2 {stage2}, top-ups {topups}"
@@ -612,8 +636,10 @@ def grid_scores(predictions: GridPredictions, candidates: GridCandidates, gates:
         raise ValueError(f"the actual cash is for origins {actual_origins}, the predictions "
                          f"for {origins}")
     projected = projected_at(origins, horizons, week_zero)
-    stage1 = scored_numbers(gates.stage1, "stage1")
-    stage2 = scored_numbers(gates.stage2, "stage2")
+    stage1 = shortlisted_numbers(gates.stage1, scored_numbers(gates.stage1, "stage1"),
+                                 "stage1", "log loss", lowest=True)
+    stage2 = shortlisted_numbers(gates.stage2, scored_numbers(gates.stage2, "stage2"),
+                                 "stage2", "deviance skill", lowest=False)
     combinations = []
     for i, j, k in itertools.product(stage1, stage2, range(len(candidates.topups))):
         # One subset of the extra blocks for both stages (U18.5).

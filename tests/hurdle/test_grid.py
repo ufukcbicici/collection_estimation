@@ -2590,10 +2590,15 @@ def test_grid_gates_run_on_grid_predictions_output(g_result):
 # Mostly on a hand-made `GridPredictions` (seeded, nothing fitted): companies TR02 and TR04,
 # origins 18 and 22, h 1..5, three customers per company; p and m columns per candidate; top-up
 # tables in `topup_forecasts`' shape. The actual cash is `actual_totals` on a seeded weekly
-# table. The gates are hand-made tables (`scored_numbers` reads only the number column and
-# "eligible"). The scores are checked against an independent computation by hand (sums, the
-# projected level, WAPE / bias formulas). At the end, on the U16.3 grid itself: combination
-# (0, 0, 0) scores exactly as `rolling_forecasts` with the same settings.
+# table. The gates are hand-made tables shaped as the real ones: the number column,
+# "extra_blocks" (as `with_params` copies it from the params), "log loss" and "deviance skill"
+# (as the gate functions give them) and "eligible". Since `shortlisted_numbers`, grid_scores
+# scores per subset only the eligible candidate best on its stage's measure, plus candidate 0:
+# with the default measures below (SC_LOG_LOSS, SC_SKILL) and every candidate eligible, that
+# is stage 1 {0, 1} and stage 2 {0, 2}, so the default table has 2 x 2 x 2 = 8 rows. The scores
+# are checked against an independent computation by hand (sums, the projected level, WAPE /
+# bias formulas). At the end, on the U16.3 grid itself: combination (0, 0, 0) scores exactly as
+# `rolling_forecasts` with the same settings.
 # =============================================================================================
 
 from datetime import date  # noqa: E402
@@ -2603,7 +2608,7 @@ from collection_estimation.hurdle.evaluate import (  # noqa: E402
     rolling_forecasts)
 from collection_estimation.hurdle.forecast import CONSOLIDATED, forecast_totals  # noqa: E402
 from collection_estimation.hurdle.grid import (  # noqa: E402
-    GRID_SCORE_COLUMNS, combination_name, grid_scores, scored_numbers)
+    GRID_SCORE_COLUMNS, combination_name, grid_scores, scored_numbers, shortlisted_numbers)
 from collection_estimation.hurdle.prices import projected_levels  # noqa: E402
 from collection_estimation.hurdle.topups import TOPUP_COLUMNS  # noqa: E402
 from tests.hurdle.test_evaluate import make_weekly, make_weeks  # noqa: E402
@@ -2670,12 +2675,37 @@ def sc_candidates(n1=3, n2=3, n3=2):
         topups=[f"<t {k}>" for k in range(n3)])
 
 
-def sc_gate(number_column, eligible):
-    return pd.DataFrame({number_column: list(range(len(eligible))), "eligible": list(eligible)})
+# The default measures of the hand-made gate tables, by candidate number. Stage 1 (lowest log
+# loss best): candidate 1, then 4, 2, 3, 0. Stage 2 (highest deviance skill best): candidate 2,
+# then 3, 1, 4, 0. So with every candidate eligible and one subset, the shortlists are {0, 1}
+# and {0, 2} (two candidates: {0, 1} and {0, 1}); candidate 0 is never the best.
+SC_LOG_LOSS = [0.50, 0.30, 0.40, 0.45, 0.35]
+SC_SKILL = [0.10, 0.20, 0.30, 0.25, 0.15]
 
 
-def sc_gates(eligible1=(True, True, True), eligible2=(True, True, True)):
-    return GridGates(stage1=sc_gate("stage1", eligible1), stage2=sc_gate("stage2", eligible2))
+def sc_gate(number_column, eligible, blocks=None, log_loss=None, skill=None):
+    """A gate table shaped as grid_gates' (number, extra_blocks, the two measures, eligible).
+    `blocks` defaults to "none" for every candidate (sc_candidates' subset)."""
+    n = len(eligible)
+    # Past the fifth candidate, each worse than candidate 0.
+    default_log_loss = [SC_LOG_LOSS[i] if i < 5 else 0.5 + 0.01 * i for i in range(n)]
+    default_skill = [SC_SKILL[i] if i < 5 else 0.1 - 0.01 * i for i in range(n)]
+    return pd.DataFrame({number_column: list(range(n)),
+                         "extra_blocks": list(blocks) if blocks is not None else ["none"] * n,
+                         "log loss": list(log_loss) if log_loss is not None else default_log_loss,
+                         "deviance skill": list(skill) if skill is not None else default_skill,
+                         "eligible": list(eligible)})
+
+
+def sc_gates(eligible1=(True, True, True), eligible2=(True, True, True), blocks1=None,
+             blocks2=None, log_loss=None, skill=None):
+    return GridGates(stage1=sc_gate("stage1", eligible1, blocks=blocks1, log_loss=log_loss),
+                     stage2=sc_gate("stage2", eligible2, blocks=blocks2, skill=skill))
+
+
+# The shortlists of the default sc_gates() (every candidate eligible).
+SC_SHORT1, SC_SHORT2 = [0, 1], [0, 2]
+SC_COMBINATIONS = list(itertools.product(SC_SHORT1, SC_SHORT2, range(2)))
 
 
 def sc_actual(origins=SC_ORIGINS, missing=(), seed=3, horizons=SC_H, zero_company=None):
@@ -2826,6 +2856,206 @@ def test_scored_numbers_on_grid_gates_output(gate_result):
     assert scored_numbers(gates.stage2, "stage2") == [0, 1, 2]
 
 
+# --- shortlisted_numbers --------------------------------------------------------------------
+
+def short_gates(number_column="stage1", numbers=None, blocks=None, log_loss=None, skill=None,
+                eligible=None):
+    """A gate table as grid_gates gives it, by column lists (all of the same length)."""
+    n = len(next(column for column in (numbers, blocks, log_loss, skill, eligible)
+                 if column is not None))
+    numbers = list(numbers) if numbers is not None else list(range(n))
+    return pd.DataFrame({number_column: numbers,
+                         "extra_blocks": list(blocks) if blocks is not None else ["none"] * n,
+                         "log loss": list(log_loss) if log_loss is not None else [0.5] * n,
+                         "deviance skill": list(skill) if skill is not None else [0.1] * n,
+                         "eligible": list(eligible) if eligible is not None else [True] * n})
+
+
+def short1(gates, scored=None):
+    scored = scored_numbers(gates, "stage1") if scored is None else scored
+    return shortlisted_numbers(gates, scored, "stage1", "log loss", lowest=True)
+
+
+def short2(gates, scored=None):
+    scored = scored_numbers(gates, "stage2") if scored is None else scored
+    return shortlisted_numbers(gates, scored, "stage2", "deviance skill", lowest=False)
+
+
+# Three subsets: none {0, 1, 2}, dues {3, 4}, habits {5}.
+SHORT_BLOCKS = ["none", "none", "none", "dues", "dues", "habits"]
+
+
+def test_shortlisted_numbers_lowest_is_the_lowest_measure_per_subset_plus_0():
+    gates = short_gates(blocks=SHORT_BLOCKS, log_loss=[0.6, 0.4, 0.3, 0.2, 0.25, 0.9])
+    assert short1(gates) == [0, 2, 3, 5]
+
+
+def test_shortlisted_numbers_highest_is_the_highest_measure_per_subset_plus_0():
+    gates = short_gates("stage2", blocks=SHORT_BLOCKS, skill=[0.1, 0.4, 0.3, 0.2, 0.25, -0.5])
+    assert short2(gates) == [0, 1, 4, 5]
+
+
+def test_shortlisted_numbers_the_direction_decides_the_pick():
+    # The same column read both ways picks the opposite end of each subset.
+    values = [0.5, 0.1, 0.9, 0.3, 0.7, 0.2]
+    gates = short_gates(blocks=SHORT_BLOCKS, log_loss=values)
+    assert shortlisted_numbers(gates, list(range(6)), "stage1", "log loss", lowest=True) == [
+        0, 1, 3, 5]
+    assert shortlisted_numbers(gates, list(range(6)), "stage1", "log loss", lowest=False) == [
+        0, 2, 4, 5]
+
+
+def test_shortlisted_numbers_read_the_named_measure_only():
+    gates = short_gates(blocks=["none"] * 3, log_loss=[0.5, 0.1, 0.9], skill=[0.0, 0.0, 1.0])
+    assert shortlisted_numbers(gates, [0, 1, 2], "stage1", "log loss", lowest=True) == [0, 1]
+    assert shortlisted_numbers(gates, [0, 1, 2], "stage1", "deviance skill",
+                               lowest=False) == [0, 2]
+
+
+def test_shortlisted_numbers_an_ineligible_candidate_is_never_chosen_even_if_best():
+    # Candidate 2 has by far the best log loss but failed a gate; the next eligible is chosen.
+    gates = short_gates(log_loss=[0.6, 0.4, 0.01, 0.5], eligible=[True, True, False, True])
+    assert short1(gates) == [0, 1]
+    # Even when it is in `scored` (as a caller might pass it).
+    assert short1(gates, scored=[0, 1, 2, 3]) == [0, 1]
+
+
+def test_shortlisted_numbers_an_ineligible_best_of_highest_is_never_chosen():
+    gates = short_gates("stage2", skill=[0.1, 0.2, 0.99, 0.3], eligible=[True, True, False, True])
+    assert short2(gates) == [0, 3]
+
+
+def test_shortlisted_numbers_keep_0_when_it_is_ineligible_and_not_best():
+    gates = short_gates(blocks=SHORT_BLOCKS, log_loss=[0.9, 0.4, 0.3, 0.2, 0.25, 0.5],
+                        eligible=[False] + [True] * 5)
+    assert short1(gates) == [0, 2, 3, 5]
+
+
+def test_shortlisted_numbers_0_eligible_and_best_is_listed_once_and_alone_in_its_subset():
+    gates = short_gates(log_loss=[0.1, 0.4, 0.3])
+    assert short1(gates) == [0]
+
+
+def test_shortlisted_numbers_without_0_in_scored_0_is_absent():
+    gates = short_gates(log_loss=[0.1, 0.4, 0.3])
+    # 0 would be the best and is eligible, but it is not in `scored`.
+    assert short1(gates, scored=[1, 2]) == [2]
+
+
+def test_shortlisted_numbers_with_0_in_scored_but_no_row_for_it_still_lists_0():
+    # 0 comes from `scored`, not from the table.
+    gates = short_gates(numbers=[1, 2], log_loss=[0.4, 0.3])
+    assert short1(gates, scored=[0, 1, 2]) == [0, 2]
+
+
+def test_shortlisted_numbers_candidates_not_in_scored_are_ignored():
+    # Candidate 2 is eligible and best, but the caller did not score it: 1 is the pick.
+    gates = short_gates(log_loss=[0.6, 0.4, 0.1, 0.5])
+    assert short1(gates, scored=[0, 1, 3]) == [0, 1]
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations(range(4))))
+def test_shortlisted_numbers_a_tie_goes_to_the_lower_number_whatever_the_row_order(order):
+    # Candidates 1 and 3 tie for the best log loss (0.2), and 2 and 3 for the best skill.
+    base = short_gates(log_loss=[0.6, 0.2, 0.4, 0.2])
+    assert short1(base.iloc[list(order)]) == [0, 1]
+    base2 = short_gates("stage2", skill=[0.1, 0.2, 0.7, 0.7])
+    assert short2(base2.iloc[list(order)]) == [0, 2]
+
+
+def test_shortlisted_numbers_a_tie_with_0_keeps_0_alone():
+    gates = short_gates(log_loss=[0.2, 0.3, 0.2])
+    assert short1(gates) == [0]
+
+
+def test_shortlisted_numbers_a_subset_with_no_eligible_candidate_adds_nothing():
+    gates = short_gates(blocks=SHORT_BLOCKS, log_loss=[0.6, 0.4, 0.3, 0.2, 0.25, 0.9],
+                        eligible=[True, True, True, False, False, True])
+    assert short1(gates) == [0, 2, 5]
+
+
+def test_shortlisted_numbers_a_subset_whose_eligible_were_not_scored_adds_nothing():
+    gates = short_gates(blocks=SHORT_BLOCKS, log_loss=[0.6, 0.4, 0.3, 0.2, 0.25, 0.9])
+    assert short1(gates, scored=[0, 1, 2, 5]) == [0, 2, 5]
+
+
+def test_shortlisted_numbers_nothing_eligible_gives_only_the_current():
+    gates = short_gates(blocks=SHORT_BLOCKS, eligible=[False] * 6)
+    assert short1(gates) == [0]
+
+
+def test_shortlisted_numbers_nothing_scored_gives_nothing():
+    gates = short_gates(blocks=SHORT_BLOCKS)
+    assert short1(gates, scored=[]) == []
+
+
+def test_shortlisted_numbers_are_sorted_plain_ints_whatever_the_row_order():
+    # Subsets met in the order habits, dues, none, with picks 5, 3 and 1.
+    gates = short_gates(numbers=[5, 4, 3, 2, 1, 0],
+                        blocks=["habits", "dues", "dues", "none", "none", "none"],
+                        log_loss=[0.9, 0.3, 0.2, 0.5, 0.1, 0.6])
+    found = short1(gates)
+    assert found == [0, 1, 3, 5]
+    assert all(type(n) is int for n in found)
+
+
+def test_shortlisted_numbers_of_numpy_and_float_number_columns_are_plain_ints():
+    for numbers in (np.array([0, 1, 2], dtype=np.int32), np.array([0.0, 1.0, 2.0])):
+        gates = short_gates(numbers=numbers, log_loss=[0.6, 0.4, 0.3])
+        found = shortlisted_numbers(gates, [0, 1, 2], "stage1", "log loss", lowest=True)
+        assert found == [0, 2] and all(type(n) is int for n in found)
+
+
+def test_shortlisted_numbers_find_candidates_by_number_not_by_index_or_position():
+    gates = short_gates(numbers=[2, 0, 1], log_loss=[0.1, 0.6, 0.4])
+    gates.index = pd.Index([10, 11, 12])
+    assert short1(gates) == [0, 2]
+
+
+def test_shortlisted_numbers_do_not_change_the_gate_table():
+    gates = short_gates(numbers=[3, 0, 2, 1], blocks=["dues", "none", "none", "dues"],
+                        log_loss=[0.2, 0.6, 0.4, 0.3])
+    before = gates.copy()
+    short1(gates)
+    pd.testing.assert_frame_equal(gates, before)
+
+
+def test_shortlisted_numbers_a_nan_measure_of_an_eligible_candidate_is_not_the_pick():
+    # Reported, not worked around: sort_values puts NaN last in both directions, so a NaN
+    # measure never wins while another eligible candidate in the subset has a number.
+    gates = short_gates(log_loss=[0.6, np.nan, 0.4])
+    assert short1(gates) == [0, 2]
+    gates2 = short_gates("stage2", skill=[0.1, np.nan, 0.3])
+    assert short2(gates2) == [0, 2]
+
+
+def test_shortlisted_numbers_a_lone_eligible_candidate_with_a_nan_measure_is_still_picked():
+    # Documented as found: with no other eligible candidate in its subset, an eligible row
+    # with a NaN measure is the pick. Not reachable from grid_gates (a NaN measure fails every
+    # gate there), only from a hand-made table.
+    gates = short_gates(blocks=["none", "dues"], log_loss=[0.5, np.nan])
+    assert short1(gates) == [0, 1]
+
+
+def test_shortlisted_numbers_on_grid_gates_output():
+    # The U16.4 worked example with named candidates: eligible {1, 2} in both stages.
+    predictions = gate_example()
+    candidates = gate_candidates()
+    named_candidates = GridCandidates(stage1=[named(c) for c in candidates.stage1],
+                                      stage2=[named(c) for c in candidates.stage2],
+                                      topups=candidates.topups)
+    gates = grid_gates(predictions, named_candidates, gate_settings())
+    assert set(gates.stage1["extra_blocks"]) == {"none"}
+    eligible1 = gates.stage1[gates.stage1["eligible"]]
+    eligible2 = gates.stage2[gates.stage2["eligible"]]
+    best1 = int(eligible1.sort_values(["log loss", "stage1"]).iloc[0]["stage1"])
+    best2 = int(eligible2.sort_values(["deviance skill", "stage2"],
+                                      ascending=[False, True]).iloc[0]["stage2"])
+    assert short1(gates.stage1) == sorted({0, best1})
+    assert short2(gates.stage2) == sorted({0, best2})
+    assert best1 in (1, 2) and best2 in (1, 2)
+
+
 # --- grid_scores: the table ---------------------------------------------------------------
 
 def test_grid_scores_columns_and_a_fresh_range_index(sc_result):
@@ -2834,11 +3064,13 @@ def test_grid_scores_columns_and_a_fresh_range_index(sc_result):
     assert table.index.equals(pd.RangeIndex(len(table)))
 
 
-def test_grid_scores_one_row_per_combination_of_every_candidate_when_all_eligible(sc_result):
+def test_grid_scores_one_row_per_combination_of_the_shortlists_when_all_eligible(sc_result):
+    # Was: every candidate (3 x 3 x 2). Since shortlisted_numbers: the best eligible per stage
+    # by its own measure plus the current, times every top-up.
     _, _, table = sc_result
-    assert len(table) == 3 * 3 * 2
+    assert len(table) == 2 * 2 * 2
     found = set(zip(table["stage1"], table["stage2"], table["topups"]))
-    assert found == set(itertools.product(range(3), range(3), range(2)))
+    assert found == set(SC_COMBINATIONS)
 
 
 def test_grid_scores_only_the_current_combination_is_current(sc_result):
@@ -2871,7 +3103,7 @@ def test_grid_scores_scores_are_finite_numbers(sc_result):
 
 def test_grid_scores_every_combination_equals_the_computation_by_hand(sc_result):
     predictions, actual, table = sc_result
-    for i, j, k in itertools.product(range(3), range(3), range(2)):
+    for i, j, k in SC_COMBINATIONS:
         line = sc_line(table, i, j, k)
         wape, total_wape, bias, company_wape = sc_by_hand(predictions, i, j, k, actual)
         assert line["wape"] == pytest.approx(wape, rel=1e-12), (i, j, k)
@@ -2905,7 +3137,7 @@ def pooled(scores, company, column="wape", horizon=POOLED):
 def test_grid_scores_each_combination_equals_scoring_it_alone_exactly(sc_result):
     # Being scored beside the others changes nothing: the same numbers, to the last bit.
     predictions, actual, table = sc_result
-    for i, j, k in [(0, 0, 0), (2, 1, 1), (1, 2, 0)]:
+    for i, j, k in [(0, 0, 0), (1, 2, 1), (1, 0, 0)]:
         scores = alone_scores(predictions, i, j, k, actual)
         line = sc_line(table, i, j, k)
         assert line["wape"] == pooled(scores, CONSOLIDATED)
@@ -2919,15 +3151,15 @@ def test_grid_scores_the_stage_candidates_and_topups_each_move_the_score(sc_resu
     _, _, table = sc_result
     base = sc_line(table, 0, 0, 0)["wape"]
     assert sc_line(table, 1, 0, 0)["wape"] != base
-    assert sc_line(table, 0, 1, 0)["wape"] != base
+    assert sc_line(table, 0, 2, 0)["wape"] != base
     assert sc_line(table, 0, 0, 1)["wape"] != base
 
 
 def test_grid_scores_company_wape_is_the_plain_mean_of_the_companies_pooled_wape(sc_result):
     predictions, actual, table = sc_result
-    scores = alone_scores(predictions, 1, 1, 1, actual)
+    scores = alone_scores(predictions, 1, 2, 1, actual)
     tr02, tr04 = pooled(scores, "TR02"), pooled(scores, "TR04")
-    line = sc_line(table, 1, 1, 1)
+    line = sc_line(table, 1, 2, 1)
     assert line["company_wape"] == pytest.approx((tr02 + tr04) / 2, rel=1e-15)
     # Not the consolidated WAPE: errors of the companies do not cancel in it.
     assert line["company_wape"] != line["wape"]
@@ -2972,12 +3204,13 @@ def identical_candidates(n1=2, n2=3, n3=2):
 
 
 def test_grid_scores_ties_keep_the_order_of_the_candidates():
-    # Every candidate the same: every WAPE ties, so the table is the product order itself.
+    # Every candidate the same: every WAPE ties, so the table is the product order itself (of
+    # the shortlists since shortlisted_numbers: stage 1 {0, 1}, stage 2 {0, 2}).
     table = sc_run(predictions=identical_candidates(), candidates=sc_candidates(2, 3, 2),
                    gates=sc_gates((True, True), (True, True, True)))
     assert table["wape"].nunique() == 1
     assert list(zip(table["stage1"], table["stage2"], table["topups"])) == list(
-        itertools.product(range(2), range(3), range(2)))
+        itertools.product([0, 1], [0, 2], range(2)))
     assert bool(table.loc[0, "current"]) is True
 
 
@@ -3000,10 +3233,13 @@ def test_grid_scores_ineligible_candidates_other_than_the_current_are_not_scored
                    gates=sc_gates((True, False, True), (True, True, False)))
     assert set(found["stage1"]) == {0, 2} and set(found["stage2"]) == {0, 1}
     assert len(found) == 2 * 2 * 2
-    # Each kept combination scores as in the full grid.
+    # Each kept combination scores as when scored alone (candidates 2 of stage 1 and 1 of
+    # stage 2 are not in the default table since shortlisted_numbers, so not compared to it).
     for _, line in found.iterrows():
-        full = sc_line(table, line["stage1"], line["stage2"], line["topups"])
-        assert line["wape"] == full["wape"] and line["bias"] == full["bias"]
+        alone = alone_scores(predictions, line["stage1"], line["stage2"], line["topups"],
+                             actual)
+        assert line["wape"] == pooled(alone, CONSOLIDATED)
+        assert line["bias"] == pooled(alone, CONSOLIDATED, "bias")
 
 
 def test_grid_scores_an_ineligible_current_is_still_scored_with_the_eligible_others(sc_result):
@@ -3035,13 +3271,20 @@ def test_grid_scores_every_topup_candidate_is_scored(n3):
     assert set(table["stage1"]) == {0} and set(table["stage2"]) == {0}
 
 
-def test_grid_scores_combinations_are_the_product_of_the_scored_numbers(sc_result):
+def test_grid_scores_combinations_are_the_product_of_the_shortlisted_numbers(sc_result):
+    # Was the product of scored_numbers; stage-2 candidate 1 is eligible but not the best
+    # (skill 0.2 < candidate 2's 0.3), so it is scored no more.
     predictions, actual, _ = sc_result
     gates = sc_gates((True, False, True), (False, True, True))
     found = sc_run(predictions=predictions, actual=actual, gates=gates)
-    expected = set(itertools.product(scored_numbers(gates.stage1, "stage1"),
-                                     scored_numbers(gates.stage2, "stage2"), range(2)))
+    short1 = shortlisted_numbers(gates.stage1, scored_numbers(gates.stage1, "stage1"), "stage1",
+                                 "log loss", lowest=True)
+    short2 = shortlisted_numbers(gates.stage2, scored_numbers(gates.stage2, "stage2"), "stage2",
+                                 "deviance skill", lowest=False)
+    assert (short1, short2) == ([0, 2], [0, 2])
+    expected = set(itertools.product(short1, short2, range(2)))
     assert set(zip(found["stage1"], found["stage2"], found["topups"])) == expected
+    assert len(found) == len(expected)
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
@@ -3250,18 +3493,33 @@ def test_grid_scores_an_infinite_m_of_the_current_settings_raises(sc_result):
         sc_run(predictions=remade(predictions, m=m), actual=actual)
 
 
-def test_grid_scores_a_nan_p_of_an_eligible_candidate_raises(sc_result):
-    # Eligible means scored: a broken eligible candidate is not skipped silently.
+def test_grid_scores_a_nan_p_of_a_shortlisted_candidate_raises(sc_result):
+    # Shortlisted means scored: a broken shortlisted candidate is not skipped silently. (Was
+    # candidate 2, "eligible means scored"; since shortlisted_numbers the default stage-1
+    # shortlist is {0, 1}, so the NaN goes to candidate 1.)
     predictions, actual, _ = sc_result
     p = predictions.p.copy()
-    p.iloc[7, 2] = np.nan
+    p.iloc[7, 1] = np.nan
     with pytest.raises(ValueError, match="no expected"):
         sc_run(predictions=remade(predictions, p=p), actual=actual)
 
 
+def test_grid_scores_a_nan_p_of_an_eligible_candidate_not_shortlisted_is_never_touched(sc_result):
+    # Candidate 2 is eligible but not the best by log loss: it is not forecast at all.
+    predictions, actual, table = sc_result
+    p = predictions.p.copy()
+    p.iloc[7, 2] = np.nan
+    found = sc_run(predictions=remade(predictions, p=p), actual=actual)
+    pd.testing.assert_frame_equal(found, table)
+
+
 def gated_scores(predictions):
-    """grid_gates then grid_scores on a U16.4 example (one company TR02, zero top-ups)."""
-    gates = grid_gates(predictions, gate_candidates(), gate_settings())
+    """grid_gates then grid_scores on a U16.4 example (one company TR02, zero top-ups). The
+    candidates carry "extra_blocks" (`named`), so the gate tables do, as in a real run."""
+    named_candidates = GridCandidates(stage1=[named(c) for c in gate_candidates().stage1],
+                                      stage2=[named(c) for c in gate_candidates().stage2],
+                                      topups=["<t>"])
+    gates = grid_gates(predictions, named_candidates, gate_settings())
     topups = pd.DataFrame([{"company_code": "TR02", "origin_week": origin, "h": h,
                             "target_week": origin + h, "new_customer_cash": 0.0,
                             "refunds": 0.0, "unidentified_cash": 0.0, "topup": 0.0,
@@ -3299,10 +3557,19 @@ def test_grid_scores_the_current_broken_on_unlabelled_rows_fails_its_gates_and_s
         gated_scores(predictions)
 
 
-def test_grid_scores_on_the_clean_gate_example_scores_the_eligible_and_the_current():
-    _, table = gated_scores(gate_example())
+def test_grid_scores_on_the_clean_gate_example_scores_the_shortlists_and_the_current():
+    # Was: every eligible ({1, 2} in both stages) and the current. Since shortlisted_numbers:
+    # of the eligible, the lowest log loss (stage 1) and the highest deviance skill (stage 2)
+    # from grid_gates' own tables, and the current.
+    gates, table = gated_scores(gate_example())
+    eligible1 = gates.stage1[gates.stage1["eligible"]]
+    eligible2 = gates.stage2[gates.stage2["eligible"]]
+    assert sorted(eligible1["stage1"]) == [1, 2] and sorted(eligible2["stage2"]) == [1, 2]
+    best1 = int(eligible1.loc[eligible1["log loss"].idxmin(), "stage1"])
+    best2 = int(eligible2.loc[eligible2["deviance skill"].idxmax(), "stage2"])
     assert set(zip(table["stage1"], table["stage2"])) == set(
-        itertools.product([0, 1, 2], [0, 1, 2]))
+        itertools.product([0, best1], [0, best2]))
+    assert len(table) == 4
     assert table["current"].sum() == 1
 
 
@@ -3445,9 +3712,15 @@ def g_actual(origins=G_ORIGINS):
 
 
 def g_gates(candidates, eligible1=None, eligible2=None):
+    """Gate tables for the U16.3 grid's candidates, their "extra_blocks" read from the params
+    as with_params copies them. The default measures make candidate 1 the best of each stage
+    (two candidates each), so every combination is still shortlisted."""
     n1, n2 = len(candidates.stage1), len(candidates.stage2)
-    return GridGates(stage1=sc_gate("stage1", eligible1 or (True,) * n1),
-                     stage2=sc_gate("stage2", eligible2 or (True,) * n2))
+    return GridGates(
+        stage1=sc_gate("stage1", eligible1 or (True,) * n1,
+                       blocks=[c.params["extra_blocks"] for c in candidates.stage1]),
+        stage2=sc_gate("stage2", eligible2 or (True,) * n2,
+                       blocks=[c.params["extra_blocks"] for c in candidates.stage2]))
 
 
 @pytest.fixture(scope="module")
@@ -3678,7 +3951,8 @@ def test_combination_forecast_totals_have_a_fresh_range_index_in_origin_order():
 
 def test_combination_forecast_totals_are_what_grid_scores_scores(sc_result):
     predictions, actual, table = sc_result
-    for i, j, k in [(0, 0, 0), (2, 1, 1)]:
+    # (1, 2, 1): a non-current combination of the default shortlists (was (2, 1, 1)).
+    for i, j, k in [(0, 0, 0), (1, 2, 1)]:
         totals = sc_combination(predictions, i, j, k).totals
         stacked = totals[CH_KEYS + ["total"]].rename(columns={"total": "forecast"})
         stacked = stacked.assign(method="x")[STACK_COLUMNS]

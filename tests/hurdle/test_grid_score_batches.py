@@ -3,8 +3,10 @@
 The table must not depend on the batch size (a combination's score reads its own rows only),
 each combination is forecast and scored whole within one batch, `on_batch_done(done, total)`
 is called once per batch, and a batch size below 1 is refused. Run on test_grid.py's hand-made
-GridPredictions (3 x 3 x 2 = 18 combinations, all eligible) and on test_grid_extra_blocks.py's
-labelled candidates (U18.5: only same-subset pairs). The progress lines run_grid prints from
+GridPredictions (every candidate eligible; since `shortlisted_numbers` only the shortlists are
+scored, stage 1 {0, 1} x stage 2 {0, 2} x 2 top-ups = 8 combinations) and on
+test_grid_extra_blocks.py's labelled candidates (U18.5: only same-subset pairs of the
+shortlists). The progress lines run_grid prints from
 `on_batch_done` are tested in test_grid_run.py.
 """
 import inspect
@@ -19,6 +21,7 @@ from collection_estimation.hurdle.forecast import CONSOLIDATED
 from collection_estimation.hurdle.grid import SCORE_BATCH, combination_name, grid_scores
 from tests.hurdle.test_forecast import WEEK_ZERO
 from tests.hurdle.test_grid import (
+    SC_COMBINATIONS,
     SC_COMPANIES,
     identical_candidates,
     sc_actual,
@@ -27,9 +30,13 @@ from tests.hurdle.test_grid import (
     sc_predictions,
     sc_settings,
 )
-from tests.hurdle.test_grid_extra_blocks import NAMES1, NAMES2, labelled
+from tests.hurdle.test_grid_extra_blocks import (
+    NAMES1, NAMES2, SAME_SUBSET_SHORT, labelled, labelled_gates)
 
-N = 3 * 3 * 2          # the combinations of sc_predictions() with every candidate eligible
+# The combinations of sc_predictions() with every candidate eligible: the shortlists
+# {0, 1} x {0, 2} x 2 top-ups (was 3 x 3 x 2 = 18 before shortlisted_numbers).
+N = 2 * 2 * 2
+assert len(SC_COMBINATIONS) == N
 BATCH_MESSAGE = "batch_size is {n}; at least 1 combination is needed"
 
 
@@ -87,11 +94,11 @@ def test_batch_size_and_on_batch_done_are_keyword_only_with_their_defaults():
 # --- the table does not depend on the batch size -------------------------------------------
 
 @pytest.mark.parametrize("batch_size", [
-    1, 2, 3,
-    4,              # 18 = 4 x 4 + 2: a smaller last batch
-    5,              # 18 = 3 x 5 + 3
-    7,              # 18 = 2 x 7 + 4
-    17,             # a last batch of 1
+    1, 2,
+    3,              # 8 = 2 x 3 + 2: a smaller last batch
+    4,              # 8 = 2 x 4: two whole batches
+    5,              # 8 = 5 + 3
+    7,              # a last batch of 1
     N,              # exactly the combinations: one batch
     N + 1,          # more than the combinations: one batch
     10 ** 6,
@@ -118,13 +125,14 @@ def test_the_table_of_one_batch_per_combination_equals_one_batch_of_all(case):
 
 @pytest.mark.parametrize("batch_size", [1, 2, 5, 12])
 def test_ties_keep_the_candidates_order_whatever_the_batch_size(batch_size):
-    # Every candidate the same: every WAPE ties, so the order is the product order itself.
+    # Every candidate the same: every WAPE ties, so the order is the product order itself
+    # (of the shortlists: stage 1 {0, 1}, stage 2 {0, 2}).
     predictions = identical_candidates()
     candidates, gates = sc_candidates(2, 3, 2), sc_gates((True, True), (True, True, True))
     found = scores(predictions, candidates=candidates, gates=gates, batch_size=batch_size)
     assert found["wape"].nunique() == 1
     assert list(zip(found["stage1"], found["stage2"], found["topups"])) == list(
-        itertools.product(range(2), range(3), range(2)))
+        itertools.product([0, 1], [0, 2], range(2)))
     pd.testing.assert_frame_equal(found, scores(predictions, candidates=candidates,
                                                 gates=gates), check_exact=True)
 
@@ -136,8 +144,9 @@ def test_ineligible_candidates_are_left_out_whatever_the_batch_size(case, batch_
     found = scores(predictions, gates=gates, actual=actual, batch_size=batch_size)
     pd.testing.assert_frame_equal(found, scores(predictions, gates=gates, actual=actual),
                                   check_exact=True)
-    assert set(found["stage1"]) == {0, 2} and set(found["stage2"]) == {0, 1, 2}
-    assert len(found) == 2 * 3 * 2
+    # Stage-2 candidate 1 is eligible but not shortlisted (skill 0.2 < candidate 2's 0.3).
+    assert set(found["stage1"]) == {0, 2} and set(found["stage2"]) == {0, 2}
+    assert len(found) == 2 * 2 * 2
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 5])
@@ -184,8 +193,7 @@ def test_the_batches_follow_the_product_order(case, monkeypatch):
     predictions, actual, _ = case
     batches = watch_scoring(monkeypatch)
     scores(predictions, actual=actual, batch_size=5)
-    expected = [combination_name(i, j, k)
-                for i, j, k in itertools.product(range(3), range(3), range(2))]
+    expected = [combination_name(i, j, k) for i, j, k in SC_COMBINATIONS]
     found = [method for batch in batches for method in batch]
     assert found == expected
     assert [list(batch) for batch in batches] == [expected[s:s + 5] for s in range(0, N, 5)]
@@ -212,16 +220,16 @@ def test_each_combination_is_forecast_once_whatever_the_batch_size(case, monkeyp
 
     monkeypatch.setattr(grid_module, "combination_forecast", counted)
     scores(predictions, actual=actual, batch_size=4)
-    assert made == list(itertools.product(range(3), range(3), range(2)))
+    assert made == SC_COMBINATIONS
 
 
 # --- on_batch_done -------------------------------------------------------------------------
 
 @pytest.mark.parametrize("batch_size, expected", [
     (1, [(d, N) for d in range(1, N + 1)]),
-    (4, [(4, N), (8, N), (12, N), (16, N), (18, N)]),
-    (5, [(5, N), (10, N), (15, N), (18, N)]),
-    (9, [(9, N), (18, N)]),
+    (3, [(3, N), (6, N), (8, N)]),
+    (4, [(4, N), (8, N)]),
+    (5, [(5, N), (8, N)]),
     (N, [(N, N)]),
     (N + 1, [(N, N)]),
     (SCORE_BATCH, [(N, N)]),
@@ -251,7 +259,8 @@ def test_on_batch_done_counts_are_plain_ints(case):
 
 
 def test_on_batch_done_total_counts_the_scored_combinations_only(case):
-    # With ineligible candidates the total is what is scored, not the full product.
+    # With ineligible candidates the total is what is scored, not the full product: stage 1
+    # {0} (nothing else eligible), stage 2 {0, 1} (1 the only other eligible one).
     predictions, actual, _ = case
     calls, on_batch_done = recorder()
     found = scores(predictions, gates=sc_gates((True, False, False), (True, True, False)),
@@ -276,7 +285,7 @@ def test_on_batch_done_runs_after_its_batch_is_forecast_and_scored(case, monkeyp
            on_batch_done=lambda done, total: seen.append((done, len(made), len(batches))))
     # When told `done`, exactly `done` combinations have been forecast, and one more batch
     # has been scored each time: never ahead of the work, never behind it.
-    assert seen == [(4, 4, 1), (8, 8, 2), (12, 12, 3), (16, 16, 4), (18, 18, 5)]
+    assert seen == [(4, 4, 1), (8, 8, 2)]
 
 
 @pytest.mark.parametrize("given", [{}, {"on_batch_done": None}])
@@ -293,7 +302,7 @@ def test_on_batch_done_that_raises_stops_the_scores(case, monkeypatch):
     def stop(done, total):
         raise RuntimeError(f"stopped at {done} of {total}")
 
-    with pytest.raises(RuntimeError, match="stopped at 4 of 18"):
+    with pytest.raises(RuntimeError, match="stopped at 4 of 8"):
         scores(predictions, actual=actual, batch_size=4, on_batch_done=stop)
     assert len(batches) == 1
 
@@ -305,8 +314,8 @@ def test_on_batch_done_is_called_positionally_with_done_then_total(case):
     def only_positional(a, b, /):
         seen.append((a, b))
 
-    scores(predictions, actual=actual, batch_size=10, on_batch_done=only_positional)
-    assert seen == [(10, N), (N, N)]
+    scores(predictions, actual=actual, batch_size=3, on_batch_done=only_positional)
+    assert seen == [(3, N), (6, N), (N, N)]
 
 
 # --- a batch size below 1 -----------------------------------------------------------------
@@ -386,15 +395,17 @@ def test_no_consolidated_cash_raises_at_the_first_batch_before_it_is_told(case, 
     assert calls == []
 
 
-# --- U18.5: only same-subset pairs, whatever the batch size --------------------------------
+# --- U18.5: only same-subset pairs of the shortlists, whatever the batch size ------------
 
 def subset_scores(**kwargs):
     return scores(sc_predictions(n1=4, n2=4, n3=2), candidates=labelled(NAMES1, NAMES2),
-                  gates=sc_gates((True,) * 4, (True,) * 4), **kwargs)
+                  gates=labelled_gates(NAMES1, NAMES2), **kwargs)
 
 
-SAME_SUBSET = [(i, j, k) for i, j, k in itertools.product(range(4), range(4), range(2))
-               if NAMES1[i] == NAMES2[j]]
+# test_grid_extra_blocks.py's worked shortlists: stage 1 {0, 1, 2, 3}, stage 2 {0, 2, 3}; the
+# same-subset pairs (0, 0), (1, 0), (2, 2), (3, 3), times 2 top-ups (was every same-subset
+# pair, 10, before shortlisted_numbers).
+SAME_SUBSET = SAME_SUBSET_SHORT
 
 
 @pytest.fixture(scope="module")
@@ -419,7 +430,7 @@ def test_subsets_only_same_subset_pairs_are_forecast_and_scored(monkeypatch, bat
     for i, j, _ in SAME_SUBSET:
         assert NAMES1[i] == NAMES2[j]
     total = len(SAME_SUBSET)
-    assert total == 10
+    assert total == 8
     assert len(calls) == math.ceil(total / batch_size)
     assert [t for _, t in calls] == [total] * len(calls)
     assert calls[-1] == (total, total)

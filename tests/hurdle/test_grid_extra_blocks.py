@@ -25,7 +25,9 @@ import pytest
 from collection_estimation.hurdle import grid as grid_module
 from collection_estimation.hurdle.diagnostic import Candidate
 from collection_estimation.hurdle.diagnostic_joint import stage1_grid, stage2_grid
-from collection_estimation.hurdle.forecast import stage1_predictions, stage2_predictions
+from collection_estimation.hurdle.evaluate import HORIZON_TOTAL
+from collection_estimation.hurdle.forecast import (
+    CONSOLIDATED, stage1_predictions, stage2_predictions)
 from collection_estimation.hurdle.grid import (
     ALWAYS_HASHED_BLOCKS,
     GRID_SCORE_COLUMNS,
@@ -35,26 +37,33 @@ from collection_estimation.hurdle.grid import (
     combination_count,
     grid_candidates,
     grid_predictions,
+    grid_scores,
     hashed_table,
     same_extra_blocks,
+    scored_numbers,
     setting_hash,
+    shortlisted_numbers,
     subset_name,
     with_extra_blocks,
 )
 from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings, Stage2Settings
-from tests.hurdle.test_forecast import BLOCK_COLUMNS, F_COMPANIES, make_table
+from tests.hurdle.test_forecast import BLOCK_COLUMNS, F_COMPANIES, WEEK_ZERO, make_table
 from tests.hurdle.test_grid import (
     GRID,
+    SC_COMPANIES,
     STAGE1,
     STAGE2,
     TOPUPS,
+    alone_scores,
     g_inputs,
     g_settings,
     make,
+    pooled,
     sc_actual,
     sc_gates,
     sc_predictions,
     sc_run,
+    sc_settings,
 )
 
 BOTH = ("dues", "habits")
@@ -408,6 +417,13 @@ def test_combination_count_is_far_below_the_full_product_with_subsets():
 
 
 # --- grid_scores with subsets ----------------------------------------------------------------
+#
+# Since `shortlisted_numbers`, grid_scores scores per subset only the eligible candidate of each
+# stage best on its measure (stage 1 the lowest log loss, stage 2 the highest deviance skill),
+# plus candidate 0. With NAMES1 / NAMES2 and test_grid.py's default measures (SC_LOG_LOSS,
+# SC_SKILL), every candidate eligible: stage 1 none {0, 1} -> 1, dues {2}, habits {3}: {0, 1, 2,
+# 3}; stage 2 none {0}, dues {1, 2} -> 2 (0.3 > 0.2), habits {3}: {0, 2, 3}. Same-subset pairs:
+# (0, 0), (1, 0), (2, 2), (3, 3).
 
 def labelled(names1, names2, n3=2):
     """sc_candidates-like candidates whose stage candidates carry the given subset names."""
@@ -419,19 +435,29 @@ def labelled(names1, names2, n3=2):
         topups=[f"<t {k}>" for k in range(n3)])
 
 
+def labelled_gates(names1, names2, eligible1=None, eligible2=None, log_loss=None, skill=None):
+    """sc_gates whose "extra_blocks" column is the candidates' subset names, as with_params
+    copies them from the params in a real run."""
+    return sc_gates(eligible1 or (True,) * len(names1), eligible2 or (True,) * len(names2),
+                    blocks1=names1, blocks2=names2, log_loss=log_loss, skill=skill)
+
+
 NAMES1 = ["none", "none", "dues", "habits"]
 NAMES2 = ["none", "dues", "dues", "habits"]
+SHORT1 = [0, 1, 2, 3]
+SHORT2 = [0, 2, 3]
+SAME_SUBSET_SHORT = [(i, j, k) for i, j, k in itertools.product(SHORT1, SHORT2, range(2))
+                     if NAMES1[i] == NAMES2[j]]
 
 
 @pytest.fixture(scope="module")
 def subset_case():
     predictions = sc_predictions(n1=4, n2=4, n3=2)
     actual = sc_actual()
-    gates = sc_gates((True,) * 4, (True,) * 4)
-    table = sc_run(predictions=predictions, candidates=labelled(NAMES1, NAMES2), gates=gates,
-                   actual=actual)
+    table = sc_run(predictions=predictions, candidates=labelled(NAMES1, NAMES2),
+                   gates=labelled_gates(NAMES1, NAMES2), actual=actual)
     every = sc_run(predictions=predictions, candidates=labelled(["none"] * 4, ["none"] * 4),
-                   gates=gates, actual=actual)
+                   gates=sc_gates((True,) * 4, (True,) * 4), actual=actual)
     return predictions, actual, table, every
 
 
@@ -442,12 +468,12 @@ def test_grid_scores_columns_include_extra_blocks_after_topups(subset_case):
 
 
 def test_grid_scores_scores_only_same_subset_pairs(subset_case):
+    # Was: every same-subset pair (10). Since shortlisted_numbers: the same-subset pairs of
+    # the two shortlists.
     _, _, table, _ = subset_case
-    expected = {(i, j, k) for i, j, k in itertools.product(range(4), range(4), range(2))
-                if NAMES1[i] == NAMES2[j]}
     found = set(zip(table["stage1"], table["stage2"], table["topups"]))
-    assert found == expected
-    assert len(table) == len(expected) == (2 * 1 + 1 * 2 + 1 * 1) * 2
+    assert found == set(SAME_SUBSET_SHORT)
+    assert len(table) == len(SAME_SUBSET_SHORT) == 4 * 2
 
 
 def test_grid_scores_never_scores_a_cross_subset_pair(subset_case):
@@ -463,12 +489,24 @@ def test_grid_scores_extra_blocks_column_is_the_pairs_subset_name(subset_case):
     assert set(table["extra_blocks"]) == {"none", "dues", "habits"}
 
 
-def test_grid_scores_a_pair_scores_as_it_does_without_subsets(subset_case):
-    # Labelling the candidates only drops pairs: the scores of a kept pair do not move.
+def test_grid_scores_a_pair_scores_as_it_does_alone(subset_case):
+    # Labelling the candidates only drops pairs: the scores of a kept pair are its scores
+    # alone. (Was: compared with the all-"none" table, which since shortlisted_numbers no
+    # longer holds the pairs (2, 2) and (3, 3); see the next test for the pairs it holds.)
+    predictions, actual, table, _ = subset_case
+    for _, line in table.iterrows():
+        alone = alone_scores(predictions, line["stage1"], line["stage2"], line["topups"],
+                             actual)
+        assert line["wape"] == pooled(alone, CONSOLIDATED)
+        assert line["bias"] == pooled(alone, CONSOLIDATED, "bias")
+        assert line["total_wape"] == pooled(alone, CONSOLIDATED, horizon=HORIZON_TOTAL)
+
+
+def test_grid_scores_a_pair_in_both_tables_scores_the_same(subset_case):
     _, _, table, every = subset_case
     keys = ["stage1", "stage2", "topups"]
     merged = table.merge(every, on=keys, suffixes=("", "_all"))
-    assert len(merged) == len(table)
+    assert sorted(set(zip(merged["stage1"], merged["stage2"]))) == [(0, 0), (1, 0)]
     for column in ("wape", "total_wape", "bias", "company_wape"):
         np.testing.assert_array_equal(merged[column].to_numpy(),
                                       merged[f"{column}_all"].to_numpy())
@@ -483,9 +521,12 @@ def test_grid_scores_the_current_is_0_0_0_only(subset_case):
     assert current.iloc[0]["extra_blocks"] == "none"
 
 
-def test_grid_scores_all_none_is_the_full_product(subset_case):
+def test_grid_scores_all_none_is_the_product_of_the_shortlists(subset_case):
+    # Was "the full product" (4 x 4 x 2). One subset now: stage 1 {0, 1}, stage 2 {0, 2}.
     _, _, _, every = subset_case
-    assert len(every) == 4 * 4 * 2
+    assert set(zip(every["stage1"], every["stage2"], every["topups"])) == set(
+        itertools.product([0, 1], [0, 2], range(2)))
+    assert len(every) == 2 * 2 * 2
     assert set(every["extra_blocks"]) == {"none"}
 
 
@@ -496,18 +537,19 @@ def test_grid_scores_sorted_by_wape_with_subsets(subset_case):
 
 
 def test_grid_scores_a_subset_with_no_partner_in_the_other_stage_is_not_scored():
+    names1, names2 = ["none", "habits", "dues"], ["none", "dues"]
     predictions = sc_predictions(n1=3, n2=2, n3=1)
-    table = sc_run(predictions=predictions,
-                   candidates=labelled(["none", "habits", "dues"], ["none", "dues"], n3=1),
-                   gates=sc_gates((True,) * 3, (True,) * 2))
+    table = sc_run(predictions=predictions, candidates=labelled(names1, names2, n3=1),
+                   gates=labelled_gates(names1, names2))
     assert 1 not in set(table["stage1"])     # habits has no stage-2 partner
     assert set(zip(table["stage1"], table["stage2"])) == {(0, 0), (2, 1)}
 
 
 def test_grid_scores_an_ineligible_candidate_drops_its_pairs_only():
+    # Stage-1 candidate 2 (the only "dues" one) fails a gate: "dues" has no stage-1 pick.
     predictions = sc_predictions(n1=4, n2=4, n3=1)
     table = sc_run(predictions=predictions, candidates=labelled(NAMES1, NAMES2, n3=1),
-                   gates=sc_gates((True, True, False, True), (True,) * 4))
+                   gates=labelled_gates(NAMES1, NAMES2, eligible1=(True, True, False, True)))
     assert set(zip(table["stage1"], table["stage2"])) == {(0, 0), (1, 0), (3, 3)}
 
 
@@ -521,6 +563,90 @@ def test_choose_combination_reads_the_table_with_its_extra_blocks_column(subset_
         assert [chosen[k] for k in keys] == [same[k] for k in keys]
     winner = choose_combination(table, 0.0)
     assert winner["extra_blocks"] == NAMES1[winner["stage1"]]
+
+
+# --- grid_scores forecasts exactly the shortlists' same-subset pairs ------------------------
+
+def forecast_spy(monkeypatch):
+    made = []
+    real = grid_module.combination_forecast
+
+    def counted(predictions, i, j, k, **kwargs):
+        made.append((i, j, k))
+        return real(predictions, i, j, k, **kwargs)
+
+    monkeypatch.setattr(grid_module, "combination_forecast", counted)
+    return made
+
+
+# Six candidates per stage over two subsets. Some ineligible candidates are the best on their
+# measure (stage 1: 2 and 5; stage 2: 5), and the eligible picks are not the first of their
+# subset.
+WIDE1 = ["none", "none", "none", "dues", "dues", "dues"]
+WIDE2 = ["none", "none", "dues", "dues", "dues", "none"]
+WIDE_LOG_LOSS = [0.50, 0.40, 0.20, 0.35, 0.30, 0.10]
+WIDE_SKILL = [0.10, 0.30, 0.20, 0.60, 0.40, 0.90]
+WIDE_ELIGIBLE1 = (True, True, False, True, True, False)
+WIDE_ELIGIBLE2 = (False, True, True, True, False, False)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 500])
+def test_grid_scores_forecasts_exactly_the_same_subset_pairs_of_the_shortlists(monkeypatch,
+                                                                               batch_size):
+    gates = labelled_gates(WIDE1, WIDE2, eligible1=WIDE_ELIGIBLE1, eligible2=WIDE_ELIGIBLE2,
+                           log_loss=WIDE_LOG_LOSS, skill=WIDE_SKILL)
+    short1 = shortlisted_numbers(gates.stage1, scored_numbers(gates.stage1, "stage1"),
+                                 "stage1", "log loss", lowest=True)
+    short2 = shortlisted_numbers(gates.stage2, scored_numbers(gates.stage2, "stage2"),
+                                 "stage2", "deviance skill", lowest=False)
+    # By hand: stage 1 none eligible {0, 1} -> 1 (0.40), dues eligible {3, 4} -> 4 (0.30);
+    # stage 2 none eligible {1} -> 1, dues eligible {2, 3} -> 3 (0.60); and 0 in both.
+    assert (short1, short2) == ([0, 1, 4], [0, 1, 3])
+    expected = [(i, j, k) for i, j, k in itertools.product(short1, short2, range(3))
+                if WIDE1[i] == WIDE2[j]]
+    assert {(i, j) for i, j, _ in expected} == {(0, 0), (0, 1), (1, 0), (1, 1), (4, 3)}
+    made = forecast_spy(monkeypatch)
+    table = grid_scores(sc_predictions(n1=6, n2=6, n3=3), labelled(WIDE1, WIDE2, n3=3), gates,
+                        sc_actual(), sc_settings(), companies=list(SC_COMPANIES),
+                        week_zero=WEEK_ZERO, batch_size=batch_size)
+    # Forecast once each, in the product order of the shortlists.
+    assert made == expected
+    assert set(zip(table["stage1"], table["stage2"], table["topups"])) == set(expected)
+    assert len(table) == len(expected) == 5 * 3
+    assert table["current"].sum() == 1
+
+
+def test_grid_scores_the_measures_decide_which_candidates_are_scored():
+    # The same predictions and eligibility, other measures: other picks are scored.
+    names = ["none"] * 3
+    predictions = sc_predictions(n1=3, n2=3, n3=1)
+    one = sc_run(predictions=predictions, candidates=labelled(names, names, n3=1),
+                 gates=labelled_gates(names, names, log_loss=[0.5, 0.3, 0.4],
+                                      skill=[0.1, 0.3, 0.2]))
+    other = sc_run(predictions=predictions, candidates=labelled(names, names, n3=1),
+                   gates=labelled_gates(names, names, log_loss=[0.5, 0.4, 0.3],
+                                        skill=[0.1, 0.2, 0.3]))
+    assert set(zip(one["stage1"], one["stage2"])) == set(itertools.product([0, 1], [0, 1]))
+    assert set(zip(other["stage1"], other["stage2"])) == set(itertools.product([0, 2], [0, 2]))
+
+
+def test_grid_scores_a_lower_wape_candidate_is_not_scored_if_its_measure_is_worse():
+    # Each stage is chosen on its own measure, not on WAPE: of two eligible stage-2
+    # candidates, the one with the lower WAPE (scored alone) is left out when the other has
+    # the higher deviance skill in the gate table.
+    names = ["none"] * 3
+    predictions = sc_predictions(n1=1, n2=3, n3=1)
+    actual = sc_actual()
+    wapes = {j: pooled(alone_scores(predictions, 0, j, 0, actual), CONSOLIDATED)
+             for j in (1, 2)}
+    assert wapes[1] != wapes[2]
+    better, worse = sorted((1, 2), key=lambda j: wapes[j])
+    skill = [0.1, 0.1, 0.1]
+    skill[worse] = 0.5
+    table = sc_run(predictions=predictions, candidates=labelled(["none"], names, n3=1),
+                   gates=labelled_gates(["none"], names, skill=skill), actual=actual)
+    assert sorted(table["stage2"]) == [0, worse]
+    assert better not in set(table["stage2"])
 
 
 # --- ALWAYS_HASHED_BLOCKS and hashed_table ---------------------------------------------------

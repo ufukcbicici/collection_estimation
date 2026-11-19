@@ -82,8 +82,13 @@ def show_grid_scores(table, candidates, rolled, actual, horizons):
     current combination and its rank, and whether it scores exactly as step 17's model
     (`rolled`, scored here on `actual`; None if step 17 did not forecast with the model)."""
     every = combination_count(candidates)   # same extra blocks in both stages
-    print(f"        {len(table)} of {every} combinations scored (stage-1 and stage-2 "
-          f"candidates eligible or current, every top-up); the 10 best by WAPE:")
+    print(f"        {len(table)} of {every} combinations scored: per subset of the extra "
+          f"blocks the best eligible stage 1 by log loss and stage 2 by deviance skill, the "
+          f"current settings, every top-up")
+    for blocks, rows in table.groupby("extra_blocks", sort=False):
+        print(f"          {blocks}: stage 1 {sorted(set(rows['stage1']))}, "
+              f"stage 2 {sorted(set(rows['stage2']))}")
+    print("        the 10 best by WAPE:")
     print(table.head(10).round(4).to_string(index=False))
     rank = int(table.index[table["current"]][0]) + 1
     current = table[table["current"]].iloc[0]
