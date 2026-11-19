@@ -177,6 +177,8 @@ def test_every_step_1_to_11_printout_is_a_function_of_the_module():
     # U18.3 added share_groups and show_payment_habits right after it, also for main() only.
     at = expected.index("show_expected_dues") + 1
     expected[at:at] = ["share_groups", "show_payment_habits"]
+    # U19.1 added show_series_features right after it, also called by main() only.
+    expected.insert(expected.index("show_payment_habits") + 1, "show_series_features")
     assert names == expected
     for name in names:
         assert callable(getattr(preparation, name)), name

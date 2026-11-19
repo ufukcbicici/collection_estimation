@@ -7,10 +7,13 @@ own) and the copied inflation module's own figures beside the levels used (step 
 """
 from datetime import timedelta
 
+import numpy as np
 import pandas as pd
 
 from .. import inflation
+from ..benchmark import recent_level
 from ..features_receivables import before_first_ledger_week
+from ..forecast import CONSOLIDATED
 from ..holidays import public_holidays
 from ..prices import price_weeks, projected_levels, published_month
 from ..read_collections import read_one_file
@@ -311,6 +314,84 @@ def show_payment_habits(habits, table, validation_origins):
             })
         preview = pd.DataFrame(lines).set_index(column)
         print(preview.round(3).to_string())
+
+
+def show_series_features(series, real, reference, validation_origins, mean_weeks):
+    """A short printout of the series features (U19.1) and two checks before any model sees
+    them, at the validation origins:
+
+      - the trend forecasts are the `deflated_trend` reference's own (`reference`, from
+        `evaluate.deflated_reference` at those origins), wherever it used its ridge;
+      - a preview: per h, how closely trend_ratio follows the ratio that really came (the
+        cash of the target week over the same trailing mean; `real` is
+        `evaluate.real_weekly_cash`), as a correlation over the company rows, and over the
+        consolidated rows for all_trend_ratio. Near 0, the features tell the model little.
+    """
+    has_forecast = series["trend_forecast"].notna()
+    first_company = series.loc[has_forecast, "origin_week"].min()
+    first_all = series.loc[series["all_trend_forecast"].notna(), "origin_week"].min()
+    print(f"        series features: {len(series):,} rows (origins "
+          f"{series['origin_week'].min()}-{series['origin_week'].max()}, h 1-{series['h'].max()}, "
+          f"{series['company_code'].nunique()} companies); a trend forecast for "
+          f"{has_forecast.mean():.0%} of them, from origin {first_company} on (consolidated: "
+          f"from origin {first_all}); ratios over the trailing {mean_weeks} weeks")
+
+    # Check 1: the same numbers as the reference, company by company and consolidated.
+    trend = reference[(reference["reference"] == "deflated_trend") & ~reference["fallback"]]
+    differences = []
+    for _, row in trend.iterrows():
+        mine = series[(series["origin_week"] == row["origin_week"]) & (series["h"] == row["h"])]
+        if row["company_code"] == CONSOLIDATED:
+            value = mine["all_trend_forecast"].iloc[0]
+        else:
+            value = mine.loc[mine["company_code"] == row["company_code"], "trend_forecast"].iloc[0]
+        differences.append(abs(value - row["real_forecast"]))
+    # A NaN difference (a series forecast missing where the reference has one) is a mismatch.
+    # It is counted on its own: Python's max() ignores a NaN that is not first in the list.
+    missing = sum(1 for difference in differences if np.isnan(difference))
+    numbers = [difference for difference in differences if not np.isnan(difference)]
+    largest = max(numbers) if numbers else float("nan")
+    same = bool(differences) and all(difference == 0 for difference in differences)
+    print(f"        the same as the deflated_trend reference at the validation origins: "
+          f"{'yes' if same else 'NO'} ({len(differences)} forecasts compared, largest "
+          f"difference {largest:.6g}, {missing} missing in the series)")
+
+    # Check 2: the preview. The ratio that came: the target week's cash over the trailing
+    # mean at the origin (NaN if the target week has no data).
+    def ratio_that_came(company, origin, h):
+        cash = real[company]
+        mean = recent_level(cash, origin, mean_weeks)
+        if origin + h not in cash.index or not mean > 0:
+            return float("nan")
+        return cash.loc[origin + h] / mean
+
+    at_validation = series[series["origin_week"].isin(validation_origins)]
+    lines = []
+    for h, rows in at_validation.groupby("h"):
+        company_pairs = pd.DataFrame({
+            "forecast": rows["trend_ratio"].to_numpy(),
+            "came": [ratio_that_came(c, o, h) for c, o in zip(rows["company_code"],
+                                                              rows["origin_week"])],
+        }).dropna()
+        # The consolidated features repeat on every company row: one row per origin.
+        per_origin = rows.drop_duplicates("origin_week")
+        all_pairs = pd.DataFrame({
+            "forecast": per_origin["all_trend_ratio"].to_numpy(),
+            "came": [ratio_that_came(CONSOLIDATED, o, h) for o in per_origin["origin_week"]],
+        }).dropna()
+        lines.append({
+            "h": h,
+            "company rows": len(company_pairs),
+            "trend_ratio correlation": company_pairs["forecast"].corr(company_pairs["came"]),
+            "consolidated rows": len(all_pairs),
+            "all_trend_ratio correlation": all_pairs["forecast"].corr(all_pairs["came"]),
+        })
+    if not lines:
+        print("        preview: no series rows at the validation origins")
+        return
+    print("        preview on the validation origins: the forecast ratio against the ratio "
+          "that came")
+    print(pd.DataFrame(lines).set_index("h").round(3).to_string())
 
 
 def show_known(known, collections, last_week):

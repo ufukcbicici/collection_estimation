@@ -307,6 +307,40 @@ def rolling_fingerprint(table: pd.DataFrame, origins: list[int], settings, *,
     ]
 
 
+def real_weekly_cash(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
+                     companies: list[str]) -> dict[str, pd.Series]:
+    """Each company's cash per week, deflated (TRY of week 0), and the consolidated cash
+    (company "ALL"): the series `deflated_reference` fits on, and the U19 series features too.
+
+    A company's cash in a week is its gross receipts + refunds (as in `actual_totals`). Only
+    the weeks with data are in a series (a week without data is not a 0); in a week with
+    data, a company without a line has a real 0. Returns {company: series indexed by week},
+    the companies in sorted order, then "ALL".
+
+    Raises ValueError if the company list is empty or holds "ALL", if the weekly amounts hold
+    cash of a company outside the list, and as `deflate` does for a week with no price level.
+    """
+    if not companies:
+        raise ValueError("the company list is empty")
+    if CONSOLIDATED in companies:
+        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
+                         f"a company")
+    outside = sorted(set(weekly["company_code"]) - set(companies), key=str)
+    if outside:
+        raise ValueError(f"the weekly amounts have cash of companies not in the list: {outside}")
+
+    # The cash per week with data (rows) and company (columns), 0 where a company has no line.
+    with_data = sorted(set(weeks.loc[~weeks["is_missing"], "week"]))
+    net = weekly.assign(actual=weekly["gross_receipts"] + weekly["refunds"])
+    cash = (net[net["week"].isin(with_data)]
+            .pivot_table(index="week", columns="company_code", values="actual", aggfunc="sum")
+            .reindex(index=with_data, columns=sorted(set(companies)), fill_value=0.0)
+            .fillna(0.0))
+    cash[CONSOLIDATED] = cash.sum(axis=1)
+    week_of_row = pd.Series(cash.index, index=cash.index)
+    return {company: deflate(cash[company], week_of_row, levels) for company in cash.columns}
+
+
 def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series,
                        calendar: pd.DataFrame, companies: list[str], origins: list[int],
                        horizons: int, week_zero: date) -> pd.DataFrame:
@@ -336,25 +370,7 @@ def deflated_reference(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Ser
         raise ValueError("there are no origins to forecast at")
     if horizons < 1:
         raise ValueError(f"horizons is {horizons}; horizons start at 1")
-    if not companies:
-        raise ValueError("the company list is empty")
-    if CONSOLIDATED in companies:
-        raise ValueError(f"{CONSOLIDATED!r} is the code of the consolidated rows; it cannot be "
-                         f"a company")
-    outside = sorted(set(weekly["company_code"]) - set(companies), key=str)
-    if outside:
-        raise ValueError(f"the weekly amounts have cash of companies not in the list: {outside}")
-
-    # The cash per week with data (rows) and company (columns), 0 where a company has no line.
-    with_data = sorted(set(weeks.loc[~weeks["is_missing"], "week"]))
-    net = weekly.assign(actual=weekly["gross_receipts"] + weekly["refunds"])
-    cash = (net[net["week"].isin(with_data)]
-            .pivot_table(index="week", columns="company_code", values="actual", aggfunc="sum")
-            .reindex(index=with_data, columns=sorted(set(companies)), fill_value=0.0)
-            .fillna(0.0))
-    cash[CONSOLIDATED] = cash.sum(axis=1)
-    week_numbers = pd.Series(cash.index, index=cash.index)
-    real = {company: deflate(cash[company], week_numbers, levels) for company in cash.columns}
+    real = real_weekly_cash(weekly, weeks, levels, companies)
 
     projected = {origin: projected_levels(week_zero, origin,
                                           [origin + h for h in range(1, horizons + 1)])

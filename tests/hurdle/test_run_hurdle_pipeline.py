@@ -415,7 +415,7 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     # the top-ups (U12.2, U12.3), and nothing else. (U18.1 added its two statements, U18.2
     # and U18.3 two each: a heading and a printout. Since U18.4 the blocks themselves are
     # built in prepare_inputs, step 11b, so main() no longer calls expected_dues or
-    # payment_habits.)
+    # payment_habits. U19.1 added the six statements of U19_1_BLOCK.)
     body = main_tree().body
     calls = [i for i, node in enumerate(body) if isinstance(node, ast.Assign)
              and ast.unparse(node) == "inputs, details = prepare_inputs(settings, "
@@ -425,10 +425,10 @@ def test_demo_origin_guard_sits_right_after_the_inputs_are_unpacked():
     assert len(guards) == 1
     between = body[calls[0] + 1:guards[0]]
     assert ast.unparse(between[0]) == "show_preparation(inputs, details, settings)"
-    assert [ast.unparse(node) for node in between[-8:]] == [
+    assert [ast.unparse(node) for node in between[-14:]] == [
         U18_1_PRINT, U18_1_SHOW, U18_2_PRINT, U18_2_SHOW, U18_3_PRINT, U18_3_SHOW,
-        SHOW_TOPUPS, COMPARE_TOPUPS_IF]
-    for node in between[1:-8]:
+        *U19_1_BLOCK, SHOW_TOPUPS, COMPARE_TOPUPS_IF]
+    for node in between[1:-14]:
         assert isinstance(node, ast.Assign), ast.unparse(node)
         values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
         for value in values:
@@ -555,6 +555,10 @@ source = " ".join(inspect.getsource(script.main).split())
 end = "show_stage1_scores(forecast_rows, predictions, train_rows, fit_seconds)"
 assert source.count(end) == 1, end
 source = source[:source.index(end) + len(end)]
+# And from its first call: U19.1, earlier in main(), times its own step with the same line too.
+start = "show_stage1_rows(origin, train_rows, forecast_rows, train_x)"
+assert source.count(start) == 1, start
+source = source[source.index(start):]
 steps = [
     "show_stage1_rows(origin, train_rows, forecast_rows, train_x)",
     "predictions, fit_seconds = {}, {}",
@@ -3466,10 +3470,12 @@ def test_step_16_and_17_imports():
     # U16.5 added STACK_COLUMNS (show_grid_scores stacks step 17's totals with it). The
     # constants only the printouts read (HORIZON_TOTAL, KNOWN_CUSTOMERS, POOLED, REFERENCES,
     # RULE, STACK_COLUMNS) went with them to hurdle/reports/; main() still reads HURDLE.
+    # U19.1 added real_weekly_cash (the series its printout reads).
     assert [(a.name, a.asname) for a in evaluate_imports[0].names] == [
         ("HURDLE", None), ("actual_totals", None), ("balance_coherence", None),
         ("component_bias", None), ("deflated_reference", None), ("evaluation_scores", None),
-        ("paired_wape_bootstrap", None), ("payer_split", None), ("rolling_fingerprint", None),
+        ("paired_wape_bootstrap", None), ("payer_split", None), ("real_weekly_cash", None),
+        ("rolling_fingerprint", None),
         ("rolling_forecasts", None), ("rule_reference", None), ("stack_forecasts", None)]
     # The cache's one function, in an import of its own, right after evaluate's.
     cache_imports = [node for node in module.body if isinstance(node, ast.ImportFrom)
@@ -3670,7 +3676,12 @@ DEFLATED_REFERENCE_ARGS = ["weekly", "weeks", "levels", "calendar", "companies",
 
 
 def test_step_17_calls_deflated_reference_once_with_its_arguments():
-    assert len(calls_to(main_tree(), "deflated_reference")) == 1
+    # Twice in main(): here, and since U19.1 once more at the validation origins, for the
+    # series features' check (tested with U19_1_BLOCK); none elsewhere.
+    in_main = calls_to(main_tree(), "deflated_reference")
+    assert len(in_main) == 2
+    in_step_17 = {ast.unparse(call) for call in calls_to(step_17_block(), "deflated_reference")}
+    others = [call for call in in_main if ast.unparse(call) not in in_step_17]
     block = step_17_block()
     calls = calls_to(block, "deflated_reference")
     assert len(calls) == 1
@@ -3680,6 +3691,10 @@ def test_step_17_calls_deflated_reference_once_with_its_arguments():
     assigned = [node for node in block.body if isinstance(node, ast.Assign)
                 and node.value is call]
     assert len(assigned) == 1 and [ast.unparse(t) for t in assigned[0].targets] == ["reference"]
+    assert len(others) == 1
+    assert [ast.unparse(a) for a in others[0].args] == [
+        "weekly", "weeks", "levels", "calendar", "companies", "validation_origins",
+        "settings.receivables.horizons", "week_zero"]
 
 
 def test_step_17_deflated_reference_is_a_direct_statement_of_the_evaluation_block():
@@ -5256,10 +5271,10 @@ def test_each_printout_the_script_calls_is_imported_from_a_report_module():
 def test_the_script_imports_from_each_report_module_the_printouts_of_its_steps():
     imports = script_imports()
     # U18.1 added show_cleared_invoice_delays, U18.2 show_expected_dues, U18.3
-    # show_payment_habits.
+    # show_payment_habits, U19.1 show_series_features.
     assert imports["collection_estimation.hurdle.reports.preparation"] == [
         "show_cleared_invoice_delays", "show_expected_dues", "show_payment_habits",
-        "show_preparation"]
+        "show_preparation", "show_series_features"]
     assert imports["collection_estimation.hurdle.reports.stages"] == [
         "show_amount_reliability", "show_calibration", "show_cash_by_p_group",
         "show_diagnostic_grid", "show_diagnostic_splits", "show_diagnostic_test",
@@ -5307,18 +5322,19 @@ def unpacking_ends():
 
 
 def test_main_calls_show_topups_right_after_the_inputs_are_unpacked():
-    # Right after the U18.1, U18.2 and U18.3 printouts, which follow the unpacking (U18.1 moved it
-    # by two, U18.2 by two more, U18.3 by two more; U18.4 moved the two builds out of main()).
+    # Right after the U18.1, U18.2 and U18.3 printouts and the U19.1 step, which follow the
+    # unpacking (U18.1 moved it by two, U18.2 by two more, U18.3 by two more; U18.4 moved the
+    # two builds out of main(); U19.1 moved it by six, the length of U19_1_BLOCK).
     body = main_body()
     at = unpacking_ends()
-    assert ast.unparse(body[at + 7]) == SHOW_TOPUPS
+    assert ast.unparse(body[at + 13]) == SHOW_TOPUPS
     assert len(calls_to(main_tree(), "show_topups")) == 1
 
 
 def test_main_calls_compare_topups_right_after_show_topups_behind_topups_compare():
     body = main_body()
     at = unpacking_ends()
-    block = body[at + 8]
+    block = body[at + 14]
     assert ast.unparse(block) == COMPARE_TOPUPS_IF
     assert block.orelse == []
     assert len(calls_to(main_tree(), "compare_topups")) == 1
@@ -5329,7 +5345,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
     at = unpacking_ends()
     stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    for node in body[at + 7:at + 9]:
+    for node in body[at + 13:at + 15]:
         read = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
                 and isinstance(n.ctx, ast.Load)} - {"settings", "show_topups",
                                                      "compare_topups"}
@@ -5339,7 +5355,7 @@ def test_the_top_ups_read_main_names_unpacked_before_them():
 def test_the_top_ups_come_before_the_demo_origin_guard():
     body = main_body()
     at = unpacking_ends()
-    assert is_demo_origin_guard(body[at + 9])
+    assert is_demo_origin_guard(body[at + 15])
 
 
 def test_show_preparation_no_longer_runs_the_top_ups():
@@ -5478,7 +5494,9 @@ def test_main_shows_the_payment_habits_of_the_details_right_after_the_heading():
     body = main_body()
     at = unpacking_ends()
     assert ast.unparse(body[at + 6]) == U18_3_SHOW
-    assert ast.unparse(body[at + 7]) == SHOW_TOPUPS
+    # Then the U19.1 step (its heading first), then the top-ups.
+    assert ast.unparse(body[at + 7]) == U19_1_BLOCK[0]
+    assert ast.unparse(body[at + 13]) == SHOW_TOPUPS
 
 
 def test_the_u18_printouts_come_in_order_before_show_topups_in_the_source():
@@ -5599,3 +5617,106 @@ def test_the_synthetic_stages_keep_the_three_base_blocks():
     settings = load_settings(settings_file, SCRIPT.parent)
     for stage in (settings.stage1, settings.stage2):
         assert "dues" not in stage.feature_blocks and "habits" not in stage.feature_blocks
+
+
+# --- U19.1: main() makes and prints the series features, between U18.3 and the top-ups -------
+# Display only: the series features are made at every origin of the table and checked against
+# the deflated_trend reference at the validation origins. Not wired into prepare_inputs, the
+# feature blocks or the grid until U19.2.
+
+U19_1_BLOCK = [
+    "print('U19.1: the series features (the deflated_trend forecasts)')",
+    "started = time.perf_counter()",
+    "series = series_features(weekly, weeks, levels, calendar, companies, "
+    "sorted(set(table['origin_week'])), settings.receivables.horizons, SERIES_MEAN_WEEKS)",
+    "print(f'        made in {time.perf_counter() - started:.0f} s')",
+    "validation_origins = list(settings.evaluation.validation_origins)",
+    "show_series_features(series, real_weekly_cash(weekly, weeks, levels, companies), "
+    "deflated_reference(weekly, weeks, levels, calendar, companies, validation_origins, "
+    "settings.receivables.horizons, week_zero), validation_origins, SERIES_MEAN_WEEKS)",
+]
+
+
+def test_main_runs_the_u19_1_step_right_after_the_u18_3_printout():
+    body = main_body()
+    at = unpacking_ends()
+    assert ast.unparse(body[at + 6]) == U18_3_SHOW
+    assert [ast.unparse(node) for node in body[at + 7:at + 13]] == U19_1_BLOCK
+    assert ast.unparse(body[at + 13]) == SHOW_TOPUPS
+
+
+def test_the_u19_1_step_comes_between_u18_3_and_the_top_ups_in_the_source():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert (source.index("show_payment_habits(details.habits, table,")
+            < source.index('print("U19.1: the series features (the deflated_trend forecasts)")')
+            < source.index("series = series_features(")
+            < source.index("show_series_features(series,")
+            < source.index("show_topups(new_cash, refunds,"))
+
+
+def test_series_mean_weeks_is_a_module_constant_of_13():
+    module = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in module.body if isinstance(node, ast.Assign)
+             and [ast.unparse(t) for t in node.targets] == ["SERIES_MEAN_WEEKS"]]
+    assert len(found) == 1
+    assert ast.unparse(found[0].value) == "13"
+    # main() never rebinds it.
+    stores = [n for n in ast.walk(main_tree()) if isinstance(n, ast.Name)
+              and n.id == "SERIES_MEAN_WEEKS" and isinstance(n.ctx, ast.Store)]
+    assert stores == []
+
+
+def test_the_script_imports_the_u19_1_names():
+    imports = script_imports()
+    assert imports["collection_estimation.hurdle.features_series"] == ["series_features"]
+    assert "show_series_features" in imports["collection_estimation.hurdle.reports.preparation"]
+    evaluate_names = imports["collection_estimation.hurdle.evaluate"]
+    assert "real_weekly_cash" in evaluate_names and "deflated_reference" in evaluate_names
+
+
+@pytest.mark.parametrize("name", ["series_features", "show_series_features",
+                                  "real_weekly_cash"])
+def test_the_u19_1_calls_are_made_once_in_the_whole_script(name):
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == name]
+    assert len(found) == 1, name
+
+
+def test_the_u19_1_step_reads_main_names_bound_before_it():
+    body = main_body()
+    at = unpacking_ends()
+    stored = {n.id for node in body[:at + 1] for n in ast.walk(node)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    block = body[at + 7:at + 13]
+    own = {n.id for node in block for n in ast.walk(node)
+           if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    assert own == {"started", "series", "validation_origins"}
+    read = {n.id for node in block for n in ast.walk(node)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    functions = {"print", "time", "series_features", "sorted", "set", "list",
+                 "show_series_features", "real_weekly_cash", "deflated_reference",
+                 "settings", "SERIES_MEAN_WEEKS"}
+    assert read - functions - own <= stored, read - functions - own - stored
+    assert {"weekly", "weeks", "levels", "calendar", "companies", "table",
+            "week_zero"} <= stored
+
+
+def test_the_u19_1_calls_match_their_signatures():
+    import inspect
+
+    from collection_estimation.hurdle.evaluate import deflated_reference, real_weekly_cash
+    from collection_estimation.hurdle.features_series import series_features
+    from collection_estimation.hurdle.reports.preparation import show_series_features
+    for name, function in (("series_features", series_features),
+                           ("show_series_features", show_series_features),
+                           ("real_weekly_cash", real_weekly_cash)):
+        call = calls_to(main_tree(), name)[0]
+        inspect.signature(function).bind(*[ast.unparse(a) for a in call.args])
+    reference_calls = [call for call in calls_to(main_tree(), "deflated_reference")
+                       if len(call.args) > 5
+                       and ast.unparse(call.args[5]) == "validation_origins"]
+    assert len(reference_calls) == 1
+    inspect.signature(deflated_reference).bind(*[ast.unparse(a)
+                                                 for a in reference_calls[0].args])
+
