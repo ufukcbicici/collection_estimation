@@ -37,6 +37,11 @@ from collection_estimation.hurdle.features_rhythm import (
     expected_dues,
     payment_habits,
 )
+from collection_estimation.hurdle.features_series import (
+    SERIES_COLUMNS,
+    SERIES_KEYS,
+    series_features,
+)
 from collection_estimation.hurdle.fill_from_ledger import fill_missing_days
 from collection_estimation.hurdle.holidays import load_holidays
 from collection_estimation.hurdle.inputs import ModelInputs, PreparationDetails, prepare_inputs
@@ -63,6 +68,7 @@ from collection_estimation.hurdle.settings import (
     HistorySettings,
     ReceivablesSettings,
     RhythmSettings,
+    SeriesSettings,
 )
 from collection_estimation.hurdle.side_tables import (
     check_side_tables,
@@ -100,8 +106,9 @@ MODEL_FIELDS = ["companies", "week_zero", "last_week", "weeks", "weekly", "ledge
 DETAIL_FIELDS = ["daily_files", "collections_keyed", "tie", "filled_days", "collections",
                  "holidays", "receivables", "known", "identified_weekly", "panel", "checked",
                  "first_price_week", "history_start", "early_receipts", "matrix", "history",
-                 "positions", "owed", "dues", "habits"]
+                 "positions", "owed", "dues", "habits", "series"]
 RHYTHM = dict(delays_kept=5, company_delays_kept=20, payment_days_kept=10, min_payment_days=3)
+MEAN_WEEKS = 3                         # [series] mean_weeks
 BASE_BLOCKS = ("history", "calendar", "receivables")
 JOIN_KEYS = ["key", "origin_week", "h"]
 
@@ -187,7 +194,7 @@ def build_corpus(root, *, late_ledger=False, broken_tie=False, stray_company=Fal
 
 
 def make_settings(corpus, ledger_file, holidays_file, cache, *, fill=True, history=True,
-                  unidentified=(PLACEHOLDER,), rhythm=None):
+                  unidentified=(PLACEHOLDER,), rhythm=None, mean_weeks=MEAN_WEEKS):
     """Only the sections `prepare_inputs` reads, as the real settings dataclasses."""
     return SimpleNamespace(
         data=DataSettings(corpus_folder=corpus, ledger_file=ledger_file,
@@ -202,6 +209,7 @@ def make_settings(corpus, ledger_file, holidays_file, cache, *, fill=True, histo
         calendar=CalendarSettings(holiday_encodings=("drain",), drain_window=3,
                                   catch_up_window=5),
         rhythm=RhythmSettings(**{**RHYTHM, **(rhythm or {})}),
+        series=SeriesSettings(mean_weeks=mean_weeks),
     )
 
 
@@ -308,14 +316,18 @@ def direct_chain(settings):
                             settings.history.use_ledger_before_first_file, r.horizons,
                             rhythm.payment_days_kept, rhythm.min_payment_days,
                             r.leak_check_weeks)
+    series = series_features(weekly, weeks, levels, calendar, companies,
+                             sorted(set(panel["origin_week"])), r.horizons,
+                             settings.series.mean_weeks)
     table = join_features(add_deflated_label(panel, levels), history, calendar, owed, dues,
-                          habits)
+                          habits, series)
     return dict(companies=companies, week_zero=week_zero, last_week=last_week, weeks=weeks,
                 weekly=weekly, ledger=ledger, rates=rates, levels=levels, calendar=calendar,
                 table=table,
-                block_columns=block_feature_columns(history, calendar, owed, dues, habits),
+                block_columns=block_feature_columns(history, calendar, owed, dues, habits,
+                                                    series),
                 new_cash=new_cash, refunds=refunds, unidentified=unidentified,
-                dues=dues, habits=habits)
+                dues=dues, habits=habits, series=series)
 
 
 @pytest.fixture(scope="module")
@@ -442,7 +454,7 @@ def test_calendar_holds_the_holiday_position_columns(prepared):
     assert "drain_days" in inputs.calendar.columns
 
 
-def test_block_columns_has_the_five_blocks_in_feature_blocks_order(prepared):
+def test_block_columns_has_the_six_blocks_in_feature_blocks_order(prepared):
     from collection_estimation.hurdle.settings import FEATURE_BLOCKS
     inputs, _ = prepared()
     assert tuple(inputs.block_columns) == FEATURE_BLOCKS
@@ -598,9 +610,11 @@ def test_join_features_and_block_feature_columns_get_the_rhythm_blocks(spied):
     (join_args, join_kwargs, table), = spied.calls["join_features"]
     (block_args, block_kwargs, columns), = spied.calls["block_feature_columns"]
     assert join_kwargs == {} and block_kwargs == {}
-    assert len(join_args) == 6 and len(block_args) == 5
+    # U19.2: the series block is the last argument of both.
+    assert len(join_args) == 7 and len(block_args) == 6
     assert join_args[4] is spied.details.dues and join_args[5] is spied.details.habits
     assert block_args[3] is spied.details.dues and block_args[4] is spied.details.habits
+    assert join_args[6] is spied.details.series and block_args[5] is spied.details.series
     assert all(a is b for a, b in zip(join_args[1:4], block_args[:3]))
     assert table is spied.inputs.table
     assert columns is spied.inputs.block_columns
@@ -883,3 +897,97 @@ def test_show_payment_habits_runs_on_details_habits(prepared, capsys):
     printed = capsys.readouterr().out
     assert printed.strip(), "nothing printed"
     assert f"{len(details.habits):,}" in printed
+
+
+# --- U19.2: the series block (step 11c) ---------------------------------------------------
+# The tiny corpus has 8 weeks, fewer than the deflated_trend reference needs to fit
+# (`benchmark.MIN_TRAINING_WEEKS`), so every series value here is NaN: these tests check the
+# wiring (which arguments, which rows, the leak check stopping a run), not the numbers, which
+# test_features_series.py checks.
+
+def test_block_columns_series_are_the_documented_columns(prepared):
+    inputs, _ = prepared()
+    assert inputs.block_columns["series"] == SERIES_COLUMNS
+
+
+def test_details_series_has_one_row_per_company_origin_and_h(prepared):
+    inputs, details = prepared()
+    origins = sorted(set(details.panel["origin_week"]))
+    horizons = int(details.panel["h"].max())
+    assert len(details.series) == len(COMPANIES) * len(origins) * horizons
+    assert sorted(set(details.series["company_code"])) == sorted(COMPANIES)
+    assert sorted(set(details.series["origin_week"])) == origins
+    assert list(details.series.columns) == SERIES_KEYS + SERIES_COLUMNS
+
+
+def test_details_series_is_all_nan_on_the_tiny_corpus(prepared):
+    # Too few weeks for any trend: NaN, kept as NaN in the table, not a refused row.
+    inputs, details = prepared()
+    assert details.series[SERIES_COLUMNS].isna().all().all()
+    assert inputs.table[SERIES_COLUMNS].isna().all().all()
+    assert len(inputs.table) == len(details.panel)
+
+
+def test_table_series_columns_follow_the_company_origin_and_h(prepared):
+    inputs, details = prepared()
+    expected = (inputs.table[SERIES_KEYS]
+                .merge(details.series, on=SERIES_KEYS, how="left", validate="many_to_one"))
+    pd.testing.assert_frame_equal(inputs.table[SERIES_KEYS + SERIES_COLUMNS]
+                                  .reset_index(drop=True), expected)
+
+
+@pytest.mark.parametrize("fill,history", [(True, True), (False, False)])
+def test_details_series_equals_the_direct_calls(direct, prepared, fill, history):
+    _, details = prepared(fill=fill, history=history)
+    pd.testing.assert_frame_equal(details.series, direct(fill=fill, history=history)["series"])
+
+
+@pytest.fixture
+def series_spied(corpus, monkeypatch):
+    """prepare_inputs with [series] mean_weeks 6, series_features and check_series_no_leak
+    spied on."""
+    calls = {name: spy_on(monkeypatch, name)
+             for name in ("series_features", "check_series_no_leak")}
+    settings = settings_for(corpus, mean_weeks=6)
+    inputs, details = prepare_inputs(settings, with_details=True)
+    return SimpleNamespace(calls=calls, settings=settings, inputs=inputs, details=details)
+
+
+def test_series_features_is_called_once_at_every_panel_origin(series_spied):
+    (args, kwargs, result), = series_spied.calls["series_features"]
+    weekly, weeks, levels, calendar, companies, origins, horizons, mean_weeks = args
+    assert kwargs == {}
+    assert origins == sorted(set(series_spied.details.panel["origin_week"]))
+    assert horizons == series_spied.settings.receivables.horizons
+    assert mean_weeks == 6
+    assert companies == list(COMPANIES)
+    pd.testing.assert_frame_equal(weekly, series_spied.inputs.weekly)
+    pd.testing.assert_frame_equal(weeks, series_spied.inputs.weeks)
+    pd.testing.assert_series_equal(levels, series_spied.inputs.levels)
+    pd.testing.assert_frame_equal(calendar, series_spied.inputs.calendar)
+    assert result is series_spied.details.series
+
+
+def test_check_series_no_leak_gets_the_series_and_the_leak_check_weeks(series_spied):
+    (args, kwargs, result), = series_spied.calls["check_series_no_leak"]
+    series, weekly, weeks, levels, calendar, companies, horizons, mean_weeks, check_weeks = args
+    assert kwargs == {}
+    assert result is None
+    assert series is series_spied.details.series
+    assert check_weeks == series_spied.settings.receivables.leak_check_weeks == (0, 4)
+    assert mean_weeks == 6
+    assert horizons == series_spied.settings.receivables.horizons
+    (made_args, _, _), = series_spied.calls["series_features"]
+    assert all(a is b for a, b in zip(args[1:6], made_args[:5]))
+
+
+def test_the_series_leak_check_stops_the_run_when_the_stored_rows_differ(corpus, monkeypatch):
+    # series_features as seen by prepare_inputs gives rows the data cannot give (a ratio of 1
+    # where too few weeks give NaN); the check rebuilds them with the real function and stops.
+    real = inputs_module.series_features
+
+    def tampered(*args, **kwargs):
+        return real(*args, **kwargs).assign(all_trend_ratio=1.0)
+    monkeypatch.setattr(inputs_module, "series_features", tampered)
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 0 differ"):
+        prepare_inputs(settings_for(corpus))

@@ -676,7 +676,9 @@ def test_deflated_label_printout_h1_table_every_16th_week():
 # checked on main()'s source; the printout is run on a small hand-built panel and blocks in a
 # separate process: 4 panel rows (2 labelled, one of them paid; one missing week; one
 # future), one NaN in a history feature, none in the calendar, receivables or dues features,
-# and B's habit NaN (below [rhythm] min_payment_days; U18.4 joins both rhythm blocks).
+# and B's habit NaN (below [rhythm] min_payment_days; U18.4 joins both rhythm blocks). U19.2
+# joins the series block on the company too: the panel carries company_code, and the series
+# forecast is NaN at origin 0 (an early origin, A's two rows).
 TABLE = """
 import inspect
 import pandas as pd
@@ -685,11 +687,11 @@ from collection_estimation.hurdle import inputs as prep
 
 calc = " ".join(inspect.getsource(prep.prepare_inputs).split())
 shows = " ".join(inspect.getsource(reports.show_preparation).split())
-joined = "table = join_features(panel, history, calendar, owed, dues, habits)"
+joined = "table = join_features(panel, history, calendar, owed, dues, habits, series)"
 assert joined in calc, "join_features"
 assert "show_table(inputs.table, details.panel)" in shows, "show_table not called"
 assert calc.index("panel = add_deflated_label(panel, levels)") < calc.index(
-    "table = join_features(panel, history, calendar, owed, dues, habits)")
+    "table = join_features(panel, history, calendar, owed, dues, habits, series)")
 assert shows.index("show_deflated_label(") < shows.index("show_table(inputs.table, details.panel)")
 # show_table is the last printout of steps 1-11.
 assert shows.rstrip().endswith("show_table(inputs.table, details.panel)")
@@ -697,15 +699,17 @@ assert shows.rstrip().endswith("show_table(inputs.table, details.panel)")
 for built in ("history = history_features(", "calendar = calendar_features(",
               "calendar = calendar.merge(positions", "owed = receivables_features(",
               "dues = expected_dues(", "habits = payment_habits(",
+              "series = series_features(", "check_series_no_leak(",
               "panel = add_deflated_label("):
     assert calc.index(built) < calc.index("table = join_features("), built
 inspect.signature(prep.join_features).bind("panel", "history", "calendar", "owed", "dues",
-                                           "habits")
+                                           "habits", "series")
 inspect.signature(reports.show_table).bind("table", "panel")
 
 nan = float("nan")
 panel = pd.DataFrame({
     "key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], dtype=object),
+    "company_code": pd.Series(["TR02"] * 4, dtype=object),
     "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
     "h": pd.Series([1, 2, 1, 2], dtype="int64"),
     "label_status": pd.Series(["labelled", "missing_week", "labelled", "future"],
@@ -726,8 +730,13 @@ owed = pd.DataFrame({"key": pd.Series(["TR02-A", "TR02-A", "TR02-B", "TR02-B"], 
                      "open_balance": [10.0, 10.0, 20.0, 20.0]})
 dues = owed[["key", "origin_week", "h"]].assign(spread_in_target=[1.0, 2.0, 3.0, 4.0])
 habits = owed[["key", "origin_week", "h"]].assign(month_start_share=[0.25, 0.25, nan, nan])
-table = prep.join_features(panel, history, calendar, owed, dues, habits)
-assert len(table) == 4 and table.shape[1] == 13, table.shape
+series = pd.DataFrame({"company_code": pd.Series(["TR02"] * 4, dtype=object),
+                       "origin_week": pd.Series([0, 0, 1, 1], dtype="int64"),
+                       "h": pd.Series([1, 2, 1, 2], dtype="int64"),
+                       "target_week": pd.Series([1, 2, 2, 3], dtype="int64"),
+                       "trend_forecast": [nan, nan, 7.0, 7.0]})
+table = prep.join_features(panel, history, calendar, owed, dues, habits, series)
+assert len(table) == 4 and table.shape[1] == 15, table.shape
 reports.show_table(table, panel)
 print("ok")
 """
@@ -747,7 +756,7 @@ def test_training_table_printout_rows_columns_and_size():
     result = run_table()
     assert result.returncode == 0, result.stderr
     lines = [line.strip() for line in result.stdout.splitlines()]
-    assert "training table: 4 rows (panel: 4), 13 columns, about 0 MB" in lines
+    assert "training table: 4 rows (panel: 4), 15 columns, about 0 MB" in lines
 
 
 def test_training_table_printout_nan_shares_of_columns_with_any():
@@ -763,9 +772,11 @@ def test_training_table_printout_nan_shares_of_columns_with_any():
         name, value = line.split()
         shares[name] = float(value)
     # amount, amount_deflated and paid: 2 of 4 rows; weeks_since_last_payment and the habit
-    # month_start_share: B's 2 rows. The dues column has no NaN, so it is not listed.
+    # month_start_share: B's 2 rows; the series trend_forecast: origin 0's 2 rows (A's). The
+    # dues column has no NaN, so it is not listed.
     assert shares == {"amount": 0.5, "amount_deflated": 0.5, "paid": 0.5,
-                      "weeks_since_last_payment": 0.5, "month_start_share": 0.5}
+                      "weeks_since_last_payment": 0.5, "month_start_share": 0.5,
+                      "trend_forecast": 0.5}
 
 
 def test_training_table_printout_shows_one_labelled_paid_row():
@@ -783,6 +794,8 @@ def test_training_table_printout_shows_one_labelled_paid_row():
     assert int(row["business_days"]) == 5
     assert float(row["spread_in_target"]) == 1.0
     assert float(row["month_start_share"]) == 0.25
+    assert row["company_code"] == "TR02"
+    assert "trend_forecast" in row
 
 
 # show_table on a table with no labelled, paid row: it says so and returns (it used to raise
@@ -875,7 +888,7 @@ assert shows.count("show_holiday_positions(") == 1
 order = [calc.index("calendar = calendar_features("),
          calc.index("holiday_position_features("), calc.index(merge),
          calc.index("receivables_features("),
-         calc.index("table = join_features(panel, history, calendar, owed, dues, habits)")]
+         calc.index("table = join_features(panel, history, calendar, owed, dues, habits, series)")]
 assert order == sorted(order), order
 order = [shows.index("show_calendar(inputs.calendar, inputs.week_zero, details.holidays)"),
          shows.index(show), shows.index("show_owed(")]

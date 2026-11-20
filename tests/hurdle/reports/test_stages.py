@@ -54,7 +54,10 @@ owed = table[["key", "origin_week", "h", "open_invoices"]]
 dues = table[["key", "origin_week", "h"]].assign(spread_in_target=table["origin_week"] * 10.0)
 habits = table[["key", "origin_week", "h"]].assign(
     month_start_share=[0.5 if a else nan for a in is_a])
-block_columns = prep.block_feature_columns(history, calendar, owed, dues, habits)
+# The series block (U19.2), per company, origin and h; not selected here either.
+series = (table[["company_code", "origin_week", "h", "target_week"]].drop_duplicates()
+          .assign(trend_forecast=50.0))
+block_columns = prep.block_feature_columns(history, calendar, owed, dues, habits, series)
 columns = feature_columns(block_columns, ("history", "calendar", "receivables"))
 assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices"], columns
 origin = ORIGIN
@@ -321,15 +324,17 @@ def test_step_12_real_fit_predict_and_scores_on_the_tiny_table(company):
     assert lines[-1] == "ok"
 
 
-# U18.4: the same tiny table with the two rhythm blocks joined and selected (all five blocks):
-# the habit column is NaN for TR04-B, and both stage-1 models still fit, predict and print.
+# U18.4: the same tiny table with the two rhythm blocks joined and selected (all the blocks;
+# U19.2 added the series block, a constant trend_forecast here): the habit column is NaN for
+# TR04-B, and both stage-1 models still fit, predict and print.
 STAGE1_RHYTHM_FIT = STAGE1.replace('print("ok")', """
 from collection_estimation.hurdle.settings import FEATURE_BLOCKS, Stage1Settings
 table = table.merge(dues, on=["key", "origin_week", "h"]).merge(
-    habits, on=["key", "origin_week", "h"])
+    habits, on=["key", "origin_week", "h"]).merge(
+    series, on=["company_code", "origin_week", "h", "target_week"])
 columns = feature_columns(block_columns, FEATURE_BLOCKS)
 assert columns == ["h", "mean_receipts_4", "has_month_end", "open_invoices",
-                   "spread_in_target", "month_start_share"], columns
+                   "spread_in_target", "month_start_share", "trend_forecast"], columns
 train_rows = rows_known_at(table, origin)
 forecast_rows = rows_at_origin(table, origin)
 train_x = stage1_features(train_rows, columns, companies, COMPANY_AS_FEATURE)
@@ -837,7 +842,7 @@ if SCALE == "open balance":
     train_rows = train_rows.assign(open_balance=50.0)
     forecast_rows = forecast_rows.assign(open_balance=50.0)
 stage2_columns = feature_columns(prep.block_feature_columns(history, calendar, owed, dues,
-                                                           habits),
+                                                           habits, series),
                                 settings_stage2.feature_blocks)
 assert stage2_columns == ["h", "mean_receipts_4"], stage2_columns
 paid_rows = train_rows[train_rows["paid"].astype(bool)]

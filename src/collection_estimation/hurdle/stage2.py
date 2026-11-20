@@ -15,6 +15,8 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_poisson_deviance, r2_score
 
+from .stage1 import check_no_empty_feature
+
 
 def check_amounts(train_x: pd.DataFrame, amount: pd.Series) -> pd.Series:
     """`amount` as floats, after checking it can be learned from: it lines up with `train_x`,
@@ -68,12 +70,14 @@ def fit_stage2(train_x: pd.DataFrame, amount: pd.Series, exposure: pd.Series,
     stopping is off: sklearn would otherwise hold out a random tenth of the rows, mixing weeks.
     The company code, if present, is used as a category.
 
-    Raises ValueError for an unknown loss, and as `check_amounts` and `check_exposure` do.
+    Raises ValueError for an unknown loss, and as `check_amounts`, `check_exposure` and
+    `stage1.check_no_empty_feature` (a feature column NaN in every row) do.
     """
     if settings.loss not in LOSS_POWER:
         raise ValueError(f"stage 2 loss {settings.loss!r} is not one of {list(LOSS_POWER)}")
     amount = check_amounts(train_x, amount)
     exposure = check_exposure(train_x, exposure)
+    check_no_empty_feature(train_x)
     model = HistGradientBoostingRegressor(
         loss=settings.loss,
         max_iter=settings.max_iter,

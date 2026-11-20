@@ -8,8 +8,8 @@ in one place only.
 
 Every check that stops a run stays in it and fails where it did: the ledger's tie to the
 daily files (step 5), the weekly table's tie to the payment lines (step 7), the receivables'
-leak check (step 8), the side tables' tie-out, panel + A + G = gross receipts (step 9), and
-the rhythm features' leak checks (step 11b).
+leak check (step 8), the side tables' tie-out, panel + A + G = gross receipts (step 9), the
+rhythm features' leak checks (step 11b) and the series features' leak check (step 11c).
 
 It prints nothing of its own. With `with_details=True` it also returns the tables made on
 the way (`PreparationDetails`), so the pipeline can print each step as before; without, they
@@ -30,6 +30,7 @@ from .features_history import (
 )
 from .features_receivables import receivables_features
 from .features_rhythm import expected_dues, payment_habits
+from .features_series import check_series_no_leak, series_features
 from .fill_from_ledger import fill_missing_days
 from .holidays import HolidayTable, load_holidays
 from .keys import add_keys
@@ -93,6 +94,7 @@ class PreparationDetails:
     owed: pd.DataFrame                  # step 11: the receivables features
     dues: pd.DataFrame                  # step 11b: the delay-spread features (U18.2)
     habits: pd.DataFrame                # step 11b: the payment-habit features (U18.3)
+    series: pd.DataFrame                # step 11c: the series features (U19)
 
 
 def prepare_inputs(settings, *, with_details: bool = False
@@ -213,16 +215,26 @@ def prepare_inputs(settings, *, with_details: bool = False
                             min_payment_days=settings.rhythm.min_payment_days,
                             leak_check_weeks=settings.receivables.leak_check_weeks)
 
+    # Step 11c: the series features (block "series"), from [series], as known at t: the
+    # deflated_trend reference's forecast of each company's (and the consolidated) cash in the
+    # target week, fitted at each origin on the weeks up to it; then rebuilt at the
+    # [receivables] leak_check_weeks from the data cut off there.
+    origins = sorted(set(panel["origin_week"]))
+    series = series_features(weekly, weeks, levels, calendar, companies, origins, horizons,
+                             settings.series.mean_weeks)
+    check_series_no_leak(series, weekly, weeks, levels, calendar, companies, horizons,
+                         settings.series.mean_weeks, settings.receivables.leak_check_weeks)
+
     # The label in TRY of week 0, like the features; then one row per panel row with every
     # feature block.
     panel = add_deflated_label(panel, levels)
-    table = join_features(panel, history, calendar, owed, dues, habits)
+    table = join_features(panel, history, calendar, owed, dues, habits, series)
 
     inputs = ModelInputs(
         companies=companies, week_zero=week_zero, last_week=last_week, weeks=weeks,
         weekly=weekly, ledger=ledger, rates=rates, levels=levels, calendar=calendar,
         table=table,
-        block_columns=block_feature_columns(history, calendar, owed, dues, habits),
+        block_columns=block_feature_columns(history, calendar, owed, dues, habits, series),
         new_cash=new_cash, refunds=refunds, unidentified=unidentified)
     if not with_details:
         return inputs, None
@@ -232,5 +244,6 @@ def prepare_inputs(settings, *, with_details: bool = False
         receivables=receivables, known=known_all, identified_weekly=identified_weekly,
         panel=panel, checked=checked, first_price_week=first_price_week,
         history_start=history_start, early_receipts=early_receipts, matrix=matrix,
-        history=history, positions=positions, owed=owed, dues=dues, habits=habits)
+        history=history, positions=positions, owed=owed, dues=dues, habits=habits,
+        series=series)
     return inputs, details

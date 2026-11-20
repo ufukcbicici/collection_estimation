@@ -168,6 +168,9 @@ VALID = {
     # U18.3: payment_days_kept and min_payment_days are the same as synthetic.toml's (24, 3).
     "rhythm": {"delays_kept": "15", "company_delays_kept": "150", "payment_days_kept": "24",
                "min_payment_days": "3"},
+    # U19.2: the series block. mean_weeks 7 differs from synthetic.toml's 13 on purpose, so a
+    # test can tell them apart.
+    "series": {"mean_weeks": "7"},
     "stage1": {"max_iter": "300", "learning_rate": "0.05", "max_leaf_nodes": "31",
                "min_samples_leaf": "20", "random_seed": "1",
                "feature_blocks": '["history", "calendar", "receivables"]',
@@ -375,7 +378,7 @@ def test_loading_twice_gives_equal_settings(tmp_path, repo):
 
 @pytest.mark.parametrize("attribute", ["settings_file", "data", "companies",
                                        "collections_layout", "ledger_layout", "receivables",
-                                       "history", "calendar", "rhythm", "stage1", "stage2",
+                                       "history", "calendar", "rhythm", "series", "stage1", "stage2",
                                        "diagnostic", "joint_diagnostic", "topups",
                                        "calibration", "debug"])
 def test_settings_is_frozen(tmp_path, repo, attribute):
@@ -2269,7 +2272,7 @@ def test_a_missing_stage1_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['stage1']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_an_empty_stage1_section_names_every_stage1_setting(tmp_path, repo):
@@ -2453,8 +2456,8 @@ def test_seed_setting_does_not_change_week_setting_wording():
 
 def test_feature_blocks_constant():
     # U18.4: the two rhythm blocks, "dues" (U18.2) and "habits" (U18.3), come after the three
-    # base blocks.
-    assert FEATURE_BLOCKS == ("history", "calendar", "receivables", "dues", "habits")
+    # base blocks; U19.2: "series" (the deflated_trend forecasts) comes last.
+    assert FEATURE_BLOCKS == ("history", "calendar", "receivables", "dues", "habits", "series")
     assert type(FEATURE_BLOCKS) is tuple
 
 
@@ -2501,7 +2504,7 @@ def test_feature_blocks_setting_direct_calls_with_the_rhythm_blocks():
     with pytest.raises(ValueError) as error:
         feature_blocks_setting({"b": ["Dues", "habit"]}, "b", "here")
     assert str(error.value) == ("here: b holds ['Dues', 'habit']; the feature blocks are "
-                                "['history', 'calendar', 'receivables', 'dues', 'habits']")
+                                "['history', 'calendar', 'receivables', 'dues', 'habits', 'series']")
 
 
 @pytest.mark.parametrize("good, expected", [
@@ -2545,7 +2548,7 @@ def test_feature_blocks_not_a_non_empty_list_has_the_exact_message(tmp_path, rep
 def test_feature_blocks_with_an_unknown_block_has_the_exact_message(tmp_path, repo, bad, shown):
     message = exact_message(tmp_path, repo, {("stage1", "feature_blocks"): bad})
     assert message == (f"{STAGE1}: feature_blocks holds {shown}; the feature blocks are "
-                       f"['history', 'calendar', 'receivables', 'dues', 'habits']")
+                       f"['history', 'calendar', 'receivables', 'dues', 'habits', 'series']")
 
 
 @pytest.mark.parametrize("bad, shown", [
@@ -2825,7 +2828,7 @@ def test_a_missing_diagnostic_section_raises_the_exact_message(tmp_path, repo):
     assert str(error.value) == (
         f"{FILE_NAME}: missing ['diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_diagnostic_typo_has_the_exact_message(tmp_path, repo):
@@ -3561,7 +3564,7 @@ def test_a_missing_stage2_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['stage2']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', 'ledger_layout', "
-        f"'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_stage2_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -3758,7 +3761,7 @@ def test_stage2_feature_blocks_empty_has_the_exact_message(tmp_path, repo):
 def test_stage2_feature_blocks_unknown_has_the_exact_message(tmp_path, repo):
     message = exact_message(tmp_path, repo, {("stage2", "feature_blocks"): '["weather"]'})
     assert message == (f"{STAGE2}: feature_blocks holds ['weather']; the feature blocks are "
-                       f"['history', 'calendar', 'receivables', 'dues', 'habits']")
+                       f"['history', 'calendar', 'receivables', 'dues', 'habits', 'series']")
 
 
 def test_stage2_feature_blocks_twice_has_the_exact_message(tmp_path, repo):
@@ -4229,7 +4232,7 @@ def test_a_missing_joint_diagnostic_section_raises_the_exact_message(tmp_path, r
     assert message == (
         f"{FILE_NAME}: missing ['joint_diagnostic']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_joint_diagnostic_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4731,7 +4734,7 @@ def test_a_missing_calendar_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['calendar']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_calendar_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -4988,7 +4991,7 @@ def test_a_missing_topups_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['topups']; expected exactly ['calendar', 'calibration', 'collections_layout', "
         f"'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
-        f"'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', 'topups']")
+        f"'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_topups_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -5542,7 +5545,7 @@ def test_a_missing_evaluation_section_raises_the_exact_message(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['evaluation']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', 'grid', "
-        f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'stage1', 'stage2', "
+        f"'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', 'stage2', "
         f"'topups']")
 
 
@@ -6706,7 +6709,7 @@ def test_a_missing_grid_section_is_named(tmp_path, repo):
     assert message == (
         f"{FILE_NAME}: missing ['grid']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
-        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'stage1', "
+        f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', "
         f"'stage2', 'topups']")
 
 
@@ -7194,7 +7197,7 @@ def test_a_missing_rhythm_section_raises_the_exact_message(tmp_path, repo):
         f"{FILE_NAME}: missing ['rhythm']; expected exactly ['calendar', 'calibration', "
         f"'collections_layout', 'companies', 'data', 'debug', 'diagnostic', 'evaluation', "
         f"'grid', 'history', 'joint_diagnostic', 'ledger_layout', 'receivables', 'rhythm', "
-        f"'stage1', 'stage2', 'topups']")
+        f"'series', 'stage1', 'stage2', 'topups']")
 
 
 def test_a_rhythm_section_given_as_a_plain_value_raises(tmp_path, repo):
@@ -7428,7 +7431,7 @@ def test_the_habit_settings_do_not_change_the_other_sections(tmp_path, repo):
 
 from collection_estimation.hurdle.settings import extra_blocks_setting  # noqa: E402
 
-FEATURE_BLOCK_LIST = "['history', 'calendar', 'receivables', 'dues', 'habits']"
+FEATURE_BLOCK_LIST = "['history', 'calendar', 'receivables', 'dues', 'habits', 'series']"
 
 
 def test_extra_blocks_is_the_last_grid_field_before_workers_and_a_required_key():
@@ -7652,10 +7655,198 @@ def test_read_grid_checks_the_grids_before_extra_blocks():
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
-def test_the_synthetic_toml_tries_dues_and_habits_on_top():
+def test_the_synthetic_toml_tries_dues_habits_and_series_on_top():
     # Only extra_blocks is pinned; the grids themselves are the owner's to change.
+    # U19.2: "series" joined "dues" and "habits".
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
-    assert settings.grid.extra_blocks == ("dues", "habits")
+    assert settings.grid.extra_blocks == ("dues", "habits", "series")
     for block in settings.grid.extra_blocks:
         assert block not in settings.stage1.feature_blocks
         assert block not in settings.stage2.feature_blocks
+
+
+# --- [series] (U19.2) -------------------------------------------------------------------------
+# A required section with exactly one setting: mean_weeks, the window of the trailing mean the
+# series block's trend ratios divide by (`features_series`), a count (count_setting). VALID
+# holds 7 (settings/synthetic.toml has 13). "series" is also a feature block, the last of
+# FEATURE_BLOCKS, so a stage or [grid] extra_blocks may name it.
+
+from collection_estimation.hurdle.settings import SeriesSettings  # noqa: E402
+
+SERIES = f"{FILE_NAME} [series]"
+SERIES_KEYS = ["mean_weeks"]
+ALL_SECTION_LIST = ("['calendar', 'calibration', 'collections_layout', 'companies', 'data', "
+                    "'debug', 'diagnostic', 'evaluation', 'grid', 'history', 'joint_diagnostic', "
+                    "'ledger_layout', 'receivables', 'rhythm', 'series', 'stage1', 'stage2', "
+                    "'topups']")
+
+
+def test_series_settings_has_one_field_mean_weeks():
+    assert [field.name for field in dataclasses.fields(SeriesSettings)] == ["mean_weeks"]
+
+
+def test_the_series_section_is_read(tmp_path, repo):
+    series = load(tmp_path, repo).series
+    assert series == SeriesSettings(mean_weeks=7)
+    assert type(series.mean_weeks) is int
+
+
+def test_series_settings_is_frozen_and_hashable(tmp_path, repo):
+    series = load(tmp_path, repo).series
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        series.mean_weeks = 1
+    assert hash(series) == hash(SeriesSettings(mean_weeks=7))
+
+
+def test_settings_has_a_series_field_right_after_rhythm():
+    names = [field.name for field in dataclasses.fields(Settings)]
+    assert names.index("series") == names.index("rhythm") + 1
+    assert names.index("series") < names.index("stage1")
+
+
+def test_the_series_does_not_change_the_other_sections(tmp_path, repo):
+    a = load(tmp_path, repo)
+    b = load(tmp_path, repo, changes={("series", "mean_weeks"): "26"})
+    for field in dataclasses.fields(Settings):
+        if field.name != "series":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    assert b.series == SeriesSettings(mean_weeks=26)
+
+
+@pytest.mark.parametrize("text, expected", [("1", 1), ("4", 4), ("13", 13), ("52", 52),
+                                            ("100000", 100000)])
+def test_a_mean_weeks_count_is_accepted(tmp_path, repo, text, expected):
+    series = load(tmp_path, repo, changes={("series", "mean_weeks"): text}).series
+    assert series.mean_weeks == expected
+    assert type(series.mean_weeks) is int
+
+
+@pytest.mark.parametrize("text, shown", [("0", "0"), ("-1", "-1"), ("-13", "-13"),
+                                         ("true", "True"), ("false", "False"), ("2.5", "2.5"),
+                                         ("13.0", "13.0"), ('"13"', "'13'"), ("[13]", "[13]")])
+def test_a_bad_mean_weeks_has_the_exact_message(tmp_path, repo, text, shown):
+    message = exact_message(tmp_path, repo, {("series", "mean_weeks"): text})
+    assert message == f"{SERIES}: mean_weeks is {shown}, not a whole number of 1 or more"
+
+
+def test_a_missing_series_section_raises_the_exact_message(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="series")
+    assert message == f"{FILE_NAME}: missing ['series']; expected exactly {ALL_SECTION_LIST}"
+
+
+def test_a_series_section_given_as_a_plain_value_raises(tmp_path, repo):
+    message = exact_message_from(tmp_path, repo, drop_section="series", top="series = 13")
+    assert message == f"{SERIES} is 13, not a section"
+
+
+def test_an_empty_series_section_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("series", "mean_weeks"): REMOVE})
+    assert message == f"{SERIES}: missing ['mean_weeks']; expected exactly {SERIES_KEYS}"
+
+
+@pytest.mark.parametrize("key, value", [("surprise", "1"), ("window", "13"),
+                                        ("delays_kept", "20"), ("horizons", "5")])
+def test_an_unknown_series_key_has_the_exact_message(tmp_path, repo, key, value):
+    message = exact_message(tmp_path, repo, {("series", key): value})
+    assert message == f"{SERIES}: unknown [{key!r}]; expected exactly {SERIES_KEYS}"
+
+
+def test_a_series_typo_has_the_exact_message(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("series", "mean_weeks"): REMOVE,
+                                             ("series", "mean_week"): "13"})
+    assert message == (f"{SERIES}: missing ['mean_weeks']; unknown ['mean_week']; "
+                       f"expected exactly {SERIES_KEYS}")
+
+
+def test_mean_weeks_is_unknown_in_rhythm(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "mean_weeks"): "13"})
+    assert message.startswith(f"{RHYTHM}: unknown ['mean_weeks']; ")
+
+
+def test_a_bad_mean_weeks_names_the_section_and_the_key(tmp_path, repo):
+    raises_naming(tmp_path, repo, "[series]", "mean_weeks",
+                  changes={("series", "mean_weeks"): "0"})
+
+
+def test_a_bad_rhythm_is_reported_before_a_bad_series_key(tmp_path, repo):
+    # Sections are read in file order: [rhythm] comes before [series].
+    message = exact_message(tmp_path, repo, {("rhythm", "min_payment_days"): "1",
+                                             ("series", "surprise"): "1"})
+    assert message == f"{RHYTHM}: min_payment_days is 1; it must be 2 or more"
+
+
+def test_a_bad_rhythm_cross_check_is_reported_before_a_bad_series_key(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "payment_days_kept"): "2",
+                                             ("rhythm", "min_payment_days"): "5",
+                                             ("series", "surprise"): "1"})
+    assert message.startswith(f"{RHYTHM}: min_payment_days is 5, above payment_days_kept 2")
+
+
+def test_a_bad_rhythm_count_is_reported_before_a_bad_series_key(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("rhythm", "min_payment_days"): "0",
+                                             ("series", "surprise"): "1"})
+    assert message.startswith(f"{RHYTHM}: min_payment_days is 0")
+
+
+def test_a_bad_series_key_is_reported_before_a_bad_stage1(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {("series", "surprise"): "1",
+                                             ("stage1", "max_iter"): "0"})
+    assert message.startswith(f"{SERIES}: unknown ['surprise']")
+
+
+@pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
+def test_the_synthetic_series_settings():
+    assert load_settings(SYNTHETIC_SETTINGS, REPO_ROOT).series == SeriesSettings(mean_weeks=13)
+
+
+# --- "series" as a feature block (U19.2) -------------------------------------------------------
+
+def test_series_is_the_last_feature_block():
+    assert FEATURE_BLOCKS[-1] == "series"
+    assert FEATURE_BLOCKS.count("series") == 1
+
+
+@pytest.mark.parametrize("stage", ["stage1", "stage2"])
+def test_a_stage_may_use_the_series_block(tmp_path, repo, stage):
+    value = getattr(load(tmp_path, repo, changes={
+        (stage, "feature_blocks"): '["series", "calendar", "history"]'}), stage).feature_blocks
+    assert value == ("history", "calendar", "series")
+
+
+def test_the_series_block_alone_is_a_valid_stage_block_list(tmp_path, repo):
+    value = load(tmp_path, repo,
+                 changes={("stage1", "feature_blocks"): '["series"]'}).stage1.feature_blocks
+    assert value == ("series",)
+
+
+def test_feature_blocks_setting_puts_series_last():
+    assert feature_blocks_setting({"b": ["series", "habits", "history"]}, "b", "here") == (
+        "history", "habits", "series")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ('["series"]', ("series",)),
+    ('["series", "dues"]', ("dues", "series")),
+    ('["series", "habits", "dues"]', ("dues", "habits", "series")),
+], ids=["series", "series-dues", "all-three-reversed"])
+def test_extra_blocks_may_hold_the_series_block(tmp_path, repo, text, expected):
+    grid = load(tmp_path, repo, changes={("grid", "extra_blocks"): text}).grid
+    assert grid.extra_blocks == expected
+
+
+def test_extra_blocks_setting_puts_series_last():
+    assert extra_blocks_setting({"k": ["series", "dues"]}, "k", "here") == ("dues", "series")
+
+
+def test_extra_blocks_holding_series_already_in_a_stage_is_refused(tmp_path, repo):
+    message = exact_message(tmp_path, repo, {
+        ("stage2", "feature_blocks"): '["calendar", "history", "series"]',
+        ("grid", "extra_blocks"): '["series"]'})
+    assert message.startswith(f"{GRID_SECTION}: extra_blocks holds ['series'], already in "
+                              f"[stage1] or [stage2]")
+
+
+def test_series_repeated_in_extra_blocks_has_the_exact_message(tmp_path, repo):
+    assert grid_error(tmp_path, repo, {"extra_blocks": '["series", "series"]'}) == (
+        f"{GRID_SECTION}: extra_blocks lists a feature block more than once: "
+        f"['series', 'series']")

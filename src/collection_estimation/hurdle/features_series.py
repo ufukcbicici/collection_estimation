@@ -23,6 +23,10 @@ consolidated series (all_trend_forecast, all_trend_ratio).
   - The forecasts, not the ridge's coefficients: those are one value per company and origin,
     shared by all of its customers, and the forecast already holds what they say for the
     target week.
+
+`inputs.prepare_inputs` builds the block at every panel origin (step 11c, [series]
+mean_weeks), checks it with `check_series_no_leak` and joins it to the training table on
+company, origin week, h and target week; the grid tries it as one of [grid] extra_blocks.
 """
 import numpy as np
 import pandas as pd
@@ -113,3 +117,28 @@ def series_features(weekly: pd.DataFrame, weeks: pd.DataFrame, levels: pd.Series
                     "all_trend_ratio": all_ratio,
                 })
     return pd.DataFrame(rows, columns=SERIES_KEYS + SERIES_COLUMNS)
+
+
+def check_series_no_leak(series: pd.DataFrame, weekly: pd.DataFrame, weeks: pd.DataFrame,
+                         levels: pd.Series, calendar: pd.DataFrame, companies: list[str],
+                         horizons: int, mean_weeks: int, check_weeks: tuple[int, ...]) -> None:
+    """The leak check of the series features (`series`, from `series_features` with the same
+    arguments): each week of `check_weeks` among the origins of `series` is made again from
+    the weekly amounts, the week calendar and the price levels cut off after that week.
+
+    Raises ValueError if a rebuilt week differs: something from after the week was used.
+    """
+    origins = set(series["origin_week"])
+    for week in check_weeks:
+        if week not in origins:
+            continue
+        weekly_then = weekly[weekly["week"] <= week]
+        weeks_then = weeks[weeks["week"] <= week]
+        levels_then = levels[levels.index <= week]
+        rebuilt = series_features(weekly_then, weeks_then, levels_then, calendar, companies,
+                                  [week], horizons, mean_weeks)
+        stored = series[series["origin_week"] == week].reset_index(drop=True)
+        if not rebuilt.equals(stored):
+            raise ValueError(f"leak check: the series features of week {week} differ when made "
+                             f"again from the data up to that week, so something from after "
+                             f"it was used")

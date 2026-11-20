@@ -106,6 +106,12 @@ company_delays_kept = 200       # its company's, used instead below [receivables
 payment_days_kept = 24          # a customer's most recent payment days used (recent habit)
 min_payment_days = 3            # below this many, no habit features (NaN; 2 or more)
 
+[series]
+# The series block (U19, features_series.py): the deflated_trend reference's forecast of each
+# company's (and the consolidated) weekly cash in the target week, fitted at each origin on
+# the weeks up to it, and that forecast over the company's trailing mean (a strong or weak week).
+mean_weeks = 13                 # the trailing weeks of that mean
+
 [stage1]
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
 # weights, early stopping off). The stage-1 diagnostic's choice at origin 40 (its grid on
@@ -276,7 +282,9 @@ min_gain = 0.005                 # a pair replaces the current settings only if 
 # U18.5: feature blocks tried on top of [stage1] and [stage2] feature_blocks, every subset of
 # them (with ["dues", "habits"]: none, dues, habits, both), the same subset in both stages.
 # Each subset fits every stage setting again, so the fits grow as 2^N. [] = none tried.
-extra_blocks = ["dues", "habits"]
+# With "series" (U19): 8 subsets, 288 stage-1 and 584 stage-2 fits per origin, 10,464 fits
+# over the 12 validation origins.
+extra_blocks = ["dues", "habits", "series"]
 # How many fits run at once, each in its own process with its share of the threads (12 // 3 =
 # 4 here). Measured on this machine (origin 44, 6 + 6 fits): 3 workers fit stage 1 1.42x and
 # stage 2 1.78x faster than one at a time, about 1.2 GB each; 6 workers were slower. 1 = one

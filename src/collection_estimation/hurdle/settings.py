@@ -65,6 +65,12 @@ class RhythmSettings:
 
 
 @dataclass(frozen=True)
+class SeriesSettings:
+    """How the series block (U19) is built (see `features_series`)."""
+    mean_weeks: int             # the trailing weeks of the mean the trend ratios divide by
+
+
+@dataclass(frozen=True)
 class Stage1Settings:
     """Stage 1, the "will it pay?" classifier."""
     max_iter: int                     # number of trees
@@ -250,6 +256,7 @@ class Settings:
     history: HistorySettings
     calendar: CalendarSettings
     rhythm: RhythmSettings
+    series: SeriesSettings
     stage1: Stage1Settings
     stage2: Stage2Settings
     diagnostic: DiagnosticSettings
@@ -273,8 +280,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
     name = settings_file.name
 
     check_keys(raw, {"data", "companies", "collections_layout", "ledger_layout", "receivables",
-                     "history", "calendar", "rhythm", "stage1", "stage2", "diagnostic",
-                     "joint_diagnostic", "topups", "evaluation", "calibration", "grid", "debug"},
+                     "history", "calendar", "rhythm", "series", "stage1", "stage2",
+                     "diagnostic", "joint_diagnostic", "topups", "evaluation", "calibration", "grid", "debug"},
                name)
 
     data = raw["data"]
@@ -305,6 +312,8 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
         raise ValueError(f"{name} [rhythm]: min_payment_days is {min_payment_days}, above "
                          f"payment_days_kept {payment_days_kept}, so no customer would have "
                          f"a habit")
+    series = raw["series"]
+    check_keys(series, {"mean_weeks"}, f"{name} [series]")
     stage1 = raw["stage1"]
     check_keys(stage1, {"max_iter", "learning_rate", "max_leaf_nodes", "min_samples_leaf",
                         "random_seed", "feature_blocks", "company_as_feature",
@@ -404,6 +413,9 @@ def load_settings(settings_file: Path, repo_root: Path) -> Settings:
                                               f"{name} [rhythm]"),
             payment_days_kept=payment_days_kept,
             min_payment_days=min_payment_days,
+        ),
+        series=SeriesSettings(
+            mean_weeks=count_setting(series, "mean_weeks", f"{name} [series]"),
         ),
         stage1=Stage1Settings(
             max_iter=count_setting(stage1, "max_iter", f"{name} [stage1]"),
@@ -925,8 +937,9 @@ def day_edges_setting(table: dict, key: str, where: str) -> tuple[int, ...]:
 
 
 # The feature blocks a model can use, in the order their columns are taken. "dues" (the delay
-# spread, U18.2) and "habits" (the payment habits, U18.3) are both built from [rhythm].
-FEATURE_BLOCKS = ("history", "calendar", "receivables", "dues", "habits")
+# spread, U18.2) and "habits" (the payment habits, U18.3) are both built from [rhythm];
+# "series" (the deflated_trend forecasts, U19) from [series].
+FEATURE_BLOCKS = ("history", "calendar", "receivables", "dues", "habits", "series")
 
 
 # The holiday encodings the calendar block can get (`features_calendar.HOLIDAY_ENCODINGS`).

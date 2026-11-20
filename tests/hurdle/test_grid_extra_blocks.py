@@ -981,3 +981,114 @@ def test_grid_predictions_on_grid_candidates_with_extra_blocks(tmp_path, monkeyp
     found = ext_run(ext_table(), tmp_path, candidates=real)
     assert list(found.p.columns) == [0, 1, 2, 3] and list(found.m.columns) == [0, 1, 2, 3]
     assert sorted(calls) == all_fits(real)
+
+
+# --- U19.2: three extra blocks, "series" among them -------------------------------------------
+# settings/synthetic.toml tries [grid] extra_blocks = ["dues", "habits", "series"]: every subset
+# of the three, 2 ** 3 = 8, each in both stages.
+
+THREE = ("dues", "habits", "series")
+THREE_NAMES = ["none", "dues", "habits", "series", "dues + habits", "dues + series",
+               "habits + series", "dues + habits + series"]
+
+
+def make_three(**changes):
+    """test_grid's stand-in settings with [grid] extra_blocks = ("dues", "habits", "series")."""
+    return make(extra_blocks=THREE, **changes)
+
+
+def test_block_subsets_of_dues_habits_and_series_are_all_eight_by_size():
+    found = block_subsets(THREE)
+    assert found == [(), ("dues",), ("habits",), ("series",), ("dues", "habits"),
+                     ("dues", "series"), ("habits", "series"), ("dues", "habits", "series")]
+    assert len(set(found)) == 8
+
+
+def test_the_eight_subset_names():
+    assert [subset_name(s) for s in block_subsets(THREE)] == THREE_NAMES
+
+
+@pytest.mark.parametrize("subset, expected", [
+    (("series",), ("history", "calendar", "receivables", "series")),
+    (("series", "dues"), ("history", "calendar", "receivables", "dues", "series")),
+    (THREE, ("history", "calendar", "receivables", "dues", "habits", "series")),
+])
+def test_with_extra_blocks_puts_series_last(subset, expected):
+    assert with_extra_blocks(STAGE1, subset).feature_blocks == expected
+
+
+def test_three_extra_blocks_give_eight_subsets_in_each_stage():
+    found = grid_candidates(make_three())
+    assert list(by_subset(found.stage1)) == THREE_NAMES
+    assert list(by_subset(found.stage2)) == THREE_NAMES
+
+
+def test_three_extra_blocks_multiply_the_stage_lists_by_eight():
+    plain = grid_candidates(make())
+    found = grid_candidates(make_three())
+    assert len(found.stage1) == 8 * len(plain.stage1) == 32
+    assert len(found.stage2) == 8 * len(plain.stage2) == 32
+    assert found.topups == plain.topups
+
+
+def test_three_extra_blocks_candidate_0_is_still_the_current_settings():
+    settings = make_three()
+    found = grid_candidates(settings)
+    assert found.stage1[0].settings == settings.stage1
+    assert found.stage2[0].settings == settings.stage2
+    assert found.stage1[0].params["extra_blocks"] == "none"
+
+
+def test_three_extra_blocks_each_subsets_first_candidate_is_the_current_with_it():
+    found = grid_candidates(make_three())
+    for subset in block_subsets(THREE):
+        group = by_subset(found.stage1)[subset_name(subset)]
+        assert group[0].settings == with_extra_blocks(STAGE1, subset)
+        group = by_subset(found.stage2)[subset_name(subset)]
+        assert group[0].settings == with_extra_blocks(STAGE2, subset)
+
+
+def test_three_extra_blocks_combination_count():
+    # 8 subsets x (4 stage-1 x 4 stage-2 of that subset) x 2 top-ups.
+    assert combination_count(grid_candidates(make_three())) == 8 * 4 * 4 * 2
+
+
+def test_the_series_block_alone_as_an_extra_block_gives_two_subsets():
+    found = grid_candidates(make(extra_blocks=("series",)))
+    assert list(by_subset(found.stage1)) == ["none", "series"]
+    assert all("series" in c.settings.feature_blocks
+               for c in by_subset(found.stage1)["series"])
+    assert not any("series" in c.settings.feature_blocks
+                   for c in by_subset(found.stage1)["none"])
+
+
+def test_a_loaded_settings_with_the_three_extra_blocks(tmp_path):
+    from collection_estimation.hurdle.settings import load_settings
+    from tests.hurdle.test_settings import write_settings
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = write_settings(tmp_path, changes={
+        ("grid", "extra_blocks"): '["series", "habits", "dues"]'})
+    settings = load_settings(path, repo)
+    assert settings.grid.extra_blocks == THREE
+    found = grid_candidates(settings)
+    assert list(by_subset(found.stage1)) == THREE_NAMES
+    assert list(by_subset(found.stage2)) == THREE_NAMES
+
+
+def test_hashed_table_drops_the_series_columns_of_a_fit_without_them():
+    table = pd.DataFrame({"h": [1], "mean_receipts_4": [1.0], "spread_in_target": [2.0],
+                          "trend_forecast": [3.0], "trend_ratio": [1.1]})
+    block_columns = {"history": ["mean_receipts_4"], "calendar": [], "receivables": [],
+                     "dues": ["spread_in_target"], "habits": [],
+                     "series": ["trend_forecast", "trend_ratio"]}
+    without = hashed_table(table, block_columns, ("history", "calendar", "receivables", "dues"))
+    assert list(without.columns) == ["h", "mean_receipts_4", "spread_in_target"]
+    with_series = hashed_table(table, block_columns,
+                               ("history", "calendar", "receivables", "series"))
+    assert list(with_series.columns) == ["h", "mean_receipts_4", "trend_forecast",
+                                         "trend_ratio"]
+
+
+def test_series_is_not_an_always_hashed_block():
+    assert "series" not in ALWAYS_HASHED_BLOCKS

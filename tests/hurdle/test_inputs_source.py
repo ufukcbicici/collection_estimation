@@ -27,7 +27,8 @@ STEPS_1_TO_11 = ("list_daily_files", "load_collections", "add_keys", "load_ledge
                  "published_levels", "ledger_receipts_before", "first_history_week",
                  "weekly_matrix", "history_features", "calendar_features",
                  "holiday_position_features", "receivables_features", "add_deflated_label",
-                 "expected_dues", "payment_habits", "join_features", "block_feature_columns")
+                 "expected_dues", "payment_habits", "series_features", "check_series_no_leak",
+                 "join_features", "block_feature_columns")
 
 
 def prepare_tree():
@@ -250,17 +251,18 @@ def test_step_11b_is_built_after_the_receivables_and_before_the_join():
         "habits = payment_habits(")
 
 
-def test_step_11b_join_features_gets_the_two_blocks_last():
+def test_step_11b_join_features_gets_the_two_blocks_then_the_series():
+    # U19.2: the series block (step 11c) comes after the two rhythm blocks.
     call = only_call("join_features")
     assert [ast.unparse(arg) for arg in call.args] == [
-        "panel", "history", "calendar", "owed", "dues", "habits"]
+        "panel", "history", "calendar", "owed", "dues", "habits", "series"]
     assert call.keywords == []
 
 
-def test_step_11b_block_feature_columns_gets_the_two_blocks_last():
+def test_step_11b_block_feature_columns_gets_the_two_blocks_then_the_series():
     call = only_call("block_feature_columns")
     assert [ast.unparse(arg) for arg in call.args] == [
-        "history", "calendar", "owed", "dues", "habits"]
+        "history", "calendar", "owed", "dues", "habits", "series"]
     assert call.keywords == []
 
 
@@ -276,4 +278,84 @@ def test_step_11b_model_inputs_block_columns_come_from_block_feature_columns():
     found = calls_to(prepare_tree(), "ModelInputs")
     assert len(found) == 1
     assert keywords_of(found[0])["block_columns"] == (
-        "block_feature_columns(history, calendar, owed, dues, habits)")
+        "block_feature_columns(history, calendar, owed, dues, habits, series)")
+
+
+# --- step 11c (U19.2): the series block -------------------------------------------------------
+# Built at every panel origin with [series] mean_weeks, checked against a rebuild from the
+# data cut off at the [receivables] leak_check_weeks, then joined last.
+
+def test_step_11c_inputs_module_imports_both_from_features_series():
+    module = ast.parse(INPUTS_MODULE.read_text(encoding="utf-8"))
+    found = [node for node in module.body if isinstance(node, ast.ImportFrom)
+             and node.module == "features_series" and node.level == 1]
+    assert len(found) == 1
+    assert sorted(alias.name for alias in found[0].names) == ["check_series_no_leak",
+                                                              "series_features"]
+
+
+def test_step_11c_origins_are_every_panel_origin_sorted():
+    found = assignments_to(prepare_tree(), "origins")
+    assert len(found) == 1
+    assert ast.unparse(found[0].value) == "sorted(set(panel['origin_week']))"
+
+
+def test_step_11c_series_features_arguments():
+    call = only_call("series_features")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "weekly", "weeks", "levels", "calendar", "companies", "origins", "horizons",
+        "settings.series.mean_weeks"]
+    assert call.keywords == []
+
+
+def test_step_11c_check_series_no_leak_arguments():
+    call = only_call("check_series_no_leak")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "series", "weekly", "weeks", "levels", "calendar", "companies", "horizons",
+        "settings.series.mean_weeks", "settings.receivables.leak_check_weeks"]
+    assert call.keywords == []
+
+
+def test_step_11c_calls_match_the_function_signatures():
+    import inspect
+
+    from collection_estimation.hurdle.features_series import (
+        check_series_no_leak, series_features)
+    for name, function in (("series_features", series_features),
+                           ("check_series_no_leak", check_series_no_leak)):
+        call = only_call(name)
+        inspect.signature(function).bind(*[ast.unparse(a) for a in call.args],
+                                         **keywords_of(call))
+
+
+def test_step_11c_series_is_bound_once_to_series_features():
+    found = assignments_to(prepare_tree(), "series")
+    assert len(found) == 1
+    value = found[0].value
+    assert isinstance(value, ast.Call) and ast.unparse(value.func) == "series_features"
+
+
+def test_step_11c_is_built_and_checked_after_the_rhythm_blocks_and_before_the_join():
+    source = prepare_source()
+    order = [source.index("habits = payment_habits("),
+             source.index("origins = sorted(set(panel["),
+             source.index("series = series_features("),
+             source.index("check_series_no_leak("),
+             source.index("panel = add_deflated_label(panel, levels)"),
+             source.index("table = join_features(")]
+    assert order == sorted(order), order
+
+
+def test_step_11c_details_keep_the_series():
+    found = calls_to(prepare_tree(), "PreparationDetails")
+    assert len(found) == 1
+    assert keywords_of(found[0])["series"] == "series"
+
+
+def test_step_11c_preparation_details_has_a_series_field_last():
+    import dataclasses
+
+    from collection_estimation.hurdle.inputs import PreparationDetails
+    names = [field.name for field in dataclasses.fields(PreparationDetails)]
+    assert names[-1] == "series"
+    assert names.index("series") == names.index("habits") + 1

@@ -519,3 +519,204 @@ def test_leak_test_has_teeth_a_change_at_the_origin_does_show():
     moved = rows_at(20, changed, weeks, levels)
     assert not moved["trend_forecast"].equals(full["trend_forecast"])
     assert not moved["all_trend_forecast"].equals(full["all_trend_forecast"])
+
+
+# --- check_series_no_leak (U19.2) ------------------------------------------------------------
+# prepare_inputs (step 11c) builds the series rows at every panel origin, then calls
+# check_series_no_leak with the [receivables] leak_check_weeks: each check week that is one of
+# the rows' origins is made again from the weekly amounts, the week calendar and the price
+# levels cut off after it, and must equal the stored rows exactly. A week that is not an
+# origin is skipped. Below, "stored" rows are made at origins 5, 14, 20 and 24 for h = 1, 2
+# with a mean window of 4 weeks; origin 5 is too early for a trend (all NaN).
+
+from collection_estimation.hurdle.evaluate import real_weekly_cash as _real  # noqa: E402
+from collection_estimation.hurdle.features_series import check_series_no_leak  # noqa: E402
+
+CHECK_ORIGINS = [5, 14, 20, 24]
+
+
+def leak_message(week):
+    return (f"leak check: the series features of week {week} differ when made again from the "
+            f"data up to that week, so something from after it was used")
+
+
+def stored(weekly=None, origins=CHECK_ORIGINS, horizons=2, mean_weeks=4):
+    weekly = example_weekly() if weekly is None else weekly
+    return series_features(weekly, make_weeks(LAST, missing=MISSING), make_levels(),
+                           simple_calendar(), list(COMPANIES), origins, horizons, mean_weeks)
+
+
+def check(series, check_weeks, horizons=2, mean_weeks=4, weekly=None):
+    """check_series_no_leak against the example's honest data."""
+    weekly = example_weekly() if weekly is None else weekly
+    return check_series_no_leak(series, weekly, make_weeks(LAST, missing=MISSING),
+                                make_levels(), simple_calendar(), list(COMPANIES), horizons,
+                                mean_weeks, check_weeks)
+
+
+def leaked_at(week):
+    """The honest rows, except those of origin `week`: made at week + 1 (one week of data too
+    many) and labelled as made at `week`, h and target week as if at `week`."""
+    honest = stored()
+    late = stored(origins=[week + 1])
+    late = late.assign(origin_week=week, target_week=late["target_week"] - 1)
+    rows = pd.concat([honest[honest["origin_week"] != week], late])
+    return rows.sort_values(["origin_week", "h", "company_code"]).reset_index(drop=True)
+
+
+# honest input passes
+
+def test_check_passes_on_honest_rows_and_returns_none():
+    assert check(stored(), (14, 20)) is None
+
+
+def test_check_passes_at_every_origin():
+    check(stored(), tuple(CHECK_ORIGINS))
+
+
+def test_check_passes_at_an_early_origin_whose_rows_are_all_nan():
+    series = stored()
+    assert series.loc[series["origin_week"] == 5, SERIES_COLUMNS].isna().all().all()
+    check(series, (5,))
+
+
+def test_check_passes_with_a_long_mean_window_and_three_horizons():
+    check(stored(horizons=3, mean_weeks=13), (14, 24), horizons=3, mean_weeks=13)
+
+
+def test_check_passes_when_the_rows_have_a_non_default_index():
+    series = stored()
+    series.index = range(100, 100 + len(series))
+    check(series, (14, 20))
+
+
+def test_check_passes_when_the_data_after_the_week_differ_from_the_data_the_rows_came_from():
+    # Rows made from data that differ only after week 20 are still honest at week 20.
+    changed = example_weekly()
+    after = changed["week"] > 20
+    changed.loc[after, "gross_receipts"] = changed.loc[after, "gross_receipts"] * 9.0 + 1e6
+    check(stored(weekly=changed), (20,))
+
+
+# a real leak is caught
+
+def test_rows_made_with_one_week_too_many_raise():
+    with pytest.raises(ValueError) as error:
+        check(leaked_at(20), (20,))
+    assert str(error.value) == leak_message(20)
+
+
+def test_the_one_week_late_rows_really_differ():
+    # The leak above is a real one: the late rows are not the honest rows by chance.
+    honest = stored()
+    late = leaked_at(20)
+    at_20 = honest["origin_week"] == 20
+    assert not honest.loc[at_20, "trend_forecast"].reset_index(drop=True).equals(
+        late.loc[late["origin_week"] == 20, "trend_forecast"].reset_index(drop=True))
+
+
+def test_a_leak_at_a_week_not_checked_is_not_caught():
+    # Only the check weeks are rebuilt: a leak at 20 passes a check of 14 and 24.
+    check(leaked_at(20), (14, 24))
+
+
+def test_the_first_leaking_check_week_is_named():
+    with pytest.raises(ValueError) as error:
+        check(leaked_at(24), (14, 20, 24))
+    assert str(error.value) == leak_message(24)
+
+
+def test_a_ratio_over_the_whole_periods_mean_raises():
+    # Another leak: the trend ratio divided by the company's mean over every week, the weeks
+    # after the origin among them.
+    series = stored()
+    real = _real(example_weekly(), make_weeks(LAST, missing=MISSING), make_levels(),
+                 list(COMPANIES))
+    at_20 = series["origin_week"] == 20
+    for company in COMPANIES:
+        rows = at_20 & (series["company_code"] == company)
+        series.loc[rows, "trend_ratio"] = (series.loc[rows, "trend_forecast"]
+                                           / real[company].mean())
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 20"):
+        check(series, (20,))
+
+
+def test_rows_made_from_other_data_up_to_the_week_raise():
+    # The stored rows came from a week-20 amount seven times larger than the data checked.
+    changed = example_weekly()
+    at_20 = changed["week"] == 20
+    changed.loc[at_20, "gross_receipts"] = changed.loc[at_20, "gross_receipts"] * 7.0
+    with pytest.raises(ValueError) as error:
+        check(stored(weekly=changed), (20,))
+    assert str(error.value) == leak_message(20)
+
+
+def test_one_changed_value_in_one_row_raises():
+    series = stored()
+    row = series.index[(series["origin_week"] == 14) & (series["h"] == 2)
+                       & (series["company_code"] == "2000")][0]
+    series.loc[row, "all_trend_ratio"] = series.loc[row, "all_trend_ratio"] + 1e-9
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 14"):
+        check(series, (14,))
+
+
+def test_a_number_where_the_rebuild_gives_nan_raises():
+    series = stored()
+    series.loc[series["origin_week"] == 5, "trend_forecast"] = 1.0
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 5"):
+        check(series, (5,))
+
+
+def test_a_missing_row_at_a_check_week_raises():
+    series = stored()
+    drop = series.index[(series["origin_week"] == 20) & (series["h"] == 2)
+                        & (series["company_code"] == "1000")]
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 20"):
+        check(series.drop(index=drop), (20,))
+
+
+def test_rows_made_with_another_mean_window_raise():
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 20"):
+        check(stored(mean_weeks=4), (20,), mean_weeks=13)
+
+
+def test_rows_made_with_another_horizon_count_raise():
+    with pytest.raises(ValueError, match=r"^leak check: the series features of week 20"):
+        check(stored(horizons=2), (20,), horizons=3)
+
+
+# weeks not among the origins, and no check weeks
+
+def test_check_weeks_not_among_the_origins_are_skipped():
+    # Every row is wrong, but none of the check weeks is an origin of the rows.
+    series = stored().assign(trend_forecast=-1.0)
+    assert check(series, (0, 3, 15, 99)) is None
+
+
+def test_empty_check_weeks_check_nothing():
+    series = stored().assign(trend_forecast=-1.0)
+    assert check(series, ()) is None
+
+
+def test_a_check_week_among_the_origins_is_checked_beside_skipped_ones():
+    series = stored().assign(trend_forecast=-1.0)
+    with pytest.raises(ValueError) as error:
+        check(series, (3, 14, 99))
+    assert str(error.value) == leak_message(14)
+
+
+# it changes nothing
+
+def test_check_does_not_modify_its_inputs():
+    series, weekly = stored(), example_weekly()
+    weeks, levels, calendar = make_weeks(LAST, missing=MISSING), make_levels(), simple_calendar()
+    companies = list(COMPANIES)
+    copies = (series.copy(deep=True), weekly.copy(deep=True), weeks.copy(deep=True),
+              levels.copy(deep=True), calendar.copy(deep=True), list(companies))
+    check_series_no_leak(series, weekly, weeks, levels, calendar, companies, 2, 4, (14, 20))
+    pd.testing.assert_frame_equal(series, copies[0])
+    pd.testing.assert_frame_equal(weekly, copies[1])
+    pd.testing.assert_frame_equal(weeks, copies[2])
+    pd.testing.assert_series_equal(levels, copies[3])
+    pd.testing.assert_frame_equal(calendar, copies[4])
+    assert companies == copies[5]

@@ -79,7 +79,6 @@ from collection_estimation.hurdle.reports.preparation import (  # noqa: E402
     show_preparation,
     show_series_features,
 )
-from collection_estimation.hurdle.features_series import series_features  # noqa: E402
 from collection_estimation.hurdle.reports.stages import (  # noqa: E402
     show_amount_reliability,
     show_calibration,
@@ -172,10 +171,6 @@ from collection_estimation.hurdle.settings import load_settings  # noqa: E402
 DEFAULT_SETTINGS_FILE = REPO_ROOT / "settings" / "synthetic.toml"
 SETTINGS_FILE = Path(os.environ.get("HURDLE_SETTINGS", DEFAULT_SETTINGS_FILE))
 
-# U19.1: the window of the series features' trailing mean. Becomes [series] mean_weeks in
-# U19.2, when the block is wired in.
-SERIES_MEAN_WEEKS = 13
-
 
 def main():
     settings = load_settings(SETTINGS_FILE, REPO_ROOT)
@@ -212,22 +207,17 @@ def main():
     print("U18.3: the payment habits")
     show_payment_habits(details.habits, table, settings.evaluation.validation_origins)
 
-    # U19.1: the deflated_trend reference's forecast of each company's (and the consolidated)
-    # cash in the target week, made at every origin of the panel (block "series", display
-    # only until U19.2 wires it in); checked against the reference at the validation origins,
-    # with a preview of how well its ratio to the trailing mean follows the one that came.
-    print("U19.1: the series features (the deflated_trend forecasts)")
-    started = time.perf_counter()
-    series = series_features(weekly, weeks, levels, calendar, companies,
-                             sorted(set(table["origin_week"])), settings.receivables.horizons,
-                             SERIES_MEAN_WEEKS)
-    print(f"        made in {time.perf_counter() - started:.0f} s")
+    # U19: the deflated_trend reference's forecast of each company's (and the consolidated)
+    # cash in the target week, made at every origin of the panel (block "series", built in
+    # step 11c); checked against the reference at the validation origins, with a preview of
+    # how well its ratio to the trailing mean follows the one that came.
+    print("U19: the series features (the deflated_trend forecasts)")
     validation_origins = list(settings.evaluation.validation_origins)
-    show_series_features(series, real_weekly_cash(weekly, weeks, levels, companies),
+    show_series_features(details.series, real_weekly_cash(weekly, weeks, levels, companies),
                          deflated_reference(weekly, weeks, levels, calendar, companies,
                                             validation_origins, settings.receivables.horizons,
                                             week_zero),
-                         validation_origins, SERIES_MEAN_WEEKS)
+                         validation_origins, settings.series.mean_weeks)
 
     # U12.2, the top-ups: A, R and G of every company forecast at the diagnostic origin by the
     # trailing mean ([topups] window) and by the ridge (with and without the recent level),

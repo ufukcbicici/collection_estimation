@@ -1,14 +1,15 @@
 """Tests for `hurdle/training_table.py`: `join_features` and `check_no_shared_columns`; and
 the row filters `rows_known_at` / `rows_at_origin` and `block_feature_columns` (at the end).
 
-`join_features(panel, history, calendar, owed, dues, habits)` left-joins the five feature
-blocks onto the panel (from `add_deflated_label`): history on (key, origin_week), the
+`join_features(panel, history, calendar, owed, dues, habits, series)` left-joins the six
+feature blocks onto the panel (from `add_deflated_label`): history on (key, origin_week), the
 calendar on its `week` renamed to target_week, the receivables, delay-spread (dues, U18.2)
-and payment-habit (habits, U18.3) features on (key, origin_week, h). One row per panel row,
-in the panel's order, with a fresh RangeIndex. It raises ValueError for a feature column
-sharing a name with the panel or an earlier block, for a block repeating its join keys, and
-for a panel row with no match in a block; blocks are checked in the order history, calendar,
-receivables, dues, habits. A NaN inside a matched row is kept.
+and payment-habit (habits, U18.3) features on (key, origin_week, h), and the series features
+(the deflated_trend forecasts, U19.2) on (company_code, origin_week, h, target_week). One row
+per panel row, in the panel's order, with a fresh RangeIndex. It raises ValueError for a
+feature column sharing a name with the panel or an earlier block, for a block repeating its
+join keys, and for a panel row with no match in a block; blocks are checked in the order
+history, calendar, receivables, dues, habits, series. A NaN inside a matched row is kept.
 
 Three groups:
 - hand-built blocks with values that name their own row, so a value on the wrong row shows;
@@ -35,6 +36,7 @@ from collection_estimation.hurdle.features_history import (
 )
 from collection_estimation.hurdle.features_receivables import receivables_features
 from collection_estimation.hurdle.features_rhythm import expected_dues, payment_habits
+from collection_estimation.hurdle.features_series import SERIES_COLUMNS, series_features
 from collection_estimation.hurdle.known import known_weeks
 from collection_estimation.hurdle.panel import (
     add_deflated_label,
@@ -194,12 +196,41 @@ def hand_habits(panel=None, extra=()):
     })
 
 
+SERIES_KEYS = ["company_code", "origin_week", "h", "target_week"]
+
+
+def hand_series(panel=None, extra=()):
+    """The series block (U19.2 shape): one row per (company, origin, h, target week) of the
+    panel, plus `extra` such 4-tuples. It is per company, not per key, so A and B at origin 1
+    share a row. Values name their row; origin 0 is an early origin with no trend ratio (NaN).
+    """
+    panel = hand_panel() if panel is None else panel
+    quads = list(panel[SERIES_KEYS].drop_duplicates().itertuples(index=False, name=None))
+    quads += list(extra)
+    origins = [q[1] for q in quads]
+    hs = [q[2] for q in quads]
+    return pd.DataFrame({
+        "company_code": pd.Series([q[0] for q in quads], dtype=object),
+        "origin_week": pd.Series(origins, dtype="int64"),
+        "h": pd.Series(hs, dtype="int64"),
+        "target_week": pd.Series([q[3] for q in quads], dtype="int64"),
+        "trend_forecast": pd.Series([10000.0 * o + 100 * h for o, h in zip(origins, hs)],
+                                    dtype="float64"),
+        "trend_ratio": pd.Series([nan if o == 0 else 1.0 + 0.1 * h
+                                  for o, h in zip(origins, hs)], dtype="float64"),
+        "all_trend_forecast": pd.Series([20000.0 * o + 200 * h for o, h in zip(origins, hs)],
+                                        dtype="float64"),
+        "all_trend_ratio": pd.Series([0.9 + 0.01 * h for h in hs], dtype="float64"),
+    })
+
+
 def joined(**overrides):
     inputs = {"panel": hand_panel(), "history": hand_history(), "calendar": hand_calendar(),
-              "owed": hand_owed(), "dues": hand_dues(), "habits": hand_habits()}
+              "owed": hand_owed(), "dues": hand_dues(), "habits": hand_habits(),
+              "series": hand_series()}
     inputs.update(overrides)
     return join_features(inputs["panel"], inputs["history"], inputs["calendar"],
-                         inputs["owed"], inputs["dues"], inputs["habits"])
+                         inputs["owed"], inputs["dues"], inputs["habits"], inputs["series"])
 
 
 HISTORY_FEATURES = ["customer_age_weeks", "weeks_since_last_payment", "mean_receipts_4",
@@ -210,6 +241,7 @@ OWED_FEATURES = ["due_in_target_week", "open_invoices", "usual_delay_days"]
 DUES_FEATURES = ["spread_in_target", "spread_share_in_target", "delay_iqr_days",
                  "delays_used", "delays_pooled"]
 HABITS_FEATURES = ["payment_days_used", "month_start_share", "next_payment_share_in_target"]
+SERIES_FEATURES = ["trend_forecast", "trend_ratio", "all_trend_forecast", "all_trend_ratio"]
 
 
 # --- values land on the right rows ---------------------------------------------------------
@@ -218,10 +250,10 @@ def test_one_row_per_panel_row():
     assert len(joined()) == len(hand_panel())
 
 
-def test_columns_are_panel_then_history_calendar_receivables_dues_habits():
+def test_columns_are_panel_then_history_calendar_receivables_dues_habits_series():
     assert list(joined().columns) == (list(hand_panel().columns) + HISTORY_FEATURES
                                       + CALENDAR_FEATURES + OWED_FEATURES + DUES_FEATURES
-                                      + HABITS_FEATURES)
+                                      + HABITS_FEATURES + SERIES_FEATURES)
 
 
 def test_no_merge_indicator_or_suffixed_columns_left():
@@ -284,7 +316,7 @@ def test_order_is_kept_for_a_shuffled_panel_with_a_non_default_index():
     panel = hand_panel().sample(frac=1.0, random_state=3)
     panel.index = [91, 17, 55, 3, 70, 8]
     table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), hand_dues(),
-                          hand_habits())
+                          hand_habits(), hand_series())
     assert (list(table[["key", "origin_week", "h"]].itertuples(index=False, name=None))
             == list(panel[["key", "origin_week", "h"]].itertuples(index=False, name=None)))
     # Values still follow their row, not the old position.
@@ -298,7 +330,7 @@ def test_result_has_a_fresh_range_index():
     panel = hand_panel()
     panel.index = [91, 17, 55, 3, 70, 8]
     table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), hand_dues(),
-                          hand_habits())
+                          hand_habits(), hand_series())
     pd.testing.assert_index_equal(table.index, pd.RangeIndex(len(panel)))
 
 
@@ -306,7 +338,8 @@ def test_blocks_in_a_different_row_order_give_the_same_table():
     reversed_blocks = joined(history=hand_history().iloc[::-1],
                              calendar=hand_calendar().iloc[::-1],
                              owed=hand_owed().iloc[::-1], dues=hand_dues().iloc[::-1],
-                             habits=hand_habits().iloc[::-1])
+                             habits=hand_habits().iloc[::-1],
+                             series=hand_series().iloc[::-1])
     pd.testing.assert_frame_equal(reversed_blocks, joined())
 
 
@@ -327,7 +360,8 @@ def test_every_column_keeps_its_dtype():
                **hand_calendar().dtypes.drop("week").to_dict(),
                **hand_owed().dtypes.drop(["key", "origin_week", "h"]).to_dict(),
                **hand_dues().dtypes.drop(["key", "origin_week", "h"]).to_dict(),
-               **hand_habits().dtypes.drop(["key", "origin_week", "h"]).to_dict()}
+               **hand_habits().dtypes.drop(["key", "origin_week", "h"]).to_dict(),
+               **hand_series().dtypes.drop(SERIES_KEYS).to_dict()}
     assert table.dtypes.to_dict() == sources
 
 
@@ -390,7 +424,8 @@ def test_block_rows_not_in_the_panel_are_ignored():
                    calendar=hand_calendar(first=-3, last=20),
                    owed=hand_owed(extra=[("TR02-C", 0, 1), ("TR02-A", 0, 5)]),
                    dues=hand_dues(extra=[("TR02-C", 0, 1), ("TR02-A", 0, 5)]),
-                   habits=hand_habits(extra=[("TR02-C", 0, 1), ("TR02-B", 9, 1)]))
+                   habits=hand_habits(extra=[("TR02-C", 0, 1), ("TR02-B", 9, 1)]),
+                   series=hand_series(extra=[("TR04", 0, 1, 1), ("TR02", 9, 1, 10)]))
     pd.testing.assert_frame_equal(table, joined())
 
 
@@ -398,8 +433,8 @@ def test_inputs_are_not_changed():
     panel = hand_panel()
     panel.index = [91, 17, 55, 3, 70, 8]
     history, calendar, owed = hand_history(), hand_calendar(), hand_owed()
-    dues, habits = hand_dues(), hand_habits()
-    frames = (panel, history, calendar, owed, dues, habits)
+    dues, habits, series = hand_dues(), hand_habits(), hand_series()
+    frames = (panel, history, calendar, owed, dues, habits, series)
     copies = [frame.copy(deep=True) for frame in frames]
     join_features(*frames)
     for frame, copy in zip(frames, copies):
@@ -410,7 +445,7 @@ def test_inputs_are_not_changed():
 def test_result_is_a_new_frame():
     panel = hand_panel()
     table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), hand_dues(),
-                          hand_habits())
+                          hand_habits(), hand_series())
     assert table is not panel
     table.loc[0, "amount"] = -1.0
     assert panel.loc[0, "amount"] == 50.0
@@ -419,7 +454,7 @@ def test_result_is_a_new_frame():
 def test_empty_panel_gives_an_empty_table_with_every_column_and_dtype():
     panel = hand_panel().iloc[0:0]
     table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), hand_dues(),
-                          hand_habits())
+                          hand_habits(), hand_series())
     assert len(table) == 0
     assert list(table.columns) == list(joined().columns)
     assert table.dtypes.to_dict() == joined().dtypes.to_dict()
@@ -429,7 +464,8 @@ def test_empty_panel_gives_an_empty_table_with_every_column_and_dtype():
 def test_empty_panel_and_empty_blocks_give_an_empty_table():
     table = join_features(hand_panel().iloc[0:0], hand_history().iloc[0:0],
                           hand_calendar().iloc[0:0], hand_owed().iloc[0:0],
-                          hand_dues().iloc[0:0], hand_habits().iloc[0:0])
+                          hand_dues().iloc[0:0], hand_habits().iloc[0:0],
+                          hand_series().iloc[0:0])
     assert len(table) == 0
     assert list(table.columns) == list(joined().columns)
 
@@ -642,7 +678,7 @@ def test_unmatched_first_rows_follow_the_panel_order():
     history = history[history["key"] == "TR02-A"]   # B (last in the original) is missing
     with pytest.raises(ValueError) as error:
         join_features(panel, history, hand_calendar(), hand_owed(), hand_dues(),
-                      hand_habits())
+                      hand_habits(), hand_series())
     assert str(error.value) == ("2 panel rows have no history features (first ['key', "
                                 "'origin_week']: [('TR02-B', 1)])")
 
@@ -679,7 +715,7 @@ def test_unmatched_list_stops_at_five_distinct_keys_and_count_stays_rows():
     panel = wide_panel(["TR02-A", "TR02-B", "TR02-C"], [0, 1, 2], [1, 2])
     with pytest.raises(ValueError) as error:
         join_features(panel, hand_history().iloc[0:0], hand_calendar(), hand_owed(panel),
-                      hand_dues(panel), hand_habits(panel))
+                      hand_dues(panel), hand_habits(panel), hand_series(panel))
     assert str(error.value) == ("18 panel rows have no history features (first ['key', "
                                 "'origin_week']: [('TR02-A', 0), ('TR02-A', 1), "
                                 "('TR02-A', 2), ('TR02-B', 0), ('TR02-B', 1)])")
@@ -694,7 +730,7 @@ def test_unmatched_list_is_distinct_in_panel_order_when_rows_interleave():
     panel.index = [7, 3, 0, 9, 4, 1, 8, 2]
     with pytest.raises(ValueError) as error:
         join_features(panel, hand_history().iloc[0:0], hand_calendar(), hand_owed(panel),
-                      hand_dues(panel), hand_habits(panel))
+                      hand_dues(panel), hand_habits(panel), hand_series(panel))
     assert str(error.value) == ("8 panel rows have no history features (first ['key', "
                                 "'origin_week']: [('TR02-A', 1), ('TR02-B', 1), "
                                 "('TR02-A', 0), ('TR02-B', 0)])")
@@ -801,7 +837,8 @@ def test_rhythm_values_follow_their_row_for_a_shuffled_panel_and_blocks():
     dues = hand_dues().sample(frac=1.0, random_state=4)
     dues.index = [9, 8, 7, 6, 5, 4]
     habits = hand_habits().iloc[[5, 0, 3, 1, 4, 2]]
-    table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), dues, habits)
+    table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), dues, habits,
+                          hand_series())
     assert (list(table[["key", "origin_week", "h"]].itertuples(index=False, name=None))
             == list(panel[["key", "origin_week", "h"]].itertuples(index=False, name=None)))
     for _, row in table.iterrows():
@@ -932,17 +969,21 @@ def test_dues_missing_rows_are_reported_before_a_habits_repeat():
 def test_the_rhythm_blocks_are_required_arguments():
     import inspect
     parameters = inspect.signature(join_features).parameters
-    assert list(parameters) == ["panel", "history", "calendar", "owed", "dues", "habits"]
+    assert list(parameters) == ["panel", "history", "calendar", "owed", "dues", "habits",
+                                "series"]
     assert all(p.default is inspect.Parameter.empty for p in parameters.values())
     with pytest.raises(TypeError):
         join_features(hand_panel(), hand_history(), hand_calendar(), hand_owed())
+    with pytest.raises(TypeError):
+        join_features(hand_panel(), hand_history(), hand_calendar(), hand_owed(), hand_dues(),
+                      hand_habits())
 
 
 def test_rhythm_blocks_with_only_join_keys_add_no_columns():
     keys = ["key", "origin_week", "h"]
     table = joined(dues=hand_dues()[keys], habits=hand_habits()[keys])
     assert list(table.columns) == (list(hand_panel().columns) + HISTORY_FEATURES
-                                   + CALENDAR_FEATURES + OWED_FEATURES)
+                                   + CALENDAR_FEATURES + OWED_FEATURES + SERIES_FEATURES)
 
 
 # --- the real chain on small in-memory data ------------------------------------------------
@@ -961,6 +1002,7 @@ DELAYS_KEPT = 5              # [rhythm], as in prepare_inputs step 11b
 COMPANY_DELAYS_KEPT = 20
 PAYMENT_DAYS_KEPT = 10
 MIN_PAYMENT_DAYS = 2
+SERIES_MEAN_WEEKS = 4        # [series], as in prepare_inputs step 11c
 T = 6
 END_OF_T = WEEK_ZERO + timedelta(days=7 * T + 6)       # 2025-07-20
 
@@ -1108,7 +1150,7 @@ def altered_data():
 
 
 def build_chain(collections, ledger, days):
-    """Steps 7 to 11b of `prepare_inputs` with the real functions, history from the ledger
+    """Steps 7 to 11c of `prepare_inputs` with the real functions, history from the ledger
     before the first file switched on. Returns every intermediate table."""
     collections = add_week_index(collections, WEEK_ZERO)
     weeks = week_calendar(days, WEEK_ZERO, SYNTHETIC_HOLIDAYS)
@@ -1139,11 +1181,14 @@ def build_chain(collections, ledger, days):
                             SYNTHETIC_HOLIDAYS, min(days), use_ledger_before_first_file=True,
                             horizons=HORIZONS, payment_days_kept=PAYMENT_DAYS_KEPT,
                             min_payment_days=MIN_PAYMENT_DAYS, leak_check_weeks=())
+    # Step 11c (U19.2): the series block at every panel origin.
+    series = series_features(weekly, weeks, levels, calendar, ["TR02"],
+                             sorted(set(panel["origin_week"])), HORIZONS, SERIES_MEAN_WEEKS)
     panel = add_deflated_label(panel, levels)
-    table = join_features(panel, history, calendar, owed, dues, habits)
+    table = join_features(panel, history, calendar, owed, dues, habits, series)
     return {"panel": panel, "history": history, "calendar": calendar, "owed": owed,
-            "dues": dues, "habits": habits, "table": table, "last_week": last_week,
-            "known": known}
+            "dues": dues, "habits": habits, "series": series, "table": table,
+            "last_week": last_week, "known": known}
 
 
 @pytest.fixture(scope="module")
@@ -1176,7 +1221,7 @@ def test_chain_has_the_expected_shape(base):
     assert len(table) == len(panel)
     features = (len(base["history"].columns) - 2 + len(base["calendar"].columns) - 1
                 + len(base["owed"].columns) - 3 + len(base["dues"].columns) - 3
-                + len(base["habits"].columns) - 3)
+                + len(base["habits"].columns) - 3 + len(base["series"].columns) - 4)
     assert table.shape[1] == len(panel.columns) + features
     pd.testing.assert_index_equal(table.index, pd.RangeIndex(len(panel)))
 
@@ -1350,20 +1395,21 @@ def test_leak_with_a_file_day_missing_after_t_only_labels_move():
 # --- block_feature_columns, rows_known_at, rows_at_origin (U10.1) --------------------------
 
 def hand_blocks():
-    return (hand_history(), hand_calendar(), hand_owed(), hand_dues(), hand_habits())
+    return (hand_history(), hand_calendar(), hand_owed(), hand_dues(), hand_habits(),
+            hand_series())
 
 
 def test_block_feature_columns_of_the_hand_blocks():
     columns = block_feature_columns(*hand_blocks())
     assert columns == {"history": HISTORY_FEATURES, "calendar": CALENDAR_FEATURES,
                        "receivables": OWED_FEATURES, "dues": DUES_FEATURES,
-                       "habits": HABITS_FEATURES}
+                       "habits": HABITS_FEATURES, "series": SERIES_FEATURES}
 
 
-def test_block_feature_columns_keys_are_the_five_blocks_in_feature_blocks_order():
+def test_block_feature_columns_keys_are_the_six_blocks_in_feature_blocks_order():
     from collection_estimation.hurdle.settings import FEATURE_BLOCKS
     columns = block_feature_columns(*hand_blocks())
-    assert list(columns) == ["history", "calendar", "receivables", "dues", "habits"]
+    assert list(columns) == ["history", "calendar", "receivables", "dues", "habits", "series"]
     assert tuple(columns) == FEATURE_BLOCKS
     assert all(type(value) is list for value in columns.values())
 
@@ -1379,7 +1425,8 @@ def test_block_feature_columns_rhythm_blocks_keep_their_column_order():
                         "origin_week", "delays_used", "spread_share_in_target"]]
     habits = hand_habits()[["next_payment_share_in_target", "origin_week", "key",
                             "payment_days_used", "h", "month_start_share"]]
-    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), dues, habits)
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), dues, habits,
+                                    hand_series())
     assert columns["dues"] == ["delays_pooled", "spread_in_target", "delay_iqr_days",
                                "delays_used", "spread_share_in_target"]
     assert columns["habits"] == ["next_payment_share_in_target", "payment_days_used",
@@ -1389,7 +1436,8 @@ def test_block_feature_columns_rhythm_blocks_keep_their_column_order():
 def test_block_feature_columns_rhythm_blocks_drop_only_their_three_join_keys():
     dues = hand_dues().assign(week=1, target_week=2)
     habits = hand_habits().assign(company_code="TR02")
-    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), dues, habits)
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), dues, habits,
+                                    hand_series())
     assert columns["dues"] == DUES_FEATURES + ["week", "target_week"]
     assert columns["habits"] == HABITS_FEATURES + ["company_code"]
 
@@ -1401,7 +1449,8 @@ def test_block_feature_columns_keep_each_blocks_column_order():
                                 "has_quarter_end", "holidays_week_before"]]
     owed = hand_owed()[["usual_delay_days", "h", "key", "open_invoices", "origin_week",
                         "due_in_target_week"]]
-    columns = block_feature_columns(history, calendar, owed, hand_dues(), hand_habits())
+    columns = block_feature_columns(history, calendar, owed, hand_dues(), hand_habits(),
+                                    hand_series())
     assert columns["history"] == ["observed_weeks_4", "mean_receipts_4", "customer_age_weeks",
                                   "weeks_since_last_payment"]
     assert columns["calendar"] == ["has_mid_month", "business_days", "has_month_end",
@@ -1415,7 +1464,8 @@ def test_block_feature_columns_drop_only_each_blocks_own_join_keys():
     history = hand_history().assign(week=1, h=2)
     calendar = hand_calendar().assign(key="x", origin_week=0)
     owed = hand_owed().assign(week=3)
-    columns = block_feature_columns(history, calendar, owed, hand_dues(), hand_habits())
+    columns = block_feature_columns(history, calendar, owed, hand_dues(), hand_habits(),
+                                    hand_series())
     assert columns["history"] == HISTORY_FEATURES + ["week", "h"]
     assert columns["calendar"] == CALENDAR_FEATURES + ["key", "origin_week"]
     assert columns["receivables"] == OWED_FEATURES + ["week"]
@@ -1426,9 +1476,10 @@ def test_block_feature_columns_of_blocks_with_only_join_keys_are_empty():
                                     hand_calendar()[["week"]],
                                     hand_owed()[["key", "origin_week", "h"]],
                                     hand_dues()[["key", "origin_week", "h"]],
-                                    hand_habits()[["key", "origin_week", "h"]])
+                                    hand_habits()[["key", "origin_week", "h"]],
+                                    hand_series()[SERIES_KEYS])
     assert columns == {"history": [], "calendar": [], "receivables": [], "dues": [],
-                       "habits": []}
+                       "habits": [], "series": []}
 
 
 def test_block_feature_columns_does_not_change_its_inputs():
@@ -1444,7 +1495,7 @@ def test_block_feature_columns_with_the_join_are_exactly_the_tables_extra_column
     table = joined()
     extra = [c for c in table.columns if c not in hand_panel().columns]
     assert extra == (columns["history"] + columns["calendar"] + columns["receivables"]
-                     + columns["dues"] + columns["habits"])
+                     + columns["dues"] + columns["habits"] + columns["series"])
 
 
 # A grid table: one key, origins 30..45, h = 1..5, the last week 42 and a missing week 38.
@@ -1638,10 +1689,10 @@ def test_rows_at_origin_takes_every_key_at_that_origin():
 
 def test_chain_block_feature_columns_are_the_tables_feature_columns(base):
     columns = block_feature_columns(base["history"], base["calendar"], base["owed"],
-                                    base["dues"], base["habits"])
+                                    base["dues"], base["habits"], base["series"])
     table = base["table"]
     features = (columns["history"] + columns["calendar"] + columns["receivables"]
-                + columns["dues"] + columns["habits"])
+                + columns["dues"] + columns["habits"] + columns["series"])
     assert features == [c for c in table.columns if c not in base["panel"].columns]
     for name in ("key", "origin_week", "h", "target_week", "week"):
         assert name not in features
@@ -1682,3 +1733,275 @@ def test_chain_rows_at_origin_features_do_not_move_when_the_data_after_t_changes
     allowed = LABEL_COLUMNS + ["label_status"]
     keep = [c for c in old.columns if c not in allowed]
     pd.testing.assert_frame_equal(old[keep], new[keep])
+
+
+# --- the series block (U19.2) --------------------------------------------------------------
+# join_features takes the series features (`features_series.series_features`) last, joined on
+# (company_code, origin_week, h, target_week): one row per company, origin and h, shared by
+# every key of that company. hand_series names its rows: trend_forecast = 10000 * origin +
+# 100 * h, all_trend_forecast = 20000 * origin + 200 * h; origin 0 has no trend_ratio (NaN).
+
+SERIES_ON = "['company_code', 'origin_week', 'h', 'target_week']"
+
+
+def test_the_series_columns_are_the_modules_series_columns():
+    assert SERIES_FEATURES == SERIES_COLUMNS
+    assert SERIES_KEYS + SERIES_FEATURES == list(hand_series().columns)
+
+
+def test_hand_series_has_one_row_per_company_origin_and_h():
+    # The panel has 6 rows but only 4 distinct (company, origin, h, target week).
+    assert len(hand_series()) == 4
+
+
+def test_the_series_row_goes_to_every_key_of_its_company_origin_and_h():
+    table = joined()
+    for _, row in table.iterrows():
+        o, h = row["origin_week"], row["h"]
+        assert row["trend_forecast"] == 10000.0 * o + 100 * h
+        assert row["all_trend_forecast"] == 20000.0 * o + 200 * h
+        assert row["all_trend_ratio"] == pytest.approx(0.9 + 0.01 * h)
+    # A and B at origin 1, h 2 share one series row.
+    a = table[(table["key"] == "TR02-A") & (table["origin_week"] == 1) & (table["h"] == 2)]
+    b = table[(table["key"] == "TR02-B") & (table["origin_week"] == 1) & (table["h"] == 2)]
+    assert a[SERIES_FEATURES].values.tolist() == b[SERIES_FEATURES].values.tolist()
+    assert a["trend_forecast"].tolist() == [10200.0]
+
+
+def test_a_nan_inside_a_series_row_is_kept_on_its_rows_only():
+    # Origin 0 is an early origin: trend_ratio NaN there, a number everywhere else.
+    table = joined()
+    assert table["trend_ratio"].isna().tolist() == (table["origin_week"] == 0).tolist()
+    assert table["trend_forecast"].notna().all()
+
+
+def test_an_all_nan_series_row_is_kept_not_refused():
+    # An origin too early for any trend: every series column NaN, still a matched row.
+    series = hand_series()
+    early = series["origin_week"] == 0
+    series.loc[early, SERIES_FEATURES] = nan
+    table = joined(series=series)
+    assert len(table) == len(hand_panel())
+    at_0 = table["origin_week"] == 0
+    assert table.loc[at_0, SERIES_FEATURES].isna().all().all()
+    assert table.loc[~at_0, SERIES_FEATURES].notna().all().all()
+
+
+def test_the_series_columns_stay_float():
+    table = joined()
+    for column in SERIES_FEATURES:
+        assert table[column].dtype == np.float64, column
+
+
+def test_the_series_values_follow_their_row_for_a_shuffled_panel_and_block():
+    panel = hand_panel().sample(frac=1.0, random_state=5)
+    panel.index = [12, 4, 33, 0, 8, 61]
+    series = hand_series().iloc[[3, 1, 0, 2]]
+    series.index = [70, 71, 72, 73]
+    table = join_features(panel, hand_history(), hand_calendar(), hand_owed(), hand_dues(),
+                          hand_habits(), series)
+    assert (list(table[["key", "origin_week", "h"]].itertuples(index=False, name=None))
+            == list(panel[["key", "origin_week", "h"]].itertuples(index=False, name=None)))
+    for _, row in table.iterrows():
+        assert row["trend_forecast"] == 10000.0 * row["origin_week"] + 100 * row["h"]
+    pd.testing.assert_index_equal(table.index, pd.RangeIndex(len(panel)))
+
+
+def test_series_rows_of_other_companies_origins_and_horizons_are_ignored():
+    series = hand_series(extra=[("TR04", 0, 1, 1), ("TR04", 1, 2, 3), ("TR02", 7, 1, 8),
+                                ("TR02", 1, 5, 6)])
+    pd.testing.assert_frame_equal(joined(series=series), joined())
+
+
+def test_the_series_is_joined_on_the_company():
+    # The same origins and horizons, but for another company: no panel row matches.
+    series = hand_series().assign(company_code="TR04")
+    with pytest.raises(ValueError) as error:
+        joined(series=series)
+    assert str(error.value) == (f"6 panel rows have no series features (first {SERIES_ON}: "
+                                f"[('TR02', 0, 1, 1), ('TR02', 0, 2, 2), ('TR02', 1, 1, 2), "
+                                f"('TR02', 1, 2, 3)])")
+
+
+def test_the_series_is_joined_on_the_target_week_too():
+    # The row for (TR02, 1, 2) carries target week 4 instead of 3: it does not match.
+    series = hand_series()
+    wrong = (series["origin_week"] == 1) & (series["h"] == 2)
+    series.loc[wrong, "target_week"] = 4
+    with pytest.raises(ValueError) as error:
+        joined(series=series)
+    assert str(error.value) == (f"2 panel rows have no series features (first {SERIES_ON}: "
+                                f"[('TR02', 1, 2, 3)])")
+
+
+def test_the_series_is_joined_on_h_not_only_on_the_target_week():
+    # Swap h between (origin 0, h 1) and (origin 0, h 2), keeping the target weeks: the rows
+    # (TR02, 0, 2, 1) and (TR02, 0, 1, 2) match no panel row.
+    series = hand_series()
+    at_0 = series["origin_week"] == 0
+    series.loc[at_0, "h"] = series.loc[at_0, "h"].map({1: 2, 2: 1})
+    with pytest.raises(ValueError) as error:
+        joined(series=series)
+    assert str(error.value) == (f"2 panel rows have no series features (first {SERIES_ON}: "
+                                f"[('TR02', 0, 1, 1), ('TR02', 0, 2, 2)])")
+
+
+def test_an_unmatched_panel_row_in_the_series_raises():
+    series = hand_series()
+    series = series[~((series["origin_week"] == 1) & (series["h"] == 1))]
+    with pytest.raises(ValueError) as error:
+        joined(series=series)
+    # (TR02, 1, 1, 2) is used by A and B: two panel rows, one missing key.
+    assert str(error.value) == (f"2 panel rows have no series features (first {SERIES_ON}: "
+                                f"[('TR02', 1, 1, 2)])")
+
+
+def test_an_empty_series_block_raises_for_every_panel_row():
+    with pytest.raises(ValueError, match=r"^6 panel rows have no series features"):
+        joined(series=hand_series().iloc[0:0])
+
+
+def test_a_series_block_repeating_its_join_key_raises():
+    series = pd.concat([hand_series(), hand_series().iloc[[2]]], ignore_index=True)
+    with pytest.raises(ValueError) as error:
+        joined(series=series)
+    assert str(error.value) == (f"the series features repeat {SERIES_ON} in 1 rows "
+                                f"(first: [('TR02', 1, 1, 2)])")
+
+
+def test_a_series_repeat_with_different_values_still_raises():
+    # The same four keys with another forecast: which one is right cannot be told.
+    extra = hand_series().iloc[[0]].assign(trend_forecast=-1.0)
+    with pytest.raises(ValueError, match=r"^the series features repeat"):
+        joined(series=pd.concat([hand_series(), extra], ignore_index=True))
+
+
+def test_a_series_block_per_key_cannot_be_joined():
+    # A series block without the company (e.g. keyed per customer) lacks a join key.
+    series = hand_series().drop(columns="company_code")
+    with pytest.raises((KeyError, ValueError)):
+        joined(series=series)
+
+
+@pytest.mark.parametrize("column, other", [("amount", "the panel"),
+                                           ("key", "the panel"),
+                                           ("mean_receipts_4", "the history features"),
+                                           ("business_days", "the calendar features"),
+                                           ("open_invoices", "the receivables features"),
+                                           ("delays_used", "the dues features"),
+                                           ("month_start_share", "the habits features")])
+def test_a_series_column_shared_with_another_column_raises(column, other):
+    with pytest.raises(ValueError) as error:
+        joined(series=hand_series().assign(**{column: 1.0}))
+    assert str(error.value) == (f"the series features and {other} both have a column "
+                                f"'{column}'")
+
+
+def test_an_earlier_block_with_a_series_column_name_is_named_by_the_series():
+    # The habits come first, so the series block is the one reported.
+    with pytest.raises(ValueError) as error:
+        joined(habits=hand_habits().assign(trend_forecast=1.0))
+    assert str(error.value) == ("the series features and the habits features both have a "
+                                "column 'trend_forecast'")
+
+
+def test_a_series_shared_column_is_reported_before_an_earlier_blocks_missing_rows():
+    with pytest.raises(ValueError, match="^the series features and the panel both have"):
+        joined(history=hand_history().iloc[0:0], series=hand_series().assign(paid=1.0))
+
+
+def test_habits_missing_rows_are_reported_before_a_series_repeat():
+    series = pd.concat([hand_series(), hand_series().iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="^6 panel rows have no habits features"):
+        joined(habits=hand_habits().iloc[0:0], series=series)
+
+
+def test_a_series_block_with_only_join_keys_adds_no_columns():
+    table = joined(series=hand_series()[SERIES_KEYS])
+    assert list(table.columns) == (list(hand_panel().columns) + HISTORY_FEATURES
+                                   + CALENDAR_FEATURES + OWED_FEATURES + DUES_FEATURES
+                                   + HABITS_FEATURES)
+
+
+def test_the_series_block_is_not_changed():
+    series = hand_series()
+    copy = series.copy(deep=True)
+    joined(series=series)
+    pd.testing.assert_frame_equal(series, copy)
+
+
+def test_a_panel_of_two_companies_takes_each_companys_series():
+    # B moves to company TR04: its rows must take TR04's series row, not TR02's.
+    panel = hand_panel()
+    panel.loc[panel["key"] == "TR02-B", "company_code"] = "TR04"
+    series = hand_series(panel)
+    tr04 = series["company_code"] == "TR04"
+    series.loc[tr04, "trend_forecast"] = -series.loc[tr04, "trend_forecast"]
+    table = joined(panel=panel, series=series)
+    for _, row in table.iterrows():
+        sign = -1.0 if row["company_code"] == "TR04" else 1.0
+        assert row["trend_forecast"] == sign * (10000.0 * row["origin_week"] + 100 * row["h"])
+
+
+# --- block_feature_columns: the series block (U19.2) ---------------------------------------
+
+def test_block_feature_columns_series_are_its_four_columns():
+    assert block_feature_columns(*hand_blocks())["series"] == SERIES_COLUMNS
+
+
+def test_block_feature_columns_series_keep_their_column_order():
+    series = hand_series()[["all_trend_ratio", "h", "trend_forecast", "company_code",
+                            "target_week", "all_trend_forecast", "origin_week", "trend_ratio"]]
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), hand_dues(),
+                                    hand_habits(), series)
+    assert columns["series"] == ["all_trend_ratio", "trend_forecast", "all_trend_forecast",
+                                 "trend_ratio"]
+
+
+def test_block_feature_columns_series_drop_only_their_four_join_keys():
+    # "key" and "week" are not join keys of the series block: they count as features here.
+    series = hand_series().assign(key="x", week=1)
+    columns = block_feature_columns(hand_history(), hand_calendar(), hand_owed(), hand_dues(),
+                                    hand_habits(), series)
+    assert columns["series"] == SERIES_FEATURES + ["key", "week"]
+
+
+def test_block_feature_columns_series_does_not_touch_the_other_blocks():
+    columns = block_feature_columns(*hand_blocks())
+    others = [c for name in ("history", "calendar", "receivables", "dues", "habits")
+              for c in columns[name]]
+    assert not set(others) & set(SERIES_FEATURES)
+
+
+def test_block_feature_columns_takes_the_series_as_a_required_argument():
+    import inspect
+    parameters = inspect.signature(block_feature_columns).parameters
+    assert list(parameters) == ["history", "calendar", "owed", "dues", "habits", "series"]
+    with pytest.raises(TypeError):
+        block_feature_columns(hand_history(), hand_calendar(), hand_owed(), hand_dues(),
+                              hand_habits())
+
+
+def test_block_feature_columns_of_the_real_series_features_are_series_columns(base):
+    assert block_feature_columns(base["history"], base["calendar"], base["owed"],
+                                 base["dues"], base["habits"],
+                                 base["series"])["series"] == SERIES_COLUMNS
+
+
+# --- the chain: the series block end to end ------------------------------------------------
+
+def test_chain_every_series_feature_equals_the_block(base):
+    table = base["table"]
+    series = base["series"].set_index(SERIES_KEYS)
+    expected = series.loc[list(zip(table["company_code"], table["origin_week"], table["h"],
+                                   table["target_week"]))].reset_index(drop=True)
+    pd.testing.assert_frame_equal(table[SERIES_COLUMNS], expected)
+
+
+def test_chain_series_features_at_or_before_t_do_not_move_when_the_data_after_t_changes(
+        base, altered):
+    old = base["table"]
+    new = altered["table"]
+    old_up = old.loc[old["origin_week"] <= T, SERIES_COLUMNS].reset_index(drop=True)
+    new_up = new.loc[new["origin_week"] <= T, SERIES_COLUMNS].reset_index(drop=True)
+    pd.testing.assert_frame_equal(old_up, new_up)

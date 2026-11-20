@@ -1976,3 +1976,81 @@ def test_exposure_unknown_scale_is_checked_before_anything_else():
 def test_exposure_unknown_floor_is_checked_before_the_open_balance_column():
     with pytest.raises(ValueError, match="^stage 2 balance_floor 'average'"):
         exposure(floor_train(), history_rows(), exposure_settings(floor="average"))
+
+
+# --- U19.2: fit_stage2 refuses a feature column NaN in every row ------------------------------
+# stage1.check_no_empty_feature, called after the loss, check_amounts and check_exposure.
+
+from collection_estimation.hurdle import stage2 as stage2_module  # noqa: E402
+from collection_estimation.hurdle.stage1 import check_no_empty_feature  # noqa: E402
+
+
+def stage2_empty_message(columns, rows):
+    return (f"the feature columns {columns} are NaN in every training row ({rows} rows); the "
+            f"trees cannot be fitted with them. Fit at a later origin or without their feature "
+            f"block")
+
+
+def test_stage2_uses_stage1s_check_no_empty_feature():
+    assert stage2_module.check_no_empty_feature is check_no_empty_feature
+
+
+@pytest.mark.parametrize("loss", ["poisson", "gamma", "squared_error"])
+def test_fit_stage2_refuses_an_empty_feature_column_with_the_clear_message(loss):
+    x, amount = synthetic_xa()
+    x = x.assign(trend_forecast=np.nan)
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, amount, ones(x), stage2_settings(loss=loss))
+    assert str(error.value) == stage2_empty_message(["trend_forecast"], len(x))
+
+
+def test_fit_stage2_names_several_empty_columns_in_column_order():
+    x, amount = synthetic_xa()
+    x = x.assign(trend_ratio=np.nan, all_trend_forecast=np.nan)
+    x = x[["trend_ratio", "h", "s", "z", "company_code", "all_trend_forecast"]]
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, amount, ones(x), stage2_settings())
+    assert str(error.value) == stage2_empty_message(["trend_ratio", "all_trend_forecast"],
+                                                    len(x))
+
+
+def test_fit_stage2_checks_the_loss_first():
+    x, amount = synthetic_xa()
+    x = x.assign(trend_forecast=np.nan)
+    with pytest.raises(ValueError, match=r"^stage 2 loss 'tweedie' is not one of"):
+        fit_stage2(x, amount, ones(x), dataclasses.replace(stage2_settings(), loss="tweedie"))
+
+
+def test_fit_stage2_checks_the_amounts_before_the_empty_columns():
+    x, amount = synthetic_xa()
+    x = x.assign(trend_forecast=np.nan)
+    with pytest.raises(ValueError, match=r"^amount is 0 or below in 1 rows"):
+        fit_stage2(x, amount.mask(amount.index == amount.index[0], 0.0), ones(x),
+                   stage2_settings())
+    with pytest.raises(ValueError, match=r"^there are no paid rows"):
+        fit_stage2(x.iloc[0:0], amount.iloc[0:0], ones(x.iloc[0:0]), stage2_settings())
+
+
+def test_fit_stage2_checks_the_exposure_before_the_empty_columns():
+    x, amount = synthetic_xa()
+    x = x.assign(trend_forecast=np.nan)
+    exposure = ones(x)
+    exposure.iloc[3] = 0.0
+    with pytest.raises(ValueError, match=r"^exposure is NaN, infinite, or 0 or below in 1 rows"):
+        fit_stage2(x, amount, exposure, stage2_settings())
+
+
+def test_fit_stage2_with_a_column_known_in_one_row_still_fits():
+    x, amount = synthetic_xa()
+    values = np.full(len(x), np.nan)
+    values[0] = 1.0
+    model = fit_stage2(x.assign(trend_forecast=values), amount, ones(x), stage2_settings())
+    assert "trend_forecast" in model.feature_names_in_
+
+
+def test_fit_stage2_an_all_missing_company_category_is_refused():
+    x, amount = synthetic_xa()
+    x["company_code"] = pd.Categorical([None] * len(x), categories=["TR02", "TR04"])
+    with pytest.raises(ValueError) as error:
+        fit_stage2(x, amount, ones(x), stage2_settings())
+    assert str(error.value) == stage2_empty_message(["company_code"], len(x))

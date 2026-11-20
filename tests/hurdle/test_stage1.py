@@ -33,10 +33,12 @@ BLOCK_COLUMNS = {
     "calendar": ["business_days", "has_month_end"],
     "receivables": ["open_invoices", "due_in_target_week"],
 }
-# With the two rhythm blocks of U18.4 (dues, habits), in FEATURE_BLOCKS order.
+# With the two rhythm blocks of U18.4 (dues, habits) and the series block of U19.2, in
+# FEATURE_BLOCKS order.
 BLOCK_COLUMNS_ALL = dict(BLOCK_COLUMNS,
                          dues=["spread_in_target", "delays_used"],
-                         habits=["payment_days_used", "month_start_share"])
+                         habits=["payment_days_used", "month_start_share"],
+                         series=["trend_forecast", "trend_ratio"])
 BASE_BLOCKS = ("history", "calendar", "receivables")
 COMPANIES = ["TR02", "TR04", "TR05", "TR06", "TR91"]
 
@@ -76,7 +78,7 @@ def test_feature_columns_with_no_blocks_is_only_h():
 
 def test_feature_columns_h_comes_first_always():
     for blocks in (("calendar",), ("receivables", "calendar"), BASE_BLOCKS, FEATURE_BLOCKS,
-                   ("habits", "dues")):
+                   ("habits", "dues"), ("series",), ("series", "history")):
         assert feature_columns(BLOCK_COLUMNS_ALL, blocks)[0] == "h"
 
 
@@ -84,14 +86,14 @@ def test_feature_columns_an_empty_block_adds_nothing():
     columns = dict(BLOCK_COLUMNS_ALL, calendar=[], habits=[])
     assert feature_columns(columns, FEATURE_BLOCKS) == [
         "h", "customer_age_weeks", "mean_receipts_4", "open_invoices", "due_in_target_week",
-        "spread_in_target", "delays_used"]
+        "spread_in_target", "delays_used", "trend_forecast", "trend_ratio"]
 
 
-def test_feature_columns_all_five_blocks_in_feature_blocks_order():
+def test_feature_columns_all_six_blocks_in_feature_blocks_order():
     assert feature_columns(BLOCK_COLUMNS_ALL, FEATURE_BLOCKS) == [
         "h", "customer_age_weeks", "mean_receipts_4", "business_days", "has_month_end",
         "open_invoices", "due_in_target_week", "spread_in_target", "delays_used",
-        "payment_days_used", "month_start_share"]
+        "payment_days_used", "month_start_share", "trend_forecast", "trend_ratio"]
 
 
 def test_feature_columns_base_blocks_take_no_rhythm_column():
@@ -100,7 +102,7 @@ def test_feature_columns_base_blocks_take_no_rhythm_column():
     assert (feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS)
             == feature_columns(BLOCK_COLUMNS, BASE_BLOCKS))
     leaked = set(feature_columns(BLOCK_COLUMNS_ALL, BASE_BLOCKS)) & set(
-        BLOCK_COLUMNS_ALL["dues"] + BLOCK_COLUMNS_ALL["habits"])
+        BLOCK_COLUMNS_ALL["dues"] + BLOCK_COLUMNS_ALL["habits"] + BLOCK_COLUMNS_ALL["series"])
     assert leaked == set()
 
 
@@ -509,7 +511,7 @@ def chain():
 
 def chain_block_columns(chain):
     return block_feature_columns(chain["history"], chain["calendar"], chain["owed"],
-                                 chain["dues"], chain["habits"])
+                                 chain["dues"], chain["habits"], chain["series"])
 
 
 def chain_columns(chain, blocks=FEATURE_BLOCKS):
@@ -531,7 +533,9 @@ def test_chain_feature_columns_are_h_then_the_blocks(chain):
     owed = [c for c in chain["owed"].columns if c not in ("key", "origin_week", "h")]
     dues = [c for c in chain["dues"].columns if c not in ("key", "origin_week", "h")]
     habits = [c for c in chain["habits"].columns if c not in ("key", "origin_week", "h")]
-    assert columns == ["h"] + history + calendar + owed + dues + habits
+    series = [c for c in chain["series"].columns
+              if c not in ("company_code", "origin_week", "h", "target_week")]
+    assert columns == ["h"] + history + calendar + owed + dues + habits + series
 
 
 def test_chain_base_blocks_hold_no_dues_or_habits_column(chain):
@@ -1133,11 +1137,13 @@ def test_both_fits_raise_the_check_labels_messages(fit, case):
 # is_amount_column
 
 def test_amount_columns_is_the_documented_set():
-    # The six receivables amounts, plus (U18.4) the four deflated amounts of the dues block.
+    # The six receivables amounts, plus (U18.4) the four deflated amounts of the dues block,
+    # plus (U19.2) the two forecasts of the series block (TRY of week 0).
     assert AMOUNT_COLUMNS == {"last_payment_amount", "due_before_target_week",
                               "due_in_target_week", "due_after_target_week", "unapplied_cash",
                               "open_balance", "spread_in_target", "spread_before_target",
-                              "overdue_beyond_habit", "shifted_due_in_target"}
+                              "overdue_beyond_habit", "shifted_due_in_target",
+                              "trend_forecast", "all_trend_forecast"}
 
 
 @pytest.mark.parametrize("column", [
@@ -1698,7 +1704,11 @@ def test_chain_rhythm_columns_hold_nan_on_the_training_rows(chain):
     assert x[habits].isna().any().any(), "no NaN in the habits: the case is not exercised"
 
 
-@pytest.mark.parametrize("blocks", [FEATURE_BLOCKS, BASE_BLOCKS + ("dues",),
+# U19.2: "all-five" is the base and both rhythm blocks, no longer FEATURE_BLOCKS. The chain
+# has 13 weeks, too few for any deflated_trend forecast, so its series columns are all NaN on
+# the training rows, and fit_stage1 refuses them (check_no_empty_feature; see
+# test_hgb_on_the_chain_with_every_block_names_the_empty_series_columns).
+@pytest.mark.parametrize("blocks", [BASE_BLOCKS + ("dues", "habits"), BASE_BLOCKS + ("dues",),
                                     BASE_BLOCKS + ("habits",)],
                          ids=["all-five", "base+dues", "base+habits"])
 def test_hgb_fits_and_predicts_on_the_chain_with_the_rhythm_blocks(chain, blocks):
@@ -1901,3 +1911,237 @@ def test_predict_paid_on_the_baseline_does_not_change_x():
     copy = x.copy(deep=True)
     predict_paid(model, x)
     pd.testing.assert_frame_equal(x, copy)
+
+
+# --- U19.2: the series block's amounts -------------------------------------------------------
+# The series block (`features_series`) holds two forecasts of a week's cash in TRY of week 0,
+# trend_forecast (the company's) and all_trend_forecast (the consolidated one), and two ratios
+# of a forecast to a trailing mean. The forecasts are amounts, so the baseline log-scales them;
+# the ratios are not.
+
+SERIES_AMOUNTS = ["trend_forecast", "all_trend_forecast"]
+SERIES_RATIOS = ["trend_ratio", "all_trend_ratio"]
+
+
+@pytest.mark.parametrize("column", SERIES_AMOUNTS)
+def test_is_amount_column_true_for_the_series_forecasts(column):
+    assert column in AMOUNT_COLUMNS
+    assert is_amount_column(column) is True
+
+
+@pytest.mark.parametrize("column", SERIES_RATIOS + ["trend_forecast_", "trend_forecasts",
+                                                    "all_trend", "Trend_forecast"])
+def test_is_amount_column_false_for_the_series_ratios_and_near_misses(column):
+    assert is_amount_column(column) is False
+
+
+def test_is_amount_column_on_the_chain_series_columns(chain):
+    columns = chain_columns(chain, ("series",))
+    assert [column for column in columns if is_amount_column(column)] == SERIES_AMOUNTS
+
+
+def series_xy(n=600, seed=3):
+    """Columns as stage1_features gives them for h and the series block alone: the two
+    forecasts lognormal TRY (the company's NaN for an early tenth), the two ratios around 1.
+    Paid when the company's forecast is large."""
+    rng = np.random.default_rng(seed)
+    early = rng.random(n) < 0.1
+    forecast = rng.lognormal(mean=12, sigma=1.5, size=n)
+    x = pd.DataFrame({
+        "h": rng.integers(1, 6, size=n).astype("float64"),
+        "trend_forecast": np.where(early, np.nan, forecast),
+        "trend_ratio": rng.normal(1.0, 0.2, size=n),
+        "all_trend_forecast": rng.lognormal(mean=14, sigma=1.0, size=n),
+        "all_trend_ratio": rng.normal(1.0, 0.1, size=n),
+    })
+    paid = pd.Series(forecast > np.quantile(forecast, 0.5), index=x.index, name="paid")
+    return x, paid
+
+
+def test_baseline_sends_the_series_forecasts_to_the_amounts_and_the_ratios_to_the_others():
+    x, paid = series_xy()
+    parts = parts_of(fit_stage1_baseline(x, paid, stage1_settings()))
+    assert parts == {"amounts": SERIES_AMOUNTS, "others": ["h"] + SERIES_RATIOS}
+
+
+def test_baseline_log_scales_the_consolidated_forecast():
+    x, paid = series_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    # The amounts part: trend_forecast, all_trend_forecast, then trend_forecast's indicator.
+    logged = signed_log1p(x["all_trend_forecast"].to_numpy())
+    np.testing.assert_allclose(out[:, 1], (logged - logged.mean()) / logged.std(),
+                               rtol=1e-9, atol=1e-12)
+
+
+def test_baseline_log_scales_the_company_forecast_and_fills_its_nan_with_the_logged_median():
+    x, paid = series_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    imputer = model.named_steps["prepare"].named_transformers_["amounts"].steps[1][1]
+    logged = signed_log1p(x["trend_forecast"].to_numpy())
+    assert imputer.statistics_[0] == pytest.approx(np.nanmedian(logged), rel=1e-12)
+    filled = np.where(np.isnan(logged), np.nanmedian(logged), logged)
+    out = transformed(model, x)
+    np.testing.assert_allclose(out[:, 0], (filled - filled.mean()) / filled.std(),
+                               rtol=1e-9, atol=1e-12)
+
+
+def test_baseline_does_not_log_the_series_ratios():
+    x, paid = series_xy()
+    model = fit_stage1_baseline(x, paid, stage1_settings())
+    out = transformed(model, x)
+    # 2 amounts + 1 indicator, then h, trend_ratio, all_trend_ratio.
+    raw = x["trend_ratio"].to_numpy()
+    np.testing.assert_allclose(out[:, 4], (raw - raw.mean()) / raw.std(), rtol=1e-9, atol=1e-12)
+
+
+def test_baseline_on_the_series_block_predicts_finite_probabilities():
+    x, paid = series_xy()
+    p = predict_paid(fit_stage1_baseline(x, paid, stage1_settings()), x)
+    assert p.between(0, 1).all() and p.notna().all()
+
+
+# --- U19.2: check_no_empty_feature ---------------------------------------------------------------
+# A feature column NaN in every training row (e.g. the series block before its first forecast)
+# is refused with a message naming it, instead of sklearn's "window shape cannot be larger than
+# input array shape". fit_stage1 checks the labels first, then the empty columns. The logistic
+# baseline is unchanged: it drops such a column.
+
+from collection_estimation.hurdle.stage1 import check_no_empty_feature  # noqa: E402
+
+
+def empty_message(columns, rows):
+    return (f"the feature columns {columns} are NaN in every training row ({rows} rows); the "
+            f"trees cannot be fitted with them. Fit at a later origin or without their feature "
+            f"block")
+
+
+def three_rows(**columns):
+    return pd.DataFrame({"h": [1.0, 2.0, 1.0], **columns}, index=[7, 8, 9])
+
+
+def test_check_no_empty_feature_passes_and_returns_none_without_an_empty_column():
+    assert check_no_empty_feature(three_rows(a=[1.0, np.nan, 3.0])) is None
+
+
+def test_check_no_empty_feature_names_one_empty_column():
+    with pytest.raises(ValueError) as error:
+        check_no_empty_feature(three_rows(trend_forecast=[np.nan] * 3, a=[1.0, 2.0, 3.0]))
+    assert str(error.value) == empty_message(["trend_forecast"], 3)
+
+
+def test_check_no_empty_feature_names_every_empty_column_in_column_order():
+    x = three_rows(z=[np.nan] * 3, a=[1.0, 2.0, 3.0], trend_ratio=[np.nan] * 3,
+                   b=[np.nan] * 3)
+    with pytest.raises(ValueError) as error:
+        check_no_empty_feature(x)
+    assert str(error.value) == empty_message(["z", "trend_ratio", "b"], 3)
+
+
+def test_check_no_empty_feature_a_column_with_one_value_is_fine():
+    check_no_empty_feature(three_rows(a=[np.nan, np.nan, 5.0]))
+
+
+def test_check_no_empty_feature_a_single_row_with_a_value_is_fine():
+    check_no_empty_feature(pd.DataFrame({"h": [1.0], "a": [0.0]}))
+
+
+def test_check_no_empty_feature_a_column_of_zeros_is_not_empty():
+    check_no_empty_feature(three_rows(a=[0.0, 0.0, 0.0]))
+
+
+def test_check_no_empty_feature_counts_the_rows_in_the_message():
+    x = pd.DataFrame({"h": [1.0] * 5, "a": [np.nan] * 5})
+    with pytest.raises(ValueError, match=r"\(5 rows\)"):
+        check_no_empty_feature(x)
+
+
+def test_check_no_empty_feature_an_all_missing_company_category_is_empty():
+    x = three_rows(company_code=pd.Categorical([None, None, None], categories=["TR02", "TR04"]))
+    with pytest.raises(ValueError) as error:
+        check_no_empty_feature(x)
+    assert str(error.value) == empty_message(["company_code"], 3)
+
+
+def test_check_no_empty_feature_a_company_category_with_one_code_is_fine():
+    x = three_rows(company_code=pd.Categorical([None, "TR02", None],
+                                               categories=["TR02", "TR04"]))
+    check_no_empty_feature(x)
+
+
+def test_check_no_empty_feature_with_no_rows_names_every_column():
+    # No rows: every column is NaN "in every row". fit_stage1 never gets here with no rows:
+    # check_labels refuses an empty paid first (see below).
+    x = pd.DataFrame({"h": pd.Series([], dtype="float64"), "a": pd.Series([], dtype="float64")})
+    with pytest.raises(ValueError) as error:
+        check_no_empty_feature(x)
+    assert str(error.value) == empty_message(["h", "a"], 0)
+
+
+def test_check_no_empty_feature_with_no_columns_passes():
+    check_no_empty_feature(pd.DataFrame(index=[1, 2]))
+
+
+def test_check_no_empty_feature_does_not_change_its_input():
+    x = three_rows(a=[np.nan] * 3)
+    copy = x.copy(deep=True)
+    with pytest.raises(ValueError):
+        check_no_empty_feature(x)
+    pd.testing.assert_frame_equal(x, copy)
+
+
+# fit_stage1
+
+def test_fit_stage1_refuses_an_empty_feature_column_with_the_clear_message():
+    x, paid = synthetic_xy()
+    x = x.assign(trend_forecast=np.nan)
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, paid, stage1_settings())
+    assert str(error.value) == empty_message(["trend_forecast"], len(x))
+
+
+def test_fit_stage1_checks_the_labels_before_the_empty_columns():
+    x, paid = synthetic_xy()
+    x = x.assign(trend_forecast=np.nan)
+    with pytest.raises(ValueError, match=r"^paid has 1 missing values"):
+        fit_stage1(x, paid.astype("boolean").mask(paid.index == paid.index[0]),
+                   stage1_settings())
+    with pytest.raises(ValueError, match=r"^paid is True in every row"):
+        fit_stage1(x, pd.Series(True, index=x.index), stage1_settings())
+    with pytest.raises(ValueError, match=r"^paid and train_x must have the same rows"):
+        fit_stage1(x, paid.iloc[1:], stage1_settings())
+
+
+def test_fit_stage1_with_no_rows_reports_the_labels_not_the_empty_columns():
+    x, paid = synthetic_xy()
+    with pytest.raises(ValueError, match=r"^paid is empty in every row"):
+        fit_stage1(x.iloc[0:0], paid.iloc[0:0], stage1_settings())
+
+
+def test_fit_stage1_with_a_column_known_in_one_row_still_fits():
+    x, paid = synthetic_xy()
+    values = np.full(len(x), np.nan)
+    values[0] = 1.0
+    model = fit_stage1(x.assign(trend_forecast=values), paid, stage1_settings())
+    assert "trend_forecast" in model.feature_names_in_
+
+
+def test_the_baseline_still_fits_with_an_empty_feature_column():
+    x, paid = synthetic_xy()
+    p = predict_paid(fit_stage1_baseline(x.assign(trend_forecast=np.nan), paid,
+                                         stage1_settings()), x.assign(trend_forecast=np.nan))
+    assert p.notna().all() and p.between(0, 1).all()
+
+
+# the 13-week chain: too early for any series forecast
+
+def test_hgb_on_the_chain_with_every_block_names_the_empty_series_columns(chain):
+    from collection_estimation.hurdle.features_series import SERIES_COLUMNS
+    from tests.hurdle.test_training_table import T
+    columns = chain_columns(chain, FEATURE_BLOCKS)
+    rows = rows_known_at(chain["table"], T)
+    x = stage1_features(rows, columns, COMPANIES, True)
+    assert x[SERIES_COLUMNS].isna().all().all()
+    with pytest.raises(ValueError) as error:
+        fit_stage1(x, rows["paid"], stage1_settings(min_samples_leaf=2))
+    assert str(error.value) == empty_message(SERIES_COLUMNS, len(x))

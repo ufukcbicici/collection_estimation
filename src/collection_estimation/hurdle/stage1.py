@@ -60,6 +60,19 @@ def stage1_features(rows: pd.DataFrame, columns: list[str], companies: list[str]
     return features
 
 
+def check_no_empty_feature(train_x: pd.DataFrame) -> None:
+    """Raise ValueError naming every feature column of `train_x` that is NaN in every row.
+
+    The boosted trees refuse such a column with an error that names nothing ("window shape
+    cannot be larger than input array shape"). It happens when every training row is too
+    early for a block, e.g. the series block before its first forecast (about origin 11)."""
+    empty = [column for column in train_x.columns if train_x[column].isna().all()]
+    if empty:
+        raise ValueError(f"the feature columns {empty} are NaN in every training row "
+                         f"({len(train_x)} rows); the trees cannot be fitted with them. Fit "
+                         f"at a later origin or without their feature block")
+
+
 def check_labels(train_x: pd.DataFrame, paid: pd.Series) -> pd.Series:
     """`paid` as True/False, after checking it can be learned from: it lines up with
     `train_x`, has no missing value and holds both outcomes. Raises ValueError otherwise."""
@@ -86,9 +99,11 @@ def fit_stage1(train_x: pd.DataFrame, paid: pd.Series, settings,
     rows, mixing weeks. The company code, if present, is used as a category.
 
     Raises ValueError if `paid` has a missing value, does not line up with `train_x`, or
-    holds only one class (see `check_labels`).
+    holds only one class (see `check_labels`), and if a feature column is NaN in every row
+    (see `check_no_empty_feature`).
     """
     paid = check_labels(train_x, paid)
+    check_no_empty_feature(train_x)
     model = HistGradientBoostingClassifier(
         loss="log_loss",
         max_iter=settings.max_iter,
@@ -121,7 +136,9 @@ AMOUNT_COLUMNS = {"last_payment_amount", "due_before_target_week", "due_in_targe
                   "due_after_target_week", "unapplied_cash", "open_balance",
                   # the delay spread ("dues", U18.2)
                   "spread_in_target", "spread_before_target", "overdue_beyond_habit",
-                  "shifted_due_in_target"}
+                  "shifted_due_in_target",
+                  # the deflated_trend forecasts ("series", U19)
+                  "trend_forecast", "all_trend_forecast"}
 AMOUNT_PATTERN = re.compile(r"mean_receipts_\d+|median_payment_\d+|overdue_up_to_\d+"
                             r"|overdue_\d+_to_\d+|overdue_over_\d+")
 
