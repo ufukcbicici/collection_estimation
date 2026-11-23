@@ -116,13 +116,14 @@ mean_weeks = 13                 # the trailing weeks of that mean
 # Stage 1, the "will it pay?" classifier (HistGradientBoostingClassifier, log loss, no class
 # weights, early stopping off). The stage-1 diagnostic's choice at origin 40 (its grid on
 # validation weeks 41-45); was 300 / 0.05 / 31, within 0.0002 log loss and 4x faster. The
-# settings grid (U16) tries others.
+# settings grid (U16) tries others; its run of 20 November 2026 (with series) kept these tree
+# settings and added the dues, habits and series blocks (validation WAPE 0.1501 against 0.1599).
 max_iter = 900                  # number of trees
 learning_rate = 0.01
 max_leaf_nodes = 63             # leaves per tree
 min_samples_leaf = 20           # rows per leaf, at least
 random_seed = 1
-feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
+feature_blocks = ["history", "calendar", "receivables", "dues", "habits", "series"]   # the horizon h is always in
 company_as_feature = true       # the company code (one of the EY entities) as a category
 baseline_c = 1.0                # the logistic-regression baseline's C (inverse regularisation)
 
@@ -130,19 +131,21 @@ baseline_c = 1.0                # the logistic-regression baseline's C (inverse 
 # Stage 2, the "how much, if it pays?" regressor (HistGradientBoostingRegressor on the paid
 # rows, target amount_deflated, early stopping off). The company code goes in exactly when it
 # does for stage 1. Starting values copy [stage1]; the stage-2 diagnostic (U11.5) tries others.
+# The settings grid's run of 20 November 2026 (with series) chose these; was 300 / 0.05 / 31,
+# own mean floor, without the dues, habits and series blocks.
 loss = "poisson"                # "poisson" (keeps the cash total), "gamma" (relative errors:
                                 # big payments weigh little) or "squared_error" (big payments
                                 # dominate; can predict below 0)
 max_iter = 300                  # number of trees
-learning_rate = 0.05
-max_leaf_nodes = 31             # leaves per tree
+learning_rate = 0.03
+max_leaf_nodes = 15             # leaves per tree
 min_samples_leaf = 20           # rows per leaf, at least
 random_seed = 1
-feature_blocks = ["history", "calendar", "receivables"]   # the horizon h is always in
+feature_blocks = ["history", "calendar", "receivables", "dues", "habits", "series"]   # the horizon h is always in
 scale = "open balance"          # m = s x E. "none": E = 1, s is the amount. "open balance":
                                 # E = the open balance (lifted to the floor), s is the share
                                 # of the balance paid
-balance_floor = "own mean"      # E's floor: "median" or "mean" of the paid training amounts,
+balance_floor = "median"        # E's floor: "median" or "mean" of the paid training amounts,
                                 # or "own mean", the customer's own mean payment
 own_mean_window = 52            # "own mean": the customer's payments over this many weeks
                                 # (one of the [history] windows) ...
@@ -283,8 +286,9 @@ min_gain = 0.005                 # a pair replaces the current settings only if 
 # them (with ["dues", "habits"]: none, dues, habits, both), the same subset in both stages.
 # Each subset fits every stage setting again, so the fits grow as 2^N. [] = none tried.
 # With "series" (U19): 8 subsets, 288 stage-1 and 584 stage-2 fits per origin, 10,464 fits
-# over the 12 validation origins.
-extra_blocks = ["dues", "habits", "series"]
+# over the 12 validation origins. Emptied after the run of 20 November 2026: all three blocks
+# are now in [stage1] and [stage2] feature_blocks, and a block may not be in both places.
+extra_blocks = []
 # How many fits run at once, each in its own process with its share of the threads (12 // 3 =
 # 4 here). Measured on this machine (origin 44, 6 + 6 fits): 3 workers fit stage 1 1.42x and
 # stage 2 1.78x faster than one at a time, about 1.2 GB each; 6 workers were slower. 1 = one

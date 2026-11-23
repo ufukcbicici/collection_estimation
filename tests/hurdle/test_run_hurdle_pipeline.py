@@ -5610,14 +5610,16 @@ def test_the_settings_read_by_the_u18_printouts_exist_in_the_synthetic_settings(
 
 
 def test_the_synthetic_stages_keep_the_three_base_blocks():
-    # U18.4 makes "dues" and "habits" selectable; settings/synthetic.toml does not select them.
+    # U18.4 makes "dues" and "habits" selectable, U19.2 "series". Which of them the stages use
+    # is the settings grid's choice (its run of 20 November 2026 added all three), so that is
+    # not pinned; whatever it chose, both stages keep the three base blocks.
     from collection_estimation.hurdle.settings import load_settings
     settings_file = SCRIPT.parent / "settings" / "synthetic.toml"
     if not settings_file.exists():
         pytest.skip("settings/synthetic.toml absent")
     settings = load_settings(settings_file, SCRIPT.parent)
     for stage in (settings.stage1, settings.stage2):
-        assert "dues" not in stage.feature_blocks and "habits" not in stage.feature_blocks
+        assert {"history", "calendar", "receivables"} <= set(stage.feature_blocks)
 
 
 # --- U19 (U19.2): main() prints the series features, between U18.3 and the top-ups -------------

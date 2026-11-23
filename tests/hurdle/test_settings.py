@@ -242,8 +242,8 @@ VALID = {
              "stage2_skill_tolerance": "0.04", "stage2_ratio_band": "[0.85, 1.15]",
              "topup_windows": "[13, 4]", "topup_ridge_with_level": "[false, true]",
              "min_gain": "0.01",
-             # U18.5: no extra block here (synthetic.toml tries ["dues", "habits"]); the
-             # extra_blocks tests set it themselves.
+             # U18.5: no extra block here (synthetic.toml's is the grid owner's to change);
+             # the extra_blocks tests set it themselves.
              "extra_blocks": "[]",
              # [grid] workers: 2 (synthetic.toml has 3), so a test can tell which file was read.
              "workers": "2"},
@@ -1285,10 +1285,41 @@ def test_the_synthetic_settings_hold_the_expected_values():
     assert settings.history.use_ledger_before_first_file is True
     assert settings.debug.demo_origin == 40
     assert type(settings.debug.demo_origin) is int
-    assert settings.stage1 == Stage1Settings(
-        max_iter=900, learning_rate=0.01, max_leaf_nodes=63, min_samples_leaf=20,
-        random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, baseline_c=1.0)
+    assert_synthetic_stage1(settings.stage1)
+
+
+# The settings grid (U16) writes its choice into synthetic.toml's [stage1] and [stage2]: the
+# tree settings, stage 2's loss, scale and floor, and the feature blocks (the three base blocks
+# plus any [grid] extra_blocks it kept). So the tests of the repo's own file do not pin those
+# values, only that they are valid and well-typed; the settings the grid never tries are pinned.
+
+BASE_FEATURE_BLOCKS = ("history", "calendar", "receivables")
+
+
+def assert_grid_chosen_blocks(blocks):
+    """A stage's feature_blocks as the grid may leave them: a tuple of FEATURE_BLOCKS names in
+    FEATURE_BLOCKS order, each once, with the three base blocks always in."""
+    assert type(blocks) is tuple
+    assert len(set(blocks)) == len(blocks)
+    assert blocks == tuple(block for block in FEATURE_BLOCKS if block in blocks)
+    assert set(BASE_FEATURE_BLOCKS) <= set(blocks)
+
+
+def assert_grid_chosen_trees(stage):
+    """A stage's tree settings, which the grid may change: valid values of the right type."""
+    assert type(stage.max_iter) is int and stage.max_iter >= 1
+    assert type(stage.learning_rate) is float and 0 < stage.learning_rate <= 1
+    assert type(stage.max_leaf_nodes) is int and stage.max_leaf_nodes >= 2
+
+
+def assert_synthetic_stage1(stage1):
+    """settings/synthetic.toml's [stage1]: the grid-chosen values checked, the rest pinned."""
+    assert isinstance(stage1, Stage1Settings)
+    assert_grid_chosen_trees(stage1)
+    assert_grid_chosen_blocks(stage1.feature_blocks)
+    assert (stage1.min_samples_leaf, stage1.random_seed) == (20, 1)
+    assert stage1.company_as_feature is True
+    assert stage1.baseline_c == 1.0
 
 
 
@@ -2762,10 +2793,7 @@ def test_debug_settings_fields():
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_stage1_and_demo_origin_settings():
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
-    assert settings.stage1 == Stage1Settings(
-        max_iter=900, learning_rate=0.01, max_leaf_nodes=63, min_samples_leaf=20,
-        random_seed=1, feature_blocks=("history", "calendar", "receivables"),
-        company_as_feature=True, baseline_c=1.0)
+    assert_synthetic_stage1(settings.stage1)
     assert settings.debug.demo_origin == 40
     assert type(settings.debug.demo_origin) is int
 
@@ -3795,12 +3823,19 @@ def test_a_bad_stage2_value_is_reported_after_stage1(tmp_path, repo):
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_stage2_settings():
+    # The grid-chosen values (trees, loss, scale, floor, blocks) are checked, not pinned; see
+    # assert_synthetic_stage1.
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
-    assert settings.stage2 == Stage2Settings(
-        loss="poisson", max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
-        min_samples_leaf=20, random_seed=1,
-        feature_blocks=("history", "calendar", "receivables"), scale="open balance",
-        balance_floor="own mean", own_mean_window=52, own_mean_prior_weeks=1.0)
+    stage2 = settings.stage2
+    assert isinstance(stage2, Stage2Settings)
+    assert_grid_chosen_trees(stage2)
+    assert_grid_chosen_blocks(stage2.feature_blocks)
+    assert stage2.loss in STAGE2_LOSSES
+    assert stage2.scale in STAGE2_SCALES
+    assert stage2.balance_floor in BALANCE_FLOORS
+    assert (stage2.min_samples_leaf, stage2.random_seed) == (20, 1)
+    assert stage2.own_mean_window == 52
+    assert stage2.own_mean_prior_weeks == 1.0
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
@@ -4129,8 +4164,9 @@ def test_choice_setting_does_not_change_the_table():
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml not added yet")
 def test_the_synthetic_balance_scaling_settings():
     raw = tomllib.loads(SYNTHETIC_SETTINGS.read_text(encoding="utf-8"))
-    assert raw["stage2"]["scale"] == "open balance"
-    assert raw["stage2"]["balance_floor"] == "own mean"
+    # scale and balance_floor are the settings grid's to choose: valid choices, not pinned.
+    assert raw["stage2"]["scale"] in STAGE2_SCALES
+    assert raw["stage2"]["balance_floor"] in BALANCE_FLOORS
     assert raw["stage2"]["own_mean_window"] == 52
     assert raw["stage2"]["own_mean_prior_weeks"] == 1
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
@@ -7655,12 +7691,17 @@ def test_read_grid_checks_the_grids_before_extra_blocks():
 
 
 @pytest.mark.skipif(not SYNTHETIC_SETTINGS.exists(), reason="settings/synthetic.toml absent")
-def test_the_synthetic_toml_tries_dues_habits_and_series_on_top():
-    # Only extra_blocks is pinned; the grids themselves are the owner's to change.
-    # U19.2: "series" joined "dues" and "habits".
+def test_the_synthetic_toml_extra_blocks_are_beside_the_stage_blocks():
+    # Nothing is pinned: a grid run moves the blocks it keeps from [grid] extra_blocks into
+    # the stages' feature_blocks (20 November 2026: all three, leaving extra_blocks = []).
+    # What holds whatever the run chose: extra_blocks is a tuple of FEATURE_BLOCKS names in
+    # FEATURE_BLOCKS order, none of the base blocks, and none also in a stage's blocks.
     settings = load_settings(SYNTHETIC_SETTINGS, REPO_ROOT)
-    assert settings.grid.extra_blocks == ("dues", "habits", "series")
-    for block in settings.grid.extra_blocks:
+    extra = settings.grid.extra_blocks
+    assert type(extra) is tuple
+    assert extra == tuple(block for block in FEATURE_BLOCKS if block in extra)
+    assert not set(extra) & set(BASE_FEATURE_BLOCKS)
+    for block in extra:
         assert block not in settings.stage1.feature_blocks
         assert block not in settings.stage2.feature_blocks
 
